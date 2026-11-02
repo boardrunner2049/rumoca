@@ -255,7 +255,8 @@ fn reject_unsupported_statements(
             rumoca_core::Statement::Empty { .. } => {}
             rumoca_core::Statement::Assignment { comp, span, .. } => {
                 require_span(*span, "initial algorithm assignment")?;
-                if comp.parts().is_empty() || comp.parts().iter().any(|part| !part.subs.is_empty())
+                if comp.parts().is_empty()
+                    || !rumoca_core::component_ref_element_subscripts(comp).is_empty()
                 {
                     return Err(unsupported(
                         "an assignment target must be one whole, unsubscripted coordinate",

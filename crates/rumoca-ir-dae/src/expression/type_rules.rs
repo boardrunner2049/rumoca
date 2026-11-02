@@ -10,17 +10,11 @@ pub(super) fn validate_static_quotient(
         unreachable!("builtin result validation proves quotient arity")
     };
     let operator = quotient_name(builtin);
-    let Some(lhs) = static_numeric_value(storage, lhs.index()) else {
-        return Err(DaeConstructionError::NonStaticDiscontinuity {
-            operator,
-            span: at.span(),
-        });
-    };
-    let Some(rhs) = static_numeric_value(storage, rhs.index()) else {
-        return Err(DaeConstructionError::NonStaticDiscontinuity {
-            operator,
-            span: at.span(),
-        });
+    let (Some(lhs), Some(rhs)) = (
+        static_numeric_value(storage, lhs.index()),
+        static_numeric_value(storage, rhs.index()),
+    ) else {
+        return validate_time_invariant_quotient(storage, operator, [*lhs, *rhs], at);
     };
     let function = match builtin {
         PureBuiltin::Div => rumoca_core::BuiltinFunction::Div,
@@ -37,6 +31,40 @@ pub(super) fn validate_static_quotient(
             span: at.span(),
         })
     }
+}
+
+/// MLS §3.7.2: a quotient generates events where its value changes. One whose
+/// operands are fixed for the whole simulation (constants, parameters, the
+/// binders of a parameter-sized domain) never changes, so the plain builtin
+/// is exact and needs no event owner. A statically zero divisor is still an
+/// undefined domain; a parameter divisor that evaluates to zero surfaces at
+/// runtime, like any parameter reciprocal.
+fn validate_time_invariant_quotient(
+    storage: &Storage,
+    operator: &'static str,
+    arguments: [ExprId<'_>; 2],
+    at: DaeProvenance,
+) -> Result<(), DaeConstructionError> {
+    if static_numeric_value(storage, arguments[1].index())
+        .is_some_and(|divisor| divisor == 0.0 || !divisor.is_finite())
+    {
+        return Err(DaeConstructionError::UndefinedBuiltinDomain {
+            operator,
+            span: at.span(),
+        });
+    }
+    for argument in arguments {
+        if !matches!(
+            storage.expr_variability(argument, at)?,
+            ExpressionVariability::Constant | ExpressionVariability::Parameter
+        ) {
+            return Err(DaeConstructionError::NonStaticDiscontinuity {
+                operator,
+                span: at.span(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validate_runtime_quotient(

@@ -25,7 +25,7 @@
 use rumoca_ir_ast as ast;
 use rumoca_ir_ast::AstIndexMap as IndexMap;
 
-use super::{index_binding_for_element, index_nested_modification_for_element};
+use super::index_modification_for_element;
 use crate::InstantiateResult;
 
 /// Whether an array component's elements are index-independent.
@@ -44,7 +44,7 @@ pub(super) struct HomogeneityInput<'a> {
     /// Non-`each` modifications already resolved to array literals; a non-empty
     /// list means `distribute_mods_for_element` would rewrite each element.
     pub(super) resolved_mods: &'a [(String, ast::Expression)],
-    /// The array-level binding that `index_binding_for_element` would index.
+    /// The array-level binding that each element indexes.
     pub(super) original_binding: Option<&'a ast::Expression>,
     pub(super) tree: &'a ast::ClassTree,
     pub(super) parent_components: &'a IndexMap<String, ast::Component>,
@@ -98,19 +98,11 @@ fn modification_probe(
     expr: &ast::Expression,
     tuple: &[i64],
 ) -> InstantiateResult<Option<HomogeneityVerdict>> {
-    let nested =
-        index_nested_modification_for_element(input.tree, input.parent_components, expr, tuple)?;
-    if nested.is_some() {
-        return Ok(Some(HomogeneityVerdict::Scalar("indexed nested modifier")));
-    }
-    let indexed = index_binding_for_element(input.tree, input.parent_components, expr, tuple)?;
-    // `distribute_component_ref_mods_for_element` only overwrites the element
-    // declaration when the indexed form is not an `ArrayIndex` wrapper, so an
-    // unchanged result (or a preserved wrapper) leaves the element identical.
-    if indexed != *expr && !matches!(indexed, ast::Expression::ArrayIndex { .. }) {
-        return Ok(Some(HomogeneityVerdict::Scalar(
-            "indexed component-reference modifier",
-        )));
+    // The same rule `distribute_component_ref_mods_for_element` applies: an
+    // element whose value differs from the written modifier is not a copy.
+    let indexed = index_modification_for_element(input.tree, input.parent_components, expr, tuple)?;
+    if indexed.is_some_and(|indexed| indexed != *expr) {
+        return Ok(Some(HomogeneityVerdict::Scalar("indexed modifier")));
     }
     Ok(None)
 }

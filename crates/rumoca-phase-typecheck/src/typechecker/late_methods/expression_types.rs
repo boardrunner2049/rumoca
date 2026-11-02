@@ -249,6 +249,22 @@ impl TypeChecker {
         }
     }
 
+    /// The common type of the arrays `cat(k, A, B, ...)` joins; the leading
+    /// argument is the Integer dimension.
+    fn concatenation_element_type(
+        &self,
+        args: &[Expression],
+        type_table: &TypeTable,
+    ) -> Option<TypeId> {
+        args.get(1..)?.iter().try_fold(None, |common, arg| {
+            let ty = self.infer_expression_type(arg, type_table)?;
+            Some(Some(match common {
+                None => ty,
+                Some(common) => self.common_value_type(common, ty, type_table)?,
+            }))
+        })?
+    }
+
     fn infer_builtin_result_type(
         &self,
         function: rumoca_core::BuiltinFunction,
@@ -292,6 +308,7 @@ impl TypeChecker {
             BuiltinFunction::Fill => args
                 .first()
                 .and_then(|arg| self.infer_expression_type(arg, type_table)),
+            BuiltinFunction::Cat => self.concatenation_element_type(args, type_table),
             BuiltinFunction::Cross => {
                 let [lhs, rhs] = args else {
                     return None;
@@ -325,7 +342,6 @@ impl TypeChecker {
             | BuiltinFunction::OuterProduct
             | BuiltinFunction::Symmetric
             | BuiltinFunction::Skew
-            | BuiltinFunction::Cat
             | BuiltinFunction::Hold
             | BuiltinFunction::Previous
             | BuiltinFunction::SubSample

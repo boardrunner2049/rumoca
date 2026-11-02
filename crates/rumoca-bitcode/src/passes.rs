@@ -18,8 +18,10 @@ mod asserts;
 mod constants;
 mod evaluate;
 pub mod external;
+mod family_branches;
 mod functions;
 mod inline_constants;
+mod parameter_bindings;
 pub mod pipeline;
 mod pure_calls;
 
@@ -66,6 +68,10 @@ impl PassReport {
 
 static DEAD_EXPRESSIONS: DeadExpressions = DeadExpressions;
 static PRUNE_FUNCTIONS: functions::PruneFunctions = functions::PruneFunctions;
+static FOLD_PARAMETER_BINDINGS: parameter_bindings::FoldParameterBindings =
+    parameter_bindings::FoldParameterBindings;
+static SELECT_FAMILY_BRANCHES: family_branches::SelectFamilyBranches =
+    family_branches::SelectFamilyBranches;
 static INLINE_CONSTANTS: inline_constants::InlineConstants = inline_constants::InlineConstants;
 static FOLD_CONSTANTS: constants::FoldConstants = constants::FoldConstants;
 static FOLD_PURE_CALLS: pure_calls::FoldPureCalls = pure_calls::FoldPureCalls;
@@ -80,8 +86,10 @@ static FOLD_ASSERTS: asserts::FoldAsserts = asserts::FoldAsserts;
 /// the result is the compiler's default artifact and a declared function
 /// vanishing from it because of how one call site was written is not
 /// recoverable -- TOOLBUG-029. A pass runs only when asked.)
-pub fn catalog() -> [&'static dyn Pass; 6] {
+pub fn catalog() -> [&'static dyn Pass; 8] {
     [
+        &SELECT_FAMILY_BRANCHES,
+        &FOLD_PARAMETER_BINDINGS,
         &INLINE_CONSTANTS,
         &FOLD_CONSTANTS,
         &FOLD_PURE_CALLS,

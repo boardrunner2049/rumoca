@@ -2,7 +2,6 @@ use rumoca_compile::compile::SourceRootKind;
 use rumoca_compile::{Session, SessionConfig};
 fn main() {
     let mut session = Session::new(SessionConfig {
-        fold_parameter_declaration_bindings: false,
         freeze_parameters: true,
         ..SessionConfig::default()
     });

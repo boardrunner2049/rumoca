@@ -94,9 +94,14 @@ fn seed_host_driven_input<'dae>(
     let Some(start) = variable.start() else {
         return Ok(());
     };
-    let values = rumoca_phase_solve::fmi::numeric_attribute_values(view, variable, Some(start))
-        .map_err(fmi_metadata_error)?
-        .expect("a supplied numeric start evaluates to values");
+    // A start with no numeric value (a Boolean or String input) seeds
+    // nothing: the host supplies the input, and its default stays its own.
+    let Some(values) =
+        rumoca_phase_solve::fmi::numeric_attribute_values(view, variable, Some(start))
+            .map_err(fmi_metadata_error)?
+    else {
+        return Ok(());
+    };
     for scalar in 0..variable.scalar_count() {
         let name = variable.scalar_name(scalar).ok_or_else(|| {
             preparation_error(

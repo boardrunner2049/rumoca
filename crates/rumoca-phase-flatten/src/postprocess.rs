@@ -11,10 +11,13 @@ mod constant_expansion;
 mod constant_lookup;
 mod constant_substituter;
 mod constructor_calls;
+mod discrete_array_equations;
 mod field_access;
 mod function_shape_constants;
 mod index_collapse;
 mod indexed_dimension_recovery;
+mod input_history;
+mod loop_assertions;
 mod occurrence_graph;
 mod operator_records;
 mod package_constants;
@@ -24,6 +27,7 @@ mod record_alias;
 mod record_alias_postprocess_tests;
 #[cfg(test)]
 mod substitute_constant_tests;
+mod when_element_arrays;
 
 use super::*;
 
@@ -31,14 +35,18 @@ pub(crate) use array_domain_comprehensions::rewrite_array_domain_comprehensions;
 pub(crate) use constant_lookup::constant_expr_preserves_array_shape;
 pub(crate) use constant_substituter::substitute_known_constants_expr;
 pub(crate) use constructor_calls::mark_record_constructor_calls;
+pub(crate) use discrete_array_equations::split_discrete_array_equations;
 pub(super) use field_access::{
     drop_invalid_field_access_bindings, normalize_record_array_field_access_bindings,
     resolve_nested_constructor_field_access_bindings,
 };
 pub(crate) use index_collapse::{collapse_index_refs_to_known_varrefs, field_access_flat_path};
 pub(crate) use indexed_dimension_recovery::recover_indexed_lhs_dimensions;
+pub(crate) use input_history::give_discrete_inputs_history;
+pub(crate) use loop_assertions::accumulate_loop_assertions;
 pub(crate) use operator_records::lower_operator_record_equations;
 pub(crate) use parameter_derivatives::fold_time_invariant_derivatives;
+pub(crate) use when_element_arrays::scalarize_when_element_arrays;
 
 use constant_substituter::{
     substitute_known_constants_expr_with_options, substitute_known_constants_statement,

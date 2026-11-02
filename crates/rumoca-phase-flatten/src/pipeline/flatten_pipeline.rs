@@ -1089,6 +1089,10 @@ pub(crate) fn finalize_flat_model(
     inject_referenced_qualified_class_constants(tree, class_index, model_name, flat, overlay, ctx)?;
     substitute_constants_collecting_calls(flat, ctx, overlay, tree, class_index, model_name)?;
     fold_time_invariant_derivatives(flat);
+    crate::postprocess::accumulate_loop_assertions(flat);
+    crate::postprocess::split_discrete_array_equations(flat);
+    crate::postprocess::give_discrete_inputs_history(flat)?;
+    crate::postprocess::scalarize_when_element_arrays(flat)?;
     crate::postprocess::rewrite_array_domain_comprehensions(flat)?;
     resolve_nested_constructor_field_access_bindings(flat);
     // MLS §4.5 / §12.3: an explicitly frozen artifact may specialize pure

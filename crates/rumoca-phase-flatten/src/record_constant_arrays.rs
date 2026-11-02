@@ -61,14 +61,24 @@ pub(crate) fn synthesize_component_modification_binding(
     if comp.modifications.is_empty() || !component_type_is_record(comp, class_index) {
         return None;
     }
-    if let Some(array_binding) = synthesize_each_array_component_modification_binding(comp) {
+    if let Some(array_binding) =
+        synthesize_each_array_component_modification_binding(comp, class_index)
+    {
         return Some(array_binding);
     }
-    synthesize_scalar_component_modification_binding(comp)
+    // An array whose modifiers are not all `each`, or whose extent is not a
+    // literal, has no single record value: a scalar constructor would stand
+    // for the whole array and drop its shape. Its elements keep their own
+    // instantiated bindings instead.
+    if !comp.shape_expr.is_empty() {
+        return None;
+    }
+    synthesize_scalar_component_modification_binding(comp, class_index)
 }
 
 fn synthesize_each_array_component_modification_binding(
     comp: &ast::Component,
+    class_index: &ast::ClassDefIndex<'_>,
 ) -> Option<ast::Expression> {
     let [len] = comp.shape.as_slice() else {
         return None;
@@ -81,7 +91,7 @@ fn synthesize_each_array_component_modification_binding(
     {
         return None;
     }
-    let scalar = synthesize_scalar_component_modification_binding(comp)?;
+    let scalar = synthesize_scalar_component_modification_binding(comp, class_index)?;
     let span = scalar.span();
     Some(ast::Expression::Array {
         elements: vec![scalar; *len],
@@ -92,12 +102,18 @@ fn synthesize_each_array_component_modification_binding(
 
 fn synthesize_scalar_component_modification_binding(
     comp: &ast::Component,
+    class_index: &ast::ClassDefIndex<'_>,
 ) -> Option<ast::Expression> {
     let span = first_modification_span(comp)?;
     let type_def_id = comp
         .type_def_id
         .expect("record modification synthesis requires an exactly resolved type declaration");
-    let type_name = comp.type_name.to_string();
+    // The constructor is the record's own: name it by its declaration, not
+    // by the spelling the declaring scope used (`R` inside package `P` is the
+    // constructor `P.R`).
+    let type_name = class_index
+        .qualified_name(type_def_id)
+        .map_or_else(|| comp.type_name.to_string(), str::to_string);
     let location = comp
         .type_name
         .name

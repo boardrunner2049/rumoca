@@ -57,8 +57,8 @@ pub(super) use discrete_values::DiscreteValueTopologyPlan;
 use discrete_values::analyze_discrete_value_topology;
 pub(super) use equation_partitions::{
     AggregateDiscreteConnections, DiscreteValueAssignmentPlan, EquationPartition,
-    discrete_value_assignment, equation_partition, structured_discrete_assignments,
-    structured_discrete_element_assignments,
+    discrete_value_assignment, equation_partition, row_owned_discrete_family,
+    structured_discrete_assignments, structured_discrete_element_assignments,
 };
 use equation_partitions::{
     aggregate_discrete_connections, defined_discrete_targets, discrete_connection_ranks,
@@ -663,10 +663,16 @@ fn analyze_expression_support(
     Ok(ExpressionSupportPlans {
         // Assertion conditions are lowered through the same comprehension
         // plans (CDL `ExtractSignal`: `assert(andTrue({... for i in 1:n}))`).
+        // A `for`-equation family lowers its template, not the scalar cells,
+        // so an array constructor in its body is planned from the template.
         comprehensions: analyze_comprehensions(
             all_model_expressions(flat)
                 .chain(assertion_expressions(flat))
-                .chain(when_chain_expressions(flat)),
+                .chain(when_chain_expressions(flat))
+                .chain(structured_template_expressions(&flat.structured_equations))
+                .chain(structured_template_expressions(
+                    &flat.initial_structured_equations,
+                )),
             constants,
         )?,
         delays: analyze_delays(flat, constants)?,
@@ -789,7 +795,7 @@ fn analyze_structured_family_rows(
 ) -> Result<(HashSet<usize>, HashSet<usize>), ToDaeError> {
     let continuous = validate_structured_families(
         &flat.structured_equations,
-        flat.equations.len(),
+        &flat.equations,
         roles,
         expression_roles,
         states,
@@ -798,7 +804,7 @@ fn analyze_structured_family_rows(
     )?;
     let initialization = validate_structured_families(
         &flat.initial_structured_equations,
-        flat.initial_equations.len(),
+        &flat.initial_equations,
         roles,
         expression_roles,
         states,
@@ -1316,6 +1322,9 @@ fn constant_context(flat: &flat::Model) -> Result<EvalContext, ToDaeError> {
                     None => continue,
                 },
             };
+            if variable.binding.is_none() && variable.start.is_none() {
+                context.add_defaulted_parameter(name.to_string());
+            }
             match evaluated {
                 Ok(value) => {
                     context.add_instance_parameter(variable.instance_id, name.to_string(), value);

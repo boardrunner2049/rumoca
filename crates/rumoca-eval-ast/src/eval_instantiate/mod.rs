@@ -731,6 +731,9 @@ fn resolve_scoped_record_field_expr(
     component_expr_for_structural_eval(field).cloned()
 }
 
+mod component_member;
+use component_member::eval_integer_component_member_ref;
+
 #[derive(Copy, Clone)]
 pub(super) struct IntegerEvalEnv<'a> {
     mod_env: &'a ast::ModificationEnvironment,
@@ -1194,6 +1197,10 @@ fn eval_integer_component_ref(
     }
 
     if let Some(value) = eval_integer_class_constant_ref(comp_ref, env, depth, local_ints) {
+        return Some(value);
+    }
+
+    if let Some(value) = eval_integer_component_member_ref(comp_ref, env, depth) {
         return Some(value);
     }
 

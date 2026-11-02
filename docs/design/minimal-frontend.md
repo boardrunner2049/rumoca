@@ -199,3 +199,37 @@ heavy-solve and template suites) gave:
 - `fold-pure-calls` folds only scalar results with literal arguments, where
   the frontend step also folded arrays and used frozen parameter values.
 - Declaring Real array constants and per-instance constants.
+
+## Status (2026-10-08): the second sweep
+
+Every step that still rewrote the model before bitcode export was
+inventoried again, across instantiate, flatten and DAE construction, and
+sorted by the same question as before. Three more moved.
+
+| Was | Now |
+|---|---|
+| Instantiate: `fold_parameter_declaration_bindings` (on by default) evaluated a non-structural declaration binding when it happened to come out an Integer -- `parameter Real d = k * 10` with `k = 2` reached Flat as the Integer `20` | `fold-parameter-bindings`. The frontend keeps every non-structural, non-discrete binding as written; the pass writes the value, typed as declared (`20.0`), when the binding settles from literals, constants and non-tunable parameters. A binding that reads a tunable parameter is never folded: it can change on the artifact, and galec's `Recalibrate` recomputes the binding from it. `--no-fold-parameter-bindings` runs the default group without the pass; the session/instantiate option is gone. |
+| DAE construction: `selected_constant_branch` lowered only the arm of a structured body's top-level `if` that the constant context (every fixed parameter, tunable ones included) selected | `select-family-branches`, over every equation family (initial ones included) and the per-point bodies a materialized family packs, with the same environment. Construction lowers the whole conditional. |
+| Flatten: a Real package constant was declared as a model constant only where an *equation* read it; bindings, attributes, family templates and assertion conditions still had the number substituted | The declaration covers all of those, so `parameter Real w = 2*P.c` keeps `P.c` through lowering and `inline-constants` / `fold-parameter-bindings` fold it. |
+
+Default group, in order: `select-family-branches`, `fold-parameter-bindings`,
+`inline-constants`, `fold-constants`, `fold-pure-calls`, `fold-asserts`,
+`prune-functions`, `dead-expressions`.
+
+**What the sweep found and left, with the reason each one is lowering.**
+
+| Step | Why it cannot be a pass |
+|---|---|
+| `specialize_frozen_bindings` (`--freeze-parameters`) | It folds calls whose functions contain `while`, which the DAE's function body form cannot carry; without the fold those models have no DAE. The profile says so: it "does not add general runtime `while` support". |
+| `DelayPlan::Identity` (`delay(x, 0)` → `x`) | The DAE's delay node demands a strictly positive delay time; a zero delay has no other representation. |
+| Time-event scheduling (`time_event_instant`) | Choosing a scheduled time event over a zero crossing changes *when* the event fires, not what the model is; it is event semantics (MLS §8.5), not a cheaper equivalent. It does evaluate tunable parameters into the instant -- a candidate if the artifact grows an owner for parameter-dependent time events. |
+| Structural/discrete binding resolution, structural if-equation and when-branch selection, for-range and comprehension evaluation, empty-range and zero-sized-reduction removal | MLS §18.3 / §8.3.4 / §10.5: shape, state selection and equation count depend on them. |
+| `fold_time_invariant_derivatives` | MLS §3.7.4.2: the DAE has no derivative coordinate for a parameter. |
+| `specialize_function_inputs`, `prune_unreachable_functions` | Monomorphization; a function-typed input cannot reach a DAE (unchanged from the table above). |
+| Proven-branch selection and loop compaction inside function bodies | The DAE refuses a function loop it would have to scalar-expand, and dead arms can hold recursion or unprovable `fill` extents; without them models that compile today are rejected. Several sub-steps are classic optimizations (dead-store elimination, fission, reduction recognition) serving as enablers -- the next candidates once the bitcode body form can carry what they remove. |
+| `rewrite_if` during constant substitution | A dead `a[i-1]` would be out of bounds after loop specialization. |
+| Param-variability family cheapening | Not a model rewrite: internal compile memory, output byte-identical. |
+
+**Still open.** Real *array* package constants and per-instance (replaceable
+`Medium`) constants are still substituted by the frontend; declaring them
+needs an array-literal binding and a per-occurrence qualified name.

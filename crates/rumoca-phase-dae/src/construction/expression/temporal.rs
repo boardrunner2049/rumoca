@@ -78,7 +78,7 @@ pub(super) fn lower_history_operator<'dae>(
     let plan = symbols
         .functions
         .history_operators
-        .certificate(function, span, variable.instance_id)
+        .certificate(function, span, variable.instance_id, subscripts)
         .ok_or_else(missing)?;
     if plan.subscripts() != subscripts {
         return Err(missing());

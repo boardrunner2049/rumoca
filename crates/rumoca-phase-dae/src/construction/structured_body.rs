@@ -8,9 +8,8 @@ pub(super) fn lower_structured_body<'dae>(
     generated_root: Option<dae::DaeGeneration>,
     _owner_span: Span,
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
-    if let Some(selected) = selected_constant_branch(body, symbols.functions.constants) {
-        return lower_expression_scoped(construction, symbols, binders, selected, generated_root);
-    }
+    // An `if` whose conditions parameter values decide is lowered whole;
+    // selecting its branch is the `select-family-branches` bitcode pass.
     let normalized = normalize_conditional_residual(body);
     let body = normalized.as_ref().unwrap_or(body);
     let generated_root = normalized
@@ -18,31 +17,6 @@ pub(super) fn lower_structured_body<'dae>(
         .then_some(dae::DaeGeneration::ConditionLowering)
         .or(generated_root);
     lower_expression_scoped(construction, symbols, binders, body, generated_root)
-}
-
-fn selected_constant_branch<'expression>(
-    body: &'expression Expression,
-    constants: &EvalContext,
-) -> Option<&'expression Expression> {
-    let Expression::If {
-        branches,
-        else_branch,
-        ..
-    } = body
-    else {
-        return None;
-    };
-    for (condition, value) in branches {
-        match eval_expr(condition, constants)
-            .ok()
-            .and_then(|value| value.as_bool())
-        {
-            Some(true) => return Some(value),
-            Some(false) => {}
-            None => return None,
-        }
-    }
-    Some(else_branch)
 }
 
 /// Normalize an equation-level conditional whose every branch defines the

@@ -394,6 +394,12 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         }
         let mut sources = Vec::with_capacity(arguments.len());
         for argument in arguments.iter() {
+            let argument_dimensions = self.node(argument).value_type().dimensions();
+            // An empty operand contributes no element (`cat(1, {a}, zeros(0))`
+            // is `{a}`) and has no registers to read.
+            if argument_dimensions.contains(&0) {
+                continue;
+            }
             let start = self.pack_expression(argument)?;
             let argument_dimensions = self.node(argument).value_type().dimensions();
             let mut promoted = vec![1_u32; dimensions.len()];
@@ -408,6 +414,9 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             .try_fold(1usize, |count, extent| count.checked_mul(*extent as usize));
         let count =
             count.ok_or_else(|| LowerError::contract("concatenation extent overflow", span))?;
+        if count == 0 || sources.is_empty() {
+            return Ok(self.next_register);
+        }
         let dst_start = self.next_register;
         for _ in 0..count {
             self.register(span)?;

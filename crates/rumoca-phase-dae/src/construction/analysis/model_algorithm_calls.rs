@@ -194,7 +194,7 @@ fn analyze_event_function_output(
     result_shape: &[u32],
     span: Span,
 ) -> Result<ModelEventFunctionOutputPlan, ToDaeError> {
-    if output.parts().iter().any(|part| !part.subs.is_empty()) {
+    if !rumoca_core::component_ref_element_subscripts(output).is_empty() {
         return Err(ToDaeError::unsupported_algorithm(
             "model",
             "a function-call receiver must be one whole coordinate or record",

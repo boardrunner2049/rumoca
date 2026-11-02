@@ -158,6 +158,13 @@ fn expression_is_statically_zero_sized(
         ast::Expression::ComponentReference(component) => {
             component_ref_is_statically_zero_sized(ctx, component, prefix)
         }
+        // `{}` and a constructor over an empty domain (`sum(f(i) for i in 1:0)`,
+        // MLS §10.4.1): no element, whatever the body would have referenced.
+        ast::Expression::Array { elements, .. } => elements.is_empty(),
+        ast::Expression::ArrayComprehension { indices, .. } => indices.iter().any(|index| {
+            expand_range_indices(ctx, &index.range, prefix, index.range.span())
+                .is_ok_and(|values| values.is_empty())
+        }),
         _ => find_array_refs_needing_expansion(expr, prefix, ctx)
             .iter()
             .any(|array_ref| array_ref.dims.iter().any(|dim| *dim <= 0)),

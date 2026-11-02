@@ -662,18 +662,46 @@ fn distribute_component_ref_mods_for_element(
         }
 
         if let Some(indexed) =
-            index_nested_modification_for_element(tree, parent_components, expr, indices)?
+            index_modification_for_element(tree, parent_components, expr, indices)?
         {
-            scalar_comp.modifications.insert(name.clone(), indexed);
-            continue;
-        }
-
-        let indexed = index_binding_for_element(tree, parent_components, expr, indices)?;
-        if !matches!(indexed, ast::Expression::ArrayIndex { .. }) {
             scalar_comp.modifications.insert(name.clone(), indexed);
         }
     }
     Ok(())
+}
+
+/// The value one element of an array component takes from a non-`each`
+/// modifier on the whole array (MLS §7.2.5), or `None` when the modifier
+/// applies to the element unchanged.
+///
+/// A modifier whose element cannot be selected structurally is kept as
+/// written: `(expr)[k]` is not formed, so a scalar modifier missing `each`
+/// still applies to every element.
+pub(super) fn index_modification_for_element(
+    tree: &ast::ClassTree,
+    parent_components: &IndexMap<String, ast::Component>,
+    expr: &ast::Expression,
+    indices: &[i64],
+) -> InstantiateResult<Option<ast::Expression>> {
+    if let Some(indexed) =
+        index_nested_modification_for_element(tree, parent_components, expr, indices)?
+    {
+        return Ok(Some(indexed));
+    }
+    // Arithmetic over array values (`r_C = geometry.armMount / 2`): select the
+    // element in the operand that carries the array dimension.
+    if matches!(
+        expr,
+        ast::Expression::Binary { .. }
+            | ast::Expression::Unary { .. }
+            | ast::Expression::Parenthesized { .. }
+    ) && let Some(indexed) =
+        index_array_expression_for_element(tree, parent_components, expr, indices)?
+    {
+        return Ok(Some(indexed));
+    }
+    let indexed = index_binding_for_element(tree, parent_components, expr, indices)?;
+    Ok((!matches!(indexed, ast::Expression::ArrayIndex { .. })).then_some(indexed))
 }
 
 fn index_nested_modification_for_element(

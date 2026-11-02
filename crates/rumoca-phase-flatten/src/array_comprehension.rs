@@ -122,9 +122,12 @@ pub(crate) fn expand_array_comprehension_bindings(
         };
 
         // Preserve structured comprehensions when dimensions are inferable from
-        // symbolic ranges/body shape; avoid eager scalar expansion.
+        // symbolic ranges/body shape; avoid eager scalar expansion. A body
+        // that indexes an expanded component array by the iterator names no
+        // aggregate Flat coordinate, so it is unrolled below instead.
         if let Some(binding) = &flat_var.binding
             && let Some(inferred_dims) = infer_array_dimensions(binding)
+            && !indexes_expanded_component_array(expr, &prefix, overlay)
         {
             if inferred_dims.len() >= flat_var.dims.len() {
                 flat_var.dims = inferred_dims.clone();
@@ -173,6 +176,33 @@ pub(crate) fn expand_array_comprehension_bindings(
         }
     }
     Ok(changed_binding)
+}
+
+/// Whether `expr` selects an element of an expanded component array
+/// (`rotors[i].kT`).
+///
+/// Such an array has no aggregate Flat coordinate, only its elements
+/// (`rotors[1].kT`, ...), so a comprehension over it resolves only once each
+/// element is named.
+fn indexes_expanded_component_array(
+    expr: &ast::Expression,
+    prefix: &ast::QualifiedName,
+    overlay: &ast::InstanceOverlay,
+) -> bool {
+    ast::collect_component_refs(expr).iter().any(|reference| {
+        (0..reference.parts.len().saturating_sub(1)).any(|end| {
+            if reference.parts[end].subs.is_none() {
+                return false;
+            }
+            let mut array = reference.clone();
+            array.parts.truncate(end + 1);
+            array.parts[end].subs = None;
+            let path = crate::equations::build_qualified_name(prefix, &array);
+            overlay
+                .array_parent_dims
+                .contains_key(&rumoca_core::ComponentPath::from_flat_path(&path))
+        })
+    })
 }
 
 /// Try to evaluate all index ranges for a comprehension. Returns None if any range

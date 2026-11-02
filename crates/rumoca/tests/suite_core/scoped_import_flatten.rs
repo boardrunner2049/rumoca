@@ -18,12 +18,26 @@ fn flatten_model(source: &str, model: &str) -> rumoca_ir_flat::Model {
     flatten_ref(tree, &overlay, model).expect("flatten should succeed")
 }
 
-fn expr_real(expr: &rumoca_core::Expression) -> f64 {
+/// The Real an expression denotes: a literal, or a reference to the model
+/// constant the frontend declares for a Real package constant (the
+/// `inline-constants` pass replaces it by the value later).
+fn expr_real(flat: &rumoca_ir_flat::Model, expr: &rumoca_core::Expression) -> f64 {
     match expr {
         rumoca_core::Expression::Literal {
             value: rumoca_core::Literal::Real(value),
             ..
         } => *value,
+        rumoca_core::Expression::VarRef {
+            name, subscripts, ..
+        } if subscripts.is_empty() => {
+            let constant = flat_var(flat, name.as_str());
+            assert!(
+                matches!(constant.variability, rumoca_core::Variability::Constant(_)),
+                "`{}` should be a declared constant",
+                name.as_str()
+            );
+            expr_real(flat, constant.binding.as_ref().expect("constant binding"))
+        }
         other => panic!("expected Real literal, got {other:?}"),
     }
 }
@@ -86,21 +100,27 @@ end ScopedImport;
         .binding
         .as_ref()
         .expect("b.local binding");
-    assert_eq!(expr_real(a_local), 10.0);
-    assert_eq!(expr_real(b_local), 20.0);
+    assert_eq!(expr_real(&flat, a_local), 10.0);
+    assert_eq!(expr_real(&flat, b_local), 20.0);
 
     let a_attr = flat_var(&flat, "a.attr");
     let b_attr = flat_var(&flat, "b.attr");
     assert_eq!(
-        expr_real(a_attr.start.as_ref().expect("a.attr start")),
+        expr_real(&flat, a_attr.start.as_ref().expect("a.attr start")),
         10.0
     );
-    assert_eq!(expr_real(a_attr.min.as_ref().expect("a.attr min")), 10.0);
     assert_eq!(
-        expr_real(b_attr.start.as_ref().expect("b.attr start")),
+        expr_real(&flat, a_attr.min.as_ref().expect("a.attr min")),
+        10.0
+    );
+    assert_eq!(
+        expr_real(&flat, b_attr.start.as_ref().expect("b.attr start")),
         20.0
     );
-    assert_eq!(expr_real(b_attr.min.as_ref().expect("b.attr min")), 20.0);
+    assert_eq!(
+        expr_real(&flat, b_attr.min.as_ref().expect("b.attr min")),
+        20.0
+    );
 
     let a_cell_p = flat_var(&flat, "a.cell.p")
         .binding
@@ -110,11 +130,12 @@ end ScopedImport;
         .binding
         .as_ref()
         .expect("b.cell.p binding");
-    assert_eq!(expr_real(a_cell_p), 10.0);
-    assert_eq!(expr_real(b_cell_p), 20.0);
+    assert_eq!(expr_real(&flat, a_cell_p), 10.0);
+    assert_eq!(expr_real(&flat, b_cell_p), 20.0);
 
     assert_eq!(
         expr_real(
+            &flat,
             flat_var(&flat, "a.cell.x")
                 .start
                 .as_ref()
@@ -124,6 +145,7 @@ end ScopedImport;
     );
     assert_eq!(
         expr_real(
+            &flat,
             flat_var(&flat, "b.cell.x")
                 .start
                 .as_ref()

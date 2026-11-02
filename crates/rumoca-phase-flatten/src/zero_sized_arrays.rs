@@ -43,8 +43,12 @@ pub(crate) fn materialize_referenced_zero_sized_array_variables(
             indices: Box::default(),
             kind: flat::InstanceKind::Materialized,
         });
+        // The placeholder is typed Real (see `variable_type_names` below);
+        // finalization derives its zero-sized identity from the scalar one.
+        let type_id = flat.predefined_scalar_type(flat.predefined_types.real);
         let variable = flat::Variable {
             instance_id,
+            type_id,
             name: var_name.clone(),
             component_ref: name.component_ref().cloned(),
             source_span,

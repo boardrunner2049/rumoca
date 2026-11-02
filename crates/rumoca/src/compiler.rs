@@ -301,9 +301,8 @@ pub struct Compiler {
     source_root_paths: Vec<String>,
     /// Enable verbose output.
     verbose: bool,
-    /// Keep a derived parameter's declaration binding as written instead of
-    /// replacing it with the constant it evaluates to. See
-    /// `SessionConfig::fold_parameter_declaration_bindings`.
+    /// Keep a derived parameter's declaration binding as written: the
+    /// default group then runs without `fold-parameter-bindings`.
     no_fold_parameter_bindings: bool,
     freeze_parameters: bool,
     /// Bitcode passes to run between the frontend's DAE and everything
@@ -360,6 +359,12 @@ impl Compiler {
     /// plain compile runs them to keep producing the same model.
     fn requested_passes(&self) -> Vec<String> {
         match self.passes.as_slice() {
+            [] if self.no_fold_parameter_bindings => rumoca_bitcode::passes::catalog()
+                .into_iter()
+                .map(|pass| pass.name())
+                .filter(|name| *name != "fold-parameter-bindings")
+                .map(str::to_string)
+                .collect(),
             [] => vec!["default".to_string()],
             requested
                 if requested
@@ -383,7 +388,6 @@ impl Compiler {
     /// The session configuration these settings describe.
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
-            fold_parameter_declaration_bindings: !self.no_fold_parameter_bindings,
             freeze_parameters: self.freeze_parameters,
             ..SessionConfig::default()
         }

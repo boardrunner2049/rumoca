@@ -9,7 +9,9 @@
 //! bitcode pass replaces the reference with the value when optimization is
 //! asked for (docs/design/minimal-frontend.md).
 //!
-//! Only Real scalars are declared, and only constants owned
+//! References are kept in equations, equation-family templates, assertion
+//! conditions and variable attributes. Only Real scalars are declared, and
+//! only constants owned
 //! by their declaration. Integer, Boolean and enumeration constants select
 //! branches, size arrays and index them, where lowering needs the literal;
 //! a constant specialized per instance (a replaceable `Medium` package) has
@@ -54,7 +56,42 @@ pub(super) fn declare_real_package_constants(
     {
         equation.residual = declarer.rewrite_expression(&equation.residual)?;
     }
-    let real = real_scalar_type(flat);
+    for family in flat
+        .structured_equations
+        .iter_mut()
+        .chain(flat.initial_structured_equations.iter_mut())
+    {
+        if let Some(template) = family.template.as_mut() {
+            for body in &mut template.body {
+                *body = declarer.rewrite_expression(body)?;
+            }
+        }
+    }
+    for assertion in flat
+        .assert_equations
+        .iter_mut()
+        .chain(flat.initial_assert_equations.iter_mut())
+    {
+        assertion.condition = declarer.rewrite_expression(&assertion.condition)?;
+    }
+    // Attributes too: `parameter Real w = 2 * Modelica.Constants.pi` keeps
+    // the name, and `inline-constants` with `fold-parameter-bindings` folds
+    // it when optimization is asked for.
+    for variable in flat.variables.values_mut() {
+        for attribute in [
+            &mut variable.binding,
+            &mut variable.start,
+            &mut variable.min,
+            &mut variable.max,
+            &mut variable.nominal,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *attribute = declarer.rewrite_expression(attribute)?;
+        }
+    }
+    let real = flat.predefined_scalar_type(flat.predefined_types.real);
     for (name, declared) in declarer.declared {
         let var_name = rumoca_core::VarName::new(&name);
         let instance_id = flat.materialize_instance(flat::InstanceRelation {
@@ -162,29 +199,6 @@ impl Declarer<'_> {
         );
         Ok(Some(qualified.clone()))
     }
-}
-
-/// The effective type of a Real scalar, interned when no instantiated
-/// component already carries one.
-fn real_scalar_type(flat: &mut flat::Model) -> rumoca_core::TypeId {
-    let real = flat.predefined_types.real;
-    if let Some((&id, _)) = flat.effective_types.iter().find(|(_, effective)| {
-        effective.canonical_type() == real
-            && effective.nominal_type() == real
-            && effective.dimensions().is_empty()
-    }) {
-        return id;
-    }
-    let id = flat
-        .effective_types
-        .keys()
-        .map(rumoca_core::TypeId::index)
-        .max()
-        .map_or(real, |index| rumoca_core::TypeId::new(index + 1));
-    let effective = rumoca_core::EffectiveType::new(real, real, Vec::<i64>::new())
-        .expect("the predefined Real type is known");
-    flat.effective_types.insert(id, effective);
-    id
 }
 
 /// A finite Real literal: what the frontend would have inlined for a Real

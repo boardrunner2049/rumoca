@@ -377,3 +377,82 @@ fn trace_points_carry_onto_a_fresh_export_by_variable_name() {
     let error = carry_observations(&traced, &mut renamed).unwrap_err();
     assert!(error.to_string().contains("`x`"), "{error}");
 }
+
+/// `parameter k = 2; parameter d = k * 10; der(x) = -x / d`.
+fn derived_parameter_model() -> (RbcModel, VariableId) {
+    let mut b = Builder::new("Derived");
+    let x = b.state("x", 1.0);
+    let k = b.parameter("k", 2.0);
+    let d = b.parameter("d", 0.0);
+    let k_ref = b.parameter_ref(k);
+    let ten = b.real(10.0);
+    let product = b.binary(RbcBinaryOp::Multiply, k_ref, ten);
+    let xr = b.state_ref(x);
+    let d_ref = b.parameter_ref(d);
+    let quotient = b.binary(RbcBinaryOp::Divide, xr, d_ref);
+    let rhs = b.negate_of(quotient);
+    b.derivative_equation(x, rhs);
+    let mut model = b.finish();
+    model.variables[d.0 as usize].binding = Some(product);
+    (model, d)
+}
+
+#[test]
+fn a_derived_parameter_binding_folds_to_its_value() {
+    let (model, d) = derived_parameter_model();
+    let mut file = file(model);
+    let reports = run(&mut file, &["fold-parameter-bindings".into()]).expect("pass runs");
+    assert_eq!(reports[0].rewrites, 1, "only `d` is derived");
+    let binding = file.model.variables[d.0 as usize]
+        .binding
+        .expect("the binding stays");
+    assert!(matches!(
+        file.model.expressions[binding.0 as usize].node,
+        RbcExprNode::Literal {
+            value: RbcLiteral::Real { value }
+        } if value == 20.0
+    ));
+    assert!(
+        file.model.expressions.iter().any(|e| matches!(
+            e.node,
+            RbcExprNode::Coordinate {
+                coordinate: RbcCoordinate::Parameter { variable }
+            } if variable == d
+        )),
+        "the equation still reads `d`: only its binding is folded"
+    );
+}
+
+#[test]
+fn a_modifier_binding_and_an_initialization_parameter_are_not_folded() {
+    for edit in [
+        (|variable: &mut RbcVariable| {
+            variable
+                .contract
+                .as_mut()
+                .expect("builder variables carry a contract")
+                .binding_from_modification = true;
+        }) as fn(&mut RbcVariable),
+        |variable: &mut RbcVariable| variable.fixed = Some(false),
+    ] {
+        let (mut model, d) = derived_parameter_model();
+        edit(&mut model.variables[d.0 as usize]);
+        let mut file = file(model);
+        let reports = run(&mut file, &["fold-parameter-bindings".into()]).expect("pass runs");
+        assert_eq!(reports[0].rewrites, 0);
+    }
+}
+
+#[test]
+fn a_binding_that_reads_a_tunable_parameter_is_not_folded() {
+    let (mut model, _) = derived_parameter_model();
+    let k = model
+        .variables
+        .iter_mut()
+        .find(|variable| variable.name == "k")
+        .expect("k is declared");
+    k.tunable = true;
+    let mut file = file(model);
+    let reports = run(&mut file, &["fold-parameter-bindings".into()]).expect("pass runs");
+    assert_eq!(reports[0].rewrites, 0, "`k` may change on the artifact");
+}

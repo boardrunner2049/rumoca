@@ -2,13 +2,14 @@ use super::*;
 
 pub(super) fn validate_structured_families(
     families: &[flat::StructuredEquationFamily],
-    equation_count: usize,
+    equations: &[flat::Equation],
     runtime_roles: &HashMap<VarName, PlannedRole>,
     expression_roles: &HashMap<VarName, PlannedRole>,
     states: &HashSet<VarName>,
     record_array_fields: &RecordArrayFieldPlans,
     model_values: &ShapeEnvironment,
 ) -> Result<HashSet<usize>, ToDaeError> {
+    let equation_count = equations.len();
     let mut covered = HashSet::new();
     for family in families {
         require_span(family.span, "structured equation family")?;
@@ -50,6 +51,9 @@ pub(super) fn validate_structured_families(
             {
                 structured_discrete_assignments(&template.body, runtime_roles, family.span)?;
             }
+        }
+        if row_owned_discrete_family(family, equations, runtime_roles) {
+            continue;
         }
         let represented_rows = match &family.template {
             Some(template) => represented_template_rows(

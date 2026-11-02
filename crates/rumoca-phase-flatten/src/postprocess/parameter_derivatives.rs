@@ -10,6 +10,12 @@
 //! Only operands whose result shape is known exactly are folded: a whole
 //! variable, or a variable selected by scalar subscripts. A slice keeps the
 //! call, and DAE validation reports it with a source diagnostic.
+//!
+//! `der(expr)` of a linear expression is first distributed over it (MLS
+//! §3.7.4.2 defines `der` of any Real expression): `der(a - b)` is
+//! `der(a) - der(b)` and `der(k * x)` is `k * der(x)` for a time-invariant
+//! `k`. Each operand is then a variable whose derivative the DAE owns, or a
+//! time-invariant one this pass folds. Anything else keeps the call.
 
 use super::*;
 use rumoca_core::ExpressionRewriter;
@@ -72,6 +78,89 @@ struct DerivativeFolder<'a> {
 }
 
 impl DerivativeFolder<'_> {
+    /// `der(argument)` distributed one level over a linear `argument`.
+    fn distribute(&self, argument: &Expression, span: rumoca_core::Span) -> Option<Expression> {
+        use rumoca_core::{OpBinary, OpUnary};
+        let der = |operand: &Expression| {
+            Box::new(Expression::BuiltinCall {
+                function: rumoca_core::BuiltinFunction::Der,
+                args: vec![operand.clone()],
+                span,
+            })
+        };
+        Some(match argument {
+            Expression::Binary {
+                op: op @ (OpBinary::Add | OpBinary::Sub | OpBinary::AddElem | OpBinary::SubElem),
+                lhs,
+                rhs,
+                span,
+            } => Expression::Binary {
+                op: op.clone(),
+                lhs: der(lhs),
+                rhs: der(rhs),
+                span: *span,
+            },
+            Expression::Unary {
+                op: op @ (OpUnary::Minus | OpUnary::DotMinus),
+                rhs,
+                span,
+            } => Expression::Unary {
+                op: op.clone(),
+                rhs: der(rhs),
+                span: *span,
+            },
+            Expression::Unary {
+                op: OpUnary::Plus | OpUnary::DotPlus,
+                rhs,
+                ..
+            } => *der(rhs),
+            Expression::Binary {
+                op: op @ (OpBinary::Mul | OpBinary::MulElem),
+                lhs,
+                rhs,
+                span,
+            } if self.is_time_invariant(lhs) => Expression::Binary {
+                op: op.clone(),
+                lhs: lhs.clone(),
+                rhs: der(rhs),
+                span: *span,
+            },
+            Expression::Binary {
+                op: op @ (OpBinary::Mul | OpBinary::MulElem | OpBinary::Div | OpBinary::DivElem),
+                lhs,
+                rhs,
+                span,
+            } if self.is_time_invariant(rhs) => Expression::Binary {
+                op: op.clone(),
+                lhs: der(lhs),
+                rhs: rhs.clone(),
+                span: *span,
+            },
+            _ => return None,
+        })
+    }
+
+    /// An expression over literals and parameters/constants only.
+    fn is_time_invariant(&self, expression: &Expression) -> bool {
+        match expression {
+            Expression::Literal { .. } => true,
+            Expression::VarRef {
+                name, subscripts, ..
+            } => {
+                self.invariant.dims.contains_key(name.as_str())
+                    && subscripts.iter().all(|subscript| match subscript {
+                        rumoca_core::Subscript::Expr { expr, .. } => self.is_time_invariant(expr),
+                        _ => true,
+                    })
+            }
+            Expression::Unary { rhs, .. } => self.is_time_invariant(rhs),
+            Expression::Binary { lhs, rhs, .. } => {
+                self.is_time_invariant(lhs) && self.is_time_invariant(rhs)
+            }
+            _ => false,
+        }
+    }
+
     /// The exact result extents of `der(argument)` when the operand is time
     /// invariant, or `None` when the operator must stay.
     fn invariant_extents(&self, argument: &Expression) -> Option<Vec<i64>> {
@@ -126,6 +215,16 @@ fn zero_of_extents(extents: &[i64], span: rumoca_core::Span) -> Option<Expressio
 
 impl ExpressionRewriter for DerivativeFolder<'_> {
     fn rewrite_expression(&mut self, expr: &Expression) -> Expression {
+        if let Expression::BuiltinCall {
+            function: rumoca_core::BuiltinFunction::Der,
+            args,
+            span,
+        } = expr
+            && let [argument] = args.as_slice()
+            && let Some(distributed) = self.distribute(argument, *span)
+        {
+            return self.rewrite_expression(&distributed);
+        }
         if let Expression::BuiltinCall {
             function: rumoca_core::BuiltinFunction::Der,
             args,

@@ -974,6 +974,44 @@ pub(in crate::construction) fn discrete_value_assignment<'flat>(
     }
 }
 
+/// A materialized family of discrete-value assignments to distinct targets
+/// (`legs[j].on = sel[j]` over a component array): every materialized row
+/// defines its own target, and the discrete topology plans each as its own
+/// owner, so the rows are lowered one by one and the template is not. The
+/// rows decide, not the template: `legs[j].on` names no coordinate until `j`
+/// is a number.
+///
+/// Element assignments into one array target are excluded: those rows are
+/// already validated and owned together through the aggregate pass.
+pub(in crate::construction) fn row_owned_discrete_family(
+    family: &flat::StructuredEquationFamily,
+    equations: &[flat::Equation],
+    roles: &HashMap<VarName, PlannedRole>,
+) -> bool {
+    let Some(template) = family.template.as_ref() else {
+        return false;
+    };
+    let Ok(points) = family.domain.scalar_count() else {
+        return false;
+    };
+    let Some(rows) = points
+        .checked_mul(family.equations_per_point)
+        .and_then(|count| family.first_equation_index.checked_add(count))
+        .and_then(|end| equations.get(family.first_equation_index..end))
+    else {
+        return false;
+    };
+    family.interiors_materialized
+        && !rows.is_empty()
+        && !structured_discrete_element_assignments(&template.body, roles)
+        && rows.iter().all(|row| {
+            matches!(
+                discrete_value_assignment(&row.residual, roles, row.span),
+                Ok(Some(_))
+            )
+        })
+}
+
 pub(in crate::construction) fn structured_discrete_assignments<'flat>(
     bodies: &'flat [Expression],
     roles: &HashMap<VarName, PlannedRole>,

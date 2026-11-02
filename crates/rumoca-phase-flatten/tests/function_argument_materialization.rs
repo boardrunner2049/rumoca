@@ -66,7 +66,8 @@ fn named_and_dependent_default_arguments_are_positional_in_final_flat() {
     // in declaration order. The supplied argument is `time` rather than a
     // literal so the call survives pure-constant folding; what is asserted is
     // unchanged, namely that the dependent default carries the *actual*
-    // argument and the package constant is substituted.
+    // argument and the package constant is resolved (to the model constant the
+    // frontend declares for it; `inline-constants` replaces it by the value).
     assert_eq!(args.len(), 2);
     assert!(
         matches!(&args[0], Expression::VarRef { name, .. } if name.as_str() == "time"),
@@ -78,16 +79,31 @@ fn named_and_dependent_default_arguments_are_positional_in_final_flat() {
             &args[1],
             Expression::Binary { lhs, rhs, .. }
                 if matches!(lhs.as_ref(), Expression::VarRef { name, .. } if name.as_str() == "time")
-                && matches!(
-                    rhs.as_ref(),
-                    Expression::Literal {
-                        value: rumoca_core::Literal::Real(value),
-                        ..
-                    } if *value == 1.0
-                )
+                && real_value(&model, rhs) == Some(1.0)
         ),
         "the dependent default materializes as `value + defaultOffset` with the \
-         actual argument and the constant substituted, found {:?}",
+         actual argument and the constant resolved, found {:?}",
         &args[1]
     );
+}
+
+/// A Real literal, or a reference to a declared constant with a Real literal
+/// binding.
+fn real_value(model: &rumoca_ir_flat::Model, expression: &Expression) -> Option<f64> {
+    match expression {
+        Expression::Literal {
+            value: rumoca_core::Literal::Real(value),
+            ..
+        } => Some(*value),
+        Expression::VarRef {
+            name, subscripts, ..
+        } if subscripts.is_empty() => {
+            let constant = model
+                .variables
+                .get(&rumoca_core::VarName::new(name.as_str()))?;
+            matches!(constant.variability, rumoca_core::Variability::Constant(_)).then_some(())?;
+            real_value(model, constant.binding.as_ref()?)
+        }
+        _ => None,
+    }
 }

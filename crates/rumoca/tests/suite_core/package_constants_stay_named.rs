@@ -33,7 +33,11 @@ fn rumoca(args: &[&str]) -> Output {
 }
 
 fn dae_text(source: &str, passes: &[&str]) -> String {
-    let mut args = vec!["compile", source, "--model", "KC.M", "--emit", "dae-mo"];
+    model_dae_text(source, "KC.M", passes)
+}
+
+fn model_dae_text(source: &str, model: &str, passes: &[&str]) -> String {
+    let mut args = vec!["compile", source, "--model", model, "--emit", "dae-mo"];
     for pass in passes {
         args.extend(["--pass", pass]);
     }
@@ -72,5 +76,37 @@ fn the_frontend_declares_a_package_constant_and_the_pass_inlines_it() {
         dae_text(source, &[]),
         optimized,
         "a plain compile runs the default group"
+    );
+}
+
+const BINDING_FIXTURE: &str = "\
+package KB
+  package P
+    constant Real c = 3.0;
+  end P;
+  model M
+    parameter Real w = 2*P.c;
+    Real x(start = 1, fixed = true);
+  equation
+    der(x) = -w*x;
+  end M;
+end KB;
+";
+
+#[test]
+fn a_binding_keeps_the_package_constant_named_until_the_passes_fold_it() {
+    let work = tempdir().expect("temp dir");
+    let source = work.path().join("KB.mo");
+    fs::write(&source, BINDING_FIXTURE).expect("fixture written");
+    let source = source.to_str().expect("utf-8 path");
+    let lowered = model_dae_text(source, "KB.M", &["none"]);
+    assert!(
+        lowered.contains("KB.P.c"),
+        "the binding names the declared constant: {lowered}"
+    );
+    let optimized = model_dae_text(source, "KB.M", &[]);
+    assert!(
+        optimized.contains("parameter Real w(start = 6.0) = 6.0;"),
+        "inline-constants then fold-parameter-bindings give w its value: {optimized}"
     );
 }

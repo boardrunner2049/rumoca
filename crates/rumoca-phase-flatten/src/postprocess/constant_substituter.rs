@@ -91,6 +91,50 @@ impl FallibleExpressionRewriter for KnownConstantSubstituter<'_> {
                 else_branch,
                 span,
             } => self.rewrite_if(branches, else_branch, *span),
+            rumoca_core::Expression::BuiltinCall {
+                function:
+                    function @ (rumoca_core::BuiltinFunction::Sum
+                    | rumoca_core::BuiltinFunction::Product),
+                args,
+                span,
+            } => {
+                let rewritten = self.walk_expression(expr)?;
+                // MLS §10.3.4: the reduction of an empty array is the
+                // operation's identity. A constructor over an empty domain
+                // (`sum(f[i] for i in 1:0)`) has no element whose type the
+                // reduction could carry, and may name components that do not
+                // exist.
+                let rumoca_core::Expression::BuiltinCall {
+                    args: rewritten_args,
+                    ..
+                } = &rewritten
+                else {
+                    return Ok(rewritten);
+                };
+                let [argument] = rewritten_args.as_slice() else {
+                    return Ok(rewritten);
+                };
+                let empty = match argument {
+                    rumoca_core::Expression::Array { elements, .. } => elements.is_empty(),
+                    rumoca_core::Expression::ArrayComprehension { indices, .. } => indices
+                        .iter()
+                        .any(|index| statically_empty_range(&index.range, self.env.ctx)),
+                    _ => false,
+                };
+                if !empty || args.len() != 1 {
+                    return Ok(rewritten);
+                }
+                Ok(rumoca_core::Expression::Literal {
+                    value: rumoca_core::Literal::Real(
+                        if *function == rumoca_core::BuiltinFunction::Sum {
+                            0.0
+                        } else {
+                            1.0
+                        },
+                    ),
+                    span: *span,
+                })
+            }
             other => self.walk_expression(other),
         }
     }
@@ -106,6 +150,37 @@ impl FallibleExpressionRewriter for KnownConstantSubstituter<'_> {
             }),
             other => Ok(other.clone()),
         }
+    }
+}
+
+/// `a:b` (or `a:s:b`) that selects no value. Its bounds are literals or
+/// Integer parameters the frontend settled: a constructor's range sizes an
+/// array, so it is structural (MLS §10.4.1).
+fn statically_empty_range(range: &rumoca_core::Expression, ctx: &Context) -> bool {
+    let rumoca_core::Expression::Range {
+        start, step, end, ..
+    } = range
+    else {
+        return false;
+    };
+    let integer = |expression: &rumoca_core::Expression| match expression {
+        rumoca_core::Expression::Literal {
+            value: rumoca_core::Literal::Integer(value),
+            ..
+        } => Some(*value),
+        rumoca_core::Expression::VarRef {
+            name, subscripts, ..
+        } if subscripts.is_empty() => ctx.parameter_values.get(name.as_str()).copied(),
+        _ => None,
+    };
+    let (Some(start), Some(end)) = (integer(start), integer(end)) else {
+        return false;
+    };
+    match step.as_deref().map(integer) {
+        None => start > end,
+        Some(Some(step)) if step > 0 => start > end,
+        Some(Some(step)) if step < 0 => start < end,
+        _ => false,
     }
 }
 

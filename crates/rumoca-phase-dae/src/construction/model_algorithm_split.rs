@@ -65,7 +65,9 @@ fn continuous_prefix_len(flat: &flat::Model, algorithm: &flat::Algorithm) -> usi
         let rumoca_core::Statement::Assignment { comp, value, .. } = statement else {
             break;
         };
-        if comp.parts().is_empty() || comp.parts().iter().any(|part| !part.subs.is_empty()) {
+        if comp.parts().is_empty()
+            || !rumoca_core::component_ref_element_subscripts(comp).is_empty()
+        {
             break;
         }
         assignments.push((comp, value));

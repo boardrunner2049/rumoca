@@ -113,6 +113,7 @@ use package_constant_imports::{
 use source_scope::{
     SourceScopeIndex, class_declaration_source_scope, component_declaration_source_scope,
     expression_source_scope, register_zero_sized_array_component,
+    register_zero_sized_record_fields,
 };
 use templates::get_or_compute_template;
 #[cfg(test)]
@@ -206,22 +207,6 @@ pub struct InstantiateOptions {
     /// expansion and exists so differential tests can prove the two paths
     /// produce identical overlays.
     pub compact_component_families: bool,
-    /// Replace a parameter's declaration binding with the constant it evaluates
-    /// to, when it evaluates to one (`parameter Real d = k * 10` with `k = 2`
-    /// becomes `d = 20`).
-    ///
-    /// Enabled by default, because it is what makes a derived parameter usable
-    /// as a value rather than as an expression. Turning it off keeps the
-    /// binding as written, so a consumer can see *which* parameters a derived
-    /// one is derived from — a dependency an analysis cannot recover once the
-    /// arithmetic has been carried out.
-    ///
-    /// This never disables evaluation, only the rewrite. MLS §18.3 structural
-    /// parameters — array dimensions, for-loop ranges, if-equation conditions —
-    /// must be known at translation time and are still resolved, as are
-    /// discrete-typed bindings, so the shape of the flattened model is
-    /// unchanged either way.
-    pub fold_parameter_declaration_bindings: bool,
     /// Explicit frozen-parameter compilation profile. Fixed parameters become
     /// translation-evaluated inputs and cannot be changed on the artifact.
     /// Initialization-determined (`fixed=false`) parameters remain deferred.
@@ -234,7 +219,6 @@ impl Default for InstantiateOptions {
             depth_limit: DEFAULT_INSTANTIATION_DEPTH_LIMIT,
             root_modifications: Vec::new(),
             compact_component_families: true,
-            fold_parameter_declaration_bindings: true,
             freeze_parameters: false,
         }
     }
@@ -1545,6 +1529,7 @@ fn instantiate_component(
             binding_source_for_record_expansion: binding_source_for_record_expansion.as_ref(),
             binding_scope_for_record_expansion: binding_scope_for_record_expansion.as_ref(),
             binding_is_each,
+            binding_from_modification,
             effective_components: scope.effective_components,
             type_overrides: &nested_type_overrides,
             modifier_imports: scope.imports.attributes,
@@ -1664,11 +1649,7 @@ fn prepare_component_binding_info(
     let start_from_declaration_binding =
         !binding_from_modification && binding.is_some() && attrs.start == binding;
     if !binding_from_modification
-        && declaration_binding_allows_structural_resolution(
-            comp,
-            is_discrete_type,
-            ctx.options.fold_parameter_declaration_bindings,
-        )
+        && declaration_binding_needs_structural_resolution(comp, is_discrete_type)
         && let Some(declaration_binding) = binding.as_ref()
     {
         let resolved_binding = mod_env::resolve_declaration_binding_expr(
@@ -1692,23 +1673,17 @@ fn prepare_component_binding_info(
     })
 }
 
-fn declaration_binding_allows_structural_resolution(
+fn declaration_binding_needs_structural_resolution(
     comp: &ast::Component,
     is_discrete_type: bool,
-    fold_parameters: bool,
 ) -> bool {
-    // A structural parameter (MLS §18.3) and a discrete-typed binding must be
-    // resolved whatever the caller asked for: the first decides array extents
-    // and branch selection, the second the value a `when` settles on, and both
-    // change the shape of the model rather than only a number inside it.
-    if comp.is_structural || is_discrete_type {
-        return true;
-    }
-    fold_parameters
-        && matches!(
-            comp.variability,
-            rumoca_core::Variability::Parameter(_) | rumoca_core::Variability::Constant(_)
-        )
+    // A structural parameter (MLS §18.3) and a discrete-typed binding are
+    // resolved here: the first decides array extents and branch selection,
+    // the second the value a `when` settles on, and both change the shape of
+    // the model rather than only a number inside it. Any other binding keeps
+    // the dependency it was written with; replacing it by its value is the
+    // `fold-parameter-bindings` bitcode pass (docs/design/minimal-frontend.md).
+    comp.is_structural || is_discrete_type
 }
 
 struct NestedComponentRequest<'a> {
@@ -1724,6 +1699,8 @@ struct NestedComponentRequest<'a> {
     binding_source_for_record_expansion: Option<&'a ast::Expression>,
     binding_scope_for_record_expansion: Option<&'a ast::QualifiedName>,
     binding_is_each: bool,
+    /// The record binding is an outer modification, not the declaration's.
+    binding_from_modification: bool,
     effective_components: &'a IndexMap<String, ast::Component>,
     type_overrides: &'a TypeOverrideMap,
     /// Import aliases of the class that wrote these modifications (MLS §13.2),
@@ -1759,6 +1736,7 @@ fn instantiate_nested_component_if_needed(
             binding_source_for_record_expansion: request.binding_source_for_record_expansion,
             binding_scope_for_record_expansion: request.binding_scope_for_record_expansion,
             binding_is_each: request.binding_is_each,
+            binding_from_modification: request.binding_from_modification,
             effective_components: request.effective_components,
             type_overrides: request.type_overrides,
             modifier_imports: request.modifier_imports,
@@ -1802,6 +1780,7 @@ struct NestedInstantiationInput<'a> {
     binding_source_for_record_expansion: Option<&'a ast::Expression>,
     binding_scope_for_record_expansion: Option<&'a ast::QualifiedName>,
     binding_is_each: bool,
+    binding_from_modification: bool,
     effective_components: &'a IndexMap<String, ast::Component>,
     type_overrides: &'a TypeOverrideMap,
     /// Import aliases of the class that wrote these modifications (MLS §13.2).
@@ -1826,6 +1805,7 @@ fn instantiate_nested_class(
         binding_source_for_record_expansion,
         binding_scope_for_record_expansion,
         binding_is_each,
+        binding_from_modification,
         effective_components,
         type_overrides,
         modifier_imports,
@@ -1868,7 +1848,15 @@ fn instantiate_nested_class(
                 each: binding_is_each,
             },
             nested_class,
-            &targeted_keys,
+            // MLS §7.2.4: an outer modification binding the whole record
+            // overrides the declaration's own field modifiers
+            // (`chassis(aggregate = a)` over `MP aggregate(mass = 1)`); field
+            // modifiers written at the same or an outer level still win.
+            if binding_from_modification {
+                &shifted_parent_keys
+            } else {
+                &targeted_keys
+            },
         )?
     } else {
         IndexMap::default()

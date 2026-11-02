@@ -8,10 +8,25 @@ use super::*;
 /// The source span alone is not an occurrence identity: separate flattened
 /// instances may retain the same declaration span. Pairing it with the exact
 /// runtime instance makes certificate lookup independent of rendered names.
+/// A loop over an array variable repeats one span and instance for every
+/// element (`change(x[j])` for `j` in `1:3`), so the element's literal
+/// subscripts complete the identity; a symbolic subscript (a family binder)
+/// is the one template occurrence of its span.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct HistoryOperatorKey {
     span: Span,
     instance: InstanceId,
+    element: Box<[Option<i64>]>,
+}
+
+fn element_key(subscripts: &[Subscript]) -> Box<[Option<i64>]> {
+    subscripts
+        .iter()
+        .map(|subscript| match subscript {
+            Subscript::Index { value, .. } => Some(*value),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,8 +62,13 @@ impl HistoryOperatorPlans {
         function: BuiltinFunction,
         span: Span,
         instance: InstanceId,
+        subscripts: &[Subscript],
     ) -> Option<&HistoryOperatorPlan> {
-        let plan = self.plans.get(&HistoryOperatorKey { span, instance })?;
+        let plan = self.plans.get(&HistoryOperatorKey {
+            span,
+            instance,
+            element: element_key(subscripts),
+        })?;
         (plan.function == function).then_some(plan)
     }
 }
@@ -136,6 +156,7 @@ impl HistoryOperatorAnalyzer<'_> {
         let key = HistoryOperatorKey {
             span,
             instance: variable.instance_id,
+            element: element_key(subscripts),
         };
         let plan = HistoryOperatorPlan {
             function,

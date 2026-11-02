@@ -372,9 +372,33 @@ pub(super) fn evaluate_clock_seconds(
     span: Span,
 ) -> Result<f64, ToDaeError> {
     let value = eval_expr(expression, constants).map_err(|error| {
+        // A parameter nobody gave a value reads as its type's default, and
+        // that is usually why the interval fails (`1 / frequency` with no
+        // `frequency`): name it, as the fix is to supply it.
+        let mut references = Vec::new();
+        expression.collect_var_refs(&mut references);
+        let mut valueless = references
+            .iter()
+            .map(|reference| reference.as_str().to_string())
+            .filter(|name| constants.is_defaulted_parameter(name))
+            .collect::<Vec<_>>();
+        valueless.sort();
+        valueless.dedup();
+        let hint = if valueless.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} has no value (no binding or start), so it reads as 0 (MLS §8.6)",
+                valueless
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         ToDaeError::unsupported_runtime_operator(
             "sample",
-            format!("{owner} is not parameter-evaluable: {error}"),
+            format!("{owner} is not parameter-evaluable: {error}{hint}"),
             span,
         )
     })?;

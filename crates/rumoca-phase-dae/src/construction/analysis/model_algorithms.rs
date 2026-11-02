@@ -226,7 +226,7 @@ impl DeclarativeSequenceProof<'_> {
         span: Span,
         assigned: &mut HashSet<VarName>,
     ) -> Result<(), ToDaeError> {
-        if component.parts().iter().any(|part| !part.subs.is_empty()) {
+        if !rumoca_core::component_ref_element_subscripts(component).is_empty() {
             return Err(unsupported_declarative_statement(span));
         }
         reject_unassigned_reads(value, &self.targets, assigned)?;
@@ -957,7 +957,9 @@ fn validate_declarative_sequence(
         match statement {
             rumoca_core::Statement::Assignment { comp, value, span } => {
                 let written = assignment_target(comp);
-                if &written != target || comp.parts().iter().any(|part| !part.subs.is_empty()) {
+                if &written != target
+                    || !rumoca_core::component_ref_element_subscripts(comp).is_empty()
+                {
                     return Err(ToDaeError::unsupported_algorithm(
                         "model",
                         "declarative scalar algorithm assignment escaped its checked target",

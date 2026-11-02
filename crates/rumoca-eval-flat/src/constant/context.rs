@@ -45,6 +45,10 @@ pub struct EvalContext {
     /// of reporting the name as unknown.
     deferred_parameters: EvalIndexMap<DeferredParameterSource>,
 
+    /// Parameters with neither a binding nor a `start`, valued at their type's
+    /// default (MLS §8.6). A failure their value causes names them.
+    defaulted_parameters: EvalIndexMap<()>,
+
     /// Lexical instance scope used for modification-binding lookup.
     lookup_scope: Option<ComponentPath>,
 }
@@ -70,6 +74,7 @@ impl EvalContext {
             array_dimensions: IndexMap::with_capacity_and_hasher(parameters, FxBuildHasher),
             values_by_instance: IndexMap::with_capacity_and_hasher(parameters, FxBuildHasher),
             deferred_parameters: IndexMap::with_capacity_and_hasher(0, FxBuildHasher),
+            defaulted_parameters: IndexMap::with_capacity_and_hasher(0, FxBuildHasher),
             lookup_scope: None,
         }
     }
@@ -118,6 +123,18 @@ impl EvalContext {
     /// valueless parameter.
     pub fn deferred_parameter(&self, name: &str) -> Option<DeferredParameterSource> {
         self.lookup_value(&self.deferred_parameters, name).copied()
+    }
+
+    /// Record that `name` has no written value and evaluates to its type's
+    /// default.
+    pub fn add_defaulted_parameter(&mut self, name: impl Into<String>) {
+        self.defaulted_parameters.insert(name.into(), ());
+    }
+
+    /// Whether `name` evaluates to its type's default for want of a value.
+    pub fn is_defaulted_parameter(&self, name: &str) -> bool {
+        self.lookup_value(&self.defaulted_parameters, name)
+            .is_some()
     }
 
     /// Add shape metadata without materializing placeholder element values.

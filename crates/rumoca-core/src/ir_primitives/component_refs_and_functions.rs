@@ -573,21 +573,51 @@ pub fn extract_algorithm_outputs(statements: &[Statement]) -> Vec<Reference> {
 }
 
 pub fn component_ref_to_base_reference(comp: &ComponentReference) -> Reference {
+    // Only the written variable's own element selection is dropped: `x[2]`
+    // writes `x`. An index on an enclosing part selects which element of a
+    // component array the variable belongs to, and is part of the
+    // variable's name -- `c[1].y` writes `c[1].y`, not `c.y`.
+    let last = comp.parts().len().saturating_sub(1);
     let component_ref = ComponentReference::construct(
         comp.local(),
         comp.span(),
         comp.parts()
             .iter()
-            .map(|part| ComponentRefPart {
+            .enumerate()
+            .map(|(position, part)| ComponentRefPart {
                 ident: part.ident.clone(),
                 span: part.span,
-                subs: Vec::new(),
+                subs: if position == last || !literal_element(&part.subs) {
+                    Vec::new()
+                } else {
+                    part.subs.clone()
+                },
                 def_id: part.def_id,
             })
             .collect(),
     )
     .expect("a nonempty reference remains nonempty when subscripts are removed");
     Reference::from_component_reference(component_ref)
+}
+
+/// The subscripts [`component_ref_to_base_reference`] drops: the selection
+/// within the written variable, in order.
+pub fn component_ref_element_subscripts(comp: &ComponentReference) -> Vec<Subscript> {
+    let last = comp.parts().len().saturating_sub(1);
+    comp.parts()
+        .iter()
+        .enumerate()
+        .filter(|(position, part)| *position == last || !literal_element(&part.subs))
+        .flat_map(|(_, part)| part.subs.iter().cloned())
+        .collect()
+}
+
+/// A subscript list that names one element by literal indices.
+fn literal_element(subscripts: &[Subscript]) -> bool {
+    !subscripts.is_empty()
+        && subscripts
+            .iter()
+            .all(|subscript| matches!(subscript, Subscript::Index { .. }))
 }
 
 /// Return a component-path base name with all bracketed subscripts removed.

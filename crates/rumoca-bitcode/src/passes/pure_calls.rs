@@ -130,7 +130,7 @@ fn replacements(
         .collect()
 }
 
-fn literal(scalar: RbcScalar, value: &Value) -> Option<RbcLiteral> {
+pub(super) fn literal(scalar: RbcScalar, value: &Value) -> Option<RbcLiteral> {
     Some(match (scalar, value) {
         (RbcScalar::Real, Value::Real(value)) => RbcLiteral::Real { value: *value },
         (RbcScalar::Real, Value::Integer(value)) => RbcLiteral::Real {

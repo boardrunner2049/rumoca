@@ -43,6 +43,8 @@ mod clocked_coincident_exchange;
 mod clocked_sample_regression;
 mod connection_normalization_golden;
 mod enumeration_compact_range_test;
+mod family_branch_selection;
+mod fire_library_constructs;
 mod fmi_me_host_divergence;
 mod for_eq_array_test;
 mod for_loop_element_derivative_alias;

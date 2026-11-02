@@ -102,6 +102,23 @@ pub(crate) fn expression(model: &RbcModel, id: ExprId) -> Option<Value> {
     let mut scope = Scope {
         model,
         frame: None,
+        parameters: None,
+        cache: HashMap::new(),
+    };
+    scope.eval(id)
+}
+
+/// Evaluate a model-scope expression whose only model reads are parameters
+/// and constants with a value in `parameters`.
+pub(crate) fn expression_with_parameters(
+    model: &RbcModel,
+    id: ExprId,
+    parameters: &HashMap<VariableId, Value>,
+) -> Option<Value> {
+    let mut scope = Scope {
+        model,
+        frame: None,
+        parameters: Some(parameters),
         cache: HashMap::new(),
     };
     scope.eval(id)
@@ -139,6 +156,7 @@ impl Frame<'_> {
         let mut scope = Scope {
             model: self.model,
             frame: Some(self),
+            parameters: None,
             cache: HashMap::new(),
         };
         scope.eval(id)
@@ -292,6 +310,9 @@ fn iterate(domain: &RbcDomain) -> Option<Vec<Vec<i64>>> {
 struct Scope<'a, 'm> {
     model: &'m RbcModel,
     frame: Option<&'a mut Frame<'m>>,
+    /// Values of the model's parameters and constants, for a model-scope
+    /// evaluation that may read them.
+    parameters: Option<&'a HashMap<VariableId, Value>>,
     cache: HashMap<u32, Value>,
 }
 
@@ -396,6 +417,11 @@ impl Scope<'_, '_> {
     }
 
     fn coordinate(&self, coordinate: RbcCoordinate) -> Option<Value> {
+        if let (RbcCoordinate::Parameter { variable }, Some(parameters)) =
+            (coordinate, self.parameters)
+        {
+            return parameters.get(&variable).cloned();
+        }
         let frame = self.frame.as_ref()?;
         match coordinate {
             RbcCoordinate::FunctionParameter { ordinal, .. } => {

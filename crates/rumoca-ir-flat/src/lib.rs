@@ -446,6 +446,32 @@ impl Model {
         Ok(())
     }
 
+    /// The effective type of an unshaped predefined scalar `ty`, interned
+    /// when no instantiated component already carries one.
+    ///
+    /// A variable Flat itself introduces (a declared package constant, a
+    /// zero-sized placeholder) has no instantiated occurrence to copy its
+    /// identity from; finalization derives its shaped identity from this one.
+    pub fn predefined_scalar_type(&mut self, ty: TypeId) -> TypeId {
+        if let Some((&id, _)) = self.effective_types.iter().find(|(_, effective)| {
+            effective.canonical_type() == ty
+                && effective.nominal_type() == ty
+                && effective.dimensions().is_empty()
+        }) {
+            return id;
+        }
+        let id = self
+            .effective_types
+            .keys()
+            .map(TypeId::index)
+            .max()
+            .map_or(ty, |index| TypeId::new(index + 1));
+        let effective = EffectiveType::new(ty, ty, Vec::<i64>::new())
+            .expect("a predefined scalar type is known");
+        self.effective_types.insert(id, effective);
+        id
+    }
+
     /// Issue exact effective identities after every Flat shape producer has run.
     ///
     /// Typecheck supplies nominal/canonical identity. Flattening can settle a

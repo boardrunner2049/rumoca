@@ -114,12 +114,7 @@ pub(super) fn lower_algorithm_assignment<'dae>(
     let provenance = dae::DaeProvenance::source(span)?;
     if let Some(&target_coordinate) = context.coordinates.get(&target) {
         let value = lower_algorithm_expression(construction, context, value)?;
-        let subscripts = component
-            .parts()
-            .iter()
-            .flat_map(|part| part.subs.iter())
-            .cloned()
-            .collect::<Vec<_>>();
+        let subscripts = rumoca_core::component_ref_element_subscripts(component);
         let value = if subscripts.is_empty() {
             value
         } else {

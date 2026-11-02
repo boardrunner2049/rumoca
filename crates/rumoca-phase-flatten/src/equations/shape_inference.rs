@@ -48,8 +48,58 @@ fn infer_component_ref_dims(
     // This handles references like `A[i]` when only `A` has known dimensions.
     let unscripted = strip_subscripts_from_component_ref(cr);
     let qualified_unscripted = build_qualified_name(prefix, &unscripted);
-    let dims = ctx.get_array_dimensions(&qualified_unscripted)?;
-    project_component_dims_by_subscripts(dims, cr, prefix, ctx)
+    if let Some(dims) = ctx.get_array_dimensions(&qualified_unscripted) {
+        return project_component_dims_by_subscripts(dims, cr, prefix, ctx);
+    }
+    infer_component_array_member_dims(cr, prefix, ctx)
+}
+
+/// `rotors.v` where `rotors` is an expanded array of components: the
+/// reference selects `v` of every element (MLS §10.6.1), so its shape is the
+/// array's extents followed by one element's `v`. Only an unsubscripted array
+/// part spreads this way; the element shape is read from the first element,
+/// which every element shares.
+fn infer_component_array_member_dims(
+    cr: &ast::ComponentReference,
+    prefix: &ast::QualifiedName,
+    ctx: &Context,
+) -> Option<Vec<i64>> {
+    for split in 1..cr.parts.len() {
+        if cr.parts[split - 1].subs.is_some() {
+            continue;
+        }
+        let mut head = cr.clone();
+        head.parts.truncate(split);
+        let Some(array_dims) = ctx
+            .get_array_dimensions(&build_qualified_name(prefix, &head))
+            .filter(|dims| !dims.is_empty() && dims.iter().all(|&extent| extent > 0))
+        else {
+            continue;
+        };
+        let mut element = cr.clone();
+        element.parts[split - 1].subs = Some(
+            array_dims
+                .iter()
+                .map(|_| ast::Subscript::Expression(first_index(cr.span)))
+                .collect(),
+        );
+        let member_dims = infer_component_ref_dims(&element, prefix, ctx)?;
+        let mut dims = array_dims.clone();
+        dims.extend(member_dims);
+        return Some(dims);
+    }
+    None
+}
+
+fn first_index(span: rumoca_core::Span) -> ast::Expression {
+    ast::Expression::Terminal {
+        terminal_type: ast::TerminalType::UnsignedInteger,
+        token: rumoca_core::Token {
+            text: std::sync::Arc::from("1"),
+            ..Default::default()
+        },
+        span,
+    }
 }
 
 pub(crate) fn strip_subscripts_from_component_ref(

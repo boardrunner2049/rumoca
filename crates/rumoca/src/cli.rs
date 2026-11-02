@@ -298,11 +298,12 @@ pub struct ModelOptions {
     /// Keep derived parameter bindings as written instead of replacing them
     /// with the constant they evaluate to.
     ///
-    /// By default `parameter Real d = k * 10` with `k = 2` is emitted as
-    /// `d = 20`, which is the value a solver wants but erases the fact that `d`
-    /// is derived from `k`. With this flag the binding reaches the flat and DAE
-    /// models as `k * 10`, so an analysis can follow the dependency back to the
-    /// parameter a user actually sets.
+    /// By default the `fold-parameter-bindings` pass emits `parameter Real d =
+    /// k * 10` with `k = 2` as `d = 20.0`, which is the value a solver wants
+    /// but erases the fact that `d` is derived from `k`. With this flag the
+    /// default pass group runs without it, so the binding stays `k * 10` and an
+    /// analysis can follow the dependency back to the parameter a user
+    /// actually sets. (The frontend itself never folds it.)
     ///
     /// Structural parameters (MLS §18.3 — array dimensions, for-loop ranges,
     /// if-equation conditions) and discrete-typed bindings are still evaluated,

@@ -1162,6 +1162,10 @@ fn eval_integer_shape_component_ref(
         return Some(value);
     }
 
+    if let Some(value) = super::eval_integer_component_member_ref(comp_ref, env, depth) {
+        return Some(value);
+    }
+
     // Fall back to record-field resolution for paths like `data.n` where the
     // value lives in a record default/modification environment.
     super::eval_integer_record_field_ref(comp_ref, env, depth)

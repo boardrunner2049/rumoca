@@ -92,6 +92,12 @@ pub(super) fn instantiate_effective_components(
             && dims.contains(&0)
         {
             register_zero_sized_array_component(ctx, overlay, name, dims);
+            let zero_sized_record = type_info
+                .class_def
+                .filter(|class| class.class_type == rumoca_core::ClassType::Record);
+            if let Some(record) = zero_sized_record.filter(|_| !type_info.is_primitive) {
+                register_zero_sized_record_fields(tree, ctx, overlay, &[name], dims, record)?;
+            }
             if !type_info.is_primitive {
                 continue;
             }

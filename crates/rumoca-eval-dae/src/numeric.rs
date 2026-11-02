@@ -995,20 +995,28 @@ where
         span: Span,
     ) -> Result<Vec<usize>, NumericEvaluationError> {
         let dimensions = base_node.value_type().dimensions();
-        if subscripts.len() != dimensions.len() {
+        if subscripts.len() > dimensions.len() {
             return Err(failure(
                 NumericEvaluationErrorKind::UnsupportedOperation,
-                "numeric evaluation requires one subscript per array dimension",
+                "numeric evaluation requires at most one subscript per array dimension",
                 span,
             ));
         }
 
+        // MLS §10.5: an omitted trailing subscript selects the whole axis
+        // (`m[1]` of a matrix is its first row).
         let mut flats = vec![0usize];
         for (axis, extent) in dimensions.iter().copied().enumerate() {
-            let selected = match subscripts
-                .get(axis)
-                .expect("checked update has one subscript per selected axis")
-            {
+            let Some(subscript) = subscripts.get(axis) else {
+                flats = expand_flat_indices(
+                    flats,
+                    &(0..extent as usize).collect::<Vec<_>>(),
+                    extent,
+                    span,
+                )?;
+                continue;
+            };
+            let selected = match subscript {
                 dae::SubscriptView::Index {
                     expression,
                     provenance,

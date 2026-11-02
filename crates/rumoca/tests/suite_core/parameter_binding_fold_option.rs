@@ -1,25 +1,23 @@
-//! `SessionConfig::fold_parameter_declaration_bindings` — keep a derived
-//! parameter's binding as written.
+//! Derived parameter bindings: the frontend keeps them as written, the
+//! `fold-parameter-bindings` pass folds them.
 //!
-//! By default `parameter Real d = k * 10` with `k = 2` reaches Flat as
-//! `d = 20`. That is the value a solver wants, but it erases the fact that `d`
-//! is derived from `k`, and no later phase can recover it: the arithmetic has
-//! already been carried out. An analysis that asks "which knob does the user
-//! turn to reach this denominator" needs the chain, so the fold is optional.
+//! `parameter Real d = k * 10` with `k = 2` reaches Flat and the frontend's
+//! DAE as `k * 10`: the dependency on `k` is a fact about the model, and no
+//! later phase could recover it once the arithmetic had been carried out.
+//! When `k` cannot change after translation (`Evaluate = true`), a plain
+//! `rumoca compile` emits `d = 20.0`, the value a solver wants, because its
+//! default pass group folds it; `--no-fold-parameter-bindings` runs the group
+//! without that pass. A tunable `k` is never folded away.
 //!
-//! What the option must *not* do is change the model. MLS §18.3 structural
-//! parameters decide array extents and branch selection, and Integer/Boolean/
-//! String parameters seed those decisions for nested components, so both are
-//! resolved either way. These tests pin that split: the Real chain survives,
-//! the shape does not move.
+//! What lowering must *not* do is leave a binding unresolved that decides the
+//! model's shape. MLS §18.3 structural parameters decide array extents and
+//! branch selection, and Integer/Boolean/String parameters seed those
+//! decisions for nested components, so the frontend resolves those.
 
 use rumoca_compile::compile::{Session, SessionConfig};
 
-fn session(fold: bool) -> Session {
-    Session::new(SessionConfig {
-        fold_parameter_declaration_bindings: fold,
-        ..SessionConfig::default()
-    })
+fn session() -> Session {
+    Session::new(SessionConfig::default())
 }
 
 /// The rendered binding of a flat variable, or `"<none>"` when it has none.
@@ -35,6 +33,30 @@ fn binding_of(flat: &rumoca_compile::compile::FlatModel, name: &str) -> String {
         .map_or_else(|| "<none>".to_string(), |expr| format!("{expr:?}"))
 }
 
+/// The binding node of `name` in the bitcode of a full `rumoca compile`.
+fn compiled_binding(source: &str, model: &str, name: &str, no_fold: bool) -> String {
+    let compiled = rumoca::Compiler::new()
+        .model(model)
+        .no_fold_parameter_bindings(no_fold)
+        .compile_str(source, &format!("{model}.mo"))
+        .expect("model compiles");
+    let file = rumoca_bitcode::export(
+        &compiled.dae,
+        None,
+        model,
+        &rumoca_bitcode::ExportOptions::default(),
+    )
+    .expect("compiled model exports");
+    let variable = file
+        .model
+        .variables
+        .iter()
+        .find(|variable| variable.name == name)
+        .unwrap_or_else(|| panic!("artifact has no variable `{name}`"));
+    let binding = variable.binding.expect("variable keeps a binding");
+    format!("{:?}", file.model.expressions[binding.0 as usize].node)
+}
+
 const DERIVED: &str = "\
 model Derived
   parameter Real k = 2;
@@ -46,23 +68,8 @@ end Derived;
 ";
 
 #[test]
-fn folding_on_replaces_a_derived_real_binding_with_its_value() {
-    let mut session = session(true);
-    session
-        .add_document("derived.mo", DERIVED)
-        .expect("fixture parses");
-    let compiled = session.compile_model("Derived").expect("model compiles");
-
-    let binding = binding_of(&compiled.flat, "d");
-    assert!(
-        !binding.contains('k'),
-        "default folding should have consumed the reference to `k`, got {binding}"
-    );
-}
-
-#[test]
-fn folding_off_keeps_the_derived_real_binding_as_written() {
-    let mut session = session(false);
+fn the_frontend_keeps_a_derived_real_binding_as_written() {
+    let mut session = session();
     session
         .add_document("derived.mo", DERIVED)
         .expect("fixture parses");
@@ -71,15 +78,54 @@ fn folding_off_keeps_the_derived_real_binding_as_written() {
     let binding = binding_of(&compiled.flat, "d");
     assert!(
         binding.contains('k'),
-        "unfolded binding should still name `k`, got {binding}"
+        "the frontend should keep the reference to `k`, got {binding}"
     );
     // The point of keeping it is that the dependency is readable, not merely
     // that some expression survived: `d` must still be the product.
     assert!(
         binding.contains("Mul") || binding.contains("Multiply") || binding.contains('*'),
-        "unfolded binding should still be the product, got {binding}"
+        "the binding should still be the product, got {binding}"
     );
 }
+
+#[test]
+fn the_default_pass_group_folds_a_binding_settled_at_translation() {
+    let binding = compiled_binding(EVALUATED, "Derived", "d", false);
+    assert!(
+        binding.contains("Literal") && binding.contains("20.0"),
+        "`fold-parameter-bindings` should write the value, got {binding}"
+    );
+}
+
+#[test]
+fn a_binding_that_reads_a_tunable_parameter_keeps_reading_it() {
+    // `k` can be changed on the artifact without recompiling; `d` must follow.
+    let binding = compiled_binding(DERIVED, "Derived", "d", false);
+    assert!(
+        binding.contains("Binary"),
+        "a tunable input must not be folded away, got {binding}"
+    );
+}
+
+#[test]
+fn no_fold_parameter_bindings_skips_the_pass() {
+    let binding = compiled_binding(EVALUATED, "Derived", "d", true);
+    assert!(
+        binding.contains("Binary"),
+        "without the pass the binding should still be the product, got {binding}"
+    );
+}
+
+/// `k` is not tunable, so `d`'s value is settled at translation.
+const EVALUATED: &str = "\
+model Derived
+  parameter Real k = 2 annotation(Evaluate = true);
+  parameter Real d = k * 10;
+  Real x;
+equation
+  der(x) = 1 / d;
+end Derived;
+";
 
 const STRUCTURAL: &str = "\
 model Structural
@@ -100,61 +146,36 @@ end Structural;
 ";
 
 #[test]
-fn folding_off_still_resolves_structural_and_discrete_parameters() {
-    let mut compiled = Vec::new();
-    for fold in [true, false] {
-        let mut session = session(fold);
-        session
-            .add_document("structural.mo", STRUCTURAL)
-            .expect("fixture parses");
-        compiled.push(
-            session
-                .compile_model("Structural")
-                .unwrap_or_else(|error| panic!("fold={fold} should still compile: {error:?}")),
-        );
-    }
-    let (folded, unfolded) = (&compiled[0], &compiled[1]);
+fn the_frontend_still_resolves_structural_and_discrete_parameters() {
+    let mut session = session();
+    session
+        .add_document("structural.mo", STRUCTURAL)
+        .expect("fixture parses");
+    let compiled = session
+        .compile_model("Structural")
+        .unwrap_or_else(|error| panic!("should compile: {error:?}"));
 
     for name in ["n", "useExtra"] {
-        assert_eq!(
-            binding_of(&folded.flat, name),
-            binding_of(&unfolded.flat, name),
-            "`{name}` decides model shape and must resolve identically either way"
+        let binding = binding_of(&compiled.flat, name);
+        assert!(
+            !binding.contains("base"),
+            "`{name}` decides model shape and must be resolved, got {binding}"
         );
     }
-
     // Shape is the real claim: the array extent and the conditional component
-    // are decided before any of this, so the variable sets must match exactly.
-    let names = |result: &rumoca_compile::compile::CompilationResult| {
-        let mut found: Vec<String> = result
+    // are decided from the resolved values.
+    let has = |name: &str| {
+        compiled
             .flat
             .variables
-            .keys()
-            .map(ToString::to_string)
-            .collect();
-        found.sort();
-        found
+            .contains_key(&rumoca_core::VarName::intern(name))
     };
-    assert_eq!(
-        names(folded),
-        names(unfolded),
-        "unfolding a Real binding must not change which variables exist"
-    );
-    assert_eq!(
-        folded.flat.equations.len(),
-        unfolded.flat.equations.len(),
-        "unfolding a Real binding must not change the equation count"
-    );
-
-    // And the Real parameter is the one thing that does differ.
-    assert!(binding_of(&unfolded.flat, "gain").contains("base"));
-    assert!(!binding_of(&folded.flat, "gain").contains("base"));
-}
-
-#[test]
-fn folding_is_on_by_default() {
+    assert!(has("extra"), "the conditional component should exist");
     assert!(
-        SessionConfig::default().fold_parameter_declaration_bindings,
-        "turning this off by default would change every consumer's flat output"
+        has("y[3]") || has("y"),
+        "the array should have extent 3: {:?}",
+        compiled.flat.variables.keys().collect::<Vec<_>>()
     );
+    // And the Real parameter keeps its dependency.
+    assert!(binding_of(&compiled.flat, "gain").contains("base"));
 }

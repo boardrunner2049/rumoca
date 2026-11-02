@@ -474,6 +474,47 @@ impl KnownFlatVars {
         })
     }
 
+    /// `arr[i].member` where `arr` was never expanded into elements.
+    ///
+    /// A component array whose extent instantiation could not settle keeps one
+    /// occurrence, and Flat owns each member as one variable carrying the
+    /// array's extents first (`arr.member`, dims `[n, ...]`). An element's
+    /// member is then that variable at the element's indices, followed by any
+    /// the member itself is subscripted with. Only a reference that names no
+    /// variable as written and whose de-subscripted spelling does is
+    /// rewritten; anything else is left for the DAE phase to report.
+    fn unexpanded_array_member_expression(
+        &self,
+        name: &rumoca_core::Reference,
+        subscripts: &[rumoca_core::Subscript],
+        span: rumoca_core::Span,
+    ) -> Option<rumoca_core::Expression> {
+        if self.names.contains_key(&name.var_name().id()) {
+            return None;
+        }
+        let parts = name.component_ref()?.parts();
+        let (last, inner) = parts.split_last()?;
+        if inner.iter().all(|part| part.subs.is_empty()) {
+            return None;
+        }
+        let mut moved = Vec::new();
+        for part in inner.iter().chain([last]) {
+            moved.extend(part.subs.iter().cloned());
+        }
+        moved.extend_from_slice(subscripts);
+        let member = strip_inner_subscripts(name.as_str())?;
+        let rumoca_core::Expression::VarRef { name: member, .. } =
+            self.expression(&member, span)?
+        else {
+            return None;
+        };
+        Some(rumoca_core::Expression::VarRef {
+            name: member,
+            subscripts: moved,
+            span,
+        })
+    }
+
     /// Compile-time integer value of whatever occurrence `expr` names.
     fn occurrence_integer_value(&self, expr: &rumoca_core::Expression) -> Option<i64> {
         if self.occurrences.is_empty() {
@@ -516,6 +557,12 @@ impl ExpressionRewriter for CollapseIndexRewriter<'_> {
                 .and_then(|cursor| self.known_flat_vars.cursor_expression(cursor, *span))
             {
                 return collapsed;
+            }
+            if let Some(member) = self
+                .known_flat_vars
+                .unexpanded_array_member_expression(name, subscripts, *span)
+            {
+                return member;
             }
         }
         if let rumoca_core::Expression::FieldAccess {
@@ -725,7 +772,21 @@ fn collapse_var_field_access(
             return Some(expression);
         }
     }
-    None
+    // An element of a component array that was never expanded: the member is
+    // one variable over the array's extents (`arr.member[i]`).
+    if subscripts.is_empty() {
+        return None;
+    }
+    let rumoca_core::Expression::VarRef { name, .. } =
+        known_flat_vars.expression(&format!("{base_name}.{field}"), span)?
+    else {
+        return None;
+    };
+    Some(rumoca_core::Expression::VarRef {
+        name,
+        subscripts: subscripts.to_vec(),
+        span,
+    })
 }
 
 /// Compile-time element indices a subscript list selects (MLS §4.5).
@@ -747,6 +808,22 @@ fn fold_indices(
         }
     }
     Some(indices)
+}
+
+/// `a[1].b[2].c[3]` -> `a.b.c`: every bracket group of a dotted path removed.
+/// `None` when the brackets do not nest cleanly.
+fn strip_inner_subscripts(path: &str) -> Option<String> {
+    let mut stripped = String::with_capacity(path.len());
+    let mut depth = 0usize;
+    for character in path.chars() {
+        match character {
+            '[' => depth += 1,
+            ']' => depth = depth.checked_sub(1)?,
+            _ if depth == 0 => stripped.push(character),
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(stripped)
 }
 
 fn subscript_suffix(
