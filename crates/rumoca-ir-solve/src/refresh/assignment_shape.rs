@@ -1,5 +1,10 @@
-use super::dependency::{ScalarProgramYDependency, register_is_written_by, y_load_indices};
+mod additive;
+mod producers;
+pub(super) mod tensor_affine;
+
+use super::dependency::{ScalarProgramYDependency, y_load_indices};
 use crate::{BinaryOp, LinearOp, StridedOperand, TargetAssignmentShape, UnaryOp};
+use producers::{ProgramPrefix, UniqueProgram};
 
 pub(super) fn canonical_assignment_shape_for_output(
     program: &[LinearOp],
@@ -8,15 +13,13 @@ pub(super) fn canonical_assignment_shape_for_output(
 ) -> Option<TargetAssignmentShape> {
     let (output, store_position) = store_output_registers(program).nth(output_offset)?;
     let prefix = program.get(..store_position)?;
-    if !writes_unique_registers(prefix) {
-        return None;
-    }
+    let producers = UniqueProgram::new(prefix)?;
     let dependencies = ScalarProgramYDependency::new(prefix);
-    canonical_assignment_shape(prefix, output, target_y_index, &dependencies)
+    canonical_assignment_shape(producers.view(), output, target_y_index, &dependencies)
 }
 
 fn canonical_assignment_shape(
-    prefix: &[LinearOp],
+    prefix: ProgramPrefix<'_>,
     output: u32,
     target_y_index: usize,
     dependencies: &ScalarProgramYDependency<'_>,
@@ -25,29 +28,47 @@ fn canonical_assignment_shape(
         .into_iter()
         .flatten()
         .find_map(|(target, expression, target_scale)| {
-            if target_load_index(prefix, target) != Some(target_y_index)
-                || dependencies.depends_on(expression, target_y_index)
-            {
+            let load = target_load(prefix, target)?;
+            if load.index != target_y_index || dependencies.depends_on(expression, target_y_index) {
                 return None;
             }
             Some(TargetAssignmentShape::Direct {
                 target_y_index,
                 expr_reg: expression,
                 target_scale,
-                expr_eval_len: producer_position(prefix, expression)?.checked_add(1)?,
+                expr_eval_len: producer_position(prefix, expression)?
+                    .checked_add(1)?
+                    .max(load.required_eval_len),
             })
         });
     direct
+        .or_else(|| zero_assignment_shape(prefix, output, target_y_index))
         .or_else(|| {
             affine_assignment_shapes(prefix, output, dependencies)
                 .into_iter()
                 .find(|shape| shape.target_y_index() == target_y_index)
         })
+        .or_else(|| additive::derive(prefix, output, target_y_index, dependencies))
         .or_else(|| {
-            affine_residual_assignment_shapes(prefix, output, dependencies)
-                .into_iter()
-                .find(|shape| shape.target_y_index() == target_y_index)
+            Some(TargetAssignmentShape::TensorAffine {
+                target_y_index,
+                projection: tensor_affine::derive(prefix, output, target_y_index, dependencies)?,
+                expr_eval_len: prefix.len(),
+            })
         })
+}
+
+fn zero_assignment_shape(
+    prefix: ProgramPrefix<'_>,
+    output: u32,
+    target_y_index: usize,
+) -> Option<TargetAssignmentShape> {
+    let (register, _) = strip_affine_output_wrappers(prefix, output);
+    let load = target_load(prefix, register)?;
+    (load.index == target_y_index).then_some(TargetAssignmentShape::Zero {
+        target_y_index,
+        expr_eval_len: prefix.len(),
+    })
 }
 
 /// Derive every assignment isolator owned by one checked scalar program.
@@ -61,16 +82,40 @@ pub fn derive_target_assignment_shapes(
     program: &[LinearOp],
 ) -> Vec<(usize, TargetAssignmentShape)> {
     let mut shapes = Vec::new();
+    // The outputs of one range store share their prefix, so its producers,
+    // dependencies, and loaded targets are derived once per store.
+    let mut store: Option<PrefixAnalysis<'_>> = None;
     for (output_offset, (output, store_position)) in store_output_registers(program).enumerate() {
         let Some(prefix) = program.get(..store_position) else {
             continue;
         };
-        if !writes_unique_registers(prefix) {
-            continue;
+        if store
+            .as_ref()
+            .is_none_or(|analysis| analysis.position != store_position)
+        {
+            // A prefix without unique producers exposes no certificate, so its
+            // dependencies and targets are never needed.
+            store = Some(PrefixAnalysis {
+                position: store_position,
+                analysis: UniqueProgram::new(prefix).map(|producers| {
+                    (
+                        producers,
+                        ScalarProgramYDependency::new(prefix),
+                        y_load_indices(prefix),
+                    )
+                }),
+            });
         }
-        let dependencies = ScalarProgramYDependency::new(prefix);
-        for target in y_load_indices(prefix) {
-            let Some(shape) = canonical_assignment_shape(prefix, output, target, &dependencies)
+        let Some(PrefixAnalysis {
+            analysis: Some((producers, dependencies, targets)),
+            ..
+        }) = store.as_ref()
+        else {
+            continue;
+        };
+        for &target in targets {
+            let Some(shape) =
+                canonical_assignment_shape(producers.view(), output, target, dependencies)
             else {
                 continue;
             };
@@ -87,6 +132,141 @@ pub fn derive_target_assignment_shapes(
     shapes
 }
 
+/// One store position's prefix analyses, shared by the outputs it stores.
+struct PrefixAnalysis<'a> {
+    position: usize,
+    analysis: Option<(
+        UniqueProgram<'a>,
+        ScalarProgramYDependency<'a>,
+        std::collections::BTreeSet<usize>,
+    )>,
+}
+
+/// The construction proof that the isolator of `target_y_index` in output
+/// `output_offset` of `program` divides by a coefficient bounded away from
+/// zero: a unit or literal-scaled target, a nonzero literal coefficient, a
+/// nonzero constant sum of weights, or a tensor projection with no product
+/// factor. A coefficient computed from run-time values has no proof.
+#[must_use]
+pub fn isolator_coefficient_proof(
+    program: &[LinearOp],
+    output_offset: usize,
+    target_y_index: usize,
+) -> crate::CausalCoefficient {
+    use crate::CausalCoefficient;
+    let nonzero = |value: f64| value != 0.0 && value.is_finite();
+    let Some((_, store_position)) = store_output_registers(program).nth(output_offset) else {
+        return CausalCoefficient::Unproven;
+    };
+    let Some(producers) = program.get(..store_position).and_then(UniqueProgram::new) else {
+        return CausalCoefficient::Unproven;
+    };
+    match canonical_assignment_shape_for_output(program, output_offset, target_y_index) {
+        Some(TargetAssignmentShape::Zero { .. }) => CausalCoefficient::Unit,
+        Some(TargetAssignmentShape::Direct { target_scale, .. }) if nonzero(target_scale) => {
+            CausalCoefficient::Unit
+        }
+        Some(TargetAssignmentShape::Affine {
+            coefficient_reg: None,
+            coefficient_scale,
+            ..
+        }) if nonzero(coefficient_scale) => CausalCoefficient::Literal,
+        Some(TargetAssignmentShape::Affine {
+            coefficient_reg: Some(register),
+            coefficient_scale,
+            ..
+        }) if nonzero(coefficient_scale)
+            && matches!(
+                producer(producers.view(), register),
+                Some(LinearOp::Const { value, .. }) if nonzero(*value)
+            ) =>
+        {
+            CausalCoefficient::Literal
+        }
+        Some(TargetAssignmentShape::Additive { coefficient, .. }) if nonzero(coefficient) => {
+            CausalCoefficient::Literal
+        }
+        Some(TargetAssignmentShape::TensorAffine { projection, .. })
+            if projection.steps.iter().all(|(_, rule)| {
+                !matches!(
+                    rule,
+                    tensor_affine::ProjectionRule::LeftProduct
+                        | tensor_affine::ProjectionRule::RightProduct
+                )
+            }) =>
+        {
+            CausalCoefficient::Unit
+        }
+        _ => CausalCoefficient::Unproven,
+    }
+}
+
+/// The solver-Y indices output `output_offset` of `program` depends on,
+/// derived once for every [`OutputYReads::contains`] query.
+#[must_use]
+pub fn output_y_reads(program: &[LinearOp], output_offset: usize) -> OutputYReads {
+    let Some((output, store_position)) = store_output_registers(program).nth(output_offset) else {
+        return OutputYReads::Absent;
+    };
+    let Some(prefix) = program.get(..store_position) else {
+        return OutputYReads::Absent;
+    };
+    match ScalarProgramYDependency::new(prefix).register_dependencies(output) {
+        Some(reads) => OutputYReads::Bounded(reads),
+        None => OutputYReads::Unbounded,
+    }
+}
+
+/// The solver-Y reads of one program output: none for an output the program
+/// does not store, an exact set, or every index when the dependency analysis
+/// cannot bound the output's register.
+#[derive(Clone, Debug)]
+pub enum OutputYReads {
+    Absent,
+    Bounded(std::collections::BTreeSet<usize>),
+    Unbounded,
+}
+
+impl OutputYReads {
+    #[must_use]
+    pub fn contains(&self, y_index: usize) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::Bounded(reads) => reads.contains(&y_index),
+            Self::Unbounded => true,
+        }
+    }
+}
+
+/// Whether solver-Y `target_y_index` enters output `output_offset` of
+/// `program` as an affine term whose coefficient is a literal zero, which no
+/// isolator solves for (SPEC_0032).
+#[must_use]
+pub fn isolates_through_zero_coefficient(
+    program: &[LinearOp],
+    output_offset: usize,
+    target_y_index: usize,
+) -> bool {
+    let Some((output, store_position)) = store_output_registers(program).nth(output_offset) else {
+        return false;
+    };
+    let Some(producers) = program.get(..store_position).and_then(UniqueProgram::new) else {
+        return false;
+    };
+    let prefix = producers.view();
+    let (output, _) = strip_affine_output_wrappers(prefix, output);
+    let Some((BinaryOp::Add | BinaryOp::Sub, lhs, rhs)) = binary_operands(prefix, output) else {
+        return false;
+    };
+    [lhs, rhs]
+        .into_iter()
+        .flat_map(|side| affine_target_terms(prefix, side).into_iter().flatten())
+        .any(|(target, coefficient)| {
+            target_load(prefix, target).is_some_and(|load| load.index == target_y_index)
+                && coefficient.is_some_and(|register| zero_constant(prefix, register))
+        })
+}
+
 #[must_use]
 pub fn derive_target_assignment_shape_for_output(
     program: &[LinearOp],
@@ -96,30 +276,13 @@ pub fn derive_target_assignment_shape_for_output(
     canonical_assignment_shape_for_output(program, output_offset, target_y_index)
 }
 
-fn writes_unique_registers(program: &[LinearOp]) -> bool {
-    let mut written = std::collections::BTreeSet::new();
-    program.iter().all(|operation| {
-        let Some(start) = operation.dst_register() else {
-            return true;
-        };
-        let Ok(count) = u32::try_from(operation.dst_register_count()) else {
-            return false;
-        };
-        (0..count).all(|offset| {
-            start
-                .checked_add(offset)
-                .is_some_and(|dst| written.insert(dst))
-        })
-    })
-}
-
 fn affine_assignment_shapes(
-    program: &[LinearOp],
+    program: ProgramPrefix<'_>,
     output: u32,
     dependencies: &ScalarProgramYDependency<'_>,
 ) -> Vec<TargetAssignmentShape> {
     let (output, output_scale) = strip_affine_output_wrappers(program, output);
-    let Some(LinearOp::Binary { op, lhs, rhs, .. }) = producer(program, output) else {
+    let Some((op, lhs, rhs)) = binary_operands(program, output) else {
         return Vec::new();
     };
     let (lhs_scale, rhs_scale) = match op {
@@ -128,22 +291,22 @@ fn affine_assignment_shapes(
         _ => return Vec::new(),
     };
     let mut shapes = Vec::new();
-    for (target, coefficient) in affine_target_terms(program, *lhs).into_iter().flatten() {
+    for (target, coefficient) in affine_target_terms(program, lhs).into_iter().flatten() {
         push_affine_assignment_shape(
             &mut shapes,
             program,
             (target, coefficient, lhs_scale),
-            *rhs,
+            rhs,
             rhs_scale,
             dependencies,
         );
     }
-    for (target, coefficient) in affine_target_terms(program, *rhs).into_iter().flatten() {
+    for (target, coefficient) in affine_target_terms(program, rhs).into_iter().flatten() {
         push_affine_assignment_shape(
             &mut shapes,
             program,
             (target, coefficient, rhs_scale),
-            *lhs,
+            lhs,
             lhs_scale,
             dependencies,
         );
@@ -153,16 +316,24 @@ fn affine_assignment_shapes(
 
 fn push_affine_assignment_shape(
     shapes: &mut Vec<TargetAssignmentShape>,
-    program: &[LinearOp],
+    program: ProgramPrefix<'_>,
     target_term: (u32, Option<u32>, f64),
     offset: u32,
     offset_scale: f64,
     dependencies: &ScalarProgramYDependency<'_>,
 ) {
     let (target, coefficient, coefficient_scale) = target_term;
-    let Some(target_y_index) = target_load_index(program, target) else {
+    let Some(load) = target_load(program, target) else {
         return;
     };
+    // A coefficient proven zero at construction isolates nothing: the step
+    // would divide by zero at every evaluation (SPEC_0032).
+    if coefficient_scale == 0.0
+        || coefficient.is_some_and(|register| zero_constant(program, register))
+    {
+        return;
+    }
+    let target_y_index = load.index;
     if dependencies.depends_on(offset, target_y_index)
         || coefficient.is_some_and(|register| dependencies.depends_on(register, target_y_index))
     {
@@ -183,7 +354,7 @@ fn push_affine_assignment_shape(
         coefficient_reg: coefficient,
         offset_scale,
         coefficient_scale,
-        expr_eval_len,
+        expr_eval_len: expr_eval_len.max(load.required_eval_len),
     };
     if shapes
         .iter()
@@ -193,7 +364,10 @@ fn push_affine_assignment_shape(
     }
 }
 
-fn affine_target_terms(program: &[LinearOp], register: u32) -> [Option<(u32, Option<u32>)>; 2] {
+fn affine_target_terms(
+    program: ProgramPrefix<'_>,
+    register: u32,
+) -> [Option<(u32, Option<u32>)>; 2] {
     if target_load_index(program, register).is_some() {
         return [Some((register, None)), None];
     }
@@ -217,122 +391,7 @@ fn affine_target_terms(program: &[LinearOp], register: u32) -> [Option<(u32, Opt
     }
 }
 
-fn affine_residual_assignment_shapes(
-    program: &[LinearOp],
-    residual: u32,
-    dependencies: &ScalarProgramYDependency<'_>,
-) -> Vec<TargetAssignmentShape> {
-    let Some(expr_eval_len) =
-        producer_position(program, residual).and_then(|position| position.checked_add(1))
-    else {
-        return Vec::new();
-    };
-    let mut loads = Vec::new();
-    collect_affine_y_loads(
-        program,
-        residual,
-        &mut std::collections::BTreeSet::new(),
-        &mut loads,
-    );
-    let mut shapes = Vec::new();
-    for (target_y_index, target_reg) in loads {
-        let Some(coefficient) =
-            additive_target_coefficient(program, residual, target_y_index, dependencies)
-        else {
-            continue;
-        };
-        if coefficient == 0.0 || !coefficient.is_finite() {
-            continue;
-        }
-        shapes.push(TargetAssignmentShape::AffineResidual {
-            target_y_index,
-            target_reg,
-            residual_reg: residual,
-            coefficient,
-            expr_eval_len,
-        });
-    }
-    shapes
-}
-
-fn additive_target_coefficient(
-    program: &[LinearOp],
-    register: u32,
-    target_y_index: usize,
-    dependencies: &ScalarProgramYDependency<'_>,
-) -> Option<f64> {
-    if !dependencies.depends_on(register, target_y_index) {
-        return Some(0.0);
-    }
-    match producer(program, register)? {
-        _ if target_load_index(program, register) == Some(target_y_index) => Some(1.0),
-        LinearOp::Move { src, .. } => {
-            additive_target_coefficient(program, *src, target_y_index, dependencies)
-        }
-        LinearOp::Unary {
-            op: UnaryOp::Neg,
-            arg,
-            ..
-        } => additive_target_coefficient(program, *arg, target_y_index, dependencies)
-            .map(|value| -value),
-        LinearOp::Binary {
-            op: BinaryOp::Add,
-            lhs,
-            rhs,
-            ..
-        } => Some(
-            additive_target_coefficient(program, *lhs, target_y_index, dependencies)?
-                + additive_target_coefficient(program, *rhs, target_y_index, dependencies)?,
-        ),
-        LinearOp::Binary {
-            op: BinaryOp::Sub,
-            lhs,
-            rhs,
-            ..
-        } => Some(
-            additive_target_coefficient(program, *lhs, target_y_index, dependencies)?
-                - additive_target_coefficient(program, *rhs, target_y_index, dependencies)?,
-        ),
-        _ => None,
-    }
-}
-
-fn collect_affine_y_loads(
-    program: &[LinearOp],
-    register: u32,
-    visited: &mut std::collections::BTreeSet<u32>,
-    loads: &mut Vec<(usize, u32)>,
-) {
-    if !visited.insert(register) {
-        return;
-    }
-    if let Some(index) = target_load_index(program, register) {
-        if loads.iter().all(|(existing, _)| *existing != index) {
-            loads.push((index, register));
-        }
-        return;
-    }
-    match producer(program, register) {
-        Some(LinearOp::Move { src, .. })
-        | Some(LinearOp::Unary {
-            op: UnaryOp::Neg,
-            arg: src,
-            ..
-        }) => collect_affine_y_loads(program, *src, visited, loads),
-        Some(LinearOp::Binary {
-            op: BinaryOp::Add | BinaryOp::Sub,
-            lhs,
-            rhs,
-            ..
-        }) => {
-            collect_affine_y_loads(program, *lhs, visited, loads);
-            collect_affine_y_loads(program, *rhs, visited, loads);
-        }
-        _ => {}
-    }
-}
-
-fn strip_affine_output_wrappers(program: &[LinearOp], mut register: u32) -> (u32, f64) {
+fn strip_affine_output_wrappers(program: ProgramPrefix<'_>, mut register: u32) -> (u32, f64) {
     let mut scale = 1.0;
     loop {
         match producer(program, register) {
@@ -364,7 +423,7 @@ fn strip_affine_output_wrappers(program: &[LinearOp], mut register: u32) -> (u32
     }
 }
 
-fn is_zero_literal(program: &[LinearOp], register: u32) -> bool {
+fn is_zero_literal(program: ProgramPrefix<'_>, register: u32) -> bool {
     matches!(
         producer(program, register),
         Some(LinearOp::Const { value: 0.0, .. })
@@ -409,7 +468,7 @@ fn store_output_registers(program: &[LinearOp]) -> impl Iterator<Item = (u32, us
 }
 
 fn assignment_expression_registers(
-    program: &[LinearOp],
+    program: ProgramPrefix<'_>,
     output: u32,
 ) -> [Option<(u32, u32, f64)>; 2] {
     match producer(program, output) {
@@ -464,6 +523,41 @@ fn assignment_expression_registers(
     }
 }
 
+fn binary_operands(program: ProgramPrefix<'_>, output: u32) -> Option<(BinaryOp, u32, u32)> {
+    match *producer(program, output)? {
+        LinearOp::Binary { op, lhs, rhs, .. } => Some((op, lhs, rhs)),
+        LinearOp::TensorBinary {
+            dst_start,
+            op,
+            lhs_start,
+            rhs_start,
+            count,
+            lhs_stride,
+            rhs_stride,
+            lanes,
+        } => {
+            let (lhs, rhs) = tensor_binary_operands(
+                output,
+                dst_start,
+                (
+                    StridedOperand {
+                        start: lhs_start,
+                        stride: lhs_stride,
+                    },
+                    StridedOperand {
+                        start: rhs_start,
+                        stride: rhs_stride,
+                    },
+                ),
+                count,
+                lanes,
+            )?;
+            Some((op, lhs, rhs))
+        }
+        _ => None,
+    }
+}
+
 fn tensor_binary_operands(
     output: u32,
     destination_start: u32,
@@ -486,7 +580,7 @@ fn tensor_binary_operands(
 }
 
 fn subtraction_assignment_registers(
-    program: &[LinearOp],
+    program: ProgramPrefix<'_>,
     lhs: u32,
     rhs: u32,
     scale: f64,
@@ -497,34 +591,89 @@ fn subtraction_assignment_registers(
     ]
 }
 
-fn target_load_index(program: &[LinearOp], register: u32) -> Option<usize> {
-    match *producer(program, register)? {
-        LinearOp::LoadY { dst, index } if dst == register => Some(index),
-        LinearOp::TensorLoad {
-            dst_start,
-            input: crate::TensorInputKind::Y,
-            input_start,
-            count,
-            lanes,
-            ..
-        } => {
-            let offset = register.checked_sub(dst_start)? as usize;
-            (lanes != 0 && offset < count.checked_mul(lanes)? && offset.is_multiple_of(lanes))
-                .then(|| input_start.checked_add(offset / lanes))?
+fn target_load_index(program: ProgramPrefix<'_>, register: u32) -> Option<usize> {
+    target_load(program, register).map(|load| load.index)
+}
+
+struct TargetLoad {
+    index: usize,
+    required_eval_len: usize,
+}
+
+fn target_load(mut program: ProgramPrefix<'_>, mut register: u32) -> Option<TargetLoad> {
+    let mut required_eval_len = 0;
+    loop {
+        let position = producer_position(program, register)?;
+        match program.operation(position)? {
+            LinearOp::LoadY { index, .. } => {
+                return Some(TargetLoad {
+                    index: *index,
+                    required_eval_len,
+                });
+            }
+            LinearOp::TensorLoad {
+                dst_start,
+                input: crate::TensorInputKind::Y,
+                input_start,
+                count,
+                lanes,
+                ..
+            } => {
+                let offset = register.checked_sub(*dst_start)? as usize;
+                if *lanes == 0
+                    || offset >= count.checked_mul(*lanes)?
+                    || !offset.is_multiple_of(*lanes)
+                {
+                    return None;
+                }
+                return Some(TargetLoad {
+                    index: input_start.checked_add(offset / lanes)?,
+                    required_eval_len,
+                });
+            }
+            LinearOp::Move { src, .. } => register = *src,
+            operation => {
+                register = projected_input_register(operation, register)?;
+                required_eval_len = required_eval_len.max(position.checked_add(1)?);
+            }
         }
-        _ => None,
+        program = program.before(position)?;
     }
 }
 
-fn producer(program: &[LinearOp], register: u32) -> Option<&LinearOp> {
-    program
-        .iter()
-        .rev()
-        .find(|operation| register_is_written_by(operation, register))
+fn projected_input_register(operation: &LinearOp, register: u32) -> Option<u32> {
+    let (starts, projection) = match operation {
+        LinearOp::PureCall {
+            dst_start,
+            input_starts,
+            site,
+        } => (
+            input_starts,
+            site.projected_input_coordinate(register.checked_sub(*dst_start)? as usize)?,
+        ),
+        LinearOp::PureCallDirectional {
+            dst_start,
+            input_starts,
+            site,
+        } => (
+            input_starts,
+            site.projected_input_coordinate(register.checked_sub(*dst_start)? as usize)?,
+        ),
+        _ => return None,
+    };
+    starts
+        .get(projection.0)?
+        .checked_add(u32::try_from(projection.1).ok()?)
 }
 
-fn producer_position(program: &[LinearOp], register: u32) -> Option<usize> {
-    program
-        .iter()
-        .rposition(|operation| register_is_written_by(operation, register))
+fn zero_constant(program: ProgramPrefix<'_>, register: u32) -> bool {
+    matches!(producer(program, register), Some(LinearOp::Const { value, .. }) if *value == 0.0)
+}
+
+fn producer(program: ProgramPrefix<'_>, register: u32) -> Option<&LinearOp> {
+    program.operation(program.producer_position(register)?)
+}
+
+fn producer_position(program: ProgramPrefix<'_>, register: u32) -> Option<usize> {
+    program.producer_position(register)
 }

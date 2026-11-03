@@ -107,9 +107,9 @@ Three mechanisms are used; choosing the wrong one defeats the fail-fast contract
 
 | Mechanism | When to use | Phase scope |
 |---|---|---|
-| `emit()` on `&mut Diagnostics` | User errors in early phases — multiple independent errors exist; collecting all at once gives better IDE diagnostics | parse, resolve, flatten, instantiate |
-| `?` (bubble up `Result`) | User errors in late phases, or intra-phase propagation — input is already validated; one error aborts the phase | DAE, structural, solve lowering |
-| `panic!` / `expect("invariant")` | Internal compiler invariant violations — a bug in rumoca, not in the user's Modelica; earlier phases must have guaranteed this cannot happen | any phase, any location |
+| `emit()` on `&mut Diagnostics` | User errors in early phases, where collecting every independent error gives better IDE diagnostics | parse, resolve, flatten, instantiate |
+| `?` (bubble up `Result`) | User errors in late phases or intra-phase propagation over validated input; one error aborts the phase | DAE, structural, solve lowering |
+| `panic!` / `expect("invariant")` | Internal invariant violations (a rumoca bug, not a Modelica error) that earlier phases guarantee cannot happen | any phase, any location |
 | `debug_assert!` | Hot-loop invariants guaranteed by construction where an always-on check would add measurable overhead | tight loops in structural/solve |
 
 **Classifying an error:**
@@ -143,12 +143,11 @@ Error codes use mnemonic prefixes for readability:
 | EM0xx | class merge | **M**erge | Class-tree merge errors |
 | ES0xx | structural | **S**tructural | Matching/BLT/singularity (`ES001`-`ES002` warnings, `ES01x` errors) |
 | EL0xx | solve lowering | so**L**ve | DAE → Solve-IR lowering (`EL001`-`EL011` rows, `EL02x` assembly, `EL03x` overrides) |
-| EX0xx | sim runtime | e**X**ecution | Solver, runtime-preparation, parameter-override |
+| EX0xx | sim runtime | e**X**ecution | Solver, runtime-preparation, parameter-override, singular active mode |
+| WX0xx | sim runtime | e**X**ecution | Non-aborting runtime diagnostics: `WX001` a violated warning-level assertion (MLS §8.3.7) |
 | EG0xx | GALEC IR | **G**ALEC | GALEC IR parse/validation errors |
 | EGT0xx | GALEC target projection | **G**ALEC **T**arget | DAE-to-GALEC projection/export errors |
 | EFM0xx | eFMI packaging | e**FM**I | eFMI manifest/packaging errors |
-| EA0xx | model analysis | **A**nalysis | Analysis/verification pass failures (SPEC_0052) |
-| WA0xx | model analysis | **A**nalysis | Non-fatal analysis findings and verification-pass diagnostics |
 | WP/WR/WT/etc | (same) | | Warnings per phase |
 
 The leading letter is the severity: a warning MUST NOT be minted in an `E`
@@ -159,13 +158,17 @@ match by mnemonic **suffix**. Contract tests implement this comparison locally
 in `crates/rumoca-contracts/src/test_support.rs`. A shipped code is stable:
 retire it rather than renumber or reuse.
 
-The former GALEC-target meanings of `ET001`–`ET023` are retired because they
-collided with typecheck. GALEC target projection now emits `EGT001`–`EGT023`;
-the typecheck meanings of `ET0xx` are unchanged.
+`ET0xx` codes belong to typecheck; GALEC target projection emits
+`EGT001`–`EGT023`.
+
+`WX0xx` diagnostics never abort a run; each site is reported once, at its
+first observation (SPEC_0022 EQN-036).
 
 `EI013` is retired. Older builds used it for the non-fatal synthesized-inner
 notice; the phase-owned diagnostic is `WI013`, whose prefix records its warning
-severity.
+severity. `WI013` fires when MLS §5.4 automatic inner creation succeeds; when it
+cannot, `EI015` reports same-name outer declarations that name different classes
+and `EI012` reports an outer whose class is partial.
 
 **Known drift**, tracked separately: `rumoca-phase-structural` emits
 `ES001`/`ES002` at warning severity. For these, severity MUST be read from the
@@ -319,6 +322,8 @@ and `to_miette_with_source_map` render a diagnostic for terminal display.
 | `skip(...)` large context parameters in instrumented functions | Avoid heavy debug formatting |
 | Instrument phase entry/exit, eval failures, connection processing, for-range eval | These are the high-value debug points |
 | CLI debug/dump syntax is non-normative until `rum` implements it | No spec drift ahead of implementation |
+| Structural inspection may retain an already-owned stalled DAE with its manifold and exact failure only at discard; it cannot affect reduction choices or create a successful product | Failed intermediate equations remain inspectable |
+| The production observer MUST NOT allocate, clone IR, or repeat analysis for inspection | Diagnostics add no production work |
 
 ## Rationale
 

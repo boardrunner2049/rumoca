@@ -1,28 +1,25 @@
+//! Row scaling and the scaled Newton system for the algebraic projection.
+//!
+//! Scaling rows by their own magnitude before measuring convergence, so that a
+//! residual test is a statement about the unknowns rather than about the units
+//! the equations happen to be written in, is J. E. Dennis Jr. and R. B.
+//! Schnabel, "Numerical Methods for Unconstrained Optimization and Nonlinear
+//! Equations", SIAM 1996, section 7.2 and the scaled stopping criteria of
+//! section 7.2.1.
+
 use faer::{
     Col,
     prelude::Solve,
-    sparse::{
-        SparseColMat, Triplet,
-        linalg::solvers::{Lu, SymbolicLu},
-    },
+    sparse::{SparseColMat, Triplet, linalg::solvers::Lu},
 };
 use nalgebra::{DMatrix, DVector};
 use rumoca_eval_solve::tensor_policy::{LinearSolveKernel, select_linear_solve_kernel};
 use rumoca_ir_solve as solve;
 
 use super::{
-    AlgebraicProjectionModel, ImplicitProjectionModel, RuntimeSolveError, algebraic_block_jacobian,
-    initial_block_jacobian, y_index_for_slot,
+    AlgebraicProjectionModel, ImplicitProjectionModel, RuntimeSolveError, SparseNewtonCache,
+    algebraic_block_jacobian, initial_block_jacobian, y_index_for_slot,
 };
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct SparseNewtonCache {
-    symbolic_lu: Option<SymbolicLu<usize>>,
-    matrix: Option<SparseColMat<usize, f64>>,
-    coordinates: Box<[(usize, usize)]>,
-    factor_values: Box<[u64]>,
-    factorization: Option<Lu<usize, f64>>,
-}
 
 pub(super) fn scaled_residual_converged(residual: &[f64], scales: &[f64], tol: f64) -> bool {
     residual.len() == scales.len()
@@ -66,7 +63,7 @@ pub(super) fn scaled_tolerance(tol: f64, scale: f64) -> f64 {
     }
 }
 
-fn valid_variable_scale(scale: f64) -> f64 {
+pub(super) fn valid_variable_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 {
         scale
     } else {
@@ -87,6 +84,22 @@ pub(super) fn model_variable_scale<M: ImplicitProjectionModel + ?Sized>(
     valid_variable_scale(model.variable_scale_for_y_index(index)).max(current_magnitude)
 }
 
+/// The solver-Y coordinate whose scale is each row's fallback: its implicit
+/// target, if it has one in solver Y.
+pub(super) fn fallback_targets<M: ImplicitProjectionModel + ?Sized>(
+    model: &M,
+    block: &solve::AlgebraicProjectionBlock,
+) -> Vec<Option<usize>> {
+    let mut targets = Vec::with_capacity(block.rows.len());
+    for &row in &block.rows {
+        targets.push(match model.implicit_target(row) {
+            Some(slot) => y_index_for_slot(slot),
+            None => None,
+        });
+    }
+    targets
+}
+
 pub(super) fn algebraic_block_scales<M: ImplicitProjectionModel + ?Sized>(
     model: &M,
     y: &[f64],
@@ -99,18 +112,14 @@ pub(super) fn algebraic_block_scales<M: ImplicitProjectionModel + ?Sized>(
         .iter()
         .map(|&index| model_variable_scale(model, index, y[index]))
         .collect::<Vec<_>>();
-    let fallback_scales = block
-        .rows
-        .iter()
+    let fallback_scales = fallback_targets(model, block)
+        .into_iter()
         .enumerate()
-        .map(|(offset, &row)| {
-            model
-                .implicit_target(row)
-                .and_then(y_index_for_slot)
-                .map_or_else(
-                    || variable_scales.get(offset).copied().unwrap_or(1.0),
-                    |index| model_variable_scale(model, index, y[index]),
-                )
+        .map(|(offset, target)| {
+            target.map_or_else(
+                || variable_scales.get(offset).copied().unwrap_or(1.0),
+                |index| model_variable_scale(model, index, y[index]),
+            )
         })
         .collect::<Vec<_>>();
     let row_scales = jacobian_row_scales(jacobian, &variable_scales, &fallback_scales, structure);
@@ -195,14 +204,14 @@ fn sparse_jacobian_row_scales(
     pattern: &solve::StructuralPattern,
 ) -> Vec<f64> {
     let mut scales = vec![0.0_f64; jacobian.nrows()];
-    for (row, column) in pattern.nonzero_coordinates() {
-        let contribution =
-            jacobian[(row, column)].abs() * valid_variable_scale(variable_scales[column]);
-        if contribution.is_finite() {
-            scales[row] = scales[row].max(contribution);
-        }
-    }
     for (row, scale) in scales.iter_mut().enumerate() {
+        pattern.visit_row_columns(row, &mut |column| {
+            let contribution =
+                jacobian[(row, column)].abs() * valid_variable_scale(variable_scales[column]);
+            if contribution.is_finite() {
+                *scale = scale.max(contribution);
+            }
+        });
         if *scale == 0.0 {
             *scale = fallback_scales.get(row).copied().unwrap_or(1.0);
         }
@@ -310,9 +319,43 @@ pub(crate) fn scaled_newton_delta_with_cache(
     scaled_newton_delta_impl(system, Some(cache), true)
 }
 
+pub(crate) fn scaled_newton_delta_with_tearing(
+    system: ScaledNewtonSystem<'_>,
+    cache: &mut SparseNewtonCache,
+    layout: &solve::AffineEliminationLayout,
+) -> Option<DVector<f64>> {
+    if system.structure != Some(layout.pattern())
+        || system.jacobian.nrows() != system.residual.len()
+        || system.jacobian.nrows() != system.row_scales.len()
+        || system.jacobian.ncols() != system.variable_scales.len()
+        || rumoca_eval_solve::projection_policy::affine_elimination_capacity(layout).is_none()
+    {
+        return None;
+    }
+    let rhs = scaled_newton_rhs(system.residual, system.row_scales);
+    let delta = cache.solve_torn_scaled(
+        system.jacobian,
+        &rhs,
+        system.row_scales,
+        system.variable_scales,
+        layout,
+    )?;
+    Some(unscale_newton_delta(&delta, system.variable_scales))
+}
+
+fn scaled_newton_rhs(residual: &[f64], row_scales: &[f64]) -> DVector<f64> {
+    DVector::from_iterator(
+        residual.len(),
+        residual
+            .iter()
+            .zip(row_scales)
+            .map(|(&value, &scale)| -value / valid_variable_scale(scale)),
+    )
+}
+
 fn scaled_newton_delta_impl(
     system: ScaledNewtonSystem<'_>,
-    cache: Option<&mut SparseNewtonCache>,
+    mut cache: Option<&mut SparseNewtonCache>,
     allow_rank_deficient_fallback: bool,
 ) -> Option<DVector<f64>> {
     let ScaledNewtonSystem {
@@ -329,25 +372,38 @@ fn scaled_newton_delta_impl(
     {
         return None;
     }
-    let rhs = DVector::from_iterator(
-        residual.len(),
-        residual
-            .iter()
-            .copied()
-            .zip(row_scales.iter().copied())
-            .map(|(value, scale)| -value / valid_variable_scale(scale)),
-    );
+    let rhs = scaled_newton_rhs(residual, row_scales);
     let sparse = structure.and_then(|pattern| {
         matches!(
             select_linear_solve_kernel(jacobian.nrows(), pattern).ok(),
             Some(LinearSolveKernel::SparseCandidate)
         )
         .then(|| {
-            sparse_scaled_newton_delta(jacobian, &rhs, row_scales, variable_scales, pattern, cache)
+            sparse_scaled_newton_delta(
+                jacobian,
+                &rhs,
+                row_scales,
+                variable_scales,
+                pattern,
+                cache.as_deref_mut(),
+            )
         })
         .flatten()
     });
     if let Some(scaled_delta) = sparse {
+        return Some(unscale_newton_delta(&scaled_delta, variable_scales));
+    }
+    if let Some(cache) = cache {
+        // The block cache keys its dense factorization on the exact Jacobian
+        // and scale bits, so a fixed system (the affine solve and its
+        // refinement) factors once and solves every residual bit-identically.
+        let scaled_delta = cache.solve_dense_scaled(
+            jacobian,
+            &rhs,
+            (row_scales, variable_scales),
+            tolerance,
+            allow_rank_deficient_fallback,
+        )?;
         return Some(unscale_newton_delta(&scaled_delta, variable_scales));
     }
     let scaled_jacobian = scaled_jacobian(jacobian, row_scales, variable_scales);
@@ -367,7 +423,7 @@ fn solve_square_newton_system(matrix: &DMatrix<f64>, rhs: &DVector<f64>) -> Opti
     matrix.clone().lu().solve(rhs)
 }
 
-fn scaled_jacobian(
+pub(super) fn scaled_jacobian(
     jacobian: &DMatrix<f64>,
     row_scales: &[f64],
     variable_scales: &[f64],
@@ -402,14 +458,7 @@ fn sparse_scaled_newton_delta(
         return None;
     }
     if let Some(cache) = cache {
-        return solve_cached_sparse_matrix(
-            matrix,
-            rhs,
-            row_scales,
-            variable_scales,
-            structure,
-            cache,
-        );
+        return cache.solve_scaled(matrix, rhs, row_scales, variable_scales, structure);
     }
     let triplets = structure
         .nonzero_coordinates()
@@ -448,67 +497,6 @@ fn solve_sparse_triplets(
     solve_with_sparse_factor(&factorization, rhs)
 }
 
-fn solve_cached_sparse_matrix(
-    source: &DMatrix<f64>,
-    rhs: &DVector<f64>,
-    row_scales: &[f64],
-    variable_scales: &[f64],
-    structure: &solve::StructuralPattern,
-    cache: &mut SparseNewtonCache,
-) -> Option<DVector<f64>> {
-    prepare_sparse_cache(source.nrows(), structure, cache)?;
-    let coordinates = &cache.coordinates;
-    let sparse = cache.matrix.as_mut()?;
-    for (value, &(row, column)) in sparse.val_mut().iter_mut().zip(coordinates) {
-        *value = source[(row, column)] * valid_variable_scale(variable_scales[column])
-            / valid_variable_scale(row_scales[row]);
-    }
-    let values_changed = sparse.val().len() != cache.factor_values.len()
-        || sparse
-            .val()
-            .iter()
-            .zip(cache.factor_values.iter())
-            .any(|(value, cached)| value.to_bits() != *cached);
-    if values_changed {
-        let symbolic = cache.symbolic_lu.as_ref()?.clone();
-        cache.factorization = Lu::try_new_with_symbolic(symbolic, sparse.as_ref()).ok();
-        cache.factor_values = sparse
-            .val()
-            .iter()
-            .map(|value| value.to_bits())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-    }
-    solve_with_sparse_factor(cache.factorization.as_ref()?, rhs)
-}
-
-fn prepare_sparse_cache(
-    dimension: usize,
-    structure: &solve::StructuralPattern,
-    cache: &mut SparseNewtonCache,
-) -> Option<()> {
-    if cache.matrix.is_some() {
-        return Some(());
-    }
-    let triplets = structure
-        .nonzero_coordinates()
-        .into_iter()
-        .map(|(row, column)| Triplet::new(row, column, 0.0))
-        .collect::<Vec<_>>();
-    let sparse =
-        SparseColMat::<usize, f64>::try_new_from_triplets(dimension, dimension, &triplets).ok()?;
-    let coordinates = sparse
-        .as_ref()
-        .triplet_iter()
-        .map(|entry| (entry.row, entry.col))
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    cache.symbolic_lu = SymbolicLu::try_new(sparse.symbolic()).ok();
-    cache.coordinates = coordinates;
-    cache.matrix = Some(sparse);
-    Some(())
-}
-
 fn solve_with_sparse_factor(
     factorization: &Lu<usize, f64>,
     rhs: &DVector<f64>,
@@ -533,3 +521,164 @@ fn sparse_triplets(
         .map(|(row, column)| Triplet::new(row, column, matrix[(row, column)]))
         .collect()
 }
+
+/// Largest finite magnitude of each row of `jacobian` over its structural
+/// entries (every column without a pattern).
+/// Whether each row's scale at `variable_scales` comes from a nonzero finite
+/// contribution rather than its fallback.
+pub(super) fn jacobian_row_derived(
+    jacobian: &DMatrix<f64>,
+    variable_scales: &[f64],
+    structure: Option<&solve::StructuralPattern>,
+) -> Vec<bool> {
+    (0..jacobian.nrows())
+        .map(|row| jacobian_row_scale(jacobian, row, variable_scales, 0.0, structure) > 0.0)
+        .collect()
+}
+
+pub(super) fn jacobian_row_magnitudes(
+    jacobian: &DMatrix<f64>,
+    structure: Option<&solve::StructuralPattern>,
+) -> Vec<f64> {
+    let pattern = structure.filter(|pattern| {
+        pattern.rows() as usize == jacobian.nrows()
+            && pattern.columns() as usize == jacobian.ncols()
+    });
+    (0..jacobian.nrows())
+        .map(|row| {
+            let mut magnitude = 0.0_f64;
+            let mut visit = |column: usize| {
+                let value = jacobian[(row, column)].abs();
+                if value.is_finite() {
+                    magnitude = magnitude.max(value);
+                }
+            };
+            match pattern {
+                Some(pattern) => pattern.visit_row_columns(row, &mut visit),
+                None => (0..jacobian.ncols()).for_each(visit),
+            }
+            magnitude
+        })
+        .collect()
+}
+
+/// One row's scale exactly as [`jacobian_row_scales`] forms it.
+fn jacobian_row_scale(
+    jacobian: &DMatrix<f64>,
+    row: usize,
+    variable_scales: &[f64],
+    fallback: f64,
+    structure: Option<&solve::StructuralPattern>,
+) -> f64 {
+    let pattern = structure.filter(|pattern| {
+        pattern.rows() as usize == jacobian.nrows()
+            && pattern.columns() as usize == jacobian.ncols()
+    });
+    let mut scale = 0.0_f64;
+    let mut visit = |column: usize| {
+        let contribution =
+            jacobian[(row, column)].abs() * valid_variable_scale(variable_scales[column]);
+        if contribution.is_finite() {
+            scale = scale.max(contribution);
+        }
+    };
+    match pattern {
+        Some(pattern) => pattern.visit_row_columns(row, &mut visit),
+        None => (0..jacobian.ncols()).for_each(visit),
+    }
+    if scale > 0.0 { scale } else { fallback }
+}
+
+/// A fixed block Jacobian with the row scales it had at the arithmetic
+/// origin, where every block unknown is zero.
+pub(super) struct OriginRowScales<'a> {
+    pub(super) jacobian: &'a DMatrix<f64>,
+    pub(super) structure: Option<&'a solve::StructuralPattern>,
+    /// [`algebraic_block_scales`] at the origin.
+    pub(super) scales: &'a [f64],
+    /// [`jacobian_row_magnitudes`] of the same Jacobian.
+    pub(super) magnitudes: &'a [f64],
+    /// [`jacobian_row_derived`] at the origin variable scales.
+    pub(super) derived: &'a [bool],
+}
+
+/// The model data the origin-bounded certificate reads, resolved once per
+/// affine projection: each block unknown's y index and declared scale, and
+/// each row's fallback coordinate (its implicit target, or the unknown at the
+/// same offset) with that coordinate's declared scale.
+pub(super) struct CertificateScales {
+    pub(super) unknowns: Vec<(usize, f64)>,
+    pub(super) fallbacks: Vec<Option<(usize, f64)>>,
+}
+
+/// [`model_variable_scale`] of a coordinate with declared scale `declared`.
+fn declared_variable_scale(declared: f64, current_value: f64) -> f64 {
+    let current_magnitude = if current_value.is_finite() {
+        current_value.abs()
+    } else {
+        0.0
+    };
+    valid_variable_scale(declared).max(current_magnitude)
+}
+
+/// Whether `residual` converges under the row scales [`algebraic_block_scales`]
+/// gives at `y`, decided without forming every row scale.
+///
+/// A block unknown's scale `max(nominal, |y|)` never falls below its origin
+/// value, and a row target outside the block keeps its value, so every
+/// finite contribution `|J| * scale` is at least its origin value while no
+/// contribution overflows (bounded by the row's largest magnitude times the
+/// largest unknown scale). A row whose origin scale came from a nonzero
+/// contribution, or which has no nonzero entry, and which is within
+/// tolerance of that origin scale, therefore converges under its scale at
+/// `y`; any other row forms that scale exactly. The decision equals
+/// [`scaled_residual_converged`] over the full scales.
+pub(super) fn origin_bounded_residual_converged(
+    y: &[f64],
+    scales: &CertificateScales,
+    origin: &OriginRowScales<'_>,
+    residual: &[f64],
+    tol: f64,
+) -> bool {
+    if residual.len() != origin.scales.len() {
+        return false;
+    }
+    let mut variable_scales = Vec::with_capacity(scales.unknowns.len());
+    for &(index, declared) in &scales.unknowns {
+        variable_scales.push(declared_variable_scale(declared, y[index]));
+    }
+    let mut largest = 0.0_f64;
+    for &scale in &variable_scales {
+        largest = largest.max(valid_variable_scale(scale));
+    }
+    for (row, &value) in residual.iter().enumerate() {
+        // A contribution only grows from the origin, so an origin scale formed
+        // from a nonzero contribution bounds the scale at `y` from below. A row
+        // on its fallback at the origin with a nonzero entry may form a
+        // smaller scale from contributions at `y` (an underflowed product), so
+        // only a row with no nonzero entry keeps its growing fallback.
+        let bounded = (origin.magnitudes[row] * largest).is_finite()
+            && (origin.derived[row] || origin.magnitudes[row] == 0.0);
+        if bounded && value.abs() <= scaled_tolerance(tol, origin.scales[row]) {
+            continue;
+        }
+        let fallback = match scales.fallbacks[row] {
+            Some((index, declared)) => declared_variable_scale(declared, y[index]),
+            None => variable_scales.get(row).copied().unwrap_or(1.0),
+        };
+        let scale = jacobian_row_scale(
+            origin.jacobian,
+            row,
+            &variable_scales,
+            fallback,
+            origin.structure,
+        );
+        if !(value.is_finite() && value.abs() <= scaled_tolerance(tol, scale)) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod origin_bounded_tests;

@@ -1,0 +1,31 @@
+//! Compile the shared FMI 3 C kernel into the WebAssembly component.
+//!
+//! The C sources under `csrc/` are the same translation units the `fmi3`
+//! target renders; the Rust crate links against their prefixed FMI 3 ABI. The
+//! `wasm32-wasip2` C compiler is supplied through the standard cargo/cc
+//! environment (`CC_wasm32_wasip2` and `AR_wasm32_wasip2`).
+
+fn main() {
+    let sources = [
+        "csrc/model.c",
+        "csrc/rmc_rows.c",
+        "csrc/rmc_isolators.c",
+        "csrc/rmc_functions.c",
+        "csrc/rmc_assign.c",
+        "csrc/rmc_jacobian.c",
+    ];
+    cc::Build::new()
+        .include("csrc")
+        .std("c11")
+        .warnings(true)
+        .warnings_into_errors(true)
+        .files(sources)
+        .compile("rumoca_fmi3_kernel");
+    for source in sources {
+        println!("cargo:rerun-if-changed={source}");
+    }
+    println!("cargo:rerun-if-changed=csrc/model.h");
+    println!("cargo:rerun-if-changed=csrc/fmi3Functions.h");
+    println!("cargo:rerun-if-changed=csrc/fmi3FunctionTypes.h");
+    println!("cargo:rerun-if-changed=csrc/fmi3PlatformTypes.h");
+}

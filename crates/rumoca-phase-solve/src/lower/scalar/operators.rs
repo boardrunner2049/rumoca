@@ -40,16 +40,19 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         let Some(operator) = LoweredUnaryOperator::of(operator) else {
             return Ok(operand);
         };
+        if operator == LoweredUnaryOperator::Negate
+            && let Some(folded) = self.fold_negation(operand, span)?
+        {
+            return Ok(folded);
+        }
         let op = match operator {
             LoweredUnaryOperator::Negate => solve::UnaryOp::Neg,
             LoweredUnaryOperator::Not => solve::UnaryOp::Not,
         };
-        let dst = self.register(span)?;
-        self.ops.push(solve::LinearOp::Unary {
-            dst,
-            op,
-            arg: operand,
-        });
+        let dst = self.solve_unary(op, operand, span)?;
+        if operator == LoweredUnaryOperator::Negate {
+            self.record_negation(dst, operand);
+        }
         let integer = self
             .integer_register(operand)
             .and_then(|value| match operator {
@@ -67,6 +70,9 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         rhs: solve::Reg,
         span: Span,
     ) -> Result<solve::Reg, LowerError> {
+        if let Some(folded) = self.fold_binary(operator, lhs, rhs, span)? {
+            return Ok(folded);
+        }
         let dst = self.register(span)?;
         let operation = match operator {
             dae::BinaryOperator::Add | dae::BinaryOperator::ElementwiseAdd => {
@@ -196,6 +202,11 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         scalar: usize,
         span: Span,
     ) -> Result<solve::Reg, LowerError> {
+        if let Some((operand, operand_scalar)) =
+            self.identity_operand_scalar(operator, lhs, rhs, scalar)
+        {
+            return self.expression(operand, operand_scalar);
+        }
         if let Some(output) =
             self.compact_tensor_binary_expression(operator, lhs, rhs, scalar, span)?
         {
@@ -236,9 +247,28 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         let lhs_count = scalar_count(self.view, lhs);
         let rhs_count = scalar_count(self.view, rhs);
         let count = lhs_count.max(rhs_count);
-        if count <= 1 {
+        // A literal operand lowers per scalar, where its lanes fold exactly. A
+        // sum or difference with any small constant operand does too: each lane
+        // costs one scalar op either way, and packing the other operand would
+        // materialize lanes a product term already dropped.
+        let additive = matches!(
+            operator,
+            dae::BinaryOperator::Add
+                | dae::BinaryOperator::ElementwiseAdd
+                | dae::BinaryOperator::Subtract
+                | dae::BinaryOperator::ElementwiseSubtract
+        );
+        let per_scalar = |operand| {
+            if additive {
+                self.is_small_constant(operand)
+            } else {
+                self.is_literal_operand(operand)
+            }
+        };
+        if count <= 1 || per_scalar(lhs) || per_scalar(rhs) {
             return Ok(None);
         }
+        let scaled = matches!(operator, dae::BinaryOperator::Multiply);
         let op = match operator {
             dae::BinaryOperator::Add | dae::BinaryOperator::ElementwiseAdd => solve::BinaryOp::Add,
             dae::BinaryOperator::Subtract | dae::BinaryOperator::ElementwiseSubtract => {
@@ -252,12 +282,19 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             dae::BinaryOperator::Divide if lhs_count == 1 || rhs_count == 1 => solve::BinaryOp::Div,
             _ => return Ok(None),
         };
-        let key = (self.context_id, op, lhs, rhs);
+        // Every scalar of the operation reads this one packed owner, so the
+        // cache answers them all; only a miss proves the operation packable.
+        let key = (self.context_id, op, scaled, lhs, rhs);
         if let Some(&(start, cached_count)) = self.tensor_binary_cache.get(&key) {
             return (scalar < cached_count)
                 .then(|| start + scalar as solve::Reg)
                 .map(Some)
                 .ok_or_else(|| LowerError::contract("tensor binary scalar is out of range", span));
+        }
+        // A scaled tensor packs only when structural incidence keeps every
+        // product term; otherwise each scalar lowers its kept terms alone.
+        if scaled && (0..count).any(|scalar| self.omits_product_term(lhs, rhs, scalar)) {
+            return Ok(None);
         }
         let lhs_start = self.pack_expression(lhs)?;
         let rhs_start = self.pack_expression(rhs)?;
@@ -290,6 +327,12 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
     ) -> Result<solve::Reg, LowerError> {
         let lhs_dimensions = self.node(lhs).value_type().dimensions().to_vec();
         let rhs_dimensions = self.node(rhs).value_type().dimensions().to_vec();
+        if self.omits_product_term(lhs, rhs, scalar)
+            || self.is_literal_operand(lhs)
+            || self.is_literal_operand(rhs)
+        {
+            return self.sparse_product(lhs, rhs, scalar, span);
+        }
         match (lhs_dimensions.as_slice(), rhs_dimensions.as_slice()) {
             ([], _) => {
                 let lhs = self.expression(lhs, 0)?;
@@ -354,6 +397,68 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                 "checked multiplication shape has no scalar projection",
                 span,
             )),
+        }
+    }
+
+    /// Whether scalar `scalar` of `lhs * rhs` has a product term structural
+    /// incidence omits as exactly zero.
+    fn omits_product_term(
+        &mut self,
+        lhs: dae::ExprId<'dae>,
+        rhs: dae::ExprId<'dae>,
+        scalar: usize,
+    ) -> bool {
+        let pairs = rumoca_eval_dae::multiplication_scalar_pairs(
+            self.node(lhs).value_type().dimensions(),
+            self.node(rhs).value_type().dimensions(),
+            scalar,
+        );
+        pairs.into_iter().any(|(lhs_index, rhs_index)| {
+            self.zero_coefficients
+                .omits_term(self.view, lhs, rhs, lhs_index, rhs_index)
+        })
+    }
+
+    /// Lower scalar `scalar` of `lhs * rhs` as the sum of the product terms
+    /// structural incidence keeps, so the program reads exactly the
+    /// coordinates the structural analysis matched.
+    fn sparse_product(
+        &mut self,
+        lhs: dae::ExprId<'dae>,
+        rhs: dae::ExprId<'dae>,
+        scalar: usize,
+        span: Span,
+    ) -> Result<solve::Reg, LowerError> {
+        let pairs = rumoca_eval_dae::multiplication_scalar_pairs(
+            self.node(lhs).value_type().dimensions(),
+            self.node(rhs).value_type().dimensions(),
+            scalar,
+        );
+        let mut sum = None;
+        for (lhs_index, rhs_index) in pairs {
+            if self
+                .zero_coefficients
+                .omits_term(self.view, lhs, rhs, lhs_index, rhs_index)
+            {
+                continue;
+            }
+            let term = if self.exact_literal(lhs, lhs_index) == Some(1.0) {
+                self.expression(rhs, rhs_index)?
+            } else if self.exact_literal(rhs, rhs_index) == Some(1.0) {
+                self.expression(lhs, lhs_index)?
+            } else {
+                let factor = self.expression(lhs, lhs_index)?;
+                let other = self.expression(rhs, rhs_index)?;
+                self.binary(dae::BinaryOperator::Multiply, factor, other, span)?
+            };
+            sum = Some(match sum {
+                None => term,
+                Some(partial) => self.binary(dae::BinaryOperator::Add, partial, term, span)?,
+            });
+        }
+        match sum {
+            Some(sum) => Ok(sum),
+            None => self.constant(0.0, span),
         }
     }
 
@@ -464,12 +569,17 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         argument: solve::Reg,
         span: Span,
     ) -> Result<solve::Reg, LowerError> {
+        let key = (self.context_id, op, argument);
+        if let Some(&value) = self.unary_values.get(&key) {
+            return Ok(value);
+        }
         let dst = self.register(span)?;
         self.ops.push(solve::LinearOp::Unary {
             dst,
             op,
             arg: argument,
         });
+        self.unary_values.insert(key, dst);
         Ok(dst)
     }
 }

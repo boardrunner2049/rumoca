@@ -59,6 +59,11 @@ the decoded programs and domains.
 Every initialized register carries one exact may-depend set. Absence from the
 register table is a construction error; there is no unknown dependency state.
 
+Fixed tensor-update dependency selection consumes a rank-sized view containing
+only whole axes and constant indices. Runtime indices and slices retain the
+conservative patch-and-selector rule; a prior Boolean classification cannot
+authorize an unreachable dynamic case inside fixed selection.
+
 | Operation | Derived dependency |
 |---|---|
 | Literal/time/ordinary parameter load | Empty with respect to solver seeds |
@@ -77,6 +82,20 @@ register table is a construction error; there is no unknown dependency state.
 
 Algebraic cancellation does not remove a dependency unless a separately proved
 rewrite establishes the identity under the selected numeric semantics.
+
+Numerical AD may omit arithmetic for tangents proved zero by its derivative
+rules in the declared seed domain. This proof follows construction, never
+sampled zero values, and does not prove the primal value constant: a discrete
+operation can have zero tangent while its value changes. Original primal
+operations, call owners, assertions, activation, and tensor domains remain
+intact. Ordinary parameter independence applies only
+to solver-Y differentiation; initialization and parameter sensitivities retain
+their parameter seeds. A restricted projection seed domain requires a separate
+source-bound artifact and cannot replace a general sensitivity artifact.
+Materializing inactive tangents or changing AD lane layout preserves compact
+tensor fills, transposes, and concatenations. A transpose may be shared only
+for the same immutable register run, shape, and lowering context; tensor extent
+must not become a list of scalar copy operations.
 
 ### Differentiation, Coloring, and Execution
 

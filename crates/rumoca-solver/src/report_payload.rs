@@ -24,10 +24,42 @@ pub struct SimulationRunMetrics {
     pub typecheck_seconds: Option<f64>,
     pub flatten_seconds: Option<f64>,
     pub todae_seconds: Option<f64>,
+    /// The projection fallback counts of the run (SPEC_0044 ME-PROJ-003).
+    pub projection_fallbacks: Option<crate::ProjectionFallbackReport>,
+}
+
+/// Each projection site's calls, fallbacks by kind, rate, and whether the rate
+/// exceeds the reporting threshold.
+pub fn projection_fallbacks_value(report: &crate::ProjectionFallbackReport) -> Value {
+    Value::Array(
+        report
+            .sites
+            .iter()
+            .map(|(site, counts)| {
+                let block = match site {
+                    crate::ProjectionSite::Block(block) => Some(*block),
+                    crate::ProjectionSite::CompletePlan => None,
+                };
+                let fallbacks = crate::ProjectionFallback::ALL
+                    .iter()
+                    .map(|fallback| (fallback.label().to_string(), json!(counts.count(*fallback))))
+                    .collect::<serde_json::Map<_, _>>();
+                json!({
+                    "block": block,
+                    "rows": counts.rows,
+                    "calls": counts.calls,
+                    "fallbacks": fallbacks,
+                    "rate": counts.rate(),
+                    "overThreshold": counts.over_threshold(),
+                })
+            })
+            .collect(),
+    )
 }
 
 pub fn build_simulation_metrics_value(sim: &SimResult, metrics: &SimulationRunMetrics) -> Value {
     json!({
+        "projectionFallbacks": metrics.projection_fallbacks.as_ref().map(projection_fallbacks_value),
         "compileSeconds": metrics.compile_seconds,
         "simulateSeconds": metrics.simulate_seconds,
         "points": sim.times.len(),
@@ -128,6 +160,7 @@ mod tests {
             data: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
             n_states: 1,
             termination: None,
+            diagnostics: Vec::new(),
             variable_meta: vec![SimVariableMeta {
                 name: "x".to_string(),
                 role: "state".to_string(),
@@ -192,5 +225,44 @@ mod tests {
         assert_eq!(metrics["compilePhaseSeconds"]["prepareContext"], 0.1);
         assert_eq!(metrics["compilePhaseSeconds"]["strictResolve"], 0.4);
         assert_eq!(metrics["compilePhaseSeconds"]["todae"], 0.8);
+    }
+
+    #[test]
+    fn metrics_list_each_projection_site_with_its_fallbacks() {
+        let mut report = crate::ProjectionFallbackReport::default();
+        report.sites.insert(
+            crate::ProjectionSite::Block(4),
+            crate::ProjectionFallbackCounts {
+                rows: 2,
+                calls: 40,
+                fallback_calls: 10,
+                fallbacks: [0, 0, 10, 0, 0, 0],
+                ..crate::ProjectionFallbackCounts::default()
+            },
+        );
+        report.sites.insert(
+            crate::ProjectionSite::CompletePlan,
+            crate::ProjectionFallbackCounts {
+                calls: 5,
+                ..crate::ProjectionFallbackCounts::default()
+            },
+        );
+        let metrics = build_simulation_metrics_value(
+            &sample_result(),
+            &SimulationRunMetrics {
+                projection_fallbacks: Some(report),
+                ..SimulationRunMetrics::default()
+            },
+        );
+
+        let sites = &metrics["projectionFallbacks"];
+        assert_eq!(sites[0]["block"], 4);
+        assert_eq!(sites[0]["rows"], 2);
+        assert_eq!(sites[0]["fallbacks"]["seed_rescue"], 10);
+        assert_eq!(sites[0]["fallbacks"]["torn_to_dense"], 0);
+        assert_eq!(sites[0]["rate"], 0.25);
+        assert_eq!(sites[0]["overThreshold"], true);
+        assert!(sites[1]["block"].is_null());
+        assert_eq!(sites[1]["overThreshold"], false);
     }
 }

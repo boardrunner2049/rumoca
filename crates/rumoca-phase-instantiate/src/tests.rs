@@ -229,7 +229,7 @@ fn test_extract_attributes_preserves_local_fixed_with_local_start() {
         .expect("valid attributes should extract");
 
     assert!(attrs.start.is_some());
-    assert_eq!(attrs.fixed, Some(true));
+    assert_eq!(attrs.fixed, Some(vec![true]));
 }
 
 #[test]
@@ -251,7 +251,52 @@ fn test_extract_attributes_preserves_local_fixed_with_outer_start() {
         .expect("valid attributes should extract");
 
     assert!(attrs.start.is_some());
-    assert_eq!(attrs.fixed, Some(true));
+    assert_eq!(attrs.fixed, Some(vec![true]));
+}
+
+#[test]
+fn test_extract_attributes_does_not_default_an_unresolved_outer_fixed() {
+    let mut comp = make_component("x", "Real", None);
+    comp.modifications
+        .insert("fixed".to_string(), make_bool_expr(true));
+    let mut mod_env = ast::ModificationEnvironment::new();
+    mod_env.add(
+        ast::QualifiedName::from_dotted("x.fixed"),
+        ast::ModificationValue::simple(make_comp_ref_expr(&["unsettled"])),
+    );
+    let tree = ast::ClassTree::default();
+    let effective_components = IndexMap::default();
+    let eval_ctx = make_eval_ctx(&tree, &mod_env, &effective_components);
+    let error = extract_attributes(&comp, &attribute_scope(&mod_env, "x"), &eval_ctx, &[])
+        .expect_err("an overriding fixed expression must not use the local default");
+    assert!(matches!(
+        *error,
+        InstantiateError::UnsupportedFixedAttribute { .. }
+    ));
+}
+
+#[test]
+fn test_extract_attributes_preserves_nonuniform_fixed_values() {
+    // MLS §4.8.6: a `fixed` modifier on an array component is itself an array
+    // of the component's dimensions, and each element governs the corresponding
+    // component element independently. Differing values must be retained per
+    // element, not collapsed or rejected.
+    let mut comp = make_component("x", "Real", None);
+    comp.modifications.insert(
+        "fixed".to_string(),
+        ast::Expression::Array {
+            elements: vec![make_bool_expr(true), make_bool_expr(false)],
+            kind: rumoca_core::ArrayConstructor::Array,
+            span: Span::DUMMY,
+        },
+    );
+    let tree = ast::ClassTree::default();
+    let mod_env = ast::ModificationEnvironment::new();
+    let effective_components = IndexMap::default();
+    let eval_ctx = make_eval_ctx(&tree, &mod_env, &effective_components);
+    let attrs = extract_attributes(&comp, &attribute_scope(&mod_env, "x"), &eval_ctx, &[])
+        .expect("a Boolean array fixed modifier is a valid per-element attribute");
+    assert_eq!(attrs.fixed, Some(vec![true, false]));
 }
 
 #[test]
@@ -610,7 +655,11 @@ fn test_continuous_declaration_binding_preserves_runtime_expression() {
         &mut ctx,
         &effective_components,
         &TypeOverrideMap::new(),
-        false,
+        &TypeInfo {
+            class_def: None,
+            is_primitive: true,
+            is_discrete: false,
+        },
         &[],
     )
     .expect("continuous binding should prepare");
@@ -643,7 +692,11 @@ fn test_parameter_declaration_binding_still_resolves_structural_expression() {
         &mut ctx,
         &effective_components,
         &TypeOverrideMap::new(),
-        true,
+        &TypeInfo {
+            class_def: None,
+            is_primitive: true,
+            is_discrete: true,
+        },
         &[],
     )
     .expect("parameter binding should prepare");

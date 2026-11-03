@@ -15,6 +15,12 @@ pub(super) struct FunctionDefinitions {
     /// Values only some conditional branches define, keyed to the conditional
     /// that left them without a total owner.
     branch_only: HashMap<VarName, BranchOnlyCoverage>,
+    /// The values the next resolved conditional may join path-partially: those
+    /// a later top-level statement uses or the function returns. Set by the
+    /// top-level sequence walk for exactly that conditional, which takes it
+    /// before its branches clone this certificate, so no nested conditional
+    /// or loop ever sees it.
+    admit_path_partial: HashSet<VarName>,
 }
 
 #[derive(Clone)]
@@ -22,6 +28,12 @@ struct BranchOnlyCoverage {
     span: Span,
     guard: Option<Expression>,
     coverage: Option<ValueCoverage>,
+    /// The conditional committed a joined definition that is total on every
+    /// path that writes the value and dead on every path that does not. MLS
+    /// §12.4.4 makes a use of the value an error exactly on those other paths,
+    /// so a top-level read is admitted behind a call-scoped definedness
+    /// assertion (`admit_asserted_reads`).
+    path_partial: bool,
 }
 
 #[derive(Clone)]
@@ -104,6 +116,7 @@ impl FunctionDefinitions {
         Self {
             values,
             branch_only: HashMap::new(),
+            admit_path_partial: HashSet::new(),
         }
     }
 
@@ -191,12 +204,17 @@ impl FunctionDefinitions {
             let Some(coverage) = branch.values.get(target) else {
                 continue;
             };
+            let path_partial = self
+                .branch_only
+                .get(target)
+                .is_some_and(|definition| definition.path_partial);
             self.branch_only.insert(
                 target.clone(),
                 BranchOnlyCoverage {
                     span,
                     guard: Some(condition.clone()),
                     coverage: Some(coverage.clone()),
+                    path_partial,
                 },
             );
         }
@@ -224,6 +242,79 @@ impl FunctionDefinitions {
         }
     }
 
+    /// Record a value the conditional at `span` leaves without a definition on
+    /// some path: path-partial when its join is admitted, otherwise without
+    /// any owner past the conditional.
+    fn leave_branch_only(
+        &mut self,
+        target: &VarName,
+        path_partial: bool,
+        context: FunctionValidationContext<'_>,
+        span: Span,
+    ) -> Result<(), ToDaeError> {
+        if !path_partial {
+            require_definable_branch_local(target, context, span)?;
+        }
+        self.values.remove(target);
+        self.branch_only.insert(
+            target.clone(),
+            BranchOnlyCoverage {
+                span,
+                guard: None,
+                coverage: None,
+                path_partial,
+            },
+        );
+        Ok(())
+    }
+
+    /// Let the next resolved conditional join path-partial values.
+    pub(super) fn admit_next_path_partial_join(&mut self, uses: HashSet<VarName>) {
+        self.admit_path_partial = uses;
+    }
+
+    /// Take the one-shot admission set by `admit_next_path_partial_join`.
+    pub(super) fn take_path_partial_admission(&mut self) -> HashSet<VarName> {
+        std::mem::take(&mut self.admit_path_partial)
+    }
+
+    /// Whether `name` holds a joined definition some paths leave undefined.
+    pub(super) fn is_path_partial(&self, name: &VarName) -> bool {
+        self.branch_only
+            .get(name)
+            .is_some_and(|definition| definition.path_partial)
+    }
+
+    /// Admit the path-partial values one top-level statement reads, returning
+    /// them in read order.
+    ///
+    /// The construction asserts each returned value defined before the
+    /// statement runs. Every path that survives that assertion is one where
+    /// the value has its total definition, so the value is total afterwards.
+    pub(super) fn admit_asserted_reads(&mut self, reads: &[VarName]) -> Vec<VarName> {
+        let mut admitted = Vec::new();
+        for name in reads {
+            if self.is_path_partial(name) && !admitted.contains(name) {
+                admitted.push(name.clone());
+            }
+        }
+        for name in &admitted {
+            self.define_whole(name);
+        }
+        admitted
+    }
+
+    /// Withdraw the path-partial admission from values a statement may write
+    /// without a whole definition the construction correlates with the
+    /// assertion predicate; reads of them stay rejected.
+    pub(super) fn withdraw_path_partial(&mut self, written: &[VarName]) {
+        for name in written {
+            if let Some(definition) = self.branch_only.get_mut(name) {
+                definition.path_partial = false;
+            }
+        }
+    }
+
     pub(super) fn is_total(&self, name: &VarName) -> bool {
         self.values.get(name).is_some_and(ValueCoverage::is_total)
     }
@@ -240,6 +331,39 @@ impl FunctionDefinitions {
         for output in &function.outputs {
             self.define_whole(&VarName::new(&output.name));
         }
+    }
+
+    /// Define every undefined output or local whose proven shape has a zero
+    /// extent, and return the entry seed of each.
+    ///
+    /// MLS §12.4.4 leaves an unwritten value without an initial value, but a
+    /// value with a zero extent has no element to leave undefined: it is total
+    /// from function entry, and its one possible value is the empty aggregate
+    /// (`Real den2[0, 2]` passed on in `Blocks.Continuous.Internal.Filter`).
+    pub(super) fn empty_value_seeds(
+        &mut self,
+        context: FunctionValidationContext<'_>,
+    ) -> Result<Vec<(VarName, FunctionValueSeed)>, ToDaeError> {
+        let mut seeds = Vec::new();
+        let function = context.function;
+        for value in function.outputs.iter().chain(&function.locals) {
+            let name = VarName::new(&value.name);
+            if value.default.is_some()
+                || self.is_defined(&name)
+                || !context
+                    .shapes
+                    .get(&name)
+                    .is_some_and(|shape| shape.contains(&0))
+            {
+                continue;
+            }
+            seeds.push((
+                name.clone(),
+                self.whole_loop_seed(&name, context, value.span)?,
+            ));
+            self.define_whole(&name);
+        }
+        Ok(seeds)
     }
 
     /// Describe the dead initial slot a loop-carried value needs when its first
@@ -392,11 +516,17 @@ impl FunctionDefinitions {
     /// every branch defines it and the conditional has an else branch. Any
     /// other value keeps no owner past the conditional, which the read check
     /// reports exactly where the algorithm would need it.
+    ///
+    /// A value in `admit_path_partial` that some paths leave undefined still
+    /// joins when every path that writes it defines every element: the joined
+    /// definition is dead on the other paths, and the value stays path-partial
+    /// until a top-level read asserts that it is defined.
     pub(super) fn join_branches(
         &mut self,
         branches: &[Self],
         exhaustive: bool,
         ordered_targets: &[VarName],
+        admit_path_partial: &HashSet<VarName>,
         context: FunctionValidationContext<'_>,
         span: Span,
     ) -> Result<Vec<VarName>, ToDaeError> {
@@ -405,16 +535,10 @@ impl FunctionDefinitions {
             let defines_everywhere =
                 exhaustive && branches.iter().all(|branch| branch.is_defined(target));
             if !self.is_defined(target) && !defines_everywhere {
-                require_definable_branch_local(target, context, span)?;
-                self.values.remove(target);
-                self.branch_only.insert(
-                    target.clone(),
-                    BranchOnlyCoverage {
-                        span,
-                        guard: None,
-                        coverage: None,
-                    },
-                );
+                let path_partial =
+                    admit_path_partial.contains(target) && path_partial_join(branches, target);
+                self.leave_branch_only(target, path_partial, context, span)?;
+                joined.extend(path_partial.then(|| target.clone()));
                 continue;
             }
             let prior = self.values.get(target).cloned();
@@ -445,6 +569,21 @@ impl FunctionDefinitions {
         }
         Ok(joined)
     }
+}
+
+/// Whether a value some paths leave undefined joins as a path-partial
+/// definition: at least one path writes it, and every path that writes it
+/// defines every element.
+fn path_partial_join(branches: &[FunctionDefinitions], target: &VarName) -> bool {
+    let mut written = false;
+    for branch in branches {
+        match branch.values.get(target) {
+            Some(coverage) if coverage.is_total() => written = true,
+            Some(_) => return false,
+            None => {}
+        }
+    }
+    written
 }
 
 fn condition_implies_guard(
@@ -506,7 +645,7 @@ fn is_boolean_false(expression: &Expression) -> bool {
     )
 }
 
-fn generated_boolean_value<'expression>(
+pub(super) fn generated_boolean_value<'expression>(
     expression: &Expression,
     context: FunctionValidationContext<'expression>,
 ) -> Option<&'expression Expression> {

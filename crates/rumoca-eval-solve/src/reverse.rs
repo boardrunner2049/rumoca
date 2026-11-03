@@ -1,5 +1,15 @@
 //! Scalar reverse-mode AD (vector-Jacobian product).
 //!
+//! The method is reverse-mode (adjoint) algorithmic differentiation: A.
+//! Griewank and A. Walther, "Evaluating Derivatives: Principles and Techniques
+//! of Algorithmic Differentiation", 2nd ed., SIAM 2008,
+//! doi:10.1137/1.9780898717761, chapter 4. The cost result that motivates it,
+//! a full gradient for a small constant multiple of one function evaluation
+//! regardless of input count, is B. Speelpenning, "Compiling Fast Partial
+//! Derivatives of Functions Given by Algorithms", PhD thesis, University of
+//! Illinois at Urbana-Champaign, 1980. The adjoint of a linear solve used by
+//! `LinearSolveComponent` is Griewank and Walther, section 3.4.
+//!
 //! For a scalar Solve-IR program `f`, the reverse sweep computes `Jᵀλ` for an
 //! output cotangent `λ` in a single pass, where `J = ∂f/∂(inputs)`. It records
 //! each row's primal register values on a forward pass, then walks the ops
@@ -17,6 +27,51 @@
 //! The reverse-sweep types are `pub` only so that
 //! `rumoca_solver::runtime::solve_runtime` (the runtime state machine that owns
 //! the scratch buffers) can drive them; they are not a general-purpose API.
+//!
+//! # Kink rules
+//!
+//! Four sites differentiate the same operations: these reverse rows, the
+//! forward dual lowering (`rumoca_phase_solve::ad`, including the fused
+//! dual-lane tensor division the evaluator, the native backend, and the C
+//! kernel execute), the typed directional owner of a pure call
+//! (`rumoca_ir_solve` `typed_program::program::directional`), and the
+//! generated C kernel, which renders the forward and directional programs. The
+//! projection solver assembles a block matrix from reverse rows and certifies
+//! it with forward Jacobian-vector products, so the sites must agree wherever
+//! an operation is not differentiable. This table is the one statement of
+//! those rules; the other sites form the same local partials in emitted
+//! operations and cite it.
+//!
+//! A partial the table qualifies "when finite" contributes zero wherever it is
+//! not finite (a vertical tangent, a pole, a point outside the real domain, an
+//! overflow, or an underflowing denominator), never a non-finite value: a NaN
+//! or infinite tangent would poison the certification of every coordinate it
+//! reaches. The remaining partials (`sin`, `cos`, `tan`, `atan`, `sinh`,
+//! `cosh`, `tanh`, `exp`, and the product rule) are finite wherever their
+//! operands are finite and the primal does not overflow; where they are not,
+//! every site produces the same non-finite value. Each rule is a function of
+//! the primal operands alone, never of which operands carry a tangent, so
+//! forward products stay linear in the direction.
+//!
+//! | Operation | Local partials, and the rule where they do not exist |
+//! |---|---|
+//! | `abs(x)` | `+1` when `x >= 0`, including `-0.0`; `-1` otherwise, including NaN |
+//! | `sign`, `floor`, `ceil`, `trunc`, `not`, `and`, `or`, comparisons | `0` everywhere, including at jumps; `integer`, `div`, `mod`, and `rem` lower through these |
+//! | `min(l, r)` / `max(l, r)` | the operand the comparison `l <= r` / `l >= r` selects; ties select `l`, and a NaN operand selects `r` |
+//! | `if` / `noEvent` / `smooth` | the branch the primal condition selects |
+//! | `sqrt(x)` | `0.5 / sqrt(x)` when finite, else `0` (so `x <= 0` gives `0`) |
+//! | `asin(x)` / `acos(x)` | `±1 / sqrt(1 - x²)` when finite, else `0` (so `|x| >= 1` gives `0`) |
+//! | `log(x)` / `log10(x)` | `1 / x` / `1 / (x ln 10)` when finite, else `0` (so `x = 0` and a subnormal `x` give `0`) |
+//! | `tan(x)` | `1 / cos²(x)`, finite for every finite `x`; NaN at a non-finite `x` |
+//! | `tanh(x)` | `1 / cosh²(x)`, which reaches `0` when `cosh` overflows |
+//! | `l / r` | `1 / r` and `-l / r²`, each when finite, else `0` (so `r = 0` gives `(0, 0)`, and a subnormal or huge `r` whose square underflows or overflows zeroes the partial that does) |
+//! | `atan2(l, r)` | `r / (l² + r²)` and `-l / (l² + r²)`, each when finite, else `0` (so the origin gives `(0, 0)`) |
+//! | `pow(l, r)` | `∂l = r·l^(r-1)` when finite, else `0` (so `l < 0` with a non-integer `r` gives `0`, and `l = 0` gives `1` at `r = 1` and `0` otherwise); `∂r = l^r·ln(l)` when `l > 0` and finite, else `0` |
+//!
+//! `rumoca_phase_solve`'s `kink_rule_tests` pin the reverse, forward, and typed
+//! directional sites together at every row of this table, and the
+//! `derivative_kinks` harness of `suite_template_runtime` pins the generated C
+//! kernel's block Jacobians at the same kinks.
 
 use rumoca_ir_solve::{BinaryOp, LinearOp, Reg, ScalarProgramBlock, UnaryOp};
 
@@ -59,6 +114,8 @@ pub struct ReverseInputs<'a> {
 pub struct ReverseScratch {
     regs: Vec<f64>,
     adj: Vec<f64>,
+    /// Registers reached only from the unselected arm of a selection.
+    untaken: Vec<bool>,
 }
 
 /// Reverse-accumulate `Jᵀ · output_cotangents` of a scalar program block into
@@ -104,8 +161,7 @@ pub fn reverse_scalar_block_vjp(
             output_cotangents,
             &mut scratch.adj,
         );
-        reverse_row_adjoints(row, &scratch.regs, &mut scratch.adj, cot)
-            .map_err(|error| error.with_source_span(span))?;
+        reverse_row_adjoints(row, scratch, cot).map_err(|error| error.with_source_span(span))?;
         debug_assert!(scratch.adj.iter().all(|value| *value == 0.0));
     }
     Ok(())
@@ -145,8 +201,7 @@ pub fn reverse_scalar_row_y_gradient(
     y_gradient.fill(0.0);
     reverse_row_adjoints(
         row,
-        &scratch.regs,
-        &mut scratch.adj,
+        scratch,
         &mut ReverseCotangents {
             y: y_gradient,
             p: &mut [],
@@ -162,6 +217,8 @@ impl ReverseScratch {
     fn prepare(&mut self, register_count: usize) {
         self.regs.resize(register_count, 0.0);
         self.adj.resize(register_count, 0.0);
+        self.untaken.clear();
+        self.untaken.resize(register_count, false);
         debug_assert!(self.adj.iter().all(|value| *value == 0.0));
     }
 }
@@ -291,10 +348,11 @@ fn forward_row_tape(
 /// observationally, since a written register is not touched again going backward.
 fn reverse_row_adjoints(
     row: &[LinearOp],
-    regs: &[f64],
-    adj: &mut [f64],
+    scratch: &mut ReverseScratch,
     cot: &mut ReverseCotangents<'_>,
 ) -> Result<(), EvalSolveError> {
+    let ReverseScratch { regs, adj, untaken } = scratch;
+    let regs = regs.as_slice();
     for op in row.iter().rev() {
         match *op {
             // No destination register: nothing to consume.
@@ -321,16 +379,30 @@ fn reverse_row_adjoints(
             LinearOp::LoadSeed { dst, index } => accumulate(cot.seed, index, take_adj(adj, dst)),
             LinearOp::Move { dst, src } => {
                 let dst_adj = take_adj(adj, dst);
+                // A copy carries an unselected arm's mark to its source.
+                if skips_untaken(untaken, adj, dst, dst_adj, &[src]) {
+                    continue;
+                }
                 add_adj(adj, src, dst_adj);
             }
+            // A selection eagerly evaluates its unselected arm, whose partials may
+            // be infinite there; that arm's zero adjoint adds nothing, since
+            // `0 * inf` would poison the shared operands. Every other operation
+            // multiplies as forward mode does, so a singular point on the taken
+            // path still yields a non-finite derivative.
             LinearOp::Unary { dst, op, arg } => {
-                let derivative = unary_derivative(op, reg(regs, arg));
                 let dst_adj = take_adj(adj, dst);
-                add_adj(adj, arg, dst_adj * derivative);
+                if skips_untaken(untaken, adj, dst, dst_adj, &[arg]) {
+                    continue;
+                }
+                add_adj(adj, arg, dst_adj * unary_derivative(op, reg(regs, arg)));
             }
             LinearOp::Binary { dst, op, lhs, rhs } => {
-                let (dl, dr) = binary_partials(op, reg(regs, lhs), reg(regs, rhs));
                 let dst_adj = take_adj(adj, dst);
+                if skips_untaken(untaken, adj, dst, dst_adj, &[lhs, rhs]) {
+                    continue;
+                }
+                let (dl, dr) = binary_partials(op, reg(regs, lhs), reg(regs, rhs));
                 add_adj(adj, lhs, dst_adj * dl);
                 add_adj(adj, rhs, dst_adj * dr);
             }
@@ -342,11 +414,13 @@ fn reverse_row_adjoints(
             } => {
                 // The adjoint flows to whichever branch the primal condition took.
                 let dst_adj = take_adj(adj, dst);
-                if reg(regs, cond) != 0.0 {
-                    add_adj(adj, if_true, dst_adj);
+                let (taken, unselected) = if reg(regs, cond) != 0.0 {
+                    (if_true, if_false)
                 } else {
-                    add_adj(adj, if_false, dst_adj);
-                }
+                    (if_false, if_true)
+                };
+                add_adj(adj, taken, dst_adj);
+                untaken[unselected as usize] = true;
             }
             LinearOp::LinearSolveComponent {
                 dst,
@@ -456,22 +530,35 @@ fn reverse_linear_solve_component(
 fn unary_derivative(op: UnaryOp, x: f64) -> f64 {
     match op {
         UnaryOp::Neg => -1.0,
-        UnaryOp::Abs => x.signum(),
+        // The forward rules select `du` when `x >= 0`, so the kink and a
+        // negative zero take the right derivative; `f64::signum` would give
+        // `-1` for `-0.0` and make reverse rows disagree with forward JVPs.
+        UnaryOp::Abs => {
+            if x >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
         UnaryOp::Sqrt => guarded(0.5 / x.sqrt()),
         UnaryOp::Sin => x.cos(),
         UnaryOp::Cos => -x.sin(),
+        // Finite for every finite `x`; NaN at a non-finite `x`, as at the
+        // forward sites, which apply it to aggregates without a guard.
         UnaryOp::Tan => {
             let c = x.cos();
-            guarded(1.0 / (c * c))
+            1.0 / (c * c)
         }
         UnaryOp::Asin => guarded(1.0 / (1.0 - x * x).sqrt()),
         UnaryOp::Acos => guarded(-1.0 / (1.0 - x * x).sqrt()),
         UnaryOp::Atan => 1.0 / (1.0 + x * x),
         UnaryOp::Sinh => x.cosh(),
         UnaryOp::Cosh => x.sinh(),
+        // The forward rules divide by `cosh²`; `1 - tanh²` would round to
+        // zero long before `cosh` overflows.
         UnaryOp::Tanh => {
-            let th = x.tanh();
-            1.0 - th * th
+            let c = x.cosh();
+            1.0 / (c * c)
         }
         UnaryOp::Exp => x.exp(),
         UnaryOp::Log => guarded(1.0 / x),
@@ -486,15 +573,10 @@ fn binary_partials(op: BinaryOp, lhs: f64, rhs: f64) -> (f64, f64) {
         BinaryOp::Add => (1.0, 1.0),
         BinaryOp::Sub => (1.0, -1.0),
         BinaryOp::Mul => (rhs, lhs),
-        // Division has no finite derivative at a zero denominator. Keep the
-        // existing AD boundary policy of contributing no gradient there.
-        BinaryOp::Div => {
-            if rhs == 0.0 {
-                (0.0, 0.0)
-            } else {
-                (1.0 / rhs, -lhs / (rhs * rhs))
-            }
-        }
+        // Each partial when finite: a zero denominator, a subnormal one whose
+        // square underflows, and an overflowing `r²` all zero the partial
+        // that does not exist rather than poisoning the product.
+        BinaryOp::Div => (guarded(1.0 / rhs), guarded(-lhs / (rhs * rhs))),
         // pow(l, r): ∂/∂l = r·l^(r-1); ∂/∂r = l^r·ln(l) (only for l > 0).
         BinaryOp::Pow => {
             let dl = guarded(rhs * lhs.powf(rhs - 1.0));
@@ -505,14 +587,11 @@ fn binary_partials(op: BinaryOp, lhs: f64, rhs: f64) -> (f64, f64) {
             };
             (dl, dr)
         }
-        // atan2(l, r): ∂/∂l = r/(l²+r²); ∂/∂r = -l/(l²+r²).
+        // atan2(l, r): ∂/∂l = r/(l²+r²); ∂/∂r = -l/(l²+r²), each when finite
+        // (the origin, where both are 0/0, contributes nothing).
         BinaryOp::Atan2 => {
             let denom = lhs * lhs + rhs * rhs;
-            if denom == 0.0 {
-                (0.0, 0.0)
-            } else {
-                (rhs / denom, -lhs / denom)
-            }
+            (guarded(rhs / denom), guarded(-lhs / denom))
         }
         // Min/Max are piecewise-linear: the gradient flows to the selected operand.
         BinaryOp::Min => {
@@ -534,6 +613,15 @@ fn binary_partials(op: BinaryOp, lhs: f64, rhs: f64) -> (f64, f64) {
     }
 }
 
+/// The forward tangent of `l / r` under the division kink rule, for the fused
+/// dual-lane tensor division: each local partial when finite, else zero,
+/// accumulated in the order the scalar forward lowering emits.
+#[must_use]
+pub fn division_tangent(lhs: f64, lhs_du: f64, rhs: f64, rhs_du: f64) -> f64 {
+    let (dl, dr) = binary_partials(BinaryOp::Div, lhs, rhs);
+    lhs_du * dl + rhs_du * dr
+}
+
 /// Replace a non-finite local derivative (e.g. `1/0`, `sqrt'(0)`) with zero so a
 /// boundary/degenerate primal point contributes no spurious gradient.
 fn guarded(value: f64) -> f64 {
@@ -551,6 +639,28 @@ fn reg(values: &[f64], r: Reg) -> f64 {
 
 fn set(regs: &mut [f64], r: Reg, value: f64) {
     regs[r as usize] = value;
+}
+
+/// Whether an operation writing `dst` passes nothing back because `dst` holds
+/// only an unselected arm's value with a zero adjoint; its operands then
+/// inherit that mark. A register the taken path also reads carries that
+/// path's adjoint and is never skipped for a nonzero one.
+fn skips_untaken(
+    untaken: &mut [bool],
+    adj: &[f64],
+    dst: Reg,
+    dst_adj: f64,
+    operands: &[Reg],
+) -> bool {
+    let skip = dst_adj == 0.0 && std::mem::take(&mut untaken[dst as usize]);
+    if skip {
+        for &operand in operands {
+            if adj[operand as usize] == 0.0 {
+                untaken[operand as usize] = true;
+            }
+        }
+    }
+    skip
 }
 
 fn add_adj(adj: &mut [f64], r: Reg, value: f64) {
@@ -603,6 +713,141 @@ mod tests {
     use super::*;
     use rumoca_ir_solve::ScalarProgramBlock;
 
+    /// `0 * (y0 * (1 / y1))` at `y1 = 0` on a taken path: forward mode gives
+    /// `0 * inf`, NaN, for the tangent in `y0`, and so must the reverse sweep,
+    /// whose zero adjoint here comes from a product, not an unselected arm.
+    #[test]
+    fn a_zero_adjoint_on_the_taken_path_still_signals_a_singular_point() {
+        let block = ScalarProgramBlock::with_output_indices(
+            vec![vec![
+                LinearOp::LoadY { dst: 0, index: 0 },
+                LinearOp::LoadY { dst: 1, index: 1 },
+                LinearOp::Const { dst: 2, value: 1.0 },
+                LinearOp::Const { dst: 3, value: 0.0 },
+                LinearOp::Binary {
+                    dst: 4,
+                    op: BinaryOp::Div,
+                    lhs: 2,
+                    rhs: 1,
+                },
+                LinearOp::Binary {
+                    dst: 5,
+                    op: BinaryOp::Mul,
+                    lhs: 0,
+                    rhs: 4,
+                },
+                LinearOp::Binary {
+                    dst: 6,
+                    op: BinaryOp::Mul,
+                    lhs: 3,
+                    rhs: 5,
+                },
+                LinearOp::StoreOutput { src: 6 },
+            ]],
+            vec![fixture_span()],
+            vec![0],
+        )
+        .expect("valid scalar block");
+        let row_registers: Vec<usize> = block
+            .programs()
+            .iter()
+            .map(|row| crate::required_registers(row).expect("register count"))
+            .collect();
+        let requirements =
+            crate::scalar_program_block_input_requirements(&block).expect("requirements");
+        let mut cot_y = [0.0_f64; 2];
+        reverse_scalar_block_vjp(
+            &ScalarVjpProgram {
+                block: &block,
+                row_registers: &row_registers,
+                requirements,
+            },
+            &ReverseInputs {
+                y: &[2.0, 0.0],
+                p: &[],
+                t: 0.0,
+                context: RowEvalContext::default(),
+            },
+            &[1.0],
+            &mut ReverseCotangents {
+                y: &mut cot_y,
+                p: &mut [],
+                seed: &mut [],
+            },
+            &mut ReverseScratch::default(),
+        )
+        .expect("reverse sweep");
+        assert!(cot_y[0].is_nan(), "{cot_y:?}");
+    }
+
+    /// `if true then y0 else copy(y0 * (1 / y1))` at `y1 = 0`: the unselected arm,
+    /// reached through a copy,
+    /// evaluates `y0 * inf`, whose partial in `y0` is infinite. Its adjoint is
+    /// zero, so it must add nothing, leaving `df/dy0 = 1` and `df/dy1 = 0`.
+    #[test]
+    fn an_unselected_arm_with_an_infinite_partial_leaves_the_adjoint_finite() {
+        let block = ScalarProgramBlock::with_output_indices(
+            vec![vec![
+                LinearOp::LoadY { dst: 0, index: 0 },
+                LinearOp::LoadY { dst: 1, index: 1 },
+                LinearOp::Const { dst: 2, value: 1.0 },
+                LinearOp::Binary {
+                    dst: 3,
+                    op: BinaryOp::Div,
+                    lhs: 2,
+                    rhs: 1,
+                },
+                LinearOp::Binary {
+                    dst: 4,
+                    op: BinaryOp::Mul,
+                    lhs: 0,
+                    rhs: 3,
+                },
+                LinearOp::Move { dst: 6, src: 4 },
+                LinearOp::Select {
+                    dst: 5,
+                    cond: 2,
+                    if_true: 0,
+                    if_false: 6,
+                },
+                LinearOp::StoreOutput { src: 5 },
+            ]],
+            vec![fixture_span()],
+            vec![0],
+        )
+        .expect("valid scalar block");
+        let row_registers: Vec<usize> = block
+            .programs()
+            .iter()
+            .map(|row| crate::required_registers(row).expect("register count"))
+            .collect();
+        let requirements =
+            crate::scalar_program_block_input_requirements(&block).expect("requirements");
+        let mut cot_y = [0.0_f64; 2];
+        reverse_scalar_block_vjp(
+            &ScalarVjpProgram {
+                block: &block,
+                row_registers: &row_registers,
+                requirements,
+            },
+            &ReverseInputs {
+                y: &[2.0, 0.0],
+                p: &[],
+                t: 0.0,
+                context: RowEvalContext::default(),
+            },
+            &[1.0],
+            &mut ReverseCotangents {
+                y: &mut cot_y,
+                p: &mut [],
+                seed: &mut [],
+            },
+            &mut ReverseScratch::default(),
+        )
+        .expect("reverse sweep");
+        assert_eq!(cot_y, [1.0, 0.0]);
+    }
+
     fn fixture_span() -> rumoca_core::Span {
         rumoca_core::Span::from_offsets(rumoca_core::SourceId::from_source_name(file!()), 0, 1)
     }
@@ -651,12 +896,7 @@ mod tests {
                 y: &[2.0],
                 p: &[],
                 t: 0.0,
-                context: RowEvalContext {
-                    seed: None,
-                    external_tables: None,
-                    pure_calls: None,
-                    runtime_state: None,
-                },
+                context: RowEvalContext::default(),
             },
             &[1.0],
             &mut ReverseCotangents {
@@ -672,6 +912,66 @@ mod tests {
             (cot_y[0] - 3.0).abs() < 1.0e-12,
             "df/dy0 should be 3 (register reuse handled), got {}",
             cot_y[0]
+        );
+    }
+
+    /// `f(y0) = abs(-y0)` at `y0 = 0`: the negation yields `-0.0`. The forward
+    /// dual rule selects the tangent when the operand is `>= 0`, so the forward
+    /// derivative is `-1`; the reverse row must agree, or a Jacobian assembled
+    /// from reverse rows disagrees with the forward JVP that certifies it. An
+    /// alias quotient that reads an eliminated member as `-representative`
+    /// produces exactly this `-0.0` at an all-zero operating point.
+    #[test]
+    fn reverse_abs_at_negative_zero_matches_the_forward_rule() {
+        let block = ScalarProgramBlock::with_output_indices(
+            vec![vec![
+                LinearOp::LoadY { dst: 0, index: 0 },
+                LinearOp::Unary {
+                    dst: 1,
+                    op: UnaryOp::Neg,
+                    arg: 0,
+                },
+                LinearOp::Unary {
+                    dst: 2,
+                    op: UnaryOp::Abs,
+                    arg: 1,
+                },
+                LinearOp::StoreOutput { src: 2 },
+            ]],
+            vec![fixture_span()],
+            vec![0],
+        )
+        .expect("valid scalar block");
+        let row_registers =
+            [crate::required_registers(&block.programs()[0]).expect("register count")];
+        let requirements =
+            crate::scalar_program_block_input_requirements(&block).expect("requirements");
+        let mut cot_y = [0.0];
+        reverse_scalar_block_vjp(
+            &ScalarVjpProgram {
+                block: &block,
+                row_registers: &row_registers,
+                requirements,
+            },
+            &ReverseInputs {
+                y: &[0.0],
+                p: &[],
+                t: 0.0,
+                context: RowEvalContext::default(),
+            },
+            &[1.0],
+            &mut ReverseCotangents {
+                y: &mut cot_y,
+                p: &mut [],
+                seed: &mut [],
+            },
+            &mut ReverseScratch::default(),
+        )
+        .expect("reverse sweep");
+        assert_eq!(
+            cot_y,
+            [-1.0],
+            "reverse abs at -0.0 takes the forward branch"
         );
     }
 
@@ -736,9 +1036,10 @@ mod tests {
 
     /// Reverse VJP through a `LinearSolveComponent` (`x = A⁻¹ b`). The 2x2 system's
     /// `A`/`b` are loaded from solver-y, so `x[0]` is a function of `y`; the reverse
-    /// `∂x0/∂y` must match a finite-difference of the forward solve.
+    /// `∂x0/∂y` must match the analytic derivative of the solve: `∂x/∂b = A⁻¹` and
+    /// `∂x/∂A_ij = -A⁻¹ e_i x_j`.
     #[test]
-    fn reverse_linear_solve_component_matches_finite_difference() {
+    fn reverse_linear_solve_component_matches_the_analytic_derivative() {
         // regs: 0..4 = A row-major [[A00,A01],[A10,A11]], 4..6 = b, 6 = x[0].
         let row = vec![
             LinearOp::LoadY { dst: 0, index: 0 },
@@ -784,12 +1085,7 @@ mod tests {
                     y,
                     p: &[],
                     t: 0.0,
-                    context: RowEvalContext {
-                        seed: None,
-                        external_tables: None,
-                        pure_calls: None,
-                        runtime_state: None,
-                    },
+                    context: RowEvalContext::default(),
                 },
                 &mut regs,
             )
@@ -807,12 +1103,7 @@ mod tests {
                 y: &y,
                 p: &[],
                 t: 0.0,
-                context: RowEvalContext {
-                    seed: None,
-                    external_tables: None,
-                    pure_calls: None,
-                    runtime_state: None,
-                },
+                context: RowEvalContext::default(),
             },
             &[1.0],
             &mut ReverseCotangents {
@@ -824,17 +1115,13 @@ mod tests {
         )
         .expect("reverse sweep");
 
-        // Central finite differences of the forward solve.
-        let h = 1.0e-6;
-        for i in 0..6 {
-            let mut yp = y;
-            let mut ym = y;
-            yp[i] += h;
-            ym[i] -= h;
-            let fd = (forward_x0(&yp) - forward_x0(&ym)) / (2.0 * h);
+        // A⁻¹ = [[3, -1], [-1, 2]] / 5, so row 0 of A⁻¹ is [0.6, -0.2], and y is
+        // ordered [A00, A01, A10, A11, b0, b1].
+        let expected = [-0.24, -0.12, 0.08, 0.04, 0.6, -0.2];
+        for (i, expected) in expected.iter().enumerate() {
             assert!(
-                (cot_y[i] - fd).abs() < 1.0e-6,
-                "∂x0/∂y[{i}]: reverse={}, finite-diff={fd}",
+                (cot_y[i] - expected).abs() < 1.0e-12,
+                "∂x0/∂y[{i}]: reverse={}, analytic={expected}",
                 cot_y[i]
             );
         }

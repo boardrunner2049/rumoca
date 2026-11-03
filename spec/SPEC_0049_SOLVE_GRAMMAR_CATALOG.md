@@ -110,6 +110,7 @@ declared end state that construction does not admit yet.
 | `BroadcastBinary` | Current | `(aggregate, scalar) -> aggregate` with `scalar_on_lhs` recording operand order; operator drawn from §2 | none | per §2 leaf | Elementwise with the scalar broadcast, preserving operand order |
 | `Transpose` | Current | `Tensor<T> -> Tensor<T>` index permutation | none | `NotApplicable` | Permutes indices; no element conversion |
 | `MatrixMultiply` | Current | Checked product dimensions; result is a tensor, or a SCALAR when the product dimensions are empty | none | `Reduction` | Contraction under the profile's accumulator and order |
+| `LinearSolve` | Current | `(Real64[n,n], Real64[n]) -> Real64[n]`, `n>0`; square matrix and matching vector; other element profiles rejected | none | status-producing linear algebra | Solve `A*x=b` with pivoting; singular or nonfinite input/output raises a typed failure. Directional rule is `A*dx=db-dA*x`; canonical operands and results stay aggregate values |
 | `Cross` | Current | Both operands exactly `[3]`, numeric element | none | `Reduction` | Three-element cross product |
 | `Identity` | Current | `identity(element_type, extent) -> [extent, extent]`. Real always admitted; Integer admitted only when its domain contains 0 AND 1; Boolean REJECTED; element type must belong to the root arithmetic | none | `NotApplicable` | Square identity of the declared extent |
 | `Diagonal` | Current | Rank-1 `[extent]` numeric operand to a square matrix — CONSTRUCTION only, never extraction | none | `NotApplicable` | Places the vector on the diagonal, zero elsewhere |
@@ -124,7 +125,7 @@ declared end state that construction does not admit yet.
 | `UpdateElement` | Current | `(aggregate, value, indices: [reg])` — one index per rank | none | `Indexing` — status | Functional update; input aggregate unchanged |
 | `UpdateSlice` | Current | `(aggregate, value, origin)` zero-based | none | `NotApplicable` | Functional slice update |
 | `UpdateView` | Current | `(aggregate, value, axes)` | none | `NotApplicable` | Functional update through a checked view |
-| `Call` | Current | `owner: SolvePureCallOwnerId`, `arguments: [reg]`, `destinations: [reg]`. Aggregate arguments and results each retain ONE typed register; destinations are ordered VALUE results followed by ASSERTION PREDICATES exactly as declared by the owner interface | callee body is a separate `TypedProgram` | call | Invokes one compiler-issued pure-call owner atomically; never merges with another invocation (SEV-048) |
+| `Call` | Current | `owner: SolvePureCallOwnerId`, `arguments: [reg]`, `destinations: [reg]`. Aggregate arguments and results each retain ONE typed register; destinations are ordered VALUE results followed by ASSERTION OUTPUTS (predicates and converted message values) exactly as declared by the owner interface | callee body is a separate `TypedProgram` | call | Invokes one compiler-issued pure-call owner atomically; never merges with another invocation (SEV-048) |
 
 **Aspirational.** SEV-001's `InvokeOp`/`EffectOp`/`Terminator` factoring is the
 proposed end state. Today `Call` is the single pure-call owner above — there is

@@ -1,0 +1,124 @@
+{
+  "target_parent": "f7ff9ddd283d67c5eda27daf409af7108d7fb108",
+  "incoming_commit": "b0058d3537c12aca71c56cd0e3cf7f3b42f7e0ba",
+  "source_sha256": {
+    "crates/rumoca-compile/src/session/compile_support.rs": "5b6cc5771431cdfffb37ca20c194c85c193ff9a5730f0d7fe02c0ba2476355cf",
+    "crates/rumoca-compile/src/session/session_impl_model_queries.rs": "a0a1916111692ee7484f0239f11ea4f115be0b750fe97c4afd15d537416edcf9",
+    "crates/rumoca-phase-dae/src/construction.rs": "2d93e507dfbc7ce1bb67934fd3d635656e57ec59c05da271ad0ca4d2c6db85f9",
+    "crates/rumoca-phase-dae/src/construction/variable_construction.rs": "aa250205b50088a16e057a10c6d3cc5ae763d10e4b948d03fb8bd1b3c968c817",
+    "crates/rumoca-phase-flatten/src/functions.rs": "b6c45c19c368e42b1c1ec13add8aa03fec55a09c606786049504ac36081ea299",
+    "crates/rumoca-phase-flatten/src/functions/pure_constants.rs": "5f9adf4be11f57f058533bf58e5b232709bf40979b49084eedb60e86359cb95d",
+    "crates/rumoca-phase-flatten/src/lib.rs": "759b4802dc798e7099d58ea2f0ce6f155fc7d3827501be89102ac1308f9bb564",
+    "crates/rumoca-phase-flatten/src/pipeline/flatten_pipeline.rs": "e639946d3fe398feb4320b0d6f8b68cc0998f63ad9946a6ad50dda1ea2eb47bb",
+    "crates/rumoca/src/cli.rs": "284f94c1934e816744f1a213aa3bebda897114733d782da5321d93554d3363ef",
+    "crates/rumoca/src/cli/parameter_profile_tests.rs": "27b2b4782bb9f85e0c337bd5918dcb27bdacf7df015693dcbe930d08d471776a",
+    "packages/modelsan/modelsan/check.py": "eeb29efb1a76121dc7c8ea24ab054a1f7ff2367d53413ae56ce3edf50eab2cdf",
+    "packages/modelsan/modelsan/pipeline.py": "d56b40c61b119dab4b509464299a0b5145c57f9d6f5ab1ef753fe73c31ea9e59",
+    "packages/modelsan/tests/test_campaign.py": "35930e0e2cc68b75dc878ee3f7484179ac6f810c132bbe0268434b90b6f01273",
+    "packages/modelsan/tests/test_check_command.py": "497f1121ff9847951dbfb19065e5d5ca1fdebade3bf67ca7f1a3e69c008c7abc",
+    "packages/modelsan/tests/test_current_bitcode.py": "16d9324738ea94ef8dbac70043e7f864e208620eee906cff39922f78ec1f0d4e",
+    "packages/modelsan/tests/test_known_msl_issues.py": "c62c4d476244a73ff8bc9b9b7a15a594597dd9f4970b861a0938ab3dbef32c6a"
+  },
+  "governing_rules": [
+    "SPEC_0007 Flat/DAE stage contracts",
+    "SPEC_0040 FLAT-C01 and STRUCT-T10",
+    "MLS 4.5, 10.3, 12.3, 18.6",
+    "SPEC_0033 sections 2 and 6a"
+  ],
+  "merge_resolution": [
+    "Preserve evaluable-parameter metadata and native table identities; remove only the obsolete settled Integer binding context.",
+    "Retain the existing is_declared_extent_argument helper and integer-step event ownership; it already covers incoming fill/linspace extent handling.",
+    "Keep invariant scalar folding and add explicit frozen binding specialization before function pruning.",
+    "Translate the incoming legacy is_matrix=false array literal to ArrayConstructor::Array.",
+    "Make the existing test-only expand_trace_filter import private: its pub(crate) re-export of a pub(super) function prevented the lib test target from compiling. Production behavior is unchanged."
+  ],
+  "verification": {
+    "environment": {
+      "CARGO_BUILD_JOBS": 4,
+      "RUST_TEST_THREADS": 4,
+      "RAYON_NUM_THREADS": 4
+    },
+    "core": {
+      "command": "cargo test --locked -p rumoca --test suite_core --quiet",
+      "passed": 1115,
+      "failed": 0
+    },
+    "parameter_profiles": {
+      "command": "cargo test --locked -p rumoca --lib parameter_profile_tests -- --nocapture",
+      "passed": 4,
+      "failed": 0
+    },
+    "trace_filter": {
+      "command": "cargo test --locked -p rumoca --lib cli::cli_tests::expand_trace_filter -- --nocapture",
+      "passed": 3,
+      "failed": 0
+    },
+    "modelsan": {
+      "command": "PYTHONPATH=packages/rumoca-bitcode:packages/modelsan:packages/modelsan/tests RUMOCA=target/debug/rumoca python3 -m unittest -v test_campaign test_check_command test_current_bitcode test_known_msl_issues",
+      "passed": 38,
+      "failed": 0,
+      "skipped": 3,
+      "notes": [
+        "The first run passed 37 tests and failed one because the backend default target/corpus/ModelicaStandardLibrary-4.1.0 path was absent. Linking the installed MSL cache made that single test pass on rerun. No Python source change was needed.",
+        "The three known-MSL-issue corpus tests are opt-in and were not enabled.",
+        "pytest is unavailable; these unittest-based modules ran with the Python standard library."
+      ]
+    },
+    "build": {
+      "command": "cargo build --locked -p rumoca --bin rumoca",
+      "result": "passed"
+    },
+    "clippy": {
+      "command": "cargo clippy --locked -p rumoca-phase-flatten -p rumoca-phase-dae --lib -- -D warnings",
+      "result": "passed"
+    },
+    "format": {
+      "command": "cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    "diff_check": {
+      "command": "git diff --cached --check",
+      "result": "passed"
+    },
+    "not_run": [
+      "Full workspace gate and full 566-model Tier 2 sweep: this integration used focused regression suites and the fixed Tier 1 canary.",
+      "The three opt-in ModelSan known-MSL-issue backend corpus tests."
+    ]
+  },
+  "canary": {
+    "scope": "Fixed 20-model Tier 1 canary; partial, not cohort parity.",
+    "command": "cargo xtask verify msl-parity --sim-targets-file infra/verification/msl-canary-20.json --results-dir target/verification/arslan-merge-20261023/canary --no-remote-quality-baseline",
+    "target_list_sha256": "536004933ce502f7a8a4317e5dd6de2b700a6b176e84d2d6e7bbe0dcdf61eafa",
+    "baseline_evidence": "docs/verification/p2-array-member-balance-20261021/canary-after.json",
+    "baseline_note": "Previously recorded validation included by target parent f7ff9ddd2; not rerun in this session.",
+    "before": {
+      "cohort_models": 20,
+      "compared_models": 12,
+      "high": 12,
+      "near": 0,
+      "deviation": 0,
+      "fallback": 0,
+      "absent": 8,
+      "absent_by_reason": {
+        "not_attempted": 6,
+        "sim_failed": 2
+      }
+    },
+    "after": {
+      "cohort_models": 20,
+      "compared_models": 12,
+      "high": 12,
+      "near": 0,
+      "deviation": 0,
+      "fallback": 0,
+      "absent": 8,
+      "absent_by_reason": {
+        "not_attempted": 6,
+        "sim_failed": 2
+      }
+    },
+    "classification_changes": [],
+    "exit_code": 0,
+    "raw_evidence": "target/verification/arslan-merge-20261023/canary"
+  }
+}

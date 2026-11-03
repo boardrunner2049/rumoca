@@ -24,7 +24,7 @@ fn frozen_context(model: &flat::Model) -> EvalContext {
     // value immutable. Every fixed parameter must be non-tunable first.
     let fixed_parameters_frozen = model.variables.values().all(|variable| {
         !matches!(variable.variability, Variability::Parameter(_))
-            || variable.fixed == Some(false)
+            || variable.fixed_uniform() == Some(false)
             || variable.evaluate
     });
     // A frozen parameter can depend on a later frozen parameter. Only insert
@@ -36,7 +36,7 @@ fn frozen_context(model: &flat::Model) -> EvalContext {
                 || (matches!(variable.variability, Variability::Parameter(_))
                     && fixed_parameters_frozen
                     && variable.evaluate))
-                || variable.fixed == Some(false)
+                || variable.fixed_uniform() == Some(false)
                 || context.parameters.contains_key(name.as_str())
             {
                 continue;
@@ -126,7 +126,7 @@ fn literal_value(value: Value, span: Span) -> Option<Expression> {
                     .into_iter()
                     .map(|value| literal_value(value, span))
                     .collect::<Option<_>>()?,
-                is_matrix: false,
+                kind: rumoca_core::ArrayConstructor::Array,
                 span,
             });
         }

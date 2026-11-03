@@ -182,7 +182,8 @@ fn build_host_state(
     trace.set_observer(observer);
     let outcome =
         run_fmi_initialization(&mut kernel.borrow_mut(), &options, options.records_trace())?;
-    let policy = build_policy(&options, &outcome, state_count)?;
+    let root_location = *kernel.borrow().root_location();
+    let policy = build_policy(&options, &outcome, state_count, &root_location)?;
     if let Some(values) = &outcome.initial_values {
         trace.record_slice(
             TraceObservationRole::Initialization,
@@ -224,6 +225,7 @@ fn build_policy(
     options: &MeSessionOptions,
     outcome: &InitializationOutcome,
     state_count: usize,
+    root_location: &rumoca_ir_solve::fmi::RootLocationPlan,
 ) -> Result<Option<MeRootSearchPolicy>, MeSessionError> {
     if outcome.termination.is_some() {
         // A session that terminated during initialization never scans, so it
@@ -237,6 +239,7 @@ fn build_policy(
         options.relative_tolerance(),
         outcome.nominals.clone(),
         state_count,
+        root_location.refinement_iteration_cap(),
     )
     .map(Some)
 }
@@ -459,7 +462,13 @@ impl MeSimulationSession<'_, '_> {
             &self.host.options,
             self.host.options.records_trace(),
         )?;
-        self.host.policy = build_policy(&self.host.options, &outcome, self.host.state_count)?;
+        let root_location = *self.host.kernel.borrow().root_location();
+        self.host.policy = build_policy(
+            &self.host.options,
+            &outcome,
+            self.host.state_count,
+            &root_location,
+        )?;
         if let Some(values) = &outcome.initial_values {
             self.host
                 .record_initialization(self.host.options.start_time(), values)?;
@@ -642,7 +651,10 @@ impl MeSimulationSession<'_, '_> {
             );
             match host.derivatives.take_error() {
                 Some(latched) => Err(latched_failure(latched)),
-                None => outcome.map_err(MeSessionError::from),
+                None => match host.derivatives.settle_discard(outcome.is_ok()) {
+                    Some(cause) => Err(latched_failure(cause)),
+                    None => outcome.map_err(MeSessionError::from),
+                },
             }
         })
     }
@@ -828,12 +840,36 @@ impl MeSimulationSession<'_, '_> {
         let located = self.scan_with_retained(&step, &retained);
         self.host.retained_indicators = retained;
         match located? {
-            Some(application) => {
+            Some(application) if !self.coincides_with_time_event(&step, &application) => {
                 crate::runtime::hotpath_stats::inc_root_hit();
                 self.apply_located_root(&step, &application, cursor)
             }
-            None => self.commit_accepted_endpoint(&step, cursor),
+            _ => self.commit_accepted_endpoint(&step, cursor),
         }
+    }
+
+    /// Whether a located root is the scheduled time event this step reaches,
+    /// under the component's `RootLocationPlan` (SPEC_0044 ME-EVENT-004); the
+    /// endpoint's time-event iteration then handles it.
+    fn coincides_with_time_event(
+        &self,
+        step: &MeAcceptedStep,
+        application: &MeRootApplication,
+    ) -> bool {
+        let Some(event_time) = self.host.reached_cached_event_time(step.accepted().time()) else {
+            return false;
+        };
+        let start = step.previous().time();
+        self.host
+            .kernel
+            .borrow()
+            .root_location()
+            .coincides_with_time_event(
+                application.application().time(),
+                event_time,
+                start,
+                step.accepted().time() - start,
+            )
     }
 
     /// The scan's view of the component and the plugin's continuous extension.
@@ -843,6 +879,7 @@ impl MeSimulationSession<'_, '_> {
             derivatives: &self.host.derivatives,
             backend: self.backend.as_ref(),
             budget: &self.host.budget,
+            event_boundary: self.host.next_event_time,
         }
     }
 
@@ -894,12 +931,10 @@ impl MeSimulationSession<'_, '_> {
     ///
     /// `fmi3CompletedIntegratorStep` commits the component's history, relation
     /// memory, and delay state, so every observation that must describe the
-    /// *left* of an event at this endpoint is taken before the callback runs.
-    /// The candidate is observed unconditionally, because the host cannot know
-    /// before the callback whether a step event is coming; it is published
-    /// immediately when the endpoint reaches the cached `nextEventTime` (the
-    /// host already knows that is an event) and otherwise only if the callback
-    /// returns `enterEventMode`. No FMI getter runs retroactively
+    /// *left* of an event at this endpoint retains its sampled states and FMU
+    /// snapshot before the callback runs. Getters run only when an event needs
+    /// that candidate: at a known time event or after `enterEventMode`, using
+    /// the captured component state and restoring the completed state afterward.
     fn commit_accepted_endpoint(
         &mut self,
         step: &MeAcceptedStep,
@@ -939,11 +974,13 @@ impl MeSimulationSession<'_, '_> {
         }
         if completed.enter_event_mode {
             // The callback originated this event, so its pre-callback left
-            // candidate is retained now. Every preceding observation is already
-            // durable, so entering Event Mode here cannot strand evidence.
+            // candidate is evaluated now. Every preceding nominal observation
+            // is durable, so entering Event Mode here cannot strand evidence.
             self.publish_event_left(pending.take())?;
             let cause = if reaches_time_event {
                 MeEventCause::TimeEvent
+            } else if completed.basis_change {
+                MeEventCause::BasisChange
             } else {
                 MeEventCause::StateEvent
             };
@@ -958,8 +995,8 @@ impl MeSimulationSession<'_, '_> {
     ///
     /// This runs while the plugin's native interval still exists and before
     /// `fmi3CompletedIntegratorStep`, so the coordinate, the sampled states, and
-    /// the observed outputs are all the same continuous-left point. Whether the
-    /// row is admissible at all is decided here, before any FMI getter runs; the
+    /// retained component context describe the same continuous-left point. The
+    /// row's admissibility is decided here, before any FMI getter runs; the
     /// recorder makes its own atomic decision when the row is published.
     ///
     /// `None` means there is nothing to publish: the coordinate is inadmissible
@@ -984,8 +1021,12 @@ impl MeSimulationSession<'_, '_> {
         }
         let mut states = try_filled(self.host.state_count, 0.0, "event-left sample")?;
         self.sample_states(coordinate, &mut states)?;
-        let values = self.host.observe_off_point(coordinate, &states)?;
-        Ok(Some(PendingEventLeft { coordinate, values }))
+        let component = self.host.kernel.borrow().fmu_state();
+        Ok(Some(PendingEventLeft {
+            coordinate,
+            states,
+            component,
+        }))
     }
 
     /// Retain a captured left candidate as published evidence.
@@ -996,11 +1037,13 @@ impl MeSimulationSession<'_, '_> {
         let Some(pending) = pending else {
             return Ok(());
         };
-        self.host.record_observed(
-            TraceObservationRole::EventLeft,
+        let values = self.host.observe_saved_point(
+            &pending.component,
             pending.coordinate,
-            &pending.values,
-        )
+            &pending.states,
+        )?;
+        self.host
+            .record_observed(TraceObservationRole::EventLeft, pending.coordinate, &values)
     }
 
     fn apply_located_root(
@@ -1336,12 +1379,12 @@ fn continues_at(next_event_time: Option<f64>, event_time: f64) -> bool {
     next_event_time.is_some_and(|next| canonical_coordinate(next).to_bits() == coordinate.to_bits())
 }
 
-/// The left-limit evidence of an accepted endpoint, observed before
-/// `fmi3CompletedIntegratorStep` and retained only if that endpoint turns out to
-/// be an event.
+/// A left-limit coordinate sampled while the native interval exists, with its
+/// pre-callback FMU state. Algebraics are evaluated only if an event needs it.
 struct PendingEventLeft {
     coordinate: f64,
-    values: Vec<f64>,
+    states: Vec<f64>,
+    component: super::MeFmuState,
 }
 
 /// One turn of the master loop.
@@ -1366,6 +1409,11 @@ struct SessionScanTarget<'a> {
     derivatives: &'a MeDerivativeController,
     backend: &'a dyn MeIntegratorBackend,
     budget: &'a TimeoutBudget,
+    /// The scheduled time event the accepted step stops at: an indicator at
+    /// or past it is the event's left limit, exactly as the integrator
+    /// evaluated the step, so a crossing before the event is not hidden by
+    /// its post-event relations.
+    event_boundary: Option<f64>,
 }
 
 impl RootScanTarget for SessionScanTarget<'_> {
@@ -1388,7 +1436,7 @@ impl RootScanTarget for SessionScanTarget<'_> {
         indicators: &mut Vec<f64>,
     ) -> Result<(), MeSessionError> {
         let mut kernel = self.kernel.borrow_mut();
-        kernel.set_time(MeTime::at(time))?;
+        kernel.set_time(MeTime::new(time, self.event_boundary))?;
         kernel.set_continuous_states(states)?;
         indicators.clear();
         kernel.get_event_indicators(indicators)?;

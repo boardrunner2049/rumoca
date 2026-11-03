@@ -88,21 +88,29 @@ pub(super) fn instantiate_effective_components(
             resolve_effective_components_for_eval,
         );
         let type_info = lookup_type_info(tree, comp, &type_name)?;
+        if dims.as_ref().is_some_and(|dims| !dims.is_empty())
+            && let Some(def_id) = comp.def_id
+        {
+            overlay.array_component_declarations.insert(def_id);
+        }
         if let Some(dims) = dims.as_ref()
             && dims.contains(&0)
         {
             register_zero_sized_array_component(ctx, overlay, name, dims);
-            let zero_sized_record = type_info
-                .class_def
-                .filter(|class| class.class_type == rumoca_core::ClassType::Record);
-            if let Some(record) = zero_sized_record.filter(|_| !type_info.is_primitive) {
-                register_zero_sized_record_fields(tree, ctx, overlay, &[name], dims, record)?;
-            }
-            if !type_info.is_primitive {
+            // MLS §10.7: retain a record array's declaration even when its
+            // domain is empty, so typecheck can establish its effective type.
+            if !type_info.is_primitive
+                && !type_info
+                    .class_def
+                    .is_some_and(|class| class.class_type == rumoca_core::ClassType::Record)
+            {
                 continue;
             }
         }
-        let should_expand = !type_info.is_primitive && dims.as_ref().is_some_and(|d| !d.is_empty());
+        let should_expand = !type_info.is_primitive
+            && dims
+                .as_ref()
+                .is_some_and(|d| !d.is_empty() && !d.contains(&0));
 
         if should_expand {
             expand_array_component(

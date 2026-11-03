@@ -31,7 +31,7 @@ pub(super) fn reject_cyclic_parameter_bindings(
             matches!(
                 variable.variability,
                 Variability::Constant(_) | Variability::Parameter(_)
-            ) && variable.fixed != Some(false)
+            ) && variable.fixed_uniform() != Some(false)
                 && context.instance_value(variable.instance_id).is_none()
         })
         .filter_map(|(name, variable)| {
@@ -55,7 +55,7 @@ pub(super) fn reject_cyclic_parameter_bindings(
         .iter()
         .map(|(_, binding, _)| {
             let mut reads = Vec::new();
-            collect_pending_reads(binding, &index, &mut reads);
+            collect_pending_reads(binding, &index, &mut reads, flat, context);
             reads
         })
         .collect();
@@ -77,7 +77,38 @@ fn collect_pending_reads(
     expression: &Expression,
     index: &HashMap<&VarName, (usize, Option<DefId>)>,
     reads: &mut Vec<usize>,
+    flat: &flat::Model,
+    context: &EvalContext,
 ) {
+    if let Expression::If {
+        branches,
+        else_branch,
+        ..
+    } = expression
+    {
+        let evaluable = evaluable_parameters(flat);
+        let mut decided = true;
+        for (condition, value) in branches {
+            let mut names = Vec::new();
+            condition.collect_var_refs(&mut names);
+            if !names.iter().all(|name| evaluable.contains(name)) {
+                decided = false;
+                break;
+            }
+            let Ok(EvalValue::Bool(selected)) = eval_expr(condition, context) else {
+                decided = false;
+                break;
+            };
+            if selected {
+                collect_pending_reads(value, index, reads, flat, context);
+                return;
+            }
+        }
+        if decided {
+            collect_pending_reads(else_branch, index, reads, flat, context);
+            return;
+        }
+    }
     if let Expression::VarRef { name, .. } = expression
         && let Some((ordinal, declaration)) = index.get(name.var_name())
         && same_declaration(name.target_def_id(), *declaration)
@@ -86,7 +117,7 @@ fn collect_pending_reads(
         reads.push(*ordinal);
     }
     for child in expression_children(expression) {
-        collect_pending_reads(child, index, reads);
+        collect_pending_reads(child, index, reads, flat, context);
     }
 }
 

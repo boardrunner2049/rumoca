@@ -205,6 +205,7 @@ tables!(
     domains,
     discrete_real_equations,
     initial_discrete_values,
+    initial_parameter_values,
     functions,
     equation_families,
     initial_equation_families,
@@ -346,6 +347,7 @@ impl Map<'_> {
         }
         m.discrete_real_equations.shift(self)?;
         m.initial_discrete_values.shift(self)?;
+        m.initial_parameter_values.shift(self)?;
         m.discrete_definitions.shift(self)?;
         m.model_event_transactions.shift(self)?;
         m.previous_values.shift(self)?;
@@ -368,6 +370,7 @@ impl Map<'_> {
         // These tables have no entry IDs, but are still concatenated/count-checked.
         let _ = (
             self.initial_discrete_values,
+            self.initial_parameter_values,
             self.discrete_definitions,
             self.model_event_transactions,
             self.structured_roots,

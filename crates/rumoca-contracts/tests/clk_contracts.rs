@@ -343,6 +343,27 @@ fn clk_011_shiftsample_on_event_clock_rejected() {
     );
 }
 
+/// The default resolution is 1, so shifting an event clock by whole ticks is
+/// valid.
+#[test]
+fn clk_011_shiftsample_on_event_clock_by_whole_ticks_accepted() {
+    rumoca_contracts::test_support::expect_success(
+        r#"
+        model M
+            Boolean b = time > 0.5;
+            Clock ec = Clock(b);
+            Clock shifted = shiftSample(ec, 1);
+            Real x(start = 0);
+        equation
+            when shifted then
+                x = previous(x) + 1;
+            end when;
+        end M;
+    "#,
+        "M",
+    );
+}
+
 // =============================================================================
 // CLK-012: backSample() cannot create clock ticks before the base-clock starts
 // =============================================================================

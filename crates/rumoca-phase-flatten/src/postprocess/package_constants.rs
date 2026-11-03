@@ -162,10 +162,31 @@ impl Declarer<'_> {
         if reference.is_generated() || self.live_vars.contains(reference.as_str()) {
             return Ok(None);
         }
-        let Some((SemanticConstantId::Declaration(declaration), value)) =
-            resolve_source_constant(reference, self.ctx)
-        else {
+        let Some((owner, value)) = resolve_source_constant(reference, self.ctx) else {
             return Ok(None);
+        };
+        let declaration = match owner {
+            SemanticConstantId::Declaration(declaration) => declaration,
+            SemanticConstantId::Exposure {
+                package,
+                declaration,
+            } => {
+                // Keep a name only when the exposing package is the declaration's
+                // original owner. Redeclarations remain occurrence-specific.
+                let Some(package_name) = self.ctx.target_def_names.get(&package) else {
+                    return Ok(None);
+                };
+                let Some(declaration_name) = self.ctx.target_def_names.get(&declaration) else {
+                    return Ok(None);
+                };
+                if crate::path_utils::scope_split(declaration_name).map(|(parent, _)| parent)
+                    != Some(package_name.as_str())
+                {
+                    return Ok(None);
+                }
+                declaration
+            }
+            SemanticConstantId::Occurrence(_) => return Ok(None),
         };
         let Some(qualified) = self.ctx.target_def_names.get(&declaration) else {
             return Ok(None);

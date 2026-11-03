@@ -4,6 +4,17 @@
 //! controller, and the most recently accepted continuous extension. FMI
 //! lifecycle, event/root handling, output cadence, tracing, and component
 //! policy remain in the common host.
+//!
+//! # References
+//!
+//! The stage tableau and the embedded fourth-order error estimate are the pair
+//! of J. R. Dormand and P. J. Prince, "A family of embedded Runge-Kutta
+//! formulae", Journal of Computational and Applied Mathematics 6(1):19-26,
+//! 1980, doi:10.1016/0771-050X(80)90013-3. The step-size controller is the
+//! standard elementary one: E. Hairer, S. P. Norsett and G. Wanner, "Solving
+//! Ordinary Differential Equations I: Nonstiff Problems", 2nd rev. ed.,
+//! Springer 1993, section II.4. The continuous extension lives in
+//! [`crate::dense_output`] and carries its own citation.
 
 use rumoca_solver::fmi_me::{
     MeAdvanceRequest, MeContinuousPoint, MeDerivativeHandle, MeIntegrationError,
@@ -16,6 +27,8 @@ use crate::dense_output::Dopri5DenseOutput;
 const METHOD: &str = "rk45";
 const MIN_STEP: f64 = 1.0e-12;
 const CONTINUOUS_EXTENSION_ORDER: u32 = 4;
+/// Step factor after the component discarded a trial point.
+const DISCARD_SHRINK: f64 = 0.25;
 
 /// Build the RK45 numerical plugin accepted by the common FMI ME host.
 ///
@@ -219,6 +232,22 @@ impl Rk45Integrator {
         Ok(step)
     }
 
+    /// The retry step after a discarded trial, or step-size underflow.
+    fn shrink_after_discard(
+        &self,
+        request: &MeAdvanceRequest,
+        step: f64,
+    ) -> Result<f64, MeIntegrationError> {
+        if step <= MIN_STEP {
+            return Err(MeIntegrationError::StepSizeUnderflow {
+                method: METHOD,
+                from_time: request.current().time(),
+                to_time: request.latest_accepted_time(),
+            });
+        }
+        Ok((step * DISCARD_SHRINK).min(request.latest_accepted_time() - request.current().time()))
+    }
+
     fn retain_interval(
         &mut self,
         start: &MeContinuousPoint,
@@ -281,7 +310,16 @@ impl MeIntegratorBackend for Rk45Integrator {
         let mut step = self.proposed_step(request)?;
         loop {
             let error_norm =
-                self.trial_step(request.current().time(), request.current().states(), step)?;
+                match self.trial_step(request.current().time(), request.current().states(), step) {
+                    // The component refused a trial point of this step: reject
+                    // it and retry a smaller one, exactly as for a large error.
+                    Err(MeIntegrationError::ComponentDiscard { .. }) => {
+                        self.fsal_time = None;
+                        step = self.shrink_after_discard(request, step)?;
+                        continue;
+                    }
+                    outcome => outcome?,
+                };
             if !error_norm.is_finite() {
                 return Err(MeIntegrationError::numerical(
                     METHOD,
@@ -417,6 +455,13 @@ fn error_norm(
         .fold(0.0_f64, f64::max))
 }
 
+/// Elementary step-size controller for an embedded pair of order `p = 5`.
+///
+/// `factor = safety * err^(-1/(p-1))`, clipped to a growth window. The safety
+/// factor 0.9 and the clip window are the conventional values of Hairer,
+/// Norsett and Wanner, "Solving Ordinary Differential Equations I", 2nd rev.
+/// ed., section II.4 (equations II.4.12 and II.4.13); the exponent -0.2 is
+/// -1/(p-1) for this pair.
 fn adapt_step(step: f64, error_norm: f64) -> f64 {
     if error_norm <= 0.0 {
         return (step * 5.0).max(MIN_STEP);
@@ -467,6 +512,9 @@ fn evaluate_derivative(
 ) -> Result<(), MeIntegrationError> {
     resize_work(out, derivatives.state_count(), "RK45 derivative workspace")?;
     derivatives.derivatives_into(time, states, out);
+    if derivatives.take_discard() {
+        return Err(MeIntegrationError::ComponentDiscard { time });
+    }
     if derivatives.has_failed() {
         return Err(MeIntegrationError::DerivativeRefused);
     }

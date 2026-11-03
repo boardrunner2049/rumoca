@@ -6,8 +6,10 @@
 //! `rumoca-solver`'s runtime should construct or mutate a [`RefreshPlan`].
 
 mod capacity;
+mod causal_proofs;
 mod dependency_domain;
 mod event_dependencies;
+mod row_analysis;
 mod schedule;
 mod source_catalog;
 mod static_domain;
@@ -21,8 +23,10 @@ use std::sync::Arc;
 use indexmap::{IndexMap, IndexSet};
 use rumoca_ir_solve as solve;
 
-use crate::prepared::{assignment_shape_reads_y_index, row_y_input_ranges};
+use crate::prepared::row_y_input_ranges;
 use crate::{EvalSolveError, PreparedScalarProgramBlock};
+use causal_proofs::causal_step_certifies_exact_assignment;
+pub use causal_proofs::{causal_step_coefficient_proof, causal_step_is_proven};
 
 use capacity::{
     reserve_refresh_deque_capacity, reserve_refresh_index_map_capacity,
@@ -30,12 +34,15 @@ use capacity::{
 };
 use dependency_domain::{CompactYDependencyError, CompactYDependencySet};
 use event_dependencies::event_consumer_dependencies;
+use row_analysis::{
+    AssignmentCertificates, PriorRowAnalysis, RowAnalysisCache, analyze_refresh_row,
+};
 
 use rumoca_ir_solve::{
     AlgebraicRefreshRow, RefreshPlan, RefreshRowOwnerId, RefreshRowSelection, RefreshRows,
     RefreshStage,
 };
-pub use schedule::build_refresh_stages;
+use schedule::build_refresh_stages;
 use source_catalog::CanonicalScalarProgramCatalog;
 use static_domain::ContinuousStaticParameters;
 
@@ -166,6 +173,7 @@ fn construct_refresh_selection(
 fn build_canonical_algebraic_refresh_plan(
     problem: &solve::SolveProblem,
     catalog: &CanonicalScalarProgramCatalog<'_>,
+    prior: Option<&PriorRowAnalysis<'_>>,
 ) -> Result<RefreshPlan, EvalSolveError> {
     validate_canonical_implicit_output_inventory(problem, catalog)?;
     let state_count = problem.solve_layout.state_scalar_count();
@@ -185,6 +193,7 @@ fn build_canonical_algebraic_refresh_plan(
         "canonical refresh target owners",
         span,
     )?;
+    let mut cache = RowAnalysisCache::default();
     for (equation_index, target) in problem.continuous.implicit_row_targets.iter().enumerate() {
         let Some(solve::ScalarSlot::Y {
             index: target_index,
@@ -204,19 +213,23 @@ fn build_canonical_algebraic_refresh_plan(
         let Some(program) = catalog.program(position.program_index) else {
             continue;
         };
-        if !crate::prepared::program_can_evaluate_declared_target(
-            program.operations,
-            position.output_offset,
-            *target_index,
-        )? || !claimed_targets.insert(*target_index)
-        {
+        let Some(analysis) = analyze_refresh_row(
+            program,
+            (
+                position.program_index,
+                equation_index,
+                position.output_offset,
+                *target_index,
+            ),
+            prior,
+            &mut cache,
+        )?
+        else {
+            continue;
+        };
+        if !claimed_targets.insert(*target_index) {
             continue;
         }
-        let assignment_shape = crate::prepared::assignment_shape_for_program_output(
-            program.operations,
-            position.output_offset,
-            *target_index,
-        )?;
         rows.push(construct_refresh_row(
             solve::AlgebraicRefreshRowDraft {
                 owner_id: RefreshRowOwnerId::checked(*target_index).ok_or_else(|| {
@@ -230,17 +243,9 @@ fn build_canonical_algebraic_refresh_plan(
                 output_offset: position.output_offset,
                 target_index: *target_index,
                 assignment_target: Some(*target_index),
-                assignment_shape,
-                direct_assignment_certified: crate::prepared::program_certifies_direct_target(
-                    program.operations,
-                    position.output_offset,
-                    *target_index,
-                )?,
-                exact_assignment_certified: crate::prepared::program_certifies_exact_target(
-                    program.operations,
-                    position.output_offset,
-                    *target_index,
-                )?,
+                assignment_shape: analysis.shape,
+                direct_assignment_certified: analysis.direct,
+                exact_assignment_certified: analysis.exact,
             },
             Some(program.span),
         )?);
@@ -507,11 +512,13 @@ fn algebraic_refresh_rows_from_row_targets(
                 output_offset: position.output_offset,
                 target_index,
                 assignment_target: Some(target_index),
-                assignment_shape: block.assignment_shape_for_output(
-                    position.program_index,
-                    position.output_offset,
-                    target_index,
-                ),
+                assignment_shape: block
+                    .assignment_shape_for_output(
+                        position.program_index,
+                        position.output_offset,
+                        target_index,
+                    )
+                    .cloned(),
                 direct_assignment_certified: block.certifies_direct_target_assignment(
                     position.program_index,
                     position.output_offset,
@@ -546,6 +553,26 @@ pub fn build_derivative_refresh_plan(
 pub fn build_continuous_refresh_owners(
     problem: &mut solve::SolveProblem,
 ) -> Result<solve::ContinuousRefreshOwners, EvalSolveError> {
+    build_refresh_owners(problem, None)
+}
+
+/// The refresh owners of an alternate reduced chart's `problem`, constructed
+/// from `primary`'s (SPEC_0040 STRUCT-T07 constraint-fold chart rows): a row
+/// with the primary's program, output offset, and target carries the primary's
+/// analysis; every other step runs as [`build_continuous_refresh_owners`] does,
+/// which constructs the same owners from scratch.
+pub fn build_continuous_refresh_owners_from(
+    problem: &mut solve::SolveProblem,
+    primary: &solve::SolveProblem,
+) -> Result<solve::ContinuousRefreshOwners, EvalSolveError> {
+    let prior = PriorRowAnalysis::new(primary)?;
+    build_refresh_owners(problem, Some(&prior))
+}
+
+fn build_refresh_owners(
+    problem: &mut solve::SolveProblem,
+    prior: Option<&PriorRowAnalysis<'_>>,
+) -> Result<solve::ContinuousRefreshOwners, EvalSolveError> {
     // Make the canonical block tearing exact-only before any refresh plan clones
     // it, so every runtime projection (the refresh owners' `simultaneous_plan`
     // and `value_projection_plan`, the value-stage plans that must replay those
@@ -553,7 +580,7 @@ pub fn build_continuous_refresh_owners(
     // same exact-only tearing.
     normalize_algebraic_projection_tearing(problem)?;
     let catalog = CanonicalScalarProgramCatalog::construct(&problem.continuous.implicit_rhs)?;
-    let algebraic = build_canonical_algebraic_refresh_plan(problem, &catalog)?;
+    let algebraic = build_canonical_algebraic_refresh_plan(problem, &catalog, prior)?;
     let state_count = problem.solve_layout.state_scalar_count();
     let derivative_dependencies =
         compute_block_dependencies(&problem.continuous.derivative_rhs, state_count)?;
@@ -626,7 +653,7 @@ pub fn build_continuous_refresh_owners(
 /// construction, so any causal step that is not a compiler-certified exact
 /// target assignment is promoted into the reduced Newton here: its unknown
 /// becomes a tear variable and its row a reduced residual. The reduced Newton
-/// (with a finite-difference Jacobian and line search over the tear variables)
+/// (with the tangent-plan Jacobian and line search over the tear variables)
 /// then carries that nonlinearity, and the remaining causal steps stay exact.
 fn normalize_algebraic_projection_tearing(
     problem: &mut solve::SolveProblem,
@@ -639,7 +666,7 @@ fn normalize_algebraic_projection_tearing(
     )?;
     for block in &mut problem.continuous.algebraic_projection_plan.blocks {
         if let Some(tearing) = block.tearing.as_mut() {
-            promote_inexact_causal_steps(tearing, &implicit_scalar_rhs);
+            promote_inexact_causal_steps(tearing, &implicit_scalar_rhs)?;
         }
     }
     Ok(())
@@ -654,39 +681,51 @@ fn normalize_algebraic_projection_tearing(
 /// variable before back-substitution runs. When every step is promoted the
 /// block degenerates to a dense reduced Newton over all its unknowns, which is
 /// exactly what an empty `causal_steps` drives.
-fn promote_inexact_causal_steps(
+///
+/// A retained step also needs a proof that its isolated coefficient is bounded
+/// away from zero (SPEC_0043 §4), which it then carries; a step without one is
+/// promoted like an inexact one, so no executor divides by a coefficient the
+/// construction did not bound.
+///
+/// A causal step whose row reads its unknown only through a coefficient proven
+/// zero is a construction error: the zero-coefficient proof omits that term
+/// from structural incidence, so matching could not have chosen the step, and
+/// the step can never isolate its unknown.
+pub(super) fn promote_inexact_causal_steps(
     tearing: &mut solve::BlockTearing,
     implicit_scalar_rhs: &PreparedScalarProgramBlock,
-) {
+) -> Result<(), EvalSolveError> {
     let mut retained = Vec::with_capacity(tearing.causal_steps.len());
-    for step in std::mem::take(&mut tearing.causal_steps) {
-        if causal_step_certifies_exact_assignment(implicit_scalar_rhs, step.row, step.y_index) {
+    for mut step in std::mem::take(&mut tearing.causal_steps) {
+        let proof = causal_step_coefficient_proof(implicit_scalar_rhs, step.row, step.y_index);
+        if proof != solve::CausalCoefficient::Unproven
+            && causal_step_certifies_exact_assignment(implicit_scalar_rhs, step.row, step.y_index)
+        {
+            step.coefficient = proof;
             retained.push(step);
-        } else {
-            tearing.tear_y_indices.push(step.y_index);
-            tearing.residual_rows.push(step.row);
+            continue;
         }
+        if let Some((program, output)) = implicit_scalar_rhs.row_output_position(step.row)
+            && implicit_scalar_rhs
+                .block()
+                .program(program)
+                .is_some_and(|ops| {
+                    solve::isolates_through_zero_coefficient(ops, output, step.y_index)
+                })
+        {
+            return Err(EvalSolveError::InvalidRow {
+                message: format!(
+                    "the causal step for solver slot {} reads it only through a coefficient proven zero; the structural incidence omits that term (SPEC_0032), so this step cannot come from matching",
+                    step.y_index
+                ),
+                span: implicit_scalar_rhs.block().program_span(program),
+            });
+        }
+        tearing.tear_y_indices.push(step.y_index);
+        tearing.residual_rows.push(step.row);
     }
     tearing.causal_steps = retained;
-}
-
-/// Whether evaluating `row`'s target isolator and writing its value satisfies
-/// the scalar residual exactly for solver-Y unknown `y_index`. This mirrors the
-/// runtime `implicit_target_assignment_is_exact` predicate exactly.
-fn causal_step_certifies_exact_assignment(
-    implicit_scalar_rhs: &PreparedScalarProgramBlock,
-    row: usize,
-    y_index: usize,
-) -> bool {
-    implicit_scalar_rhs
-        .row_output_position(row)
-        .is_some_and(|(program_idx, output_offset)| {
-            implicit_scalar_rhs.certifies_exact_target_assignment_output(
-                program_idx,
-                output_offset,
-                y_index,
-            )
-        })
+    Ok(())
 }
 
 fn extend_scalar_block_dependencies(
@@ -949,11 +988,18 @@ fn append_exact_projection_owners<A: RefreshProgramAccess + ?Sized>(
         let Some(program) = block.program(position.program_index) else {
             continue;
         };
-        if !crate::prepared::program_certifies_exact_target(
+        let assignment_shape = crate::prepared::assignment_shape_for_program_output(
             program,
             position.output_offset,
             *target_index,
-        )? {
+        )?;
+        let certificates = AssignmentCertificates::for_shape(
+            program,
+            position.output_offset,
+            *target_index,
+            assignment_shape.as_ref(),
+        )?;
+        if !certificates.exact {
             continue;
         }
         reserve_refresh_vec_capacity(rows, 1, "dependency exact-owner rows", span)?;
@@ -975,16 +1021,8 @@ fn append_exact_projection_owners<A: RefreshProgramAccess + ?Sized>(
                 output_offset: position.output_offset,
                 target_index: *target_index,
                 assignment_target: Some(*target_index),
-                assignment_shape: crate::prepared::assignment_shape_for_program_output(
-                    program,
-                    position.output_offset,
-                    *target_index,
-                )?,
-                direct_assignment_certified: crate::prepared::program_certifies_direct_target(
-                    program,
-                    position.output_offset,
-                    *target_index,
-                )?,
+                assignment_shape,
+                direct_assignment_certified: certificates.direct,
                 exact_assignment_certified: true,
             },
             span,
@@ -1050,6 +1088,7 @@ fn collect_dependency_closure<A: RefreshProgramAccess + ?Sized>(
     state_count: usize,
 ) -> Result<(IndexSet<usize>, IndexSet<usize>), EvalSolveError> {
     let span = implicit_block.first_span();
+    let exact_rows = issued_exact_assignment_rows(plan);
     let mut stack = initial_deps
         .into_seed_stack(target_to_row.keys().chain(block_by_target.keys()).copied())
         .map_err(|error| compact_dependency_error(error, span))?;
@@ -1066,22 +1105,79 @@ fn collect_dependency_closure<A: RefreshProgramAccess + ?Sized>(
         if index < state_count || !insert_dependency(&mut needed, index, span)? {
             continue;
         }
-        if let Some(block_index) = block_by_target.get(&index).copied() {
-            if insert_projection_block(&mut needed_blocks, block_index, span)? {
-                enqueue_projection_block_dependencies(
-                    plan,
-                    implicit_block,
-                    output_positions,
-                    block_index,
-                    state_count,
-                    &mut stack,
-                )?;
+        let Some(block_index) = block_by_target.get(&index).copied() else {
+            if let Some(source) = target_to_row.get(&index).copied() {
+                enqueue_source_dependencies(implicit_block, source, state_count, &mut stack, span)?;
             }
-        } else if let Some(source) = target_to_row.get(&index).copied() {
-            enqueue_source_dependencies(implicit_block, source, state_count, &mut stack, span)?;
+            continue;
+        };
+        if !insert_projection_block(&mut needed_blocks, block_index, span)? {
+            continue;
+        }
+        if let Some(row) = exact_rows.get(&index) {
+            enqueue_exact_assignment_dependencies(
+                implicit_block,
+                row,
+                state_count,
+                &mut stack,
+                span,
+            )?;
+        } else {
+            enqueue_projection_block_dependencies(
+                plan,
+                implicit_block,
+                output_positions,
+                block_index,
+                state_count,
+                &mut stack,
+            )?;
         }
     }
     Ok((needed, needed_blocks))
+}
+
+fn issued_exact_assignment_rows(plan: &RefreshPlan) -> BTreeMap<usize, &AlgebraicRefreshRow> {
+    plan.value_stages
+        .iter()
+        .filter_map(|stage| match stage {
+            RefreshStage::ExactAssignments {
+                static_rows,
+                dynamic_rows,
+                ..
+            } => Some((static_rows, dynamic_rows)),
+            _ => None,
+        })
+        .flat_map(|(static_rows, dynamic_rows)| {
+            plan.selected_rows(static_rows)
+                .iter()
+                .chain(plan.selected_rows(dynamic_rows).iter())
+        })
+        .map(|row| (row.target_index(), row))
+        .collect()
+}
+
+fn enqueue_exact_assignment_dependencies<A: RefreshProgramAccess + ?Sized>(
+    block: &A,
+    row: &AlgebraicRefreshRow,
+    state_count: usize,
+    stack: &mut Vec<usize>,
+    span: Option<rumoca_core::Span>,
+) -> Result<(), EvalSolveError> {
+    let (Some(program), Some(shape)) = (block.source_program(row.source()), row.assignment_shape())
+    else {
+        return Err(EvalSolveError::InvalidRow {
+            message: "issued exact assignment lacks its source or shape".to_string(),
+            span,
+        });
+    };
+    let reads = AssignmentYReads::new(program, shape);
+    for dependency in row_y_input_ranges(program).into_iter().flatten() {
+        if dependency >= state_count && reads.reads(dependency) {
+            reserve_refresh_vec_capacity(stack, 1, "exact assignment dependency stack", span)?;
+            stack.push(dependency);
+        }
+    }
+    Ok(())
 }
 
 fn insert_dependency(
@@ -1218,6 +1314,11 @@ fn configure_causal_seed_rows<A: RefreshProgramAccess + ?Sized>(
         &plan.rows,
         &plan.static_causal_seed_rows,
         plan.causal_solution_certified,
+        |row, targets| {
+            block.source_program(row.source()).map(|operations| {
+                refresh_row_dependency_positions(row, operations, state_count, targets)
+            })
+        },
     )
     .map_err(|error| EvalSolveError::InvalidRow {
         message: error.to_string(),
@@ -1589,6 +1690,11 @@ fn refresh_row_dependency_positions(
     producer_by_target: &BTreeMap<usize, usize>,
 ) -> Vec<usize> {
     let mut positions = BTreeSet::new();
+    // One register-dependency table of the assignment's expression prefix
+    // answers every candidate producer of this row.
+    let assignment_reads = row
+        .assignment_shape()
+        .map(|shape| AssignmentYReads::new(ops, shape));
     for mut range in row_y_input_ranges(ops) {
         range.start = range.start.max(state_count);
         if range.is_empty() {
@@ -1596,9 +1702,9 @@ fn refresh_row_dependency_positions(
         }
         for (&index, &position) in producer_by_target.range(range) {
             if index == row.target_index()
-                || row
-                    .assignment_shape()
-                    .is_some_and(|shape| !assignment_shape_reads_y_index(ops, shape, index))
+                || assignment_reads
+                    .as_ref()
+                    .is_some_and(|reads| !reads.reads(index))
             {
                 continue;
             }
@@ -1606,6 +1712,33 @@ fn refresh_row_dependency_positions(
         }
     }
     positions.into_iter().collect()
+}
+
+/// Solver-Y reads of one target assignment's value registers, evaluated over
+/// the assignment's expression prefix. A prefix that does not fit the program
+/// reads every index (fail closed).
+struct AssignmentYReads<'a> {
+    shape: &'a solve::TargetAssignmentShape,
+    dependency: Option<solve::ScalarProgramYDependency<'a>>,
+}
+
+impl<'a> AssignmentYReads<'a> {
+    fn new(ops: &'a [solve::LinearOp], shape: &'a solve::TargetAssignmentShape) -> Self {
+        Self {
+            shape,
+            dependency: ops
+                .get(..shape.expr_eval_len())
+                .map(solve::ScalarProgramYDependency::new),
+        }
+    }
+
+    fn reads(&self, y_index: usize) -> bool {
+        self.dependency.as_ref().is_none_or(|dependency| {
+            self.shape
+                .value_registers()
+                .any(|register| dependency.depends_on(register, y_index))
+        })
+    }
 }
 
 fn complete_causal_projection_is_certified<A: RefreshProgramAccess + ?Sized>(
@@ -1641,17 +1774,14 @@ fn complete_causal_projection_is_certified<A: RefreshProgramAccess + ?Sized>(
             })
             || row.target_index() < state_count
             || row.target_index() >= solver_count
+            // Every row reaching this check was issued its exact certificate
+            // from this same source program, output offset, and target.
+            || !row.exact_assignment_certified()
             || block.source_program(row.source()).is_none_or(|program| {
                 row_y_input_ranges(program)
                     .into_iter()
                     .flatten()
                     .any(|index| index >= solver_count)
-                    || !crate::prepared::program_certifies_exact_target(
-                        program,
-                        row.output_offset(),
-                        row.target_index(),
-                    )
-                    .unwrap_or(false)
             })
     }) {
         tracing::debug!(target: "rumoca_eval_solve::refresh", reason = "invalid row", equation = row.equation_index(), source_node = row.source().node(), source_program = row.source().program(), target = row.target_index(), "causal certificate rejected");

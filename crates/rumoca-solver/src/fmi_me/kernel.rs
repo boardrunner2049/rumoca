@@ -1,8 +1,10 @@
 use std::{cell::RefCell, rc::Rc};
 
+mod chart_switch;
+mod committed_seed;
 mod component;
+mod dynamic_chart;
 mod event_boundary;
-mod indicator_plan;
 
 use super::lifecycle::{MeLifecycle, MeLifecycleCommand, MeLifecycleViolation, MeState};
 use super::{
@@ -29,12 +31,13 @@ use crate::runtime::solve_runtime::{
 use crate::runtime::time::time_match_with_tol;
 use crate::solver::{SimTermination, SimVariableMeta};
 use crate::timeline;
-use indicator_plan::FmiIndicatorPlan;
+use rumoca_ir_solve::fmi::FmiIndicatorPlan;
 
 /// Residual tolerance for the component's internal algebraic refresh.
-const ALGEBRAIC_REFRESH_TOL: f64 = 1.0e-10;
+const ALGEBRAIC_REFRESH_TOL: f64 =
+    rumoca_eval_solve::projection_policy::ALGEBRAIC_REFRESH_TOLERANCE;
 /// Iteration ceiling for the component's internal algebraic/event fixed points.
-const UPDATE_MAX_ITERS: usize = 32;
+const UPDATE_MAX_ITERS: usize = rumoca_eval_solve::projection_policy::ALGEBRAIC_REFRESH_MAX_ITERS;
 
 #[derive(Clone)]
 struct CachedDerivative {
@@ -69,10 +72,33 @@ impl CachedContinuousLinearization {
 struct MeAlgebraicProjectionPolicy {
     tolerance: f64,
     settle: AlgebraicSettle,
+    manifold: ManifoldAction,
+}
+
+#[derive(Clone, Copy)]
+enum ManifoldAction {
+    CertifyInitial,
+    CorrectContinuous,
+}
+
+impl ManifoldAction {
+    fn apply(
+        self,
+        runtime: &SolveRuntime,
+        y: &mut [f64],
+        p: &[f64],
+        t: f64,
+        tol: f64,
+    ) -> Result<(), crate::runtime::solve_ops::RuntimeSolveError> {
+        match self {
+            Self::CertifyInitial => runtime.certify_state_manifold(y, p, t, tol),
+            Self::CorrectContinuous => runtime.project_state_manifold(y, p, t, tol).map(|_| ()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StateTimeCoincidence {
+pub(super) enum StateTimeCoincidence {
     None,
     Unconsumed,
     Consumed,
@@ -94,9 +120,29 @@ impl StateTimeCoincidence {
 /// SPEC_0038 forbids integrators from reaching Solve rows, layouts, opcodes,
 /// events, or runtime objects: the only way in is [`SolveMeKernel`].
 pub struct SolveMeKernel {
+    /// The active continuous basis. For a model with no folding first-integral
+    /// group this is the only basis and never changes; a chart-bearing model
+    /// swaps this pointer to `reduced_chart_runtimes[active_chart]` when the
+    /// completed-step detector requests a basis change.
     runtime: Rc<SolveRuntime>,
+    /// The runtime-executable image of every reduced state selection chart, and
+    /// the geometry the detector and the basis transition need. `None` for every
+    /// model without a folding first-integral group, keeping that path inert.
+    reduced_charts: Option<dynamic_chart::ReducedChartRuntimes>,
+    /// The index of the active chart within `reduced_charts`. Always zero (the
+    /// primary basis) when `reduced_charts` is `None`.
+    active_chart: usize,
+    /// The active chart's keep reference: its conditioning when it became
+    /// active. `None` while the primary basis is active, whose reference is its
+    /// construction conditioning.
+    active_reference: Option<f64>,
+    /// A completed step's request to transfer to a better-conditioned chart,
+    /// applied atomically in the following Event-Mode transition.
+    pending_basis_change: Option<dynamic_chart::PendingBasisChange>,
     /// The FMI event-indicator table, resolved once at instantiation.
     indicator_plan: FmiIndicatorPlan,
+    /// The component's root-location rules (SPEC_0044 ME-EVENT-004).
+    root_location: rumoca_ir_solve::fmi::RootLocationPlan,
     instance_brand: Rc<()>,
     instance_name: &'static str,
     lifecycle: MeLifecycle,
@@ -135,6 +181,9 @@ pub struct SolveMeKernel {
     boundary_event_pre_p: Option<Vec<f64>>,
 
     solver_y_guess: RefCell<Vec<f64>>,
+    committed_seed: RefCell<committed_seed::CommittedSeed>,
+    /// Who orders this instance's evaluations (Solve IR `RefreshExecutor`).
+    refresh_executor: rumoca_ir_solve::RefreshExecutor,
     /// Indicator working storage sized once from [`FmiIndicatorPlan`], so an
     /// indicator read reserves nothing proportional to the model.
     indicator_root_scratch: RefCell<Vec<f64>>,
@@ -187,6 +236,7 @@ pub(crate) struct MeKernelSnapshot {
     boundary_event_pre_y: Option<Vec<f64>>,
     boundary_event_pre_p: Option<Vec<f64>>,
     solver_y_guess: Vec<f64>,
+    committed_seed: committed_seed::CommittedSeed,
     delay_params_scratch: Vec<f64>,
     delay_solver_y_scratch: Vec<f64>,
     derivative_cache: Option<CachedDerivative>,
@@ -197,7 +247,12 @@ pub(crate) struct MeKernelSnapshot {
     last_projection_changed: bool,
     termination: Option<SimTermination>,
     settled_initialization_y: Option<Vec<f64>>,
-    runtime: SolveRuntimeSnapshot,
+    active_chart: usize,
+    active_reference: Option<f64>,
+    pending_basis_change: Option<dynamic_chart::PendingBasisChange>,
+    /// One snapshot per reduced-chart runtime, in chart index order; a single
+    /// entry for a model with no folding first-integral group.
+    runtimes: Vec<Option<SolveRuntimeSnapshot>>,
 }
 
 pub(super) fn event_right_limit_state_derivatives(
@@ -220,6 +275,11 @@ pub(super) fn event_right_limit_state_derivatives(
 }
 
 impl SolveMeKernel {
+    /// The component's root-location rules.
+    pub(crate) const fn root_location(&self) -> &rumoca_ir_solve::fmi::RootLocationPlan {
+        &self.root_location
+    }
+
     pub(crate) fn model_description(&self) -> MeModelDescription<'_> {
         MeModelDescription {
             continuous_state_count: self.state_count,
@@ -247,7 +307,7 @@ impl SolveMeKernel {
             )));
         }
         for (index, slot) in nominals.iter_mut().enumerate() {
-            *slot = self.runtime.model.solver_variable_scale(index);
+            *slot = self.active_state_nominal(index);
         }
         Ok(())
     }
@@ -309,6 +369,7 @@ impl SolveMeKernel {
         // mode accepted-point cache is no longer authoritative. This replaces
         // the retired Rumoca-only `AtStateEvent` completed-step variant.
         self.clear_runtime_caches();
+        self.suspend_seed();
         self.last_event_entry = Some(entry);
         self.pending_event_entry = Some(entry);
         self.commit_lifecycle_transition(MeLifecycleCommand::EnterEventMode)
@@ -350,6 +411,7 @@ impl SolveMeKernel {
         // clearing scheduled relation memory changed a parameter slot, the
         // complete parameter-vector cache key forces the ordinary full solve.
         self.clear_callback_value_caches();
+        self.commit_seed();
         self.seed_settled_indicator_domains()?;
         self.commit_lifecycle_transition(MeLifecycleCommand::EnterContinuousTimeMode)
     }
@@ -405,6 +467,7 @@ impl SolveMeKernel {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn get_continuous_state_derivatives(
         &self,
         derivatives: &mut Vec<f64>,
@@ -448,6 +511,29 @@ impl SolveMeKernel {
         .map_err(|error| error.at_stage(MeStage::Integration))
     }
 
+    /// Rows per state column of the continuous-state Jacobian's certified
+    /// relation, read from the Solve IR artifacts (a superset of every
+    /// directional derivative's nonzeros). A component that switches reduced
+    /// charts states the union of its charts' relations; `None` when the
+    /// artifacts carry none.
+    pub(crate) fn state_jacobian_columns(&self) -> Option<Rc<[Vec<usize>]>> {
+        if self.state_count == 0 {
+            return Some(Rc::from(Vec::new()));
+        }
+        let pattern = match &self.reduced_charts {
+            Some(charts) => charts.state_jacobian()?,
+            None => self
+                .runtime
+                .model
+                .artifacts
+                .continuous
+                .structural
+                .state_jacobian()?
+                .clone(),
+        };
+        Some(Rc::from(pattern.column_rows()))
+    }
+
     pub(crate) fn get_event_indicators(&self, indicators: &mut Vec<f64>) -> Result<(), MeError> {
         indicators.resize(self.indicator_plan.len(), 0.0);
         self.event_indicators_into(indicators)
@@ -468,26 +554,26 @@ impl SolveMeKernel {
     ) -> Result<MeCompletedIntegratorStep, MeError> {
         self.require_active_lifecycle("completed_integrator_step")?;
         self.post_event_eval_time = None;
-        let enter_event_mode = self.complete_indicator_domains()?;
+        self.mark_seed();
+        let mut enter_event_mode = self.complete_indicator_domains()?;
+        // A located indicator event takes precedence; a basis change is only
+        // requested when the step is otherwise accepted, and is re-detected on
+        // the next completed step if an event preempts it here.
+        let basis_change = !enter_event_mode && self.detect_basis_change_request()?;
+        if basis_change {
+            enter_event_mode = true;
+        }
         if enter_event_mode {
             self.clear_runtime_caches();
         } else if self.last_projection_changed {
             self.clear_derivative_cache();
-        } else {
-            // FMI does not let an importer hand an FSAL stage into the FMU.
-            // Keep the ordinary accepted-point cache private by evaluating it
-            // through the same standard derivative operation the importer
-            // could call here. A located event stays cache-free until Event
-            // Mode consumes it. The frozen solver profile caches only callback
-            // values that its importer actually requests.
-            let mut accepted_derivatives = Vec::new();
-            self.get_continuous_state_derivatives(&mut accepted_derivatives)?;
         }
         self.commit_delay_point()
             .map_err(|error| error.at_stage(MeStage::Integration))?;
         Ok(MeCompletedIntegratorStep {
             enter_event_mode,
             terminate_simulation: false,
+            basis_change,
         })
     }
 
@@ -604,6 +690,25 @@ impl SolveMeKernel {
                 sample_time,
             )
             .map_err(MeError::from)
+    }
+
+    /// Report the violated warning-level assertions at one accepted output
+    /// point (MLS §8.3.7); the observation itself is unchanged.
+    pub(crate) fn report_warnings(&self, observation: &MeObservation) -> Result<(), MeError> {
+        self.require_active_lifecycle("report_warnings")?;
+        self.require_observation_brand(observation)?;
+        self.runtime
+            .observe_warnings(
+                &observation.solver_y,
+                &observation.parameters,
+                observation.time,
+            )
+            .map_err(MeError::from)
+    }
+
+    /// The non-aborting diagnostics this component has reported.
+    pub(crate) fn diagnostics(&self) -> Vec<crate::SimDiagnostic> {
+        self.runtime.diagnostics()
     }
 
     pub(crate) fn get_outputs(
@@ -735,6 +840,7 @@ impl SolveMeKernel {
                 boundary_event_pre_y: self.boundary_event_pre_y.clone(),
                 boundary_event_pre_p: self.boundary_event_pre_p.clone(),
                 solver_y_guess: self.solver_y_guess.borrow().clone(),
+                committed_seed: self.committed_seed.borrow().clone(),
                 delay_params_scratch: self.delay_params_scratch.borrow().clone(),
                 delay_solver_y_scratch: self.delay_solver_y_scratch.borrow().clone(),
                 derivative_cache: self.derivative_cache.borrow().clone(),
@@ -748,7 +854,10 @@ impl SolveMeKernel {
                 last_projection_changed: self.last_projection_changed,
                 termination: self.termination.clone(),
                 settled_initialization_y: self.settled_initialization_y.clone(),
-                runtime: self.runtime.snapshot(),
+                active_chart: self.active_chart,
+                active_reference: self.active_reference,
+                pending_basis_change: self.pending_basis_change.clone(),
+                runtimes: self.chart_runtime_snapshots(),
             },
             instance_brand: Rc::clone(&self.instance_brand),
         }
@@ -790,6 +899,9 @@ impl SolveMeKernel {
         self.solver_y_guess
             .borrow_mut()
             .clone_from(&state.solver_y_guess);
+        self.committed_seed
+            .borrow_mut()
+            .clone_from(&state.committed_seed);
         self.delay_params_scratch
             .borrow_mut()
             .clone_from(&state.delay_params_scratch);
@@ -810,7 +922,10 @@ impl SolveMeKernel {
         self.termination.clone_from(&state.termination);
         self.settled_initialization_y
             .clone_from(&state.settled_initialization_y);
-        self.runtime.restore(&state.runtime);
+        self.restore_chart_runtimes(state.active_chart, &state.runtimes)?;
+        self.active_reference = state.active_reference;
+        self.pending_basis_change
+            .clone_from(&state.pending_basis_change);
         self.lifecycle.restore(state.lifecycle);
         Ok(())
     }
@@ -889,15 +1004,15 @@ fn option_float_bit_eq(left: Option<f64>, right: Option<f64>) -> bool {
 
 /// Select the time owned by the first event-update pass.
 ///
-/// A coincident scheduled clock owns its exact semantic tick. An ordinary
-/// located state event is applied where the host positioned the component —
-/// normally the numerical right limit, or a target/horizon it snapped to.
+/// An unconsumed coincident clock owns its exact semantic tick. A located
+/// state event after that tick has committed is applied at the host's current
+/// coordinate; the consumed clock still suppresses replay of its owned rows.
 pub(super) fn event_update_application_time(
     semantic_event_time: f64,
     component_time: f64,
-    coincident_state_time_event: bool,
+    coincidence: StateTimeCoincidence,
 ) -> f64 {
-    if coincident_state_time_event {
+    if matches!(coincidence, StateTimeCoincidence::Unconsumed) {
         semantic_event_time
     } else {
         component_time
@@ -1072,7 +1187,7 @@ fn project_algebraics(
 ) -> Result<bool, crate::runtime::solve_ops::RuntimeSolveError> {
     let tol = policy.tolerance;
     let before = y.to_vec();
-    runtime.project_state_manifold(y, p, t, tol)?;
+    policy.manifold.apply(runtime, y, p, t, tol)?;
     runtime.refresh_algebraic_and_output_slots_certified(
         t,
         y,
@@ -1091,7 +1206,7 @@ fn project_event_algebraics(
     policy: MeAlgebraicProjectionPolicy,
 ) -> Result<bool, crate::runtime::solve_ops::RuntimeSolveError> {
     let before = y.to_vec();
-    runtime.project_state_manifold(y, p, t, policy.tolerance)?;
+    policy.manifold.apply(runtime, y, p, t, policy.tolerance)?;
     runtime.refresh_event_dependency_slots_certified(
         t,
         y,

@@ -498,6 +498,31 @@ fn decl_036_type_alias() {
 }
 
 // =============================================================================
+// DECL-037: Structural parameters
+// "The number of dimensions and the dimension sizes are fixed at translation";
+// a for-equation range is evaluated at translation (MLS §10.1, §8.3.3)
+// =============================================================================
+
+#[test]
+fn decl_037_structural_parameters() {
+    expect_success(
+        r#"
+        model Test
+            parameter Integer n = 2;
+            parameter Integer m = n - 1;
+            Real x[n];
+        equation
+            for i in 1:m loop
+                x[i] = i;
+            end for;
+            x[n] = 0;
+        end Test;
+    "#,
+        "Test",
+    );
+}
+
+// =============================================================================
 // DECL-025: Operator contents
 // "Operator class may only contain declarations of functions"
 // (placement: operators may only live inside operator records)

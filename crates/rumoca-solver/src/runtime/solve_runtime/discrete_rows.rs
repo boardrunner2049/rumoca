@@ -4,7 +4,6 @@ use rumoca_ir_solve as solve;
 use crate::runtime::solve_events::event_eval_params_with_relation_overrides;
 use crate::{RuntimeSolveError, discrete_row_active_at, row_reads_solver_or_time};
 
-use super::SolveRuntime;
 use super::event_update::{
     DiscretePreSnapshot, DiscreteRowEvalInput, DiscreteRowsSettleInput, EventEvalParamCache,
     EventUpdateRowFilter,
@@ -14,6 +13,7 @@ use super::support::{
     copy_runtime_values, copy_runtime_values_into, reserve_runtime_vec_capacity,
     resize_runtime_values,
 };
+use super::{ProjectAlgebraics, SolveRuntime};
 
 #[derive(Clone)]
 pub(super) struct PreparedStructuredDiscreteRows {
@@ -1049,17 +1049,14 @@ impl SolveRuntime {
         Ok(seeded)
     }
 
-    pub(super) fn settle_discrete_rows_for_pre_snapshot<P>(
+    pub(super) fn settle_discrete_rows_for_pre_snapshot(
         &self,
         snapshot: &DiscretePreSnapshot<'_>,
         input: &mut DiscreteRowsSettleInput<'_>,
-        project_algebraics: &mut P,
-    ) -> Result<bool, RuntimeSolveError>
-    where
-        P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
-    {
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
         let mut changed_any = false;
-        for settle_iteration in 0..input.max_iters {
+        for settle_iteration in 0..self.event_schedule().fixed_point_cap() {
             // A clocked equation executes once at its superdense tick. The
             // remaining passes settle unclocked equations and algebraic
             // projection around that held result; re-running the clock owner
@@ -1070,8 +1067,47 @@ impl SolveRuntime {
                 root_relation_overrides: snapshot.root_relation_overrides,
                 event_iteration: snapshot.event_iteration.max(settle_iteration),
             };
-            let mut pass_changed = self.apply_discrete_rows_for_pre_snapshot(
-                &settle_snapshot,
+            if !self.run_settle_pass(&settle_snapshot, input, project_algebraics)? {
+                return Ok(changed_any);
+            }
+            changed_any = true;
+        }
+        self.solve_coupled_event_rows(snapshot, input)
+            .map(|changed| changed_any | changed)
+    }
+
+    /// Walk one settle pass; `false` when it settled without a change.
+    fn run_settle_pass(
+        &self,
+        snapshot: &DiscretePreSnapshot<'_>,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
+        let mut pass_changed = false;
+        for step in self.event_schedule().settle_pass() {
+            // The caller supplies a projected coordinate with runtime
+            // assignments stable. If no earlier step of this pass changed it,
+            // that certificate still holds and a full projection cannot add
+            // information.
+            if *step == solve::SettleStep::SettledIfUnchanged && !pass_changed {
+                return Ok(false);
+            }
+            pass_changed |= self.run_settle_step(*step, snapshot, input, project_algebraics)?;
+        }
+        Ok(true)
+    }
+
+    /// Run one settle-pass step and report whether it changed the coordinate.
+    fn run_settle_step(
+        &self,
+        step: solve::SettleStep,
+        snapshot: &DiscretePreSnapshot<'_>,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
+        match step {
+            solve::SettleStep::DiscreteOwners => self.apply_discrete_rows_for_pre_snapshot(
+                snapshot,
                 input.y,
                 input.p,
                 input.t,
@@ -1081,36 +1117,17 @@ impl SolveRuntime {
                     observation_only: false,
                     initialization_equations_only: false,
                 },
-            )?;
-            pass_changed |= self.apply_runtime_assignments_until_stable(
+            ),
+            solve::SettleStep::RuntimeAssignments => self.apply_runtime_assignments_until_stable(
                 input.y,
                 input.p,
                 input.t,
                 input.tol,
                 input.max_iters,
-            )?;
-            if !pass_changed {
-                // The caller supplies a projected coordinate with runtime
-                // assignments stable. If neither the active discrete owners
-                // nor their runtime assignments changed it, that certificate
-                // still holds and a full projection cannot add information.
-                return Ok(changed_any);
-            }
-            pass_changed |= project_algebraics(input.y, input.p)?;
-            pass_changed |= self.apply_runtime_assignments_until_stable(
-                input.y,
-                input.p,
-                input.t,
-                input.tol,
-                input.max_iters,
-            )?;
-            if !pass_changed {
-                return Ok(changed_any);
-            }
-            changed_any = true;
+            ),
+            solve::SettleStep::SettledIfUnchanged => Ok(false),
+            solve::SettleStep::AlgebraicProjection => project_algebraics(input.y, input.p),
         }
-        self.solve_coupled_event_rows(snapshot, input)
-            .map(|changed| changed_any | changed)
     }
 
     #[cfg(test)]
@@ -1274,6 +1291,14 @@ impl SolveRuntime {
     ) -> Result<Vec<GuardedRowValues>, RuntimeSolveError> {
         let mut guarded_values = Vec::new();
         let ordered_clocked = self.clock_partition_owns_clocked_rows();
+        // SOLVE-C58 / MLS §8.5: the equations active at one event instant are solved
+        // simultaneously. Solve lowering issues each guarded producer before
+        // every program that reads its current value, so evaluating the
+        // programs in issued order over a working state that carries each
+        // produced value forward gives every reader the instant's value; a
+        // program with no such reader sees exactly the pass-entry state.
+        let mut work_y = copy_runtime_values(input.eval_y, "guarded row work y")?;
+        let mut work_p = copy_runtime_values(input.eval_p, "guarded row work p")?;
         for program_index in 0..self.guarded_assignment_programs.len() {
             if self.event_transaction_coverage.guarded_assignments[program_index] {
                 continue;
@@ -1296,7 +1321,7 @@ impl SolveRuntime {
             if !self.guarded_assignment_accepts_snapshot(program_index, input.snapshot, input.t)? {
                 continue;
             }
-            let row_p = eval_p_cache.params(input.eval_p);
+            let row_p = eval_p_cache.params(&work_p);
             let row_p_with_root_overrides;
             let row_p = if input.snapshot.root_relation_overrides.is_empty() {
                 row_p
@@ -1311,10 +1336,17 @@ impl SolveRuntime {
             let mut values = Vec::new();
             self.eval_guarded_assignment_outputs(
                 program_index,
-                input.eval_y,
+                &work_y,
                 row_p,
                 input.t,
                 &mut values,
+            )?;
+            self.apply_guarded_assignment_outputs(
+                program_index,
+                &values,
+                input.snapshot.root_relation_overrides,
+                &mut work_y,
+                &mut work_p,
             )?;
             guarded_values.push((program_index, values));
         }

@@ -149,8 +149,17 @@ tier = 1
 id = 'ALG-017'
 category = 'Algorithm'
 name = 'LHS initialization'
-mls_ref = '§11.1'
+mls_ref = '§11.1.2'
 requirement = 'Variables on the left-hand side of := must be initialized when algorithm is invoked'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'ALG-018'
+category = 'Algorithm'
+name = 'While loop execution'
+mls_ref = '§11.2.3'
+requirement = 'The body of a while-statement is executed as long as the condition is true'
 status = 'Implemented'
 tier = 1
 
@@ -287,6 +296,24 @@ name = 'Extent coordinate order'
 mls_ref = '§18.9.1.1'
 requirement = 'Coordinates of first point shall be less than coordinates of second point'
 status = 'NotApplicable'
+tier = 1
+
+[[contracts]]
+id = 'ANN-016'
+category = 'Annotation'
+name = 'Inline expansion'
+mls_ref = '§18.3'
+requirement = 'Inline and LateInline propose inlining a function body at each call; InlineAfterIndexReduction proposes it after differentiation for index reduction'
+status = 'NotImplemented'
+tier = 1
+
+[[contracts]]
+id = 'ANN-017'
+category = 'Annotation'
+name = 'Evaluate folding'
+mls_ref = '§18.6'
+requirement = 'Evaluate = true on an evaluable parameter proposes using its value during symbolic processing, after which it cannot change'
+status = 'Implemented'
 tier = 1
 
 [[contracts]]
@@ -664,6 +691,24 @@ category = 'Array'
 name = 'outer product shape'
 mls_ref = '§10.3.5'
 requirement = 'outerProduct(v1, v2) requires two vectors and returns a matrix with extents size(v1, 1) and size(v2, 1)'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'ARR-043'
+category = 'Array'
+name = 'Record array equality element-wise'
+mls_ref = '§10.6.1'
+requirement = 'Equality of arrays of records is element-wise: each element pair is one whole-record equality, so a slice `s[1:n] = m[1:n].r`, a whole array `s = m.r`, and a for-equation over elements state the same field equations'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'ARR-044'
+category = 'Array'
+name = 'der and pre element-wise shape'
+mls_ref = '§3.7.4, §3.7.5'
+requirement = 'der(expr) and pre(y) of an array apply to every element, so the result has the operand shape; an equation between zero-sized operands has no scalar equations'
 status = 'Implemented'
 tier = 1
 
@@ -1442,6 +1487,15 @@ status = 'Implemented'
 tier = 1
 
 [[contracts]]
+id = 'DECL-037'
+category = 'Declaration'
+name = 'Structural parameters'
+mls_ref = '§10.1, §8.3.3'
+requirement = 'The number of dimensions and the dimension sizes are fixed at translation; a for-equation range is evaluated at translation'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
 id = 'EQN-001'
 category = 'Equation'
 name = 'Local balance'
@@ -1784,6 +1838,24 @@ status = 'Implemented'
 tier = 1
 
 [[contracts]]
+id = 'EQN-039'
+category = 'Equation'
+name = 'If-equation evaluable conditions'
+mls_ref = '§8.3.4'
+requirement = 'If-equations without exclusively evaluable switching conditions have the same number of equations in each branch; a parameter guard over equal branches stays a run-time branch'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'EQN-040'
+category = 'Equation'
+name = 'Initial discrete definitions'
+mls_ref = '§8.6'
+requirement = 'An initial equation pre(m) = e or m = e determines the initialization value of discrete m from the initialization solution: for a discrete-valued m, e may read parameters, time, inputs, states, and algebraics, and is applied after the projection that settles them once its read cone is proven free of discrete values'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
 id = 'EXPR-001'
 category = 'Expression'
 name = 'Relational scalar only'
@@ -2048,7 +2120,7 @@ tier = 1
 id = 'EXPR-030'
 category = 'Expression'
 name = 'spatialDistribution params'
-mls_ref = '§3.7.4.1'
+mls_ref = '§3.7.2.2'
 requirement = 'initialPoints and initialValues shall be parameter expressions of equal size'
 status = 'Implemented'
 tier = 1
@@ -2057,7 +2129,7 @@ tier = 1
 id = 'EXPR-031'
 category = 'Expression'
 name = 'spatialDistribution no vectorize'
-mls_ref = '§3.7.4.1'
+mls_ref = '§3.7.2.2'
 requirement = 'Operator cannot be vectorized according to §12.4.6'
 status = 'Implemented'
 tier = 1
@@ -2066,7 +2138,7 @@ tier = 1
 id = 'EXPR-032'
 category = 'Expression'
 name = 'cardinality scope'
-mls_ref = '§3.7.4.2'
+mls_ref = '§3.7.4.1'
 requirement = 'Should only be used in condition of assert and if-statements without connect'
 status = 'Implemented'
 tier = 1
@@ -2075,7 +2147,7 @@ tier = 1
 id = 'EXPR-033'
 category = 'Expression'
 name = 'cardinality not in function'
-mls_ref = '§3.7.4.2'
+mls_ref = '§3.7.4.1'
 requirement = 'cardinality operator not allowed inside function classes'
 status = 'Implemented'
 tier = 1
@@ -2084,7 +2156,7 @@ tier = 1
 id = 'EXPR-034'
 category = 'Expression'
 name = 'homotopy types'
-mls_ref = '§3.7.4.3'
+mls_ref = '§3.7.4.2'
 requirement = 'Scalar expressions actual and simplified are subtypes of Real'
 status = 'Implemented'
 tier = 1
@@ -2142,6 +2214,16 @@ mls_ref = '§3.7.2'
 requirement = 'div, ceil, floor, integer can only change values at events and will trigger events as needed'
 status = 'Partial'
 notes = 'div/ceil/floor/integer are constructed and lowered as pure builtins (Solve UnaryOp::Floor/Ceil, no relation-memory owner), so no event root is generated at their step points; the contract therefore holds only for arguments that are already discrete between events.'
+tier = 1
+
+[[contracts]]
+id = 'EXPR-041'
+category = 'Expression'
+name = 'smooth event freedom'
+mls_ref = '§3.7.5'
+requirement = 'A tool is free to not generate events for expressions inside smooth; smooth does not guarantee that no events will be generated'
+status = 'Implemented'
+notes = 'Rumoca takes the freedom except for a relation inside smooth(0, ..) whose operands are unknowns of its own algebraic block, which owns an event (SPEC_0044 ME-EVENT-008); crates/rumoca/tests/suite_core/loop_guarded_smooth_relations.rs checks both sides of the rule.'
 tier = 1
 
 [[contracts]]
@@ -2357,7 +2439,8 @@ category = 'Function'
 name = 'Uninitialized error'
 mls_ref = '§12.4.4'
 requirement = 'Error to use or return an uninitialized variable'
-status = 'Deferred'
+status = 'Partial'
+notes = 'A value that a top-level if of the function body defines on some paths and leaves unwritten on others fails the call only on the executed path that uses it (call-scoped assertion); a use inside a nested statement, or after a loop that may write the value, stays a typed construction rejection. Covered by func_contracts.rs func_024_value_assigned_on_the_executed_path_is_usable and func_024_use_of_a_value_the_executed_path_never_assigned_fails. A record result or protected record field that the algorithm never writes and whose type gives no default is returned uninitialized and rejected (ED022); record field defaults the algorithm does not overwrite are assigned at entry. Uninitialized scalar and array results and reads of uninitialized locals are not yet reported with this diagnostic.'
 tier = 1
 
 [[contracts]]
@@ -2374,8 +2457,8 @@ id = 'FUNC-026'
 category = 'Function'
 name = 'Vectorization non-replaceable'
 mls_ref = '§12.4.6'
-requirement = 'Only transitively non-replaceable functions support automatic vectorization'
-status = 'Deferred'
+requirement = '''"Only function classes that are transitively non-replaceable (see section 6.3.1 and section 7.1.4) may be called vectorized." §6.3.1: "A class reference is transitively non-replaceable if and only if all parts of the name satisfy the following: If the class definition is long it is transitively non-replaceable if not declared replaceable. If the class definition is short (i.e., class A = P.B) it is transitively non-replaceable if it is non-replaceable and equal to class reference (P.B) that is transitively non-replaceable." Rumoca (documented deviation, accepted extension that MSL 4.1 relies on, e.g. `Medium.prandtlNumber(states)` in `Fluid.Pipes.BaseClasses.HeatTransfer.LocalPipeFlowHeatTransfer`): a vectorized call is also accepted when, after replaceable-package selection (MLS §7.3), the call's exposure path names the function through enclosing classes that are all transitively non-replaceable, so the selected package fixes the function at translation even though the function itself is declared `replaceable` there (the restriction exists so the callee is known at translation, and it then is). A call spelled through a replaceable package alias (`replaceable package Medium = A` in the model) is accepted on the same ground when the classes enclosing the alias and its right-hand side are transitively non-replaceable: the declared selection, or the redeclaration flattening resolves to one exact function instance, fixes the package. A call whose callee is still unresolved after selection (an alias to a replaceable package, or a partial function) is refused. Tested in `suite_core/selected_package_vectorization.rs` and `func_contracts.rs`'''
+status = 'Implemented'
 tier = 1
 
 [[contracts]]
@@ -2485,6 +2568,24 @@ mls_ref = '§12.9.7'
 requirement = 'Constructor and destructor cannot be called explicitly; each constructed object is constructed and destroyed exactly once'
 status = 'Partial'
 notes = 'Only the first clause is enforced: Resolve rejects explicit constructor/destructor calls with ER134. The exactly-once construction/destruction clause is unimplemented - no phase tracks ExternalObject lifetime or emits a destructor call, and ExternalObject values cannot reach the DAE at all (construction rejects them with UnsupportedFlatSemantics).'
+tier = 1
+
+[[contracts]]
+id = 'FUNC-039'
+category = 'Function'
+name = 'Component bindings read inputs'
+mls_ref = '§12.4.4'
+requirement = 'The declaration bindings of output and protected components are evaluated in the function with its inputs available, including the fields of a record input'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'FUNC-040'
+category = 'Function'
+name = 'Function arguments'
+mls_ref = '§12.4.2.1'
+requirement = 'A function argument is a function name or a partial application binding named formals; the call evaluates the function with the bound values'
+status = 'Implemented'
 tier = 1
 
 [[contracts]]
@@ -2961,6 +3062,51 @@ category = 'Instantiation'
 name = 'Conditional component removal'
 mls_ref = '§5.6.2'
 requirement = 'Conditional components with false condition are removed and not part of simulation model'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'INST-054'
+category = 'Instantiation'
+name = 'Automatic inner creation'
+mls_ref = '§5.4'
+requirement = 'If a unique non-partial class is used for all outer declarations of the same name lacking a matching inner declaration, an inner declaration of that class is automatically added at the top of the model and a diagnostic is given'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'INST-055'
+category = 'Instantiation'
+name = 'Extends redeclaration replaces element'
+mls_ref = '§7.3'
+requirement = 'A redeclaration in the modification of an extends-clause replaces the inherited element; the derived class and its descendants see the replacing class under the element name'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'INST-056'
+category = 'Instantiation'
+name = 'Extends-modified package constant in sibling bindings'
+mls_ref = '§7.2'
+requirement = 'A constant an extends modification of a package binds has that value wherever the package is read, including inside the binding of a sibling constant and through an element selection such as `table[:, 1]`'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'INST-057'
+category = 'Instantiation'
+name = 'Occurrence-selected member class'
+mls_ref = '§7.3'
+requirement = 'A reference through a component declared by a replaceable alias names the member of the class each occurrence selected, in equations and modifier bindings alike'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'INST-058'
+category = 'Instantiation'
+name = 'Redeclare value through the enclosing occurrence'
+mls_ref = '§7.3'
+requirement = 'A redeclare value naming a replaceable element of the enclosing class denotes the class that occurrence selected for it, not the lexical default'
 status = 'Implemented'
 tier = 1
 
@@ -3559,6 +3705,24 @@ status = 'Implemented'
 tier = 1
 
 [[contracts]]
+id = 'STRM-012'
+category = 'Stream'
+name = 'actualStream flow product'
+mls_ref = '§15.3'
+requirement = 'The product of a flow variable and actualStream of a stream variable of the same connector is continuous, so a tool may treat it as smooth(0, ...)'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'STRM-013'
+category = 'Stream'
+name = 'One-direction flow'
+mls_ref = '§15.2'
+requirement = 'A connector whose flow can only enter its own component never supplies its connection set, so its term vanishes from every peer inStream mix; with no supplying peer left, inStream(c.h_outflow) is c.h_outflow'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
 id = 'TYPE-001'
 category = 'Type'
 name = 'Subtype redeclaration'
@@ -3870,6 +4034,15 @@ category = 'Type'
 name = 'Operator record consistency'
 mls_ref = '§6.7'
 requirement = 'For array/if-expressions: if A has operator record base, B must have same one'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'TYPE-036'
+category = 'Type'
+name = 'Predefined-type attribute inheritance'
+mls_ref = '§4.6.2, §4.9, §7.2.3'
+requirement = 'A component of a type derived from a predefined type carries the attribute modifications of its type chain; component and outer modifiers win, then the innermost type, then its bases'
 status = 'Implemented'
 tier = 1
 

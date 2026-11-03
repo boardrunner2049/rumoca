@@ -19,15 +19,20 @@ impl Context {
     /// Create a new flatten context.
     pub(crate) fn new() -> Self {
         Self {
+            declared_dimensions: std::sync::Arc::default(),
             parameter_values: rustc_hash::FxHashMap::default(),
             real_parameter_values: rustc_hash::FxHashMap::default(),
             boolean_parameter_values: rustc_hash::FxHashMap::default(),
             enum_parameter_values: rustc_hash::FxHashMap::default(),
             constant_values: rustc_hash::FxHashMap::default(),
             constant_values_by_def_id: rustc_hash::FxHashMap::default(),
+            constant_values_by_scope: rustc_hash::FxHashMap::default(),
+            constant_values_by_declaration: rustc_hash::FxHashMap::default(),
             ambiguous_constant_def_ids: rustc_hash::FxHashSet::default(),
             constant_values_by_occurrence: rustc_hash::FxHashMap::default(),
             class_owner_components: rustc_hash::FxHashMap::default(),
+            class_package_selections: rustc_hash::FxHashMap::default(),
+            component_type_slots: rustc_hash::FxHashMap::default(),
             component_instance_references: rustc_hash::FxHashMap::default(),
             root_class_instance: None,
             target_def_names: rustc_hash::FxHashMap::default(),
@@ -39,7 +44,10 @@ impl Context {
             array_dimensions: rustc_hash::FxHashMap::default(),
             structural_params: std::collections::HashSet::new(),
             non_structural_params: std::collections::HashSet::new(),
+            tunable_params: std::collections::HashSet::new(),
+            non_evaluable_params: std::collections::HashSet::new(),
             functions: rustc_hash::FxHashMap::default(),
+            function_result_shapes: crate::function_precollect::FunctionResultShapes::default(),
             record_aliases: rustc_hash::FxHashMap::default(),
             component_members: component_member_scope::ComponentMemberScopes::default(),
             vcg_is_root: rustc_hash::FxHashMap::default(),
@@ -48,6 +56,7 @@ impl Context {
             eval_fallback_context: std::cell::OnceCell::new(),
             current_imports: crate::qualify::ImportMap::default(),
             class_def_ids: std::sync::Arc::new(rustc_hash::FxHashSet::default()),
+            package_def_ids: std::sync::Arc::new(rustc_hash::FxHashSet::default()),
             current_class_scope_path: None,
             current_class_instance_id: None,
             simulated_root_name: None,
@@ -162,15 +171,25 @@ impl Context {
                 || var.is_discrete_type
             })
             .filter_map(|(name, var)| {
+                // Parameter `fixed` is uniform (flatten refuses non-uniform
+                // parameter arrays, EF033), so both reductions below are exact.
                 if matches!(var.variability, rumoca_core::Variability::Parameter(_))
-                    && var.fixed == Some(false)
+                    && var.fixed_uniform() == Some(false)
                     && !var.evaluate
                 {
                     self.non_structural_params.insert(name.to_string());
                 }
                 let is_fixed_parameter =
                     matches!(var.variability, rumoca_core::Variability::Parameter(_))
-                        && var.fixed != Some(false);
+                        && var.fixed_uniform() != Some(false);
+                if is_fixed_parameter && !var.evaluate {
+                    self.tunable_params.insert(name.to_string());
+                }
+                if matches!(var.variability, rumoca_core::Variability::Parameter(_))
+                    && (var.fixed_uniform() == Some(false) || var.evaluate_refused)
+                {
+                    self.non_evaluable_params.insert(name.to_string());
+                }
                 let may_be_record_alias = !var.is_primitive;
                 if var.evaluate
                     || matches!(var.variability, rumoca_core::Variability::Constant(_))

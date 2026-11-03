@@ -65,7 +65,7 @@ pub(crate) fn run_workspace_docs(root: &Path) -> Result<()> {
 /// dedicated playground/python jobs. This is the single source of truth shared
 /// by the plain-`cargo test`, doctest, and nextest-shard paths so the three
 /// can never drift apart.
-const WORKSPACE_TEST_EXCLUDES: &[&str] = &[
+pub(crate) const WORKSPACE_TEST_EXCLUDES: &[&str] = &[
     "--exclude",
     "rumoca-bind-python",
     "--exclude",
@@ -74,7 +74,7 @@ const WORKSPACE_TEST_EXCLUDES: &[&str] = &[
 
 /// Required Cargo-feature-selected regressions that plain workspace defaults
 /// do not discover. CI stages the pinned MSL cache before this command.
-const WORKSPACE_TEST_FEATURES: &[&str] = &["--features", "rumoca/msl-sim-tests"];
+pub(crate) const WORKSPACE_TEST_FEATURES: &[&str] = &["--features", "rumoca/msl-sim-tests"];
 
 /// Unit + integration tests under nextest, then doctests. nextest schedules
 /// individual tests across every core in isolated processes; plain
@@ -87,8 +87,32 @@ pub(crate) fn run_workspace_tests(root: &Path) -> Result<()> {
     args.extend_from_slice(WORKSPACE_TEST_EXCLUDES);
     args.extend_from_slice(WORKSPACE_TEST_FEATURES);
     run_cargo(root, &args)?;
+    if cfg!(target_os = "linux") {
+        run_cargo(root, MSL_HARNESS_UNIT_TEST_ARGS)?;
+    }
     run_workspace_doctests(root)
 }
+
+/// The `rumoca-test-msl` harness unit tests that need no MSL cache: the
+/// checked quality baseline, the quality gate and its migrations, the
+/// selection, merge, and reporting helpers. They read only checked-in inputs,
+/// never the ambient `target/msl/parity-config.json` of an earlier sweep; the
+/// two cohort drivers they skip are the MSL sweep itself. The library tests
+/// (band table, PR comment, speed report) run with the workspace.
+pub(crate) const MSL_HARNESS_UNIT_TEST_ARGS: &[&str] = &[
+    "test",
+    "-p",
+    "rumoca-test-msl",
+    "--features",
+    "msl-full-test",
+    "--test",
+    "msl_tests",
+    "--",
+    "--skip",
+    "balance_pipeline::balance_pipeline_core::test_msl_all",
+    "--skip",
+    "balance_pipeline::balance_pipeline_merge::test_msl_merge_and_gate",
+];
 
 /// Doctests only. `cargo nextest` cannot run doctests, so the sharded CI lane
 /// pairs its nextest partitions with exactly one invocation of this to preserve

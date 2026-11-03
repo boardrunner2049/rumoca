@@ -27,7 +27,9 @@ use rumoca_ir_solve::{
     resolve_indexed_slot,
 };
 
+mod block_residual_split;
 mod compute_block_scalarize;
+pub mod dense_basis;
 pub mod domain_diagnostics;
 pub mod execution;
 pub mod linear_solve;
@@ -36,6 +38,8 @@ mod ops;
 mod prepared;
 mod prepared_event_transaction;
 mod prepared_guarded_assignment;
+pub mod projection_policy;
+mod pure_call_execution;
 mod random_runtime;
 pub mod refresh_plan;
 pub mod reverse;
@@ -43,9 +47,11 @@ pub mod reverse;
 mod scalar_program_contract_tests;
 mod sparsity;
 mod table_runtime;
+mod tangent_lanes;
 pub mod tensor_policy;
 mod typed_program;
 mod update_rows;
+pub use block_residual_split::PreparedBlockResidualSplit;
 pub use compute_block_scalarize::{
     ScalarProgramProjection, ScalarizeError, checked_contiguous_output_count,
     checked_tensor_output_count, scalar_program_output_count, scalar_program_output_indices,
@@ -54,12 +60,14 @@ pub use compute_block_scalarize::{
 use linear_solve::{solve_component_op, solve_component_unchecked};
 pub use ops::{eval_binary, eval_compare, eval_unary};
 pub use prepared::{
-    ComputeNodeOutputRangeRequest, PreparedComputeBlock, PreparedScalarProgramBlock,
-    PreparedTornSweep, TargetAssignmentOutputRequest, TornSweepComposite, TornSweepStatus,
+    ComputeNodeOutputRangeRequest, PreparedComputeBlock, PreparedEvaluationBlock,
+    PreparedScalarProgramBlock, PreparedTornSweep, TargetAssignmentOutputRequest,
+    TargetIsolationProgram, TornSweepComposite, TornSweepRun, TornSweepStatus, replaced_programs,
     target_assignment_shape, target_assignment_shapes,
 };
 pub use prepared_event_transaction::PreparedEventTransactionProgram;
 pub use prepared_guarded_assignment::PreparedGuardedAssignmentProgram;
+pub use pure_call_execution::{PureCallExecution, PureCallInvocation};
 use random_runtime::{
     ImpureRandomState, impure_random_mutex, impure_random_sample, impure_random_stream_id,
     initial_state_values, projected_random_value, random_result_and_state, read_reg_range,
@@ -72,6 +80,10 @@ pub use sparsity::{
 pub use table_runtime::{
     TableRuntimeError, eval_table_bound_value_in, eval_table_lookup_slope_value_in,
     eval_table_lookup_value_in, eval_time_table_next_event_value_in,
+};
+pub use tangent_lanes::{
+    ColoredTangentEvaluator, DirectionCall, PreparedTangentLaneProgram, TangentPoint,
+    TornTangentEvaluator, TornTangentJacobian, causal_coefficient_is_finite,
 };
 pub use typed_program::{
     TypedProgramEvalError, TypedValue, TypedValueConstructionError, eval_pure_call,
@@ -580,7 +592,17 @@ pub struct RowEvalContext<'a> {
     pub seed: Option<&'a [f64]>,
     pub external_tables: Option<&'a [rumoca_core::ExternalTableData]>,
     pub pure_calls: Option<&'a SolvePureCallTable>,
+    pub pure_call_execution: Option<&'a dyn PureCallExecution>,
     pub runtime_state: Option<&'a SimulationRuntimeState>,
+}
+
+/// Immutable numerical point and direction for one Jacobian evaluation.
+#[derive(Clone, Copy)]
+pub struct JacobianEvalInputs<'a> {
+    pub y: &'a [f64],
+    pub p: &'a [f64],
+    pub t: f64,
+    pub seed: &'a [f64],
 }
 
 impl<'a> RowEvalContext<'a> {
@@ -1173,20 +1195,16 @@ pub fn event_action_request_from_values(
                     message: eval_event_action_message(action, y, p, t, context)?,
                 });
             }
-            SolveEventActionKind::Warning => {
-                let message = eval_event_action_message(action, y, p, t, context)?;
-                tracing::warn!(
-                    target: "rumoca_eval_solve::assert",
-                    time = t,
-                    "assertion warning: {message}"
-                );
-            }
+            // A violated warning never aborts or terminates the run; its
+            // report is owned by the runtime diagnostics (MLS §8.3.7).
+            SolveEventActionKind::Warning => {}
         }
     }
     Ok(EventActionRequest::Continue)
 }
 
-fn eval_event_action_message(
+/// The message of one event action, rendered at one point.
+pub fn eval_event_action_message(
     action: &rumoca_ir_solve::SolveEventAction,
     y: &[f64],
     p: &[f64],
@@ -1409,6 +1427,15 @@ fn trim_fraction_zeros(value: &mut String, exponent_marker: char) {
     if end != exponent {
         value.replace_range(end..exponent, "");
     }
+}
+
+/// Largest interleaved lane count of one tensor operation.
+const MAX_OP_LANES: usize = rumoca_ir_solve::MAX_TENSOR_LANES;
+
+/// Seed index of tangent lane `lane` (1-based) of element `element` of a tensor
+/// load: seeds are element-major, `lanes - 1` tangent seeds per element.
+fn tensor_seed_index(seed_start: usize, element: usize, lanes: usize, lane: usize) -> usize {
+    (seed_start + element) * (lanes - 1) + (lane - 1)
 }
 
 pub fn eval_row(
@@ -2245,14 +2272,17 @@ fn eval_lazy_tensor_load(
     for element in 0..range.count {
         regs[range.dst_start as usize + element * range.lanes] =
             values[range.input_start + element];
-        if range.lanes == 2 {
-            regs[range.dst_start as usize + element * range.lanes + 1] = match range.seed_start {
-                Some(seed_start) => input
-                    .context
-                    .seed
-                    .and_then(|seed| seed.get(seed_start + element))
-                    .copied()
-                    .ok_or_else(|| input.missing_input("seed", seed_start + element, 0))?,
+        for lane in 1..range.lanes {
+            regs[range.dst_start as usize + element * range.lanes + lane] = match range.seed_start {
+                Some(seed_start) => {
+                    let index = tensor_seed_index(seed_start, element, range.lanes, lane);
+                    input
+                        .context
+                        .seed
+                        .and_then(|seed| seed.get(index))
+                        .copied()
+                        .ok_or_else(|| input.missing_input("seed", index, 0))?
+                }
                 None => 0.0,
             };
         }
@@ -2544,10 +2574,10 @@ impl CheckedRowEvaluator<'_, '_, '_, '_> {
                             let lhs_re = self.get(lhs_start + lhs as Reg)?;
                             let rhs_re = self.get(rhs_start + rhs as Reg)?;
                             values[output] += lhs_re * rhs_re;
-                            if lanes == 2 {
-                                values[output + 1] += self.get(lhs_start + lhs as Reg + 1)?
-                                    * rhs_re
-                                    + lhs_re * self.get(rhs_start + rhs as Reg + 1)?;
+                            for lane in 1..lanes {
+                                values[output + lane] +=
+                                    self.get(lhs_start + (lhs + lane) as Reg)? * rhs_re
+                                        + lhs_re * self.get(rhs_start + (rhs + lane) as Reg)?;
                             }
                         }
                     }
@@ -2573,13 +2603,13 @@ impl CheckedRowEvaluator<'_, '_, '_, '_> {
                     let lhs_re = self.get(lhs)?;
                     let rhs_re = self.get(rhs)?;
                     values.push(eval_tensor_binary_primal(op, lhs_re, rhs_re, lanes));
-                    if lanes == 2 {
+                    for lane in 1..lanes {
                         values.push(eval_tensor_binary_tangent(
                             op,
                             lhs_re,
-                            self.get(lhs + 1)?,
+                            self.get(lhs + lane as Reg)?,
                             rhs_re,
-                            self.get(rhs + 1)?,
+                            self.get(rhs + lane as Reg)?,
                         ));
                     }
                 }
@@ -2593,15 +2623,17 @@ impl CheckedRowEvaluator<'_, '_, '_, '_> {
                 rhs_start,
                 lanes,
             } => {
-                let mut lhs = [0.0; 6];
-                let mut rhs = [0.0; 6];
-                for offset in 0..3 * lanes {
+                let count = 3 * lanes;
+                let mut lhs = [0.0; CROSS_VALUES];
+                let mut rhs = [0.0; CROSS_VALUES];
+                for offset in 0..count {
                     lhs[offset] = self.get(lhs_start + offset as Reg)?;
                     rhs[offset] = self.get(rhs_start + offset as Reg)?;
                 }
-                let values = tensor_cross_values(&lhs, &rhs, lanes);
-                for (offset, value) in values.into_iter().take(3 * lanes).enumerate() {
-                    self.set(dst_start + offset as Reg, value)?;
+                let mut values = [0.0; CROSS_VALUES];
+                tensor_cross_values(&lhs[..count], &rhs[..count], lanes, &mut values[..count]);
+                for (offset, value) in values[..count].iter().enumerate() {
+                    self.set(dst_start + offset as Reg, *value)?;
                 }
             }
             LinearOp::TensorTranspose {
@@ -2730,20 +2762,20 @@ impl CheckedRowEvaluator<'_, '_, '_, '_> {
                         rumoca_ir_solve::TensorInputKind::P => self.input.p[input_start + element],
                     };
                     self.set(dst_start + (element * lanes) as Reg, value)?;
-                    if lanes == 2 {
+                    for lane in 1..lanes {
                         let tangent = match seed_start {
-                            Some(seed_start) => self
-                                .input
-                                .context
-                                .seed
-                                .and_then(|seed| seed.get(seed_start + element))
-                                .copied()
-                                .ok_or_else(|| {
-                                    self.input.missing_input("seed", seed_start + element, 0)
-                                })?,
+                            Some(seed_start) => {
+                                let index = tensor_seed_index(seed_start, element, lanes, lane);
+                                self.input
+                                    .context
+                                    .seed
+                                    .and_then(|seed| seed.get(index))
+                                    .copied()
+                                    .ok_or_else(|| self.input.missing_input("seed", index, 0))?
+                            }
                             None => 0.0,
                         };
-                        self.set(dst_start + (element * lanes + 1) as Reg, tangent)?;
+                        self.set(dst_start + (element * lanes + lane) as Reg, tangent)?;
                     }
                 }
             }
@@ -2828,12 +2860,10 @@ impl CheckedRowEvaluator<'_, '_, '_, '_> {
                 input_starts,
                 site,
             } => {
-                let values = eval_pure_call_payload(
-                    self.input.context.pure_calls,
-                    &site,
-                    &input_starts,
-                    |register| self.get(register),
-                )?;
+                let values =
+                    eval_pure_call_payload(self.input.context, &site, &input_starts, |register| {
+                        self.get(register)
+                    })?;
                 for (offset, value) in values.into_iter().enumerate() {
                     self.set(dst_start + offset as Reg, value)?;
                 }
@@ -2844,7 +2874,7 @@ impl CheckedRowEvaluator<'_, '_, '_, '_> {
                 site,
             } => {
                 let values = eval_pure_call_directional_payload(
-                    self.input.context.pure_calls,
+                    self.input.context,
                     &site,
                     &input_starts,
                     |register| self.get(register),
@@ -3401,16 +3431,17 @@ fn eval_row_prepared_fast(
                 for element in 0..*count {
                     regs[*dst_start as usize + element * *lanes] =
                         input_values[*input_start + element];
-                    if *lanes == 2 {
-                        regs[*dst_start as usize + element * *lanes + 1] = match seed_start {
-                            Some(seed_start) => input
-                                .context
-                                .seed
-                                .and_then(|seed| seed.get(*seed_start + element))
-                                .copied()
-                                .ok_or_else(|| {
-                                    input.missing_input("seed", *seed_start + element, 0)
-                                })?,
+                    for lane in 1..*lanes {
+                        regs[*dst_start as usize + element * *lanes + lane] = match seed_start {
+                            Some(seed_start) => {
+                                let index = tensor_seed_index(*seed_start, element, *lanes, lane);
+                                input
+                                    .context
+                                    .seed
+                                    .and_then(|seed| seed.get(index))
+                                    .copied()
+                                    .ok_or_else(|| input.missing_input("seed", index, 0))?
+                            }
                             None => 0.0,
                         };
                     }
@@ -3491,12 +3522,10 @@ fn eval_row_prepared_fast(
                 input_starts,
                 site,
             } => {
-                let values = eval_pure_call_payload(
-                    input.context.pure_calls,
-                    site,
-                    input_starts,
-                    |register| Ok(regs[register as usize]),
-                )?;
+                let values =
+                    eval_pure_call_payload(input.context, site, input_starts, |register| {
+                        Ok(regs[register as usize])
+                    })?;
                 regs[*dst_start as usize..*dst_start as usize + values.len()]
                     .copy_from_slice(&values);
             }
@@ -3506,7 +3535,7 @@ fn eval_row_prepared_fast(
                 site,
             } => {
                 let values = eval_pure_call_directional_payload(
-                    input.context.pure_calls,
+                    input.context,
                     site,
                     input_starts,
                     |register| Ok(regs[register as usize]),
@@ -3690,22 +3719,23 @@ fn eval_matrix_multiply(
         let column = element % columns;
         let output = element * lanes;
         let mut re = 0.0;
-        let mut du = 0.0;
         for term in 0..inner {
             let lhs = (row * inner + term) * lanes;
             let rhs = (term * columns + column) * lanes;
-            let lhs_re = regs[lhs_start as usize + lhs];
-            let rhs_re = regs[rhs_start as usize + rhs];
-            re += lhs_re * rhs_re;
-            if lanes == 2 {
-                du += regs[lhs_start as usize + lhs + 1] * rhs_re
-                    + lhs_re * regs[rhs_start as usize + rhs + 1];
+            re += regs[lhs_start as usize + lhs] * regs[rhs_start as usize + rhs];
+        }
+        // Each tangent lane accumulates in the same term order as the dual lane.
+        for lane in 1..lanes {
+            let mut du = 0.0;
+            for term in 0..inner {
+                let lhs = (row * inner + term) * lanes;
+                let rhs = (term * columns + column) * lanes;
+                du += regs[lhs_start as usize + lhs + lane] * regs[rhs_start as usize + rhs]
+                    + regs[lhs_start as usize + lhs] * regs[rhs_start as usize + rhs + lane];
             }
+            regs[dst_start as usize + output + lane] = du;
         }
         regs[dst_start as usize + output] = re;
-        if lanes == 2 {
-            regs[dst_start as usize + output + 1] = du;
-        }
     }
 }
 
@@ -3724,11 +3754,13 @@ fn eval_tensor_binary(
         let dst = dst_start as usize + element * lanes;
         let lhs_re = regs[lhs];
         let rhs_re = regs[rhs];
-        regs[dst] = eval_tensor_binary_primal(op, lhs_re, rhs_re, lanes);
-        if lanes == 2 {
-            regs[dst + 1] =
-                eval_tensor_binary_tangent(op, lhs_re, regs[lhs + 1], rhs_re, regs[rhs + 1]);
+        let mut tangents = [0.0; MAX_OP_LANES];
+        for lane in 1..lanes {
+            tangents[lane] =
+                eval_tensor_binary_tangent(op, lhs_re, regs[lhs + lane], rhs_re, regs[rhs + lane]);
         }
+        regs[dst] = eval_tensor_binary_primal(op, lhs_re, rhs_re, lanes);
+        regs[dst + 1..dst + lanes].copy_from_slice(&tangents[1..lanes]);
     }
 }
 
@@ -3818,7 +3850,7 @@ fn eval_tensor_update(
 
 fn eval_tensor_binary_primal(op: BinaryOp, lhs_re: f64, rhs_re: f64, lanes: usize) -> f64 {
     let raw = eval_binary(op, lhs_re, rhs_re);
-    if lanes == 2 && op == BinaryOp::Div && rhs_re == 0.0 && lhs_re == 0.0 {
+    if lanes >= 2 && op == BinaryOp::Div && rhs_re == 0.0 && lhs_re == 0.0 {
         0.0
     } else {
         raw
@@ -3832,29 +3864,35 @@ fn eval_tensor_cross(
     rhs_start: Reg,
     lanes: usize,
 ) {
-    let mut lhs = [0.0; 6];
-    let mut rhs = [0.0; 6];
     let count = 3 * lanes;
+    let mut lhs = [0.0; CROSS_VALUES];
+    let mut rhs = [0.0; CROSS_VALUES];
     lhs[..count].copy_from_slice(&regs[lhs_start as usize..lhs_start as usize + count]);
     rhs[..count].copy_from_slice(&regs[rhs_start as usize..rhs_start as usize + count]);
-    let values = tensor_cross_values(&lhs, &rhs, lanes);
-    regs[dst_start as usize..dst_start as usize + count].copy_from_slice(&values[..count]);
+    tensor_cross_values(
+        &lhs[..count],
+        &rhs[..count],
+        lanes,
+        &mut regs[dst_start as usize..dst_start as usize + count],
+    );
 }
 
-fn tensor_cross_values(lhs: &[f64; 6], rhs: &[f64; 6], lanes: usize) -> [f64; 6] {
-    let mut output = [0.0; 6];
+/// Register values of the widest cross product, kept on the stack.
+const CROSS_VALUES: usize = 3 * MAX_OP_LANES;
+
+/// The cross product of two `lanes`-wide 3-vectors into `output`.
+fn tensor_cross_values(lhs: &[f64], rhs: &[f64], lanes: usize, output: &mut [f64]) {
     for (component, (first, second)) in [(1, 2), (2, 0), (0, 1)].into_iter().enumerate() {
         let dst = component * lanes;
         let first = first * lanes;
         let second = second * lanes;
         output[dst] = lhs[first] * rhs[second] - lhs[second] * rhs[first];
-        if lanes == 2 {
-            output[dst + 1] = lhs[first + 1] * rhs[second] + lhs[first] * rhs[second + 1]
-                - lhs[second + 1] * rhs[first]
-                - lhs[second] * rhs[first + 1];
+        for lane in 1..lanes {
+            output[dst + lane] = lhs[first + lane] * rhs[second] + lhs[first] * rhs[second + lane]
+                - lhs[second + lane] * rhs[first]
+                - lhs[second] * rhs[first + lane];
         }
     }
-    output
 }
 
 fn eval_tensor_binary_tangent(
@@ -3868,13 +3906,7 @@ fn eval_tensor_binary_tangent(
         BinaryOp::Add => lhs_du + rhs_du,
         BinaryOp::Sub => lhs_du - rhs_du,
         BinaryOp::Mul => lhs_du * rhs_re + lhs_re * rhs_du,
-        BinaryOp::Div => {
-            if rhs_re == 0.0 {
-                0.0
-            } else {
-                (lhs_du * rhs_re - lhs_re * rhs_du) / (rhs_re * rhs_re)
-            }
-        }
+        BinaryOp::Div => reverse::division_tangent(lhs_re, lhs_du, rhs_re, rhs_du),
         _ => {
             unreachable!("TensorBinary validation accepts only add, subtract, multiply, and divide")
         }
@@ -4371,16 +4403,26 @@ fn linear_op_name(op: &LinearOp) -> &'static str {
 }
 
 fn eval_pure_call_payload(
-    table: Option<&SolvePureCallTable>,
+    context: RowEvalContext<'_>,
     site: &SolvePureCallSite,
     input_starts: &[Reg],
     mut read: impl FnMut(Reg) -> Result<f64, EvalSolveError>,
 ) -> Result<Vec<f64>, EvalSolveError> {
-    let table = table.ok_or(EvalSolveError::MissingRuntimeState {
-        operation: "PureCall table",
-    })?;
+    let table = context
+        .pure_calls
+        .ok_or(EvalSolveError::MissingRuntimeState {
+            operation: "PureCall table",
+        })?;
     if !table.matches_site(site) || input_starts.len() != site.inputs().len() {
         return Err(invalid_row("pure-call site does not match its model owner"));
+    }
+    if let Some(execution) = context.pure_call_execution {
+        return pure_call_execution::eval_compiled_call(
+            execution,
+            PureCallInvocation::Primal(site),
+            input_starts,
+            &mut read,
+        );
     }
     eval_typed_call_payload(
         table,
@@ -4396,18 +4438,28 @@ fn eval_pure_call_payload(
 }
 
 fn eval_pure_call_directional_payload(
-    table: Option<&SolvePureCallTable>,
+    context: RowEvalContext<'_>,
     site: &SolvePureCallDirectionalSite,
     input_starts: &[Reg],
     mut read: impl FnMut(Reg) -> Result<f64, EvalSolveError>,
 ) -> Result<Vec<f64>, EvalSolveError> {
-    let table = table.ok_or(EvalSolveError::MissingRuntimeState {
-        operation: "PureCallDirectional table",
-    })?;
+    let table = context
+        .pure_calls
+        .ok_or(EvalSolveError::MissingRuntimeState {
+            operation: "PureCallDirectional table",
+        })?;
     if !table.matches_directional_site(site) || input_starts.len() != site.inputs().len() {
         return Err(invalid_row(
             "directional pure-call site does not match its model owner",
         ));
+    }
+    if let Some(execution) = context.pure_call_execution {
+        return pure_call_execution::eval_compiled_call(
+            execution,
+            PureCallInvocation::Directional(site),
+            input_starts,
+            &mut read,
+        );
     }
     eval_typed_call_payload(
         table,
@@ -4450,13 +4502,9 @@ fn eval_typed_call_payload(
     for (&start, value_type) in input_starts.iter().zip(inputs) {
         let mut elements = Vec::with_capacity(value_type.scalar_count() as usize);
         for offset in 0..value_type.scalar_count() as usize {
-            let register =
-                start
-                    .checked_add(Reg::try_from(offset).map_err(|_| {
-                        invalid_row("pure-call input range exceeds register identity")
-                    })?)
-                    .ok_or_else(|| invalid_row("pure-call input range overflows"))?;
-            elements.push(typed_kind_from_scalar(read(register)?, value_type)?);
+            elements.push(pure_call_execution::read_input_element(
+                start, offset, value_type, read,
+            )?);
         }
         arguments.push(
             TypedValue::construct(value_type.clone(), elements)
@@ -4607,9 +4655,10 @@ fn input_requirements_for_op(op: LinearOp) -> Result<RowInputRequirements, EvalS
                 count,
             )?;
             let seed_len = match seed_start {
-                Some(seed_start) if lanes == 2 => {
-                    checked_required_indexed_len("seed", seed_start, count)?
-                }
+                Some(seed_start) if lanes >= 2 => checked_required_len(
+                    "seed",
+                    tensor_seed_index(seed_start, count.saturating_sub(1), lanes, lanes - 1),
+                )?,
                 _ => 0,
             };
             Ok(match input {
@@ -4630,6 +4679,16 @@ fn input_requirements_for_op(op: LinearOp) -> Result<RowInputRequirements, EvalS
         | LinearOp::StoreOutputFunctionFold { program, .. } => {
             row_input_requirements(&program.update)
         }
+        // A region of a checked function conditional reads the same inputs as
+        // its row (a model conditional's arms load solver and seed values).
+        LinearOp::FunctionConditional { program, .. } => program
+            .arms
+            .iter()
+            .flat_map(|arm| [&arm.condition, &arm.result])
+            .chain(std::iter::once(&program.fallback))
+            .try_fold(RowInputRequirements::default(), |requirements, region| {
+                row_input_requirements(region).map(|region| requirements.merge(region))
+            }),
         _ => Ok(RowInputRequirements::default()),
     }
 }

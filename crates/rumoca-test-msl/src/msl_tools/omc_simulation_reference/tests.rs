@@ -162,6 +162,8 @@ fn select_models_preserves_generated_target_file_order() {
         force: false,
         workers: 1,
         omc_threads: 1,
+        rumoca_sim_workers: None,
+        rumoca_stage_workers: None,
         batch_timeout_seconds: 30,
         stop_time: 1.0,
         use_experiment_stop_time: false,
@@ -234,6 +236,9 @@ fn merge_cached_results_for_resume_hydrates_missing_omc_timing() {
             sim_system_seconds: None,
             total_system_seconds: None,
             omc_wall_seconds: None,
+            omc_phases: None,
+            omc_settings: None,
+            omc_timing_context: None,
             result_file: None,
             trace_file: None,
             trace_error: None,
@@ -300,6 +305,9 @@ fn ensure_omc_trace_artifacts_regenerates_missing_json_from_cached_csv() {
             sim_system_seconds: Some(0.25),
             total_system_seconds: Some(0.5),
             omc_wall_seconds: Some(0.75),
+            omc_phases: None,
+            omc_settings: None,
+            omc_timing_context: None,
             result_file: Some(format!("{model_name}_res.csv")),
             trace_file: Some(format!("sim_traces/omc/{model_name}.json")),
             trace_error: None,
@@ -366,6 +374,9 @@ fn ensure_omc_trace_artifacts_rejects_error_result_with_stale_csv() {
             sim_system_seconds: Some(0.25),
             total_system_seconds: Some(0.5),
             omc_wall_seconds: Some(0.75),
+            omc_phases: None,
+            omc_settings: None,
+            omc_timing_context: None,
             result_file: Some(format!("{model_name}_res.csv")),
             trace_file: Some(format!("sim_traces/omc/{model_name}.json")),
             trace_error: None,
@@ -424,6 +435,9 @@ fn cached_success_without_materialized_trace_source_is_not_reusable() {
         sim_system_seconds: Some(0.25),
         total_system_seconds: Some(0.5),
         omc_wall_seconds: Some(0.75),
+        omc_phases: None,
+        omc_settings: None,
+        omc_timing_context: None,
         result_file: Some(format!("{model_name}_res.csv")),
         trace_file: Some(format!("sim_traces/omc/{model_name}.json")),
         trace_error: None,
@@ -534,6 +548,9 @@ fn quantify_trace_differences_skips_excluded_model_before_trace_loading() {
             sim_system_seconds: Some(0.1),
             total_system_seconds: Some(0.2),
             omc_wall_seconds: Some(0.21),
+            omc_phases: None,
+            omc_settings: None,
+            omc_timing_context: None,
             result_file: None,
             trace_file: None,
             trace_error: None,
@@ -615,6 +632,9 @@ fn quantify_trace_differences_rejects_error_status_model_with_stale_traces() {
             sim_system_seconds: Some(0.1),
             total_system_seconds: Some(0.2),
             omc_wall_seconds: Some(0.21),
+            omc_phases: None,
+            omc_settings: None,
+            omc_timing_context: None,
             result_file: Some(format!("{model_name}_res.csv")),
             trace_file: Some(format!("sim_traces/omc/{model_name}.json")),
             trace_error: None,
@@ -689,6 +709,9 @@ fn quantify_trace_differences_rejects_undeclared_omc_trace_file() {
             sim_system_seconds: Some(0.1),
             total_system_seconds: Some(0.2),
             omc_wall_seconds: Some(0.21),
+            omc_phases: None,
+            omc_settings: None,
+            omc_timing_context: None,
             result_file: None,
             trace_file: None,
             trace_error: None,
@@ -818,15 +841,25 @@ fn load_trace_exclusions_reads_each_entrys_own_reason() {
     let temp = tempfile::tempdir().expect("tempdir");
     let exclusions_file = temp.path().join("trace_exclusions.json");
     let payload = serde_json::json!({
-        "schema": "msl_trace_compare_exclusions",
-        "exclusions": [
+        "schema": crate::msl_tools::common::TRACE_EXCLUSIONS_SCHEMA,
+        "exceptions": [
             {
                 "model_name": "Modelica.Blocks.Examples.Noise.ImpureGenerator",
-                "reason": "stochastic random-input model"
+                "kind": "impure_source",
+                "reason": "stochastic random-input model",
+                "evidence": {
+                    "facts": ["draws from Modelica.Math.Random.Generators"],
+                    "artifact": "msl:Modelica.Blocks.Examples.Noise.ImpureGenerator"
+                }
             },
             {
                 "model_name": "Modelica.Math.Random.Examples.GenerateRandomNumbers",
-                "reason": "wall-clock seeded generator"
+                "kind": "impure_source",
+                "reason": "wall-clock seeded generator",
+                "evidence": {
+                    "facts": ["seeds from the wall clock"],
+                    "artifact": "msl:Modelica.Math.Random.Examples.GenerateRandomNumbers"
+                }
             }
         ]
     });
@@ -843,6 +876,8 @@ fn load_trace_exclusions_reads_each_entrys_own_reason() {
         force: false,
         workers: 1,
         omc_threads: 1,
+        rumoca_sim_workers: None,
+        rumoca_stage_workers: None,
         batch_timeout_seconds: 1,
         stop_time: 1.0,
         use_experiment_stop_time: false,
@@ -859,13 +894,13 @@ fn load_trace_exclusions_reads_each_entrys_own_reason() {
     assert_eq!(exclusions.len(), 2);
     assert_eq!(
         exclusions.get("Modelica.Blocks.Examples.Noise.ImpureGenerator"),
-        Some(&"stochastic random-input model".to_string()),
+        Some(&"impure_source: stochastic random-input model".to_string()),
         "each entry keeps its own reason; one shared constant would attribute a false \
          rationale to every future exclusion"
     );
     assert_eq!(
         exclusions.get("Modelica.Math.Random.Examples.GenerateRandomNumbers"),
-        Some(&"wall-clock seeded generator".to_string())
+        Some(&"impure_source: wall-clock seeded generator".to_string())
     );
 }
 
@@ -980,6 +1015,9 @@ fn ensure_target_placeholders_preserves_full_target_denominator() {
             sim_system_seconds: None,
             total_system_seconds: None,
             omc_wall_seconds: None,
+            omc_phases: None,
+            omc_settings: None,
+            omc_timing_context: None,
             result_file: None,
             trace_file: None,
             trace_error: None,

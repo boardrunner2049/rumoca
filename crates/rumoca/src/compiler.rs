@@ -356,7 +356,9 @@ impl Compiler {
     /// The frontend only lowers; the optimizations it used to apply --
     /// inlining package constants, dropping proven-true assertions, folding
     /// pure calls -- are passes now (docs/design/minimal-frontend.md), so a
-    /// plain compile runs them to keep producing the same model.
+    /// plain compile runs them to keep producing the same model. A model
+    /// outside the bitcode profile still compiles natively when no pass was
+    /// named ([`crate::pass_stage::apply_implicit`]).
     fn requested_passes(&self) -> Vec<String> {
         match self.passes.as_slice() {
             [] if self.no_fold_parameter_bindings => rumoca_bitcode::passes::catalog()
@@ -376,6 +378,31 @@ impl Compiler {
             }
             requested => requested.to_vec(),
         }
+    }
+
+    /// Run the pass stage over a compiled model: `None` when it is skipped,
+    /// either by `--pass none` or because a model outside the bitcode profile
+    /// was compiled without naming a pass.
+    fn run_pass_stage(
+        &self,
+        dae: &rumoca_compile::compile::Dae,
+        flat: &rumoca_compile::compile::FlatModel,
+        model_name: &str,
+    ) -> Result<
+        Option<(
+            std::sync::Arc<rumoca_compile::compile::Dae>,
+            rumoca_bitcode::RbcFile,
+        )>,
+        CompilerError,
+    > {
+        let passes = self.requested_passes();
+        if passes.is_empty() {
+            return Ok(None);
+        }
+        if self.passes.is_empty() {
+            return crate::pass_stage::apply_implicit(dae, flat, model_name, &passes, self.verbose);
+        }
+        crate::pass_stage::apply(dae, flat, model_name, &passes, self.verbose).map(Some)
     }
 
     /// Build an artifact specialized to the declared fixed parameter values.
@@ -518,6 +545,18 @@ impl Compiler {
             let _ = session.update_document(file_name, source);
             return Ok(());
         }
+        // A file that a loaded source root already serves with this exact text
+        // is compiled from that root's cached parse, the same as a model
+        // referenced by name. Reading its enclosing package tree here would
+        // re-parse the whole library as workspace documents.
+        if let Some(uri) =
+            loaded_source_root_document_uri(session, path, source, &self.source_root_paths)
+        {
+            self.log_verbose(format!(
+                "[rumoca] Using loaded source-root document for {file_name}: {uri}"
+            ));
+            return Ok(());
+        }
 
         let files = collect_compile_unit_source_files(path)
             .map_err(|e| CompilerError::ParseError(format!("{}", e)))?;
@@ -639,16 +678,8 @@ impl Compiler {
         })?;
         let (mut result, resolved) = compilation.into_parts();
         report_compile_warnings(&mut session, model_name);
-        let passes = self.requested_passes();
         let mut bitcode = None;
-        if !passes.is_empty() {
-            let (dae, file) = crate::pass_stage::apply(
-                &result.dae,
-                &result.flat,
-                model_name,
-                &passes,
-                self.verbose,
-            )?;
+        if let Some((dae, file)) = self.run_pass_stage(&result.dae, &result.flat, model_name)? {
             result.dae = dae;
             bitcode = Some(file)
                 .filter(|file| !file.model.trace_points.is_empty() || file.execution.is_some());
@@ -768,16 +799,8 @@ impl Compiler {
 
         report_compile_warnings(&mut session, model_name);
         let mut result = result;
-        let passes = self.requested_passes();
-        if !passes.is_empty() {
-            result.dae = crate::pass_stage::apply(
-                &result.dae,
-                &result.flat,
-                model_name,
-                &passes,
-                self.verbose,
-            )?
-            .0;
+        if let Some((dae, _)) = self.run_pass_stage(&result.dae, &result.flat, model_name)? {
+            result.dae = dae;
         }
 
         if self.verbose {
@@ -795,6 +818,37 @@ impl Compiler {
 
         Ok(*result)
     }
+}
+
+/// Return the URI of the loaded source-root document that serves `path`, when
+/// that document was read from the same file and `source` is exactly the
+/// file's current text.
+///
+/// Source-root documents are keyed by the source-root path joined with the
+/// file's path relative to that root, so the lookup maps the canonical file
+/// path back into each root's own spelling. A root that was not loaded has no
+/// backed documents and never matches.
+fn loaded_source_root_document_uri(
+    session: &Session,
+    path: &Path,
+    source: &str,
+    source_root_paths: &[String],
+) -> Option<String> {
+    let canonical_file = path.canonicalize().ok()?;
+    let uri = source_root_paths.iter().find_map(|root| {
+        let root_path = Path::new(root);
+        let relative = canonical_file
+            .strip_prefix(root_path.canonicalize().ok()?)
+            .ok()?;
+        let uri = if relative.as_os_str().is_empty() {
+            root.clone()
+        } else {
+            root_path.join(relative).to_string_lossy().to_string()
+        };
+        session.is_source_root_backed_document(&uri).then_some(uri)
+    })?;
+    let file_text = fs::read_to_string(&canonical_file).ok()?;
+    (file_text == source).then_some(uri)
 }
 
 /// Print every warning-severity diagnostic the compiled model carries.
@@ -1294,6 +1348,191 @@ mod tests {
             result.is_ok(),
             "a root used only by the loaded library's classes must be loaded: {:?}",
             result.err()
+        );
+    }
+
+    /// Write a source root holding `Pkg` with a model, its dependency, and an
+    /// unrelated function whose missing purity prefix is a warning.
+    fn write_source_root_library(root: &Path) -> std::path::PathBuf {
+        let sub = root.join("Pkg").join("Sub");
+        fs::create_dir_all(&sub).expect("mkdir");
+        fs::write(root.join("Pkg").join("package.mo"), "package Pkg end Pkg;")
+            .expect("write package");
+        fs::write(sub.join("package.mo"), "within Pkg; package Sub end Sub;")
+            .expect("write sub package");
+        fs::write(
+            root.join("Pkg").join("Ext.mo"),
+            "within Pkg;\nfunction Ext\n  input Real x;\n  output Real y;\n  external \"C\" y = ext(x);\nend Ext;\n",
+        )
+        .expect("write unrelated function");
+        fs::write(
+            sub.join("Helper.mo"),
+            "within Pkg.Sub;\nmodel Helper\n  Real x(start=0);\nequation\n  der(x) = 1;\nend Helper;\n",
+        )
+        .expect("write helper");
+        let model = sub.join("Root.mo");
+        fs::write(
+            &model,
+            "within Pkg.Sub;\nmodel Root\n  Helper h;\n  Real y;\nequation\n  y = 2*h.x;\nend Root;\n",
+        )
+        .expect("write root");
+        model
+    }
+
+    fn loaded_session(compiler: &Compiler, source: &str, file_name: &str) -> Session {
+        let mut session = Session::new(SessionConfig::default());
+        compiler
+            .load_required_source_roots(&mut session, source)
+            .expect("load source roots");
+        compiler
+            .load_local_compile_unit(&mut session, source, file_name)
+            .expect("load compile unit");
+        session
+    }
+
+    /// SPEC_0040 DAE-C22: only a parameter guard over structurally different
+    /// branches is selected at translation, and it is reported once, at its
+    /// equation, naming the parameter that can no longer be set.
+    #[test]
+    fn a_structural_parameter_selection_is_reported_at_its_equation() {
+        let source = "model GuardKinds\n  parameter Boolean on = true;\n  \
+                      parameter Boolean useB = true;\n  Real x(start = 1, fixed = true);\n  \
+                      Real b;\n  Real y;\n  Real z;\nequation\n  der(x) = -x;\n  b = 2 * x;\n  \
+                      y = if on then x else 3 * x;\n  z = if useB then x else b;\nend GuardKinds;\n";
+        let compiler = Compiler::new().model("GuardKinds");
+        let mut session = loaded_session(&compiler, source, "GuardKinds.mo");
+        let warnings = rendered_warnings(&mut session, "GuardKinds")
+            .into_iter()
+            .filter(|warning| warning.contains("WD001"))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // The label is the `z = if useB ...` equation: zero-based line 11.
+        assert!(
+            warnings[0].contains("parameter useB cannot be set")
+                && warnings[0].contains("GuardKinds.mo:11"),
+            "{warnings:?}"
+        );
+    }
+
+    fn rendered_warnings(session: &mut Session, model_name: &str) -> Vec<String> {
+        let diagnostics = session.compile_model_diagnostics(model_name);
+        let source_map = diagnostics.source_map;
+        diagnostics
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let location = source_map
+                    .as_ref()
+                    .zip(diagnostic.labels.first())
+                    .and_then(|(map, label)| {
+                        rumoca_compile::compile::source_span_location(map, label.span)
+                    })
+                    .map(|loc| format!("{}:{}", loc.file_name, loc.start.line));
+                format!(
+                    "{:?} {:?} {} {:?}",
+                    diagnostic.severity, diagnostic.code, diagnostic.message, location
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_model_file_inside_loaded_source_root_reuses_source_root_documents() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("lib");
+        let model_file = write_source_root_library(&root);
+        let root_str = root.to_string_lossy().to_string();
+        let model_name = "Pkg.Sub.Root";
+        let compiler = Compiler::new().model(model_name).source_root(&root_str);
+
+        let file_source = fs::read_to_string(&model_file).expect("read model");
+        let file_name = model_file.to_string_lossy().to_string();
+        let mut by_file = loaded_session(&compiler, &file_source, &file_name);
+
+        // Every library file stays the source root's parsed document with no
+        // live text overlay: none was re-read and re-parsed as a workspace
+        // document of the compile unit.
+        for file in [
+            "Pkg/package.mo",
+            "Pkg/Ext.mo",
+            "Pkg/Sub/Helper.mo",
+            "Pkg/Sub/Root.mo",
+        ] {
+            // Documents are keyed by the path the source-root walk produced
+            // under the root as given: native separators, no canonicalization
+            // (a canonical key differs on macOS, where the temporary root is a
+            // symlink, and on Windows, where it carries the verbatim prefix).
+            let uri = file
+                .split('/')
+                .fold(root.clone(), |path, component| path.join(component))
+                .to_string_lossy()
+                .to_string();
+            assert!(
+                by_file.is_source_root_backed_document(&uri),
+                "{uri} must remain a source-root document"
+            );
+            let document = by_file.get_document(&uri).expect("library document");
+            assert!(
+                document.content.is_empty(),
+                "{uri} must not be re-parsed as a workspace document"
+            );
+        }
+
+        let by_name_source = format!("model Probe\n  {model_name} r;\nend Probe;\n");
+        let mut by_name = loaded_session(&compiler, &by_name_source, "Probe.mo");
+        assert_eq!(
+            rendered_warnings(&mut by_file, model_name),
+            rendered_warnings(&mut by_name, model_name),
+            "a model file inside a loaded source root reports the by-name diagnostics"
+        );
+
+        // The by-name compile also carries the probe document in its source
+        // map; the compiled model itself must be identical.
+        let dae_storage = |json: String| {
+            let value: serde_json::Value = serde_json::from_str(&json).expect("DAE JSON");
+            value["storage"].clone()
+        };
+        let from_file = compiler
+            .compile_file(&file_name)
+            .expect("compile model file")
+            .to_json()
+            .expect("json");
+        let from_name = compiler
+            .compile_str(&by_name_source, "Probe.mo")
+            .expect("compile by name")
+            .to_json()
+            .expect("json");
+        assert_eq!(dae_storage(from_file), dae_storage(from_name));
+    }
+
+    #[test]
+    fn test_edited_model_file_inside_source_root_compiles_the_given_text() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("lib");
+        let model_file = write_source_root_library(&root);
+        let compiler = Compiler::new()
+            .model("Pkg.Sub.Root")
+            .source_root(&root.to_string_lossy());
+        let edited = fs::read_to_string(&model_file)
+            .expect("read model")
+            .replace("y = 2*h.x;", "y = 7*h.x;");
+        let file_name = model_file.to_string_lossy().to_string();
+
+        let session = loaded_session(&compiler, &edited, &file_name);
+        let document = session.get_document(&file_name).expect("model document");
+        assert_eq!(
+            document.content.as_ref(),
+            edited,
+            "text that differs from the file must be compiled as given"
+        );
+        let json = compiler
+            .compile_str(&edited, &file_name)
+            .expect("compile edited text")
+            .to_json()
+            .expect("json");
+        assert!(
+            json.contains("\"integer\": 7"),
+            "edited equation must reach the DAE: {json}"
         );
     }
 

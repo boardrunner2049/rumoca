@@ -1097,6 +1097,7 @@ fn clocked_local_to_output_alias_is_oriented_and_ordered() {
                 output_declaration,
                 dae::VariableAttributes {
                     causality: dae::VariableCausality::Output,
+                    declared_causality: dae::DeclaredCausality::Output,
                     ..dae::VariableAttributes::default()
                 },
             )?;
@@ -1221,6 +1222,67 @@ fn coupled_b1b_residual_fails_closed_at_equation_provenance() {
             span: Some(span),
             ..
         } if feature == "coupled-discrete-real-equation" && span == equation_at.span()
+    ));
+}
+
+#[test]
+fn element_discrete_real_definition_fails_closed_at_equation_provenance() {
+    let text = "discrete Real z[2]; z[1] = 1.0; sample(0, 1);";
+    let mut sources = SourceMap::new();
+    let source = sources.add("element-real.mo", text);
+    let declaration = at(source, text, "discrete Real z[2]");
+    let equation_at = at(source, text, "z[1] = 1.0");
+    let clock_at = at(source, text, "sample(0, 1)");
+    let model = dae::Dae::construct(sources, |dae| {
+        let vector = dae.types(|types| {
+            types.intern(
+                TypeId::new(0),
+                dae::ValueType::array(dae::ScalarType::Real, [2]),
+                declaration,
+            )
+        })?;
+        let z = dae.variables(|variables| {
+            variables.discrete_real(
+                VarName::new("z"),
+                vector,
+                declaration,
+                dae::VariableAttributes::default(),
+            )
+        })?;
+        let (lhs, rhs) = dae.expressions(|expressions| {
+            let read = expressions
+                .at(equation_at)
+                .coordinate(dae::CoordinateInput::DiscreteReal(z))?;
+            let first = expressions
+                .at(equation_at)
+                .literal(dae::DaeLiteral::Integer(1))?;
+            Ok((
+                expressions.at(equation_at).index(
+                    read,
+                    [dae::Subscript::Index {
+                        expression: first,
+                        provenance: equation_at,
+                    }],
+                )?,
+                expressions
+                    .at(equation_at)
+                    .literal(dae::DaeLiteral::Real(1.0))?,
+            ))
+        })?;
+        periodic_clock(dae, clock_at)?;
+        define_real_equation(dae, equation_at, lhs, rhs)?;
+        Ok(())
+    })
+    .expect("checked element B.1b fixture");
+
+    let error = project(&model).expect_err("one element is not a whole state assignment");
+    assert!(matches!(
+        error,
+        GalecTargetError::UnsupportedFeature {
+            feature,
+            span: Some(span),
+            ..
+        } if feature == "element-discrete-real-definition" && span == equation_at.span()
     ));
 }
 

@@ -1052,6 +1052,7 @@ fn clock_domain_value_roots<'dae>(
         let Some(definition) = causal_plan.discrete_real_definition(index) else {
             continue;
         };
+        whole_discrete_real_definition(definition, equation.provenance().span())?;
         let target = dae::VariableId::from(definition.target());
         if require_discrete_real_clock_owner(&real_clocks, target, equation.provenance().span())?
             != clock.index()

@@ -452,6 +452,7 @@ fn empty_model() -> RbcModel {
         functions: Vec::new(),
         discrete_real_equations: Vec::new(),
         initial_discrete_values: Vec::new(),
+        initial_parameter_values: Vec::new(),
         name: String::new(),
         domains: Vec::new(),
         equation_families: Vec::new(),
@@ -633,6 +634,8 @@ fn parse_function(id: FunctionId, cursor: &mut Cursor<'_>) -> Result<RbcFunction
     let body = parse_function_body(cursor)?;
     let inline = if cursor.eat("inline") {
         RbcInline::Requested
+    } else if cursor.eat("lateinline") {
+        RbcInline::AfterIndexReduction
     } else if cursor.eat("noinline") {
         RbcInline::Never
     } else {
@@ -650,6 +653,7 @@ fn parse_function(id: FunctionId, cursor: &mut Cursor<'_>) -> Result<RbcFunction
         parameters,
         results,
         inline,
+        derivatives: Vec::new(),
         body,
         declaration: cursor.provenance()?,
     })
@@ -757,6 +761,31 @@ fn parse_variable_attribute(
         "class" => variable.declaring_class = Some(cursor.string()?),
         "desc" => variable.description = Some(cursor.string()?),
         "fixed" => variable.fixed = Some(cursor.word()? == "true"),
+        "fixed_elements" => {
+            variable.fixed_elements = Some(
+                serde_json::from_str(&cursor.string()?)
+                    .map_err(|error| TextError::at(cursor.line, error.to_string()))?,
+            );
+        }
+        "evaluable" => variable.evaluable = true,
+        "held" => variable.held = true,
+        "state_select" => {
+            variable.state_select = serde_json::from_str(&cursor.string()?)
+                .map_err(|error| TextError::at(cursor.line, error.to_string()))?
+        }
+        "declared" => {
+            variable.declared_causality = Some(match cursor.word()? {
+                "input" => RbcDeclaredCausality::Input,
+                "output" => RbcDeclaredCausality::Output,
+                "none" => RbcDeclaredCausality::None,
+                value => {
+                    return Err(TextError::at(
+                        cursor.line,
+                        format!("invalid declared causality {value}"),
+                    ));
+                }
+            })
+        }
         "tunable" => variable.tunable = true,
         "discrete" => variable.discrete_input = true,
         "contract" => variable.contract = Some(parse_contract(cursor)?),
@@ -796,6 +825,7 @@ fn parse_variable(id: VariableId, cursor: &mut Cursor<'_>) -> Result<RbcVariable
         name,
         role,
         causality,
+        declared_causality: None,
         value_type,
         scalar_count,
         declaration: placeholder_provenance(),
@@ -803,6 +833,10 @@ fn parse_variable(id: VariableId, cursor: &mut Cursor<'_>) -> Result<RbcVariable
         unit: None,
         description: None,
         fixed: None,
+        fixed_elements: None,
+        evaluable: false,
+        held: false,
+        state_select: RbcStateSelect::Default,
         start: None,
         min: None,
         max: None,
@@ -1304,6 +1338,10 @@ fn parse_action(cursor: &mut Cursor<'_>) -> Result<RbcAction, TextError> {
             };
             RbcAction::Assert { message, level }
         }
+        "warning" => RbcAction::Warning {
+            condition: ExprId(cursor.id('^')?),
+            message: ExprId(cursor.id('^')?),
+        },
         "terminate" => RbcAction::Terminate {
             message: ExprId(cursor.id('^')?),
         },
@@ -1454,6 +1492,7 @@ fn parse_discrete_header(cursor: &mut Cursor<'_>) -> Result<RbcDiscreteDefinitio
         targets.push(VariableId(cursor.id('%')?));
     }
     Ok(RbcDiscreteDefinition {
+        observed: cursor.eat("observed"),
         targets,
         branches: Vec::new(),
         provenance: placeholder_provenance(),
@@ -1536,6 +1575,13 @@ fn parse_statement(
         "dreq" => model
             .discrete_real_equations
             .push(parse_discrete_real_equation(cursor)?),
+        "ipval" => model
+            .initial_parameter_values
+            .push(RbcInitialDiscreteValue {
+                target: VariableId(cursor.id('%')?),
+                value: ExprId(cursor.id('^')?),
+                provenance: cursor.provenance()?,
+            }),
         "idval" => model.initial_discrete_values.push(RbcInitialDiscreteValue {
             target: VariableId(cursor.id('%')?),
             value: ExprId(cursor.id('^')?),

@@ -162,12 +162,17 @@ pub fn compile_packaged_target(
         bail!("target '{target}' does not declare a package");
     }
     ensure_target_has_rendered_files(&manifest)?;
-    validate_target_requirements(result, &manifest)?;
+    let validated = validate_target_requirements(result, &manifest)?;
     let identity = TargetModelIdentity::new(model);
     // Packaging CI drives the certifiable default; the dial is a `compile`
     // flag, and this entry point deliberately owns packaging only.
-    let renderer =
-        resolve_manifest_renderer(result, &manifest, &identity, EmissionPolicy::reviewable())?;
+    let renderer = resolve_manifest_renderer(
+        result,
+        &manifest,
+        &identity,
+        EmissionPolicy::reviewable(),
+        validated,
+    )?;
     compile_manifest_package(
         result,
         &renderer,
@@ -252,7 +257,7 @@ pub fn render_target_files(
     }
     let (bundle, manifest) = resolve_manifest_target(target, phase)?;
     ensure_target_has_rendered_files(&manifest)?;
-    validate_target_requirements(result, &manifest)?;
+    let validated = validate_target_requirements(result, &manifest)?;
 
     // Algorithm Code package targets render their artifact graph through the
     // generic checksum-web build step. In memory that is
@@ -273,8 +278,13 @@ pub fn render_target_files(
         let render = algorithm_code_web_render(&renderer, &bundle, &identity.artifact_stem);
         return crate::packaging::render_web_files(&manifest.files, render);
     }
-    let renderer =
-        resolve_manifest_renderer(result, &manifest, &identity, EmissionPolicy::reviewable())?;
+    let renderer = resolve_manifest_renderer(
+        result,
+        &manifest,
+        &identity,
+        EmissionPolicy::reviewable(),
+        validated,
+    )?;
     render_manifest_files(
         result,
         &renderer,
@@ -499,13 +509,14 @@ fn compile_manifest_target(
     emission_policy: EmissionPolicy,
 ) -> Result<()> {
     ensure_target_has_rendered_files(manifest)?;
-    validate_target_requirements(result, manifest)?;
+    let validated = validate_target_requirements(result, manifest)?;
 
     let identity = TargetModelIdentity::new(model);
 
     // Resolved before any filesystem effect: a renderer-level rejection
     // (e.g. the GALEC projection) must not leave an output directory behind.
-    let renderer = resolve_manifest_renderer(result, manifest, &identity, emission_policy)?;
+    let renderer =
+        resolve_manifest_renderer(result, manifest, &identity, emission_policy, validated)?;
     let out_dir =
         output.unwrap_or_else(|| default_target_output_dir(manifest, &identity.artifact_stem));
 
@@ -628,10 +639,22 @@ fn write_manifest_files(
     Ok(())
 }
 
+/// The capability proof for one target invocation.
+///
+/// An FMI target is proven on the checked component its renderer consumes:
+/// the Solve problem that passes the capability gate is the one that is
+/// rendered, and the model is lowered once per invocation.
+#[derive(Debug, Default)]
+struct ValidatedTarget {
+    #[cfg(feature = "fmi")]
+    fmi_component: Option<rumoca_ir_solve::fmi::FmiComponent>,
+}
+
 fn validate_target_requirements(
     result: &CompilationResult,
     manifest: &TargetManifest,
-) -> Result<()> {
+) -> Result<ValidatedTarget> {
+    let mut validated = ValidatedTarget::default();
     match manifest.ir {
         TargetTemplateIr::Dae | TargetTemplateIr::AlgorithmCode => {
             let capabilities = declared_capabilities(manifest)?;
@@ -643,6 +666,14 @@ fn validate_target_requirements(
             // source artifact as well so a partial kernel cannot erase tables,
             // randomness, events, or another target capability obligation.
             validate_dae_target_capabilities(&result.dae, manifest, capabilities)?;
+            #[cfg(feature = "fmi")]
+            if manifest.ir == TargetTemplateIr::Fmi {
+                let component = rumoca_sim::lower_fmi_component(&result.dae)
+                    .context("Construct checked FMI component")?;
+                validate_solve_target_capabilities(component.problem(), manifest, capabilities)?;
+                validated.fmi_component = Some(component);
+                return Ok(validated);
+            }
             let solve = rumoca_sim::lower_solve_problem(&result.dae)
                 .context("Lower Solve IR for target capability validation")?;
             validate_solve_target_capabilities(&solve, manifest, capabilities)?;
@@ -654,7 +685,7 @@ fn validate_target_requirements(
         // capability column could describe.
         TargetTemplateIr::Flat | TargetTemplateIr::Ast => {}
     }
-    Ok(())
+    Ok(validated)
 }
 
 /// The `[capabilities]` table a DAE-derived target must declare before it may
@@ -750,13 +781,17 @@ enum ManifestRenderer {
 /// generic IR-keyed context otherwise. The GALEC C projection runs here —
 /// once — so a rejection surfaces before any file or directory is created.
 /// (The `galec`/`galec-production` eFMU targets are dispatched separately via
-/// [`build_galec_plan`], before this is reached.)
+/// [`build_galec_plan`], before this is reached.) An FMI renderer consumes the
+/// component `validated` carries rather than lowering the model again.
 fn resolve_manifest_renderer(
     result: &CompilationResult,
     manifest: &TargetManifest,
     identity: &TargetModelIdentity<'_>,
     emission_policy: EmissionPolicy,
+    validated: ValidatedTarget,
 ) -> Result<ManifestRenderer> {
+    #[cfg(not(feature = "fmi"))]
+    let ValidatedTarget {} = validated;
     if manifest.ir == TargetTemplateIr::Solve && manifest.name.as_deref() == Some("wgsl-ode") {
         return Ok(ManifestRenderer::WgslSolve);
     }
@@ -779,8 +814,9 @@ fn resolve_manifest_renderer(
         bail!("FMI targets require the `fmi` feature");
         #[cfg(feature = "fmi")]
         {
-            let component = rumoca_sim::lower_fmi_component(&result.dae)
-                .context("Construct checked FMI component")?;
+            let Some(component) = validated.fmi_component else {
+                bail!("FMI target renderer requires the component its capability gate checked");
+            };
             // Admission preserves the correlated kernel and proves the complete
             // event profile before any FMI template receives its inventory.
             let c_profile = component
@@ -1030,7 +1066,7 @@ end FmiDelayedDecay;
             .expect("delayed target demo should compile")
     }
 
-    /// A model whose state event the generated FMI C does not implement.
+    /// A model with one state event and its relation memory.
     #[cfg(feature = "fmi")]
     fn compile_switched_target_demo() -> CompilationResult {
         let source = r#"
@@ -1045,6 +1081,23 @@ end FmiSwitchedDecay;
             .model("FmiSwitchedDecay")
             .compile_str(source, "FmiSwitchedDecay.mo")
             .expect("switched target demo should compile")
+    }
+
+    /// A model whose time event lies outside the generated FMI C profile.
+    #[cfg(feature = "fmu-packaging")]
+    fn compile_time_event_target_demo() -> CompilationResult {
+        let source = r#"
+model FmiTimeEventDecay
+  Real x(start = 1.0);
+equation
+  der(x) = if time > 0.5 then -1.0 else 1.0;
+end FmiTimeEventDecay;
+"#;
+
+        Compiler::new()
+            .model("FmiTimeEventDecay")
+            .compile_str(source, "FmiTimeEventDecay.mo")
+            .expect("time-event target demo should compile")
     }
 
     #[cfg(feature = "fmi")]
@@ -1083,24 +1136,21 @@ end FmiUndelayedDecay;
         );
     }
 
-    /// ME-EVENT-003: assertion-capable targets prove their event profile before
-    /// constructing a renderer; state-event relation memory is not admitted.
+    /// ME-EVENT-002: a state event with relation memory is admitted to the
+    /// scalar event profile, and the component renders its indicator table.
     #[cfg(feature = "fmi")]
     #[test]
-    fn fmi_targets_reject_state_events_at_the_checked_c_profile() {
+    fn fmi_targets_render_state_events_in_the_scalar_event_profile() {
         let result = compile_switched_target_demo();
         for target in ["fmi2", "fmi3"] {
-            let error = render_target_files(&result, "FmiSwitchedDecay", target, None)
-                .expect_err("static assertion support must not admit state events");
-            let profile_error = error
-                .downcast_ref::<rumoca_ir_solve::fmi::FmiCCodegenError>()
-                .expect("state events must fail the checked C profile before rendering");
-            assert!(
-                profile_error
-                    .to_string()
-                    .contains("continuous event indicators require general event support"),
-                "{target}: {error:#}"
-            );
+            let files = match render_target_files(&result, "FmiSwitchedDecay", target, None) {
+                Ok(files) => files,
+                Err(error) => panic!("{target}: {error:#}"),
+            };
+            let Some(model) = files.iter().find(|file| file.path.ends_with("model.c")) else {
+                panic!("{target} renders model.c");
+            };
+            assert!(model.content.contains("rmc_event_indicators"), "{target}");
         }
     }
 
@@ -1152,17 +1202,17 @@ end FmiUndelayedDecay;
 
     #[cfg(feature = "fmu-packaging")]
     #[test]
-    fn fmi_packaging_rejects_state_events_before_writing_any_output() {
-        let result = compile_switched_target_demo();
+    fn fmi_packaging_rejects_out_of_profile_events_before_writing_any_output() {
+        let result = compile_time_event_target_demo();
         for target in ["fmi2", "fmi3"] {
             let out_dir = tempfile::tempdir().expect("temp output dir");
             let error = compile_packaged_target(
                 &result,
-                "FmiSwitchedDecay",
+                "FmiTimeEventDecay",
                 target,
                 out_dir.path().to_path_buf(),
             )
-            .expect_err("an FMI package must reject state events");
+            .expect_err("an FMI package must reject events outside its C profile");
             assert!(
                 error
                     .downcast_ref::<rumoca_ir_solve::fmi::FmiCCodegenError>()
@@ -1174,7 +1224,7 @@ end FmiUndelayedDecay;
                     .expect("read temp output dir")
                     .count(),
                 0,
-                "{target} must reject state events before writing any artifact"
+                "{target} must reject an out-of-profile event before writing any artifact"
             );
         }
     }
@@ -1207,6 +1257,52 @@ end FmiUndelayedDecay;
                     .contains(rumoca_ir_solve::fmi::MAX_STEP_DURATION_NAME),
                 "{target} must not name a local an event-free component never publishes: {}",
                 description.content
+            );
+        }
+    }
+
+    /// The FMI capability gate proves the checked component the renderer then
+    /// consumes: the validated Solve problem is the lowering of the DAE, and
+    /// the renderer has no path that lowers the model a second time.
+    #[cfg(feature = "fmi")]
+    #[test]
+    fn fmi_target_validation_hands_its_component_to_the_renderer() {
+        let result = compile_undelayed_target_demo();
+        let identity = TargetModelIdentity::new("FmiUndelayedDecay");
+        let independent =
+            rumoca_sim::lower_solve_problem(&result.dae).expect("undelayed demo lowers");
+        for target in ["fmi2", "fmi3"] {
+            let (_, manifest) = resolve_manifest_target(target, None).expect("FMI manifest");
+            let validated =
+                validate_target_requirements(&result, &manifest).expect("FMI gate admits demo");
+            let component = validated
+                .fmi_component
+                .as_ref()
+                .expect("an FMI gate carries the component it validated");
+            assert_eq!(
+                format!("{:?}", component.problem()),
+                format!("{independent:?}"),
+                "{target}: the validated problem must be the DAE's Solve lowering"
+            );
+            resolve_manifest_renderer(
+                &result,
+                &manifest,
+                &identity,
+                EmissionPolicy::reviewable(),
+                validated,
+            )
+            .expect("the renderer consumes the validated component");
+
+            let unvalidated = resolve_manifest_renderer(
+                &result,
+                &manifest,
+                &identity,
+                EmissionPolicy::reviewable(),
+                ValidatedTarget::default(),
+            );
+            assert!(
+                unvalidated.is_err(),
+                "{target}: an FMI renderer must not lower a component of its own"
             );
         }
     }

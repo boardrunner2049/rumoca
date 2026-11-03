@@ -296,7 +296,7 @@ ctx.onFrame = (api) => {
                 title: trimMaybeString(entry.title) || `View ${out.length + 1}`,
                 type,
                 x,
-                y: type === '3d' ? y.slice(0, 2) : y,
+                y: type === '3d' ? [] : y,
                 ...(scatterSeries ? { scatterSeries } : {}),
                 ...(script ? { script } : {}),
                 ...(scriptPath ? { scriptPath } : {}),
@@ -318,6 +318,28 @@ ctx.onFrame = (api) => {
         return names.slice(0, stateCount).map(String);
     }
 
+    function availableOutputNames(result) {
+        const names = Array.isArray(result?.names) ? result.names : [];
+        const stateCount = Number.isFinite(result?.nStates) ? Math.max(0, result.nStates) : 0;
+        return names.slice(stateCount).map(String);
+    }
+
+    function parseSeriesListText(text) {
+        return String(text || '')
+            .split(/[\n,]/)
+            .map(trimMaybeString)
+            .filter(Boolean);
+    }
+
+    function toggleSeriesName(yText, name, include) {
+        const target = trimMaybeString(name);
+        const filtered = parseSeriesListText(yText).filter((entry) => entry !== target);
+        if (include && target) {
+            filtered.push(target);
+        }
+        return filtered.join(', ');
+    }
+
     function expandRequestedSeries(result, requested) {
         const names = Array.isArray(result?.names) ? result.names.map(String) : [];
         const expanded = [];
@@ -328,6 +350,14 @@ ctx.onFrame = (api) => {
             }
             if (name === '*states') {
                 expanded.push(...availableStateNames(result));
+                continue;
+            }
+            if (name === '*outputs') {
+                expanded.push(...availableOutputNames(result));
+                continue;
+            }
+            if (name === '*all') {
+                expanded.push(...names);
                 continue;
             }
             if (names.includes(name)) {
@@ -2969,13 +2999,12 @@ ctx.onFrame = (api) => {
         const x = String(xEl?.value || '').trim() || 'time';
         const y = parseLines(yEl?.value);
         if (type !== '3d' && y.length === 0) fail('Add at least one y series for each plot panel.', yEl);
-        if (type === '3d' && y.length > 0 && y.length < 2) fail('3D panels need two y entries for y/z data, or leave the field blank for script-driven views.', yEl);
         const view = {
           id: sanitizeId(preservedId || title, 'view_' + String(index + 1)),
           title,
           type,
           x,
-          y: type === '3d' && y.length === 0 ? [] : y,
+          y: type === '3d' ? [] : y,
         };
         const scriptPath = String(scriptPathEl?.value || '').trim();
         if (type === '3d' && scriptPath) view.scriptPath = scriptPath;
@@ -3353,6 +3382,14 @@ ctx.onFrame = (api) => {
     }
     document.getElementById('plotViewsList')?.addEventListener('change', (event) => {
       if (event.target?.matches?.('[data-view-field="type"]')) {
+        if (String(event.target.value || '') === '3d') {
+          const row = event.target.closest('[data-view-index]');
+          const yEl = row?.querySelector('[data-view-field="y"]');
+          if (yEl) {
+            yEl.value = '';
+            yEl.classList.remove('invalid');
+          }
+        }
         syncPlotViewVisibility();
       }
     });
@@ -3494,7 +3531,11 @@ ctx.onFrame = (api) => {
     }
 
 const VisualizationShared = {
+        availableOutputNames,
+        availableStateNames,
         buildHostedResultsPanelState,
+        expandRequestedSeries,
+        toggleSeriesName,
         flattenScenarioConfig,
         setScenarioConfigValue,
         applyScenarioConfigEdits,
@@ -3539,7 +3580,11 @@ const VisualizationShared = {
     };
 
 export {
+        availableOutputNames,
+        availableStateNames,
         buildHostedResultsPanelState,
+        expandRequestedSeries,
+        toggleSeriesName,
         flattenScenarioConfig,
         setScenarioConfigValue,
         applyScenarioConfigEdits,

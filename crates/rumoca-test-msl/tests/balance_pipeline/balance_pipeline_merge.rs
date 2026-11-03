@@ -996,13 +996,19 @@ fn merge_timing_payload(omc_payloads: &[Value]) -> Value {
             .sum::<usize>();
         root.insert(key.to_string(), json!(values));
     }
-    let workers = omc_payloads
-        .iter()
-        .filter_map(|payload| json_usize(payload, &["timing", "workers_used"]))
-        .sum::<usize>();
-    if workers > 0 {
-        root.insert("workers_used".to_string(), json!(workers));
+    // Worker counts are per shard host: each shard ran its own pool, so the
+    // merged count is the per-shard count (the largest when they differ), not
+    // their sum, and the shard count is recorded beside it.
+    for key in ["workers_used", "rumoca_sim_workers", "rumoca_stage_workers"] {
+        let workers = omc_payloads
+            .iter()
+            .filter_map(|payload| json_usize(payload, &["timing", key]))
+            .max();
+        if let Some(workers) = workers {
+            root.insert(key.to_string(), json!(workers));
+        }
     }
+    root.insert("shards".to_string(), json!(omc_payloads.len()));
     if let Some(omc_threads) = optional_same_usize(omc_payloads, &["timing", "omc_threads"]) {
         root.insert("omc_threads".to_string(), json!(omc_threads));
     }
@@ -1469,4 +1475,27 @@ fn merge_shard_parity_artifacts_writes_full_omc_and_trace_inputs() {
         trace.get("models").and_then(Value::as_object).map(Map::len),
         Some(2)
     );
+}
+
+/// Each shard ran its own OMC pool and its own rumoca simulation pool, so the
+/// merged timing keeps the per-shard worker counts and records the shard
+/// count; summing them would report contention no host saw.
+#[test]
+fn merged_omc_timing_keeps_per_shard_worker_counts() {
+    let shard = json!({
+        "timing": {
+            "workers_used": 2,
+            "rumoca_sim_workers": 2,
+            "omc_threads": 1,
+            "batches_total": 3,
+            "batches_ran": 3,
+            "batches_skipped": 0,
+            "batch_details": []
+        }
+    });
+    let merged = merge_timing_payload(&[shard.clone(), shard.clone(), shard]);
+    assert_eq!(merged["workers_used"], json!(2));
+    assert_eq!(merged["rumoca_sim_workers"], json!(2));
+    assert_eq!(merged["shards"], json!(3));
+    assert_eq!(merged["batches_ran"], json!(9));
 }

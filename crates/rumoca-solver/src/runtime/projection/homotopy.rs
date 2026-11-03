@@ -1,3 +1,19 @@
+//! Continuation for the `homotopy` initialization operator.
+//!
+//! The operator's semantics are MLS 3.6 section 3.7.4.3; the numerical method
+//! that follows the path from the simplified system to the actual one is
+//! ordinary predictor-free natural-parameter continuation with adaptive step
+//! control. E. L. Allgower and K. Georg, "Introduction to Numerical
+//! Continuation Methods", SIAM Classics in Applied Mathematics 45, 2003,
+//! chapters 1 to 3, is the reference for the method and for why a step that
+//! fails is retried at a smaller lambda increment rather than abandoned. The
+//! Modelica-specific use of it, and the reliability evidence for it on large
+//! initialization systems, is M. Sielemann, F. Casella, M. Otter, C. Clauss,
+//! J. Eborn, S. E. Mattsson and H. Olsson, "Robust Initialization of
+//! Differential-Algebraic Equations Using Homotopy", Proceedings of the 8th
+//! International Modelica Conference, 2011, pp. 75-85,
+//! doi:10.3384/ecp1106375.
+
 use super::{AlgebraicProjectionModel, RuntimeSolveError, project_initial_variables_with_plan};
 
 const INITIAL_CONTINUATION_STEP: f64 = 0.125;
@@ -33,7 +49,7 @@ pub(super) fn project_initial_variables_with_homotopy<M, F>(
 ) -> Result<(), RuntimeSolveError>
 where
     M: AlgebraicProjectionModel,
-    F: FnMut(&mut [f64], &[f64]) -> Result<(), RuntimeSolveError>,
+    F: FnMut(&mut [f64], &mut [f64]) -> Result<(), RuntimeSolveError>,
 {
     let super::InitialHomotopySystem {
         model,
@@ -41,6 +57,7 @@ where
         plan,
         homotopy_parameter_index,
         tol,
+        max_iters,
     } = system;
     let Some(lambda_index) = homotopy_parameter_index else {
         return project_initial_variables_with_plan(model, y, p, t, plan, tol);
@@ -53,8 +70,17 @@ where
     }
 
     let mut solve_at_lambda = |y: &mut [f64], p: &mut [f64]| -> Result<(), RuntimeSolveError> {
-        project_initial_variables_with_plan(model, y, p, t, plan, tol)?;
-        continuation_dependents(y, p)
+        for _ in 0..max_iters {
+            project_initial_variables_with_plan(model, y, p, t, plan, tol)?;
+            let before_discrete = p.to_vec();
+            continuation_dependents(y, p)?;
+            if *p == before_discrete {
+                return Ok(());
+            }
+        }
+        Err(RuntimeSolveError::solve_ir(
+            "initial homotopy discrete iteration did not converge",
+        ))
     };
 
     let original_y = y.to_vec();
@@ -75,6 +101,7 @@ where
         }
         let candidate_lambda = f64::min(1.0, accepted_lambda + step);
         let checkpoint = y.to_vec();
+        let checkpoint_p = p.to_vec();
         p[lambda_index] = candidate_lambda;
         match solve_at_lambda(y, p) {
             Ok(()) => {
@@ -86,7 +113,7 @@ where
             }
             Err(source) => {
                 y.copy_from_slice(&checkpoint);
-                p[lambda_index] = accepted_lambda;
+                p.copy_from_slice(&checkpoint_p);
                 step *= 0.5;
                 if step < MIN_CONTINUATION_STEP {
                     y.copy_from_slice(&original_y);
@@ -138,6 +165,7 @@ mod tests {
                         rows: vec![0],
                         y_indices: vec![0],
                         tearing: None,
+                        alternate_charts: Vec::new(),
                     }],
                 },
                 accepted_lambda: Cell::new(0.0),
@@ -222,6 +250,7 @@ mod tests {
             _p: &[f64],
             _t: f64,
             v: &[f64],
+            _rows: Option<&[usize]>,
             out: &mut [f64],
         ) -> Result<(), RuntimeSolveError> {
             out[0] = v[0];
@@ -238,6 +267,7 @@ mod tests {
             blocks: vec![solve::InitializationProjectionBlock {
                 rows: vec![0],
                 unknowns: vec![solve::scalar_slot_y(0)],
+                scales: vec![solve::InitializationUnknownScale::Solver],
             }],
         };
 
@@ -248,6 +278,7 @@ mod tests {
                 plan: &initial_plan,
                 homotopy_parameter_index: Some(0),
                 tol: 1.0e-10,
+                max_iters: 32,
             },
             &mut y,
             &mut p,
@@ -265,5 +296,107 @@ mod tests {
                 .any(|pair| pair[1] > pair[0] + 0.2),
             "the regression must exercise a rejected oversized continuation step"
         );
+    }
+
+    #[test]
+    fn continuation_restores_discrete_coordinates_before_retry() {
+        let model = StepLimitedModel::new();
+        let plan = solve::InitializationProjectionPlan {
+            blocks: vec![solve::InitializationProjectionBlock {
+                rows: vec![0],
+                unknowns: vec![solve::scalar_slot_y(0)],
+                scales: vec![solve::InitializationUnknownScale::Solver],
+            }],
+        };
+        let mut y = [0.0];
+        let mut p = [1.0, 0.0];
+        let mut accepted = 0.0;
+        let mut rejected = false;
+        project_initial_variables_with_homotopy(
+            super::super::InitialHomotopySystem {
+                model: &model,
+                t: 0.0,
+                plan: &plan,
+                homotopy_parameter_index: Some(0),
+                tol: 1e-10,
+                max_iters: 32,
+            },
+            &mut y,
+            &mut p,
+            |_, p| {
+                assert_ne!(
+                    p[1], 123.0,
+                    "a rejected discrete iterate leaked into its retry"
+                );
+                if p[0] - accepted > 0.1 {
+                    p[1] = 123.0;
+                    rejected = true;
+                    return Err(RuntimeSolveError::solve_ir("dependent step refused"));
+                }
+                p[1] = f64::from(p[0] >= 0.4);
+                accepted = p[0];
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(rejected);
+        assert_eq!(p, [1.0, 1.0]);
+        assert!((y[0] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn continuation_refuses_a_nonconverging_discrete_iteration_atomically() {
+        let model = StepLimitedModel::new();
+        let plan = solve::InitializationProjectionPlan {
+            blocks: vec![solve::InitializationProjectionBlock {
+                rows: vec![0],
+                unknowns: vec![solve::scalar_slot_y(0)],
+                scales: vec![solve::InitializationUnknownScale::Solver],
+            }],
+        };
+        let mut y = [7.0];
+        let mut p = [1.0, 0.0];
+        let error = project_initial_variables_with_homotopy(
+            super::super::InitialHomotopySystem {
+                model: &model,
+                t: 0.0,
+                plan: &plan,
+                homotopy_parameter_index: Some(0),
+                tol: 1e-10,
+                max_iters: 4,
+            },
+            &mut y,
+            &mut p,
+            |y, p| {
+                y[0] = 2.0;
+                p[1] = 1.0 - p[1];
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discrete iteration did not converge"),
+            "{error}"
+        );
+        assert_eq!(y, [7.0]);
+        assert_eq!(p, [1.0, 0.0]);
+    }
+
+    /// The combined initialization model issues no linked-kernel artifacts: it
+    /// declines every request, so initialization projects without them.
+    #[test]
+    fn the_combined_initialization_model_declines_linked_kernel_requests() {
+        let model = StepLimitedModel::new();
+        let combined = super::super::CombinedInitializationProjectionModel {
+            model: &model,
+            y_len: 1,
+            parameter_scales: vec![1.0],
+        };
+        let answer = combined
+            .linked_kernel(super::super::KernelRequest::EndBlock)
+            .expect("the request is answered");
+        assert!(matches!(answer, super::super::KernelAnswer::Declined));
     }
 }

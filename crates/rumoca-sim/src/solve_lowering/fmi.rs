@@ -71,11 +71,14 @@ pub(crate) fn lower_runtime_fmi_artifact(
 #[cfg(feature = "fmi")]
 pub fn lower_fmi_component(model: &dae::Dae) -> Result<FmiComponent, SimulationDiagnosticError> {
     let host_driven_seeds = host_driven_input_seeds(model)?;
-    rumoca_phase_solve::fmi::lower_to_fmi_component(model, &host_driven_seeds).map_err(|error| {
-        let span = error.span();
-        SimulationDiagnosticError::RuntimePreparation {
-            message: error.to_string(),
-            span,
-        }
-    })
+    let component = rumoca_phase_solve::fmi::lower_to_fmi_component(model, &host_driven_seeds)
+        .map_err(|error| {
+            let span = error.span();
+            SimulationDiagnosticError::RuntimePreparation {
+                message: error.to_string(),
+                span,
+            }
+        })?;
+    super::entry::report_unlocalizable_guards(&component.problem().continuous.unlocalizable_guards);
+    Ok(component)
 }

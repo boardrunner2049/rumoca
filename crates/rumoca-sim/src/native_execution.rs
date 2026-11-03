@@ -1,8 +1,13 @@
+#[cfg(test)]
+mod tests;
+
 use std::rc::Rc;
 
 struct CraneliftExpression(rumoca_exec_cranelift::CompiledExpressionRows);
 
 struct CraneliftJacobianExpression(rumoca_exec_cranelift::CompiledJacobianV);
+
+struct CraneliftProjectionJacobian(rumoca_exec_cranelift::CompiledProjectionJacobian);
 
 struct CraneliftAssignmentSchedule(rumoca_exec_cranelift::CompiledAssignmentSchedule);
 
@@ -13,6 +18,33 @@ struct CraneliftEventTransaction {
 }
 
 impl rumoca_solver::CompiledSolveExpression for CraneliftExpression {
+    fn call_program_outputs(
+        &self,
+        program: usize,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        external_tables: &[rumoca_core::ExternalTableData],
+        out: &mut Vec<f64>,
+    ) -> Result<bool, String> {
+        self.0
+            .call_program_outputs(program, y, p, t, external_tables, out)
+            .map_err(|error| error.to_string())
+    }
+
+    fn call_program_output(
+        &self,
+        coordinate: (usize, usize),
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        external_tables: &[rumoca_core::ExternalTableData],
+    ) -> Result<Option<f64>, String> {
+        self.0
+            .call_program_output(coordinate, y, p, t, external_tables)
+            .map_err(|error| error.to_string())
+    }
+
     fn call(
         &self,
         y: &[f64],
@@ -28,6 +60,43 @@ impl rumoca_solver::CompiledSolveExpression for CraneliftExpression {
 }
 
 impl rumoca_solver::CompiledSolveJacobianExpression for CraneliftJacobianExpression {
+    fn prepare_projection(
+        &self,
+        application: &rumoca_ir_solve::ProjectionJacobianApplication,
+    ) -> Result<Option<Rc<dyn rumoca_solver::CompiledSolveProjectionJacobian>>, String> {
+        self.0
+            .prepare_projection(application)
+            .map(|compiled| Some(Rc::new(CraneliftProjectionJacobian(compiled)) as Rc<_>))
+            .map_err(|error| error.to_string())
+    }
+    fn call_program_outputs(
+        &self,
+        program: usize,
+        inputs: rumoca_eval_solve::JacobianEvalInputs<'_>,
+        external_tables: &[rumoca_core::ExternalTableData],
+        out: &mut Vec<f64>,
+    ) -> Result<bool, String> {
+        self.0
+            .call_program_outputs(program, inputs, external_tables, out)
+            .map(|()| true)
+            .map_err(|error| error.to_string())
+    }
+
+    fn call_program_output(
+        &self,
+        coordinate: (usize, usize),
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        seed: &[f64],
+        external_tables: &[rumoca_core::ExternalTableData],
+    ) -> Result<Option<f64>, String> {
+        self.0
+            .call_program_output(coordinate, y, p, t, seed, external_tables)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
     fn call(
         &self,
         y: &[f64],
@@ -39,6 +108,21 @@ impl rumoca_solver::CompiledSolveJacobianExpression for CraneliftJacobianExpress
     ) -> Result<(), String> {
         self.0
             .call_with_external_tables(y, p, t, seed, external_tables, out)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl rumoca_solver::CompiledSolveProjectionJacobian for CraneliftProjectionJacobian {
+    fn call(
+        &self,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        external_tables: &[rumoca_core::ExternalTableData],
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        self.0
+            .call(y, p, t, external_tables, out)
             .map_err(|error| error.to_string())
     }
 }
@@ -62,16 +146,52 @@ impl rumoca_solver::CompiledSolveEventTransaction for CraneliftEventTransaction 
         let mut cells = self.cells.borrow_mut();
         let (input_cells, output_cells) = &mut *cells;
         self.pure_calls
-            .call_scalar_payload(&self.site, input, output, input_cells, output_cells)
+            .call_scalar_payload(
+                rumoca_eval_solve::PureCallInvocation::Primal(&self.site),
+                input,
+                output,
+                input_cells,
+                output_cells,
+            )
             .map_err(|error| error.to_string())
     }
 }
 
 struct CraneliftExecutionBackend {
     pure_calls: Option<rumoca_exec_cranelift::CompiledPureCallTable>,
+    call_cells: std::cell::RefCell<(Vec<u64>, Vec<u64>)>,
+}
+
+impl rumoca_eval_solve::PureCallExecution for CraneliftExecutionBackend {
+    fn call(
+        &self,
+        invocation: rumoca_eval_solve::PureCallInvocation<'_>,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), rumoca_eval_solve::EvalSolveError> {
+        let table = self.pure_calls.as_ref().ok_or(
+            rumoca_eval_solve::EvalSolveError::MissingRuntimeState {
+                operation: "native pure-call table",
+            },
+        )?;
+        let mut cells = self.call_cells.borrow_mut();
+        let (input_cells, output_cells) = &mut *cells;
+        table
+            .call_scalar_payload(invocation, input, output, input_cells, output_cells)
+            .map_err(|error| rumoca_eval_solve::EvalSolveError::InvalidRow {
+                message: error.to_string(),
+                span: None,
+            })
+    }
 }
 
 impl rumoca_solver::SolveExecutionBackend for CraneliftExecutionBackend {
+    fn pure_call_execution(&self) -> Option<&dyn rumoca_eval_solve::PureCallExecution> {
+        self.pure_calls
+            .as_ref()
+            .map(|_| self as &dyn rumoca_eval_solve::PureCallExecution)
+    }
+
     fn compile_expression(
         &self,
         block: &rumoca_ir_solve::ScalarProgramBlock,
@@ -87,6 +207,18 @@ impl rumoca_solver::SolveExecutionBackend for CraneliftExecutionBackend {
         compiled
             .map(|compiled| Rc::new(CraneliftExpression(compiled)) as Rc<_>)
             .map_err(|error| error.to_string())
+    }
+
+    fn compile_selectable_expression(
+        &self,
+        block: &rumoca_ir_solve::ScalarProgramBlock,
+    ) -> Result<Rc<dyn rumoca_solver::CompiledSolveExpression>, String> {
+        rumoca_exec_cranelift::compile_selectable_expression_scalar_program_block(
+            block,
+            self.pure_calls.as_ref(),
+        )
+        .map(|compiled| Rc::new(CraneliftExpression(compiled)) as Rc<_>)
+        .map_err(|error| error.to_string())
     }
 
     fn compile_jacobian_expression(
@@ -205,5 +337,8 @@ pub(crate) fn backend(
             None
         }
     };
-    Rc::new(CraneliftExecutionBackend { pure_calls })
+    Rc::new(CraneliftExecutionBackend {
+        pure_calls,
+        call_cells: Default::default(),
+    })
 }

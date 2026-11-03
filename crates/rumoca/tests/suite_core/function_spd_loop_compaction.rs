@@ -138,13 +138,13 @@ end checkSamples;
 model AssertionLoopSuccess
   Real state(start=0.0, fixed=true);
 equation
-  der(state) = checkSamples(3.0);
+  der(state) = checkSamples(3.0 + time);
 end AssertionLoopSuccess;
 
 model AssertionLoopFailure
   Real state(start=0.0, fixed=true);
 equation
-  der(state) = checkSamples(2.0);
+  der(state) = checkSamples(2.0 + time);
 end AssertionLoopFailure;
 "#;
 
@@ -414,10 +414,9 @@ fn guarded_output_loop_requires_a_fallthrough_value() {
         .compile_str(PARTIAL_GUARDED_OUTPUT_MODEL, "PartialGuardedOutput.mo")
         .expect_err("predicate pushdown must not invent an output value on the false path");
     // The one diagnostic this shape owns, not "any of three". The other two
-    // messages the old disjunction accepted belong to different rejections
-    // (`function_conditional_sequence_test.rs` owns the "without a definition
-    // on some branch" case), so accepting them here meant a regression that
-    // swapped one cause for another stayed green.
+    // messages the old disjunction accepted belong to different rejections,
+    // so accepting them here meant a regression that swapped one cause for
+    // another stayed green.
     assert!(
         error.to_string().contains(
             "`guardedFill` requires assignments or nested conditionals in every checked branch"

@@ -2,8 +2,23 @@
 //!
 //! Converts an N-equation algebraic loop into K iteration (tear) variables
 //! plus (N-K) causally ordered steps, reducing the nonlinear solve dimension.
+//!
+//! # References
+//!
+//! Tearing an algebraic loop down to a small residual set solved by Newton,
+//! with the remaining unknowns recovered by causal back-substitution, is H.
+//! Elmqvist and M. Otter, "Methods for tearing systems of equations in
+//! object-oriented modelling", Proceedings of ESM'94, European Simulation
+//! Multiconference, Barcelona, 1994, pp. 326-332. The heuristic this module
+//! implements, and the reason a minimum tear set is not required for
+//! correctness, are F. E. Cellier and E. Kofman, "Continuous System
+//! Simulation", Springer 2006, chapter 7. Choosing a minimum tear set is
+//! NP-hard, which is why every implementation including this one is greedy.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(test)]
+mod cost_tests;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Result of tearing an algebraic loop.
 #[derive(Debug, Clone)]
@@ -92,6 +107,10 @@ fn count_var_appearances(
     var_count
 }
 
+/// The number of remaining equations that tearing `tear_var` leaves with exactly
+/// one live unknown the equation can solve causally. [`UnlockCounts`] answers
+/// this for every unknown in one pass; this direct count is its reference.
+#[cfg(test)]
 fn causal_steps_unlocked_by_tearing(
     tear_var: usize,
     remaining_eqs: &BTreeSet<usize>,
@@ -112,6 +131,67 @@ fn causal_steps_unlocked_by_tearing(
             live.next().is_none() && causal_candidates[eq].contains(&candidate)
         })
         .count()
+}
+
+/// [`causal_steps_unlocked_by_tearing`] for every remaining unknown from one pass
+/// over the remaining equations. Tearing `v` removes it from each equation's live
+/// unknowns, so an equation unlocks exactly when its live set without `v` is a
+/// single causal candidate: a lone live candidate `c` unlocks for every `v` but
+/// `c`, and a live pair `{a, b}` unlocks for `a` when `b` is a candidate and for
+/// `b` when `a` is. Larger live sets never unlock.
+struct UnlockCounts {
+    lone: usize,
+    lone_on: HashMap<usize, usize>,
+    paired: HashMap<usize, usize>,
+}
+
+impl UnlockCounts {
+    fn count(
+        remaining_eqs: &BTreeSet<usize>,
+        remaining_unknowns: &BTreeSet<usize>,
+        eq_unknowns: &[HashSet<usize>],
+        causal_candidates: &[HashSet<usize>],
+    ) -> Self {
+        let mut unlocks = Self {
+            lone: 0,
+            lone_on: HashMap::new(),
+            paired: HashMap::new(),
+        };
+        for &eq in remaining_eqs {
+            let mut live = eq_unknowns[eq]
+                .iter()
+                .copied()
+                .filter(|var| remaining_unknowns.contains(var));
+            let Some(first) = live.next() else {
+                continue;
+            };
+            let candidates = &causal_candidates[eq];
+            match (live.next(), live.next()) {
+                (None, _) if candidates.contains(&first) => {
+                    unlocks.lone += 1;
+                    *unlocks.lone_on.entry(first).or_default() += 1;
+                }
+                (Some(second), None) => unlocks.count_pair(candidates, first, second),
+                _ => {}
+            }
+        }
+        unlocks
+    }
+
+    /// A live pair unlocks each member whose partner the equation can solve.
+    fn count_pair(&mut self, candidates: &HashSet<usize>, first: usize, second: usize) {
+        if candidates.contains(&second) {
+            *self.paired.entry(first).or_default() += 1;
+        }
+        if candidates.contains(&first) {
+            *self.paired.entry(second).or_default() += 1;
+        }
+    }
+
+    fn for_tear(&self, tear_var: usize) -> usize {
+        self.lone - self.lone_on.get(&tear_var).copied().unwrap_or(0)
+            + self.paired.get(&tear_var).copied().unwrap_or(0)
+    }
 }
 
 /// Apply greedy Cellier-style tearing to an algebraic loop.
@@ -137,6 +217,9 @@ pub fn tear_algebraic_loop(n: usize, eq_unknowns: &[HashSet<usize>]) -> Option<T
 ///
 /// `causal_candidates[e]` contains the variables that equation `e` can solve
 /// exactly. Genuinely implicit equations therefore remain tear residuals.
+/// Compare the complete plans from immediate causal progress and variable
+/// degree priorities; local connector progress can increase the final tear set.
+/// Equal-sized candidates retain the immediate-progress plan.
 pub fn tear_algebraic_loop_with_causal_candidates(
     n: usize,
     eq_unknowns: &[HashSet<usize>],
@@ -149,6 +232,62 @@ pub fn tear_algebraic_loop_with_causal_candidates(
         return None;
     }
 
+    let primary = tear_with_priority(
+        n,
+        eq_unknowns,
+        causal_candidates,
+        TearPriority::CausalUnlocks,
+    );
+    if primary
+        .as_ref()
+        .is_some_and(|plan| plan.tear_var_local_indices.len() == 1)
+    {
+        return primary;
+    }
+    let alternative = tear_with_priority(
+        n,
+        eq_unknowns,
+        causal_candidates,
+        TearPriority::VariableDegree,
+    );
+    match (primary, alternative) {
+        (Some(primary), Some(alternative))
+            if alternative.tear_var_local_indices.len() < primary.tear_var_local_indices.len() =>
+        {
+            Some(alternative)
+        }
+        (Some(primary), _) => Some(primary),
+        (None, alternative) => alternative,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TearPriority {
+    CausalUnlocks,
+    VariableDegree,
+}
+
+impl TearPriority {
+    fn score(
+        self,
+        unlocked: usize,
+        degree: usize,
+        variable: usize,
+    ) -> (usize, usize, std::cmp::Reverse<usize>) {
+        let (first, second) = match self {
+            Self::CausalUnlocks => (unlocked, degree),
+            Self::VariableDegree => (degree, unlocked),
+        };
+        (first, second, std::cmp::Reverse(variable))
+    }
+}
+
+fn tear_with_priority(
+    n: usize,
+    eq_unknowns: &[HashSet<usize>],
+    causal_candidates: &[HashSet<usize>],
+    priority: TearPriority,
+) -> Option<TearingResult> {
     let mut remaining_eqs: BTreeSet<usize> = (0..n).collect();
     let mut remaining_unknowns: BTreeSet<usize> = (0..n).collect();
     let mut causal_sequence: Vec<(usize, usize)> = Vec::new();
@@ -168,6 +307,12 @@ pub fn tear_algebraic_loop_with_causal_candidates(
         }
 
         let var_count = count_var_appearances(&remaining_eqs, eq_unknowns, &remaining_unknowns);
+        let unlocks = UnlockCounts::count(
+            &remaining_eqs,
+            &remaining_unknowns,
+            eq_unknowns,
+            causal_candidates,
+        );
 
         if var_count.is_empty() {
             // No progress possible
@@ -176,19 +321,7 @@ pub fn tear_algebraic_loop_with_causal_candidates(
 
         let &tear_var = var_count
             .iter()
-            .max_by_key(|&(v, count)| {
-                (
-                    causal_steps_unlocked_by_tearing(
-                        *v,
-                        &remaining_eqs,
-                        &remaining_unknowns,
-                        eq_unknowns,
-                        causal_candidates,
-                    ),
-                    *count,
-                    std::cmp::Reverse(*v),
-                )
-            })
+            .max_by_key(|&(v, count)| priority.score(unlocks.for_tear(*v), *count, *v))
             .map(|(v, _)| v)
             .unwrap();
 

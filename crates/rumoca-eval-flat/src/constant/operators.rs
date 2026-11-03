@@ -19,16 +19,18 @@ pub(super) fn eval_binary_op(
     }
     match op {
         OpBinary::Add => eval_add(lhs, rhs, span),
-        OpBinary::AddElem => broadcast_elementwise(eval_add, lhs, rhs, span),
+        OpBinary::AddElem => element_wise(lhs, rhs, span, eval_add),
         OpBinary::Sub => eval_sub(lhs, rhs, span),
-        OpBinary::SubElem => broadcast_elementwise(eval_sub, lhs, rhs, span),
+        OpBinary::SubElem => element_wise(lhs, rhs, span, eval_sub),
         // MLS array semantics: `*` is linear algebra multiply; `.*` is element-wise.
         OpBinary::Mul => eval_mul(lhs, rhs, span),
         OpBinary::MulElem => eval_mul_elem(lhs, rhs, span),
+        // MLS §10.6.5: `a / s` divides every element of an array by a scalar.
+        OpBinary::Div if !matches!(rhs, Value::Array(_)) => element_wise(lhs, rhs, span, eval_div),
         OpBinary::Div => eval_div(lhs, rhs, span),
-        OpBinary::DivElem => broadcast_elementwise(eval_div, lhs, rhs, span),
+        OpBinary::DivElem => element_wise(lhs, rhs, span, eval_div),
         OpBinary::Exp => eval_exp(lhs, rhs, span),
-        OpBinary::ExpElem => broadcast_elementwise(eval_exp, lhs, rhs, span),
+        OpBinary::ExpElem => element_wise(lhs, rhs, span, eval_exp),
         OpBinary::Eq => eval_eq(lhs, rhs),
         OpBinary::Neq => eval_neq(lhs, rhs),
         OpBinary::Lt => eval_lt(lhs, rhs, span),
@@ -41,37 +43,6 @@ pub(super) fn eval_binary_op(
             kind: format!("binary operator: {:?}", op),
             span,
         }),
-    }
-}
-
-/// MLS 3.6 §10.6.2-§10.6.6: the element-wise operators `.+`, `.-`, `./` and
-/// `.^` also accept one scalar operand, which is applied to every element of
-/// the other (array) operand: `2 .+ {1, 2}` is `{3, 4}` and `{1, 2} .- 1` is
-/// `{0, 1}`. Array-array and scalar-scalar operands keep the base rule.
-fn broadcast_elementwise(
-    op: fn(&Value, &Value, Span) -> Result<Value, EvalError>,
-    lhs: &Value,
-    rhs: &Value,
-    span: Span,
-) -> Result<Value, EvalError> {
-    match (lhs, rhs) {
-        (Value::Array(elements), Value::Integer(_) | Value::Real(_)) => elements
-            .iter()
-            .map(|element| broadcast_elementwise(op, element, rhs, span))
-            .collect::<Result<_, _>>()
-            .map(Value::Array),
-        (Value::Integer(_) | Value::Real(_), Value::Array(elements)) => elements
-            .iter()
-            .map(|element| broadcast_elementwise(op, lhs, element, span))
-            .collect::<Result<_, _>>()
-            .map(Value::Array),
-        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| broadcast_elementwise(op, x, y, span))
-            .collect::<Result<_, _>>()
-            .map(Value::Array),
-        _ => op(lhs, rhs, span),
     }
 }
 
@@ -136,6 +107,43 @@ pub(super) fn eval_unary_op(op: &OpUnary, rhs: &Value, span: Span) -> Result<Val
         OpUnary::Plus | OpUnary::DotPlus => Ok(rhs.clone()),
         OpUnary::Not => eval_not(rhs, span),
         OpUnary::Empty => Ok(rhs.clone()),
+    }
+}
+
+/// MLS 3.7 §10.6.2-§10.6.7 element-wise operators: an array operand pairs with
+/// an array of the same size element by element, and a scalar operand applies
+/// to every element of the other.
+fn element_wise(
+    lhs: &Value,
+    rhs: &Value,
+    span: Span,
+    scalar: fn(&Value, &Value, Span) -> Result<Value, EvalError>,
+) -> Result<Value, EvalError> {
+    match (lhs, rhs) {
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return Err(EvalError::function_error(
+                    format!("array size mismatch: {} vs {}", a.len(), b.len()),
+                    span,
+                ));
+            }
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| element_wise(x, y, span, scalar))
+                .collect::<Result<_, _>>()
+                .map(Value::Array)
+        }
+        (Value::Array(a), _) => a
+            .iter()
+            .map(|x| element_wise(x, rhs, span, scalar))
+            .collect::<Result<_, _>>()
+            .map(Value::Array),
+        (_, Value::Array(b)) => b
+            .iter()
+            .map(|y| element_wise(lhs, y, span, scalar))
+            .collect::<Result<_, _>>()
+            .map(Value::Array),
+        _ => scalar(lhs, rhs, span),
     }
 }
 

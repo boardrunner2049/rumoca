@@ -119,7 +119,20 @@ separate optional section whose presence is what makes an artifact non-total.
 Stage 3 is the only part that trades away something real, and it should be
 decided deliberately rather than arrived at.
 
-## Status (2026-09-30)
+## v0.10.1 integration (2026-10-07)
+
+The native main pipeline is now the default. Use `--pass default` (or `O1`)
+to run the bitcode optimization group, and `--pass round-trip` to test transport.
+This preserves main's support for recursive functions whose bodies the current
+bitcode profile intentionally elides. Unsupported reconstruction is still an
+error when a bitcode pipeline is explicitly requested. Main's rules for tunable
+parameter dependencies take precedence over declaration-binding folding.
+Function derivative annotations and initial Boolean parameters survive the
+bitcode round trip. Already-differentiated call provenance has no v2 encoding
+and export rejects it explicitly instead of discarding that proof.
+The measurements below describe the earlier branch baseline, not v0.10.1.
+
+## Historical status (2026-09-30)
 
 **The stage exists and is on by default.** A plain `rumoca compile` routes the
 frontend's DAE through `DAE -> RBC -> [default group] -> DAE`
@@ -209,7 +222,7 @@ sorted by the same question as before. Three more moved.
 | Was | Now |
 |---|---|
 | Instantiate: `fold_parameter_declaration_bindings` (on by default) evaluated a non-structural declaration binding when it happened to come out an Integer -- `parameter Real d = k * 10` with `k = 2` reached Flat as the Integer `20` | `fold-parameter-bindings`. The frontend keeps every non-structural, non-discrete binding as written; the pass writes the value, typed as declared (`20.0`), when the binding settles from literals, constants and non-tunable parameters. A binding that reads a tunable parameter is never folded: it can change on the artifact, and galec's `Recalibrate` recomputes the binding from it. `--no-fold-parameter-bindings` runs the default group without the pass; the session/instantiate option is gone. |
-| DAE construction: `selected_constant_branch` lowered only the arm of a structured body's top-level `if` that the constant context (every fixed parameter, tunable ones included) selected | `select-family-branches`, over every equation family (initial ones included) and the per-point bodies a materialized family packs, with the same environment. Construction lowers the whole conditional. |
+| DAE construction: `selected_constant_branch` lowered only the arm of a structured body's top-level `if` that the constant context (every fixed parameter, tunable ones included) selected | `select-family-branches`, over every equation family (initial ones included) and the per-point bodies a materialized family packs, deciding with constants and non-tunable parameters only: a guard reading a tunable parameter stays a run-time selection (SPEC_0040 DAE-C22). Construction lowers the whole conditional. |
 | Flatten: a Real package constant was declared as a model constant only where an *equation* read it; bindings, attributes, family templates and assertion conditions still had the number substituted | The declaration covers all of those, so `parameter Real w = 2*P.c` keeps `P.c` through lowering and `inline-constants` / `fold-parameter-bindings` fold it. |
 
 Default group, in order: `select-family-branches`, `fold-parameter-bindings`,

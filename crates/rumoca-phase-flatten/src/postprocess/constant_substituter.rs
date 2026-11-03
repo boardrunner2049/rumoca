@@ -49,6 +49,7 @@ pub(super) fn substitute_known_constants_expr_with_options(
             scope,
             prefer_scoped_parameters,
             expanding: None,
+            exposures: &[],
         },
     )
 }
@@ -132,6 +133,22 @@ impl FallibleExpressionRewriter for KnownConstantSubstituter<'_> {
                             1.0
                         },
                     ),
+                    span: *span,
+                })
+            }
+            rumoca_core::Expression::Index {
+                base,
+                subscripts,
+                span,
+            } => {
+                let base = self.rewrite_expression(base)?;
+                let subscripts = self.rewrite_subscripts(subscripts)?;
+                if let Some(element) = select_constant_element(&base, &subscripts) {
+                    return Ok(element.clone().with_span(*span));
+                }
+                Ok(rumoca_core::Expression::Index {
+                    base: Box::new(base),
+                    subscripts,
                     span: *span,
                 })
             }
@@ -355,12 +372,20 @@ fn substitute_indexed_constant_var_ref(
         return Ok(None);
     }
 
-    let constant_expr = if name.is_generated() {
+    // MLS §7.2: an element of a constant an extends modification of the
+    // exposing package binds (`extends Base(table = [...])`, read as `table[:, 1]`)
+    // selects from that binding, exactly as an unsubscripted read does.
+    let modified = (!name.is_generated())
+        .then(|| modified_constant_value(name.as_str(), env))
+        .flatten();
+    let constant_expr = if let Some((key, value)) = modified {
+        substitute_resolved_generated_constant(&key, value, span, env)?
+    } else if name.is_generated() {
         let Some(value) = resolve_constant_value_expr(name.as_str(), env.ctx) else {
             return Ok(None);
         };
         substitute_resolved_generated_constant(name.as_str(), value, span, env)?
-    } else if let Some((identity, value)) = resolve_source_constant(name, env.ctx) {
+    } else if let Some((identity, value)) = resolve_exposed_source_constant(name, span, env)? {
         substitute_resolved_source_constant(name.as_str(), identity, value, span, env)?
     } else {
         if name.target_def_id().is_none()
@@ -373,11 +398,48 @@ fn substitute_indexed_constant_var_ref(
         }
         return Ok(None);
     };
+    if let Some(element) = select_constant_element(&constant_expr, &subscripts) {
+        return Ok(Some(element.clone().with_span(span)));
+    }
     Ok(Some(rumoca_core::Expression::Index {
         base: Box::new(constant_expr),
         subscripts,
         span,
     }))
+}
+
+/// The element a compile-time subscript tuple selects from a constant `{...}`
+/// array value (MLS §10.5): `{"a", "b"}[2]` is `"b"`. Only literal in-range
+/// indices through nested `{...}` constructors select; anything else keeps the
+/// indexed expression.
+fn select_constant_element<'value>(
+    value: &'value rumoca_core::Expression,
+    subscripts: &[rumoca_core::Subscript],
+) -> Option<&'value rumoca_core::Expression> {
+    let Some((first, rest)) = subscripts.split_first() else {
+        return Some(value);
+    };
+    let rumoca_core::Expression::Array {
+        elements,
+        kind: rumoca_core::ArrayConstructor::Array,
+        ..
+    } = value
+    else {
+        return None;
+    };
+    let index = match first {
+        rumoca_core::Subscript::Index { value, .. } => *value,
+        rumoca_core::Subscript::Expr { expr, .. } => match expr.as_ref() {
+            rumoca_core::Expression::Literal {
+                value: rumoca_core::Literal::Integer(value),
+                ..
+            } => *value,
+            _ => return None,
+        },
+        rumoca_core::Subscript::Colon { .. } => return None,
+    };
+    let element = elements.get(usize::try_from(index).ok()?.checked_sub(1)?)?;
+    select_constant_element(element, rest)
 }
 
 fn substitute_scalar_var_ref(
@@ -464,7 +526,13 @@ fn substitute_source_scalar_var_ref(
     span: rumoca_core::Span,
     env: ConstantSubstitutionEnv<'_>,
 ) -> Result<Option<rumoca_core::Expression>, FlattenError> {
-    let Some((identity, value)) = resolve_source_constant(name, env.ctx) else {
+    // MLS §7.2: a constant an extends modification of the exposing package
+    // binds (`extends Base(k = 1)`) takes that binding, which outranks the
+    // declaration default and is keyed by the rendered exposing-package name.
+    if let Some((key, value)) = modified_constant_value(name.as_str(), env) {
+        return substitute_resolved_generated_constant(&key, value, span, env).map(Some);
+    }
+    let Some((identity, value)) = resolve_exposed_source_constant(name, span, env)? else {
         return substitute_source_constant_projection(name, span, env);
     };
     Ok(Some(substitute_resolved_source_constant(
@@ -654,8 +722,35 @@ fn substitute_resolved_generated_constant(
         scope,
         prefer_scoped_parameters: env.prefer_scoped_parameters,
         expanding: Some(&frame),
+        exposures: env.exposures,
     };
     substitute_with_env(expr.clone().with_span(span), inner)
+}
+
+/// The binding an extends modification of the exposing package gives the
+/// constant `key` names, read in `env.scope` (MLS §7.2): the rendered
+/// exposing-package key itself, or, for a reference written inside the
+/// package (`tableDensity` in a sibling binding), its scoped candidates.
+/// Only a simple name is looked up through the enclosing scopes (MLS 3.7
+/// §5.3.1); a composite name such as `world.g` starts at the component its
+/// first part names and never reaches a same-spelled constant of an
+/// enclosing scope.
+fn modified_constant_value<'e>(
+    key: &str,
+    env: ConstantSubstitutionEnv<'e>,
+) -> Option<(String, &'e rumoca_core::Expression)> {
+    let scoped = if !key.contains('.') {
+        scoped_lookup_candidates_with_scope(key, env.scope)
+    } else {
+        Vec::new()
+    };
+    std::iter::once(key.to_string())
+        .chain(scoped.into_iter().map(|(candidate, _)| candidate))
+        .find(|candidate| env.ctx.modified_constant_keys.contains(candidate.as_str()))
+        .and_then(|candidate| {
+            let value = resolve_constant_value_expr(&candidate, env.ctx)?;
+            Some((candidate, value))
+        })
 }
 
 fn substitute_resolved_source_constant(
@@ -674,6 +769,9 @@ fn substitute_resolved_source_constant(
             span,
         ));
     }
+    // The binding reads the package the constant is exposed through, so a
+    // sibling constant it names resolves there (MLS §5.3.2).
+    let exposing_scope = parent_component_scope(display);
     let frame = ConstantExpansion {
         identity,
         display,
@@ -681,6 +779,20 @@ fn substitute_resolved_source_constant(
     };
     let inner = ConstantSubstitutionEnv {
         expanding: Some(&frame),
+        scope: if exposing_scope.is_empty() {
+            env.scope
+        } else {
+            &exposing_scope
+        },
+        // A declaration read as an element of the package that exposes it is
+        // evaluated in that package: the names its binding reads resolve
+        // there (MLS §7.3, §5.3), not in the declaring class.
+        exposures: match semantic_id {
+            SemanticConstantId::Exposure { package, .. } => {
+                env.ctx.package_names(package).unwrap_or(env.exposures)
+            }
+            SemanticConstantId::Occurrence(_) | SemanticConstantId::Declaration(_) => env.exposures,
+        },
         ..env
     };
     substitute_with_env(expr.clone().with_span(span), inner)
@@ -750,6 +862,19 @@ pub(super) fn substitute_known_constants_statement(
     locals: &HashSet<String>,
     scope: &str,
 ) -> Result<(), FlattenError> {
+    substitute_exposed_constants_statement(statement, ctx, live_vars, locals, scope, &[])
+}
+
+/// [`substitute_known_constants_statement`] inside a function body exposed
+/// through `exposures` (see `function_exposures`).
+pub(super) fn substitute_exposed_constants_statement(
+    statement: &mut rumoca_core::Statement,
+    ctx: &Context,
+    live_vars: &rustc_hash::FxHashSet<String>,
+    locals: &HashSet<String>,
+    scope: &str,
+    exposures: &[String],
+) -> Result<(), FlattenError> {
     *statement = KnownConstantSubstituter {
         env: ConstantSubstitutionEnv {
             ctx,
@@ -758,8 +883,81 @@ pub(super) fn substitute_known_constants_statement(
             scope,
             prefer_scoped_parameters: false,
             expanding: None,
+            exposures,
         },
     }
     .rewrite_statement(statement)?;
     Ok(())
+}
+
+/// Resolve a source constant reference, taking the value the packages that
+/// expose the enclosing function give the declaration (MLS §7.3).
+fn resolve_exposed_source_constant<'a>(
+    name: &rumoca_core::Reference,
+    span: rumoca_core::Span,
+    env: ConstantSubstitutionEnv<'a>,
+) -> Result<Option<(SemanticConstantId, &'a rumoca_core::Expression)>, FlattenError> {
+    // `Base.cp` written explicitly names the declaring class's own element
+    // (MLS 3.7 §5.3.2), never the one an extending package modified.
+    if let Some(declaration) = name.target_def_id()
+        && let Some(value) = declaring_class_binding(name, declaration, env.ctx)
+    {
+        return Ok(Some((SemanticConstantId::Declaration(declaration), value)));
+    }
+    if let Some(declaration) = name.target_def_id()
+        && let Some(value) = super::function_exposures::exposed_constant_value(
+            env.ctx,
+            env.exposures,
+            declaration,
+            name.as_str(),
+            span,
+        )?
+    {
+        return Ok(Some((SemanticConstantId::Declaration(declaration), value)));
+    }
+    Ok(resolve_source_constant(name, env.ctx))
+}
+
+/// The value the declaring class itself gives `declaration`, when `name` is
+/// spelled through that class (`Base.cp`), keyed by its scope (FLAT-C02).
+fn declaring_class_binding<'a>(
+    name: &rumoca_core::Reference,
+    declaration: rumoca_core::DefId,
+    ctx: &'a Context,
+) -> Option<&'a rumoca_core::Expression> {
+    let prefix = name
+        .component_ref()?
+        .component_scope()
+        .prefix_parts()
+        .last()?;
+    let (scope, _) = crate::path_utils::scope_split(ctx.target_def_names.get(&declaration)?)?;
+    if ctx.target_def_names.get(&prefix.def_id).map(String::as_str) != Some(scope) {
+        return None;
+    }
+    ctx.constant_values_by_scope
+        .get(&(scope.to_string(), declaration))
+}
+
+/// Fold known constants in one expression of a function exposed through
+/// `exposures` (see `function_exposures`).
+pub(super) fn substitute_exposed_constants_expr(
+    expr: rumoca_core::Expression,
+    ctx: &Context,
+    live_vars: &rustc_hash::FxHashSet<String>,
+    locals: &HashSet<String>,
+    scope: &str,
+    exposures: &[String],
+) -> Result<rumoca_core::Expression, FlattenError> {
+    substitute_with_env(
+        expr,
+        ConstantSubstitutionEnv {
+            ctx,
+            live_vars,
+            locals,
+            scope,
+            prefer_scoped_parameters: false,
+            expanding: None,
+            exposures,
+        },
+    )
 }

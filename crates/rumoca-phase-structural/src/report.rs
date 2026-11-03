@@ -19,6 +19,9 @@ impl crate::PreparedDae<'_> {
                 n_unknowns: 0,
                 matching: Vec::new(),
                 blocks: Vec::new(),
+                aliases: crate::AliasQuotientReport::default(),
+                formal_aliases: crate::AliasQuotientReport::default(),
+                notes: Vec::new(),
             },
         })
     }
@@ -106,6 +109,15 @@ pub struct StructuralReport {
     pub matching: Vec<(String, String)>,
     /// BLT blocks in evaluation order.
     pub blocks: Vec<BlockReport>,
+    /// The STRUCT-T02 alias quotient applied before this analysis, including
+    /// every class it left unchanged and why.
+    pub aliases: crate::AliasQuotientReport,
+    /// The second, formal-derivative application of the quotient on the reduced
+    /// candidate Solve lowering executes, when one exists.
+    pub formal_aliases: crate::AliasQuotientReport,
+    /// Scope notes a reader needs to interpret this analysis, such as a
+    /// reduced state selection that executes a different system.
+    pub notes: Vec<String>,
 }
 
 impl StructuralReport {
@@ -199,6 +211,19 @@ impl fmt::Display for StructuralReport {
             self.largest_coupled_block(),
         )?;
 
+        for note in &self.notes {
+            writeln!(f, "note: {note}")?;
+        }
+        if !self.aliases.classes.is_empty() {
+            write!(f, "\n{}", self.aliases)?;
+        }
+        if !self.formal_aliases.classes.is_empty() {
+            write!(
+                f,
+                "\nformal-derivative application of the {}",
+                self.formal_aliases
+            )?;
+        }
         writeln!(f, "\nBLT blocks (evaluation order):")?;
         for (index, block) in self.blocks.iter().enumerate() {
             block.fmt_block(f, index)?;
@@ -236,6 +261,9 @@ mod tests {
         let report = StructuralReport {
             n_equations: 1_025,
             n_unknowns: 1_025,
+            aliases: crate::AliasQuotientReport::default(),
+            formal_aliases: crate::AliasQuotientReport::default(),
+            notes: Vec::new(),
             matching: Vec::new(),
             blocks: vec![
                 family_report(),
@@ -268,6 +296,9 @@ mod tests {
         let report = StructuralReport {
             n_equations: 1_024,
             n_unknowns: 1_024,
+            aliases: crate::AliasQuotientReport::default(),
+            formal_aliases: crate::AliasQuotientReport::default(),
+            notes: Vec::new(),
             matching: Vec::new(),
             blocks: vec![family_report()],
         };

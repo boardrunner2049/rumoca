@@ -69,11 +69,16 @@ fn statements_of<'dae>(
             dae::FunctionStatementView::Assertion {
                 condition,
                 message,
+                level,
                 provenance,
             } => {
                 statements.push(RbcFunctionStatement::Assertion {
                     condition: ExprId(condition.index()),
                     message: ExprId(message.index()),
+                    level: match level {
+                        dae::AssertionLevel::Error => RbcAssertionLevel::Error,
+                        dae::AssertionLevel::Warning => RbcAssertionLevel::Warning,
+                    },
                     provenance: ctx.provenance(provenance),
                 });
             }

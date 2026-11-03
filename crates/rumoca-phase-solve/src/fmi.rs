@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use rumoca_core::Span;
 use rumoca_ir_dae as dae;
 use rumoca_ir_solve::fmi::{
-    FmiCausality, FmiComponent, FmiComponentError, FmiVariability, FmiVariableInput,
+    FmiCausality, FmiComponent, FmiComponentError, FmiDeclaredCausality, FmiVariability,
+    FmiVariableInput,
 };
 use rumoca_ir_solve::{SolveVariableStorageRole, SolveVariableValueKind};
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,11 @@ impl FmiLoweringError {
     }
 }
 
-pub const FMI_COMPONENT_SCHEMA_VERSION: u16 = 1;
+/// Current FMI component wire schema; every other version is rejected.
+///
+/// 2 carries each variable's declared `input`/`output` prefix where it differs
+/// from the exported causality.
+pub const FMI_COMPONENT_SCHEMA_VERSION: u16 = 2;
 
 /// Borrowed, canonical construction inputs for one correlated FMI component.
 #[derive(Serialize)]
@@ -128,16 +133,18 @@ pub fn finish_fmi_component(
 fn lower_variables(view: dae::DaeView<'_>) -> Result<Vec<FmiVariableInput>, FmiLoweringError> {
     let mut numeric = rumoca_eval_dae::NumericEvaluator::new(view);
     view.variables()
-        .map(|(_, variable)| lower_variable(&mut numeric, variable))
+        .map(|(_, variable)| lower_variable(view, &mut numeric, variable))
         .collect()
 }
 
 fn lower_variable<'dae>(
+    view: dae::DaeView<'dae>,
     numeric: &mut rumoca_eval_dae::NumericEvaluator<'dae>,
     variable: dae::VariableView<'dae>,
 ) -> Result<FmiVariableInput, FmiLoweringError> {
     let scalar_count = variable.scalar_count();
     let role = solve_role(variable.role());
+    let causality = fmi_causality(variable.causality());
     let value_kind = solve_value_kind(variable)?;
     let start = match numeric_attribute(numeric, variable, variable.start())? {
         Some(values) => values,
@@ -158,11 +165,68 @@ fn lower_variable<'dae>(
         nominal: numeric_attribute(numeric, variable, variable.nominal())?,
         unit: variable.unit().map(str::to_owned),
         description: variable.description().map(str::to_owned),
-        causality: fmi_causality(variable.causality()),
+        causality,
+        declared_causality: declared_causality(variable.declared_causality())
+            .filter(|declared| declared.exported() != causality),
         variability: fmi_variability(variable),
         tunable: variable.is_tunable(),
+        evaluable: variable.is_evaluable(),
         declaration: variable.declaration().span(),
+        text_start: text_start(view, variable),
     })
+}
+
+/// The per-scalar literal start of a `String` declaration: its `start`
+/// attribute, else its binding, when that is a string literal or an array of
+/// string literals (a scalar literal broadcasts over an array declaration).
+/// Any other expression leaves the text start absent, and a consumer that
+/// needs one refuses the declaration rather than inventing a value.
+fn text_start<'dae>(
+    view: dae::DaeView<'dae>,
+    variable: dae::VariableView<'dae>,
+) -> Option<Vec<String>> {
+    if variable.value_type().scalar_type() != dae::ScalarType::String {
+        return None;
+    }
+    let expression = variable.start().or_else(|| variable.binding())?;
+    let mut values = Vec::new();
+    collect_string_literals(view, expression, &mut values)?;
+    let count = variable.scalar_count();
+    dae::broadcast_scalar_values(&mut values, count);
+    (values.len() == count).then_some(values)
+}
+
+fn collect_string_literals<'dae>(
+    view: dae::DaeView<'dae>,
+    expression: dae::ExprId<'dae>,
+    values: &mut Vec<String>,
+) -> Option<()> {
+    match view.expression(expression)?.operation() {
+        dae::ExpressionOperation::Literal(dae::DaeLiteral::String(text)) => {
+            values.push(text.clone());
+            Some(())
+        }
+        dae::ExpressionOperation::Array(elements) => {
+            let mut index = 0;
+            while let Some(element) = elements.get(index) {
+                collect_string_literals(view, element, values)?;
+                index += 1;
+            }
+            Some(())
+        }
+        // A literal filled over the declaration broadcasts like a scalar
+        // binding: `fill(text, n)` or an iterator-free comprehension.
+        dae::ExpressionOperation::Builtin {
+            builtin: dae::PureBuiltin::Fill,
+            arguments,
+        } => collect_string_literals(view, arguments.get(0)?, values),
+        dae::ExpressionOperation::Comprehension { body, .. } => {
+            let start = values.len();
+            collect_string_literals(view, body, values)?;
+            (values.len() == start + 1).then_some(())
+        }
+        _ => None,
+    }
 }
 
 fn numeric_attribute<'dae>(
@@ -178,7 +242,10 @@ fn numeric_attribute<'dae>(
     }
     if !matches!(
         variable.value_type().scalar_type(),
-        dae::ScalarType::Real | dae::ScalarType::Integer
+        dae::ScalarType::Real
+            | dae::ScalarType::Integer
+            | dae::ScalarType::Boolean
+            | dae::ScalarType::Enumeration
     ) {
         return Ok(None);
     }
@@ -190,9 +257,7 @@ fn numeric_attribute<'dae>(
                 message: error.to_string(),
                 span: error.span(),
             })?;
-    if values.len() == 1 && variable.scalar_count() > 1 {
-        values.resize(variable.scalar_count(), values[0]);
-    }
+    variable.broadcast_values(&mut values);
     if values.len() != variable.scalar_count() {
         return Err(FmiLoweringError::NumericMetadata {
             variable: variable.name().to_string(),
@@ -259,6 +324,14 @@ const fn fmi_causality(causality: dae::VariableCausality) -> FmiCausality {
         dae::VariableCausality::CalculatedParameter => FmiCausality::CalculatedParameter,
         dae::VariableCausality::Independent => FmiCausality::Independent,
         dae::VariableCausality::Local => FmiCausality::Local,
+    }
+}
+
+const fn declared_causality(causality: dae::DeclaredCausality) -> Option<FmiDeclaredCausality> {
+    match causality {
+        dae::DeclaredCausality::None => None,
+        dae::DeclaredCausality::Input => Some(FmiDeclaredCausality::Input),
+        dae::DeclaredCausality::Output => Some(FmiDeclaredCausality::Output),
     }
 }
 

@@ -58,13 +58,118 @@ fn index_three_inspection_agrees_with_simulation_preparation() {
     }
 }
 
+/// The reduced-selection note appears exactly when Solve lowering replaces the
+/// retained manifold: the pendulum's loop closure reduces, while a conserved
+/// unit-norm invariant keeps its source coordinates even though the reducer
+/// retains a manifold for it.
 #[test]
-fn structural_inspection_preserves_a_reduction_refusal() {
+fn structural_inspection_notes_a_reduced_selection_only_when_lowering_takes_it() {
+    let reduced_note = |report: &rumoca_phase_structural::StructuralReport| {
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("state selection built from formal derivatives"))
+    };
+    let options = SimOptions::default();
+    let pendulum = compile(PENDULUM, "Pend");
+    let report = match structural_report_for_dae(&pendulum, &options) {
+        Ok(report) => report,
+        Err(error) => panic!("the pendulum inspects: {error}"),
+    };
+    assert!(reduced_note(&report), "the pendulum reduces: {report:?}");
+
+    let rotation = compile(UNIT_ROTATION, "UnitRotation");
+    let retained = match rumoca_phase_structural::prepare_for_solve(&rotation) {
+        Ok(prepared) => prepared.inspect(|system| !system.manifold.is_empty()),
+        Err(error) => panic!("the rotation prepares: {error}"),
+    };
+    assert!(retained, "the reducer retains the unit-norm manifold");
+    let report = match structural_report_for_dae(&rotation, &options) {
+        Ok(report) => report,
+        Err(error) => panic!("the rotation inspects: {error}"),
+    };
+    assert!(
+        !reduced_note(&report),
+        "a conserved invariant is not reduced: {report:?}"
+    );
+}
+
+const UNIT_ROTATION: &str = r#"
+model UnitRotation
+  Real c(start = 1);
+  Real s(start = 0);
+  Real w;
+equation
+  w = 1 + time;
+  w = c*der(s) - s*der(c);
+  c*c + s*s = 1;
+end UnitRotation;
+"#;
+
+#[test]
+fn structural_inspection_retains_a_fixed_initial_value() {
     let source = PENDULUM.replace("start=1", "start=1, fixed=true");
     let dae = compile(&source, "Pend");
+    let options = SimOptions {
+        t_end: 0.1,
+        dt: Some(0.01),
+        ..SimOptions::default()
+    };
+    let solve = lower_dae_for_simulation(&dae, &options)
+        .expect("the retained manifold and fixed value have a joint initialization owner");
+    // The index-three pendulum reduces to an independent basis whose integrated
+    // state is a generated aggregate coordinate (fixed=false), so no source
+    // coordinate is a directly given integration start. MLS 3.6 §8.6 makes
+    // `x(start=1, fixed=true)` an initialization equation rather than a required
+    // integrator value, and SPEC_0053 section 2 solves that original
+    // initialization problem before mapping its result to the selected
+    // coordinates and adds no new fixed initial value. The fixed value is
+    // therefore enforced through the initialization solve (proved exactly by
+    // `x(0) == 1.0` below), not carried as a given-state index.
+    assert!(
+        solve
+            .problem
+            .initialization
+            .given_state_indices()
+            .is_empty()
+    );
+    let report = structural_report_for_dae(&dae, &options)
+        .expect("inspection consumes the same successful reduction");
+    assert_eq!(report.n_equations, report.n_unknowns);
+    assert_eq!(report.matching.len(), report.n_equations);
+    assert!(
+        diagnose_structural_singularity(&dae, &options)
+            .unwrap()
+            .is_none()
+    );
+    let trace =
+        simulate_dae(&dae, &options).expect("the fixed initial value must survive execution");
+    assert_eq!(trace.times.last(), Some(&0.1));
+    let x = trace.names.iter().position(|name| name == "x").unwrap();
+    let y = trace.names.iter().position(|name| name == "y").unwrap();
+    assert_eq!(trace.data[x][0], 1.0);
+    for (&x, &y) in trace.data[x].iter().zip(&trace.data[y]) {
+        assert!((x * x + y * y - 1.0).abs() < 1.0e-8);
+    }
+}
+
+#[test]
+fn structural_inspection_preserves_a_reduction_refusal() {
+    let dae = compile(
+        "model Conflict
+          Real x(start=1, fixed=true);
+          Real y(start=2, fixed=true);
+          Real f;
+        equation
+          x=y;
+          der(x)=f-x;
+          der(y)=-f-y;
+        end Conflict;",
+        "Conflict",
+    );
     let options = SimOptions::default();
     let simulation = lower_dae_for_simulation(&dae, &options)
-        .expect_err("reduction cannot discard a fixed initial value");
+        .expect_err("reduction cannot discard contradictory fixed initial values");
     let inspection = structural_report_for_dae(&dae, &options)
         .expect_err("inspection must retain the simulator's reduction refusal");
     let diagnosis = diagnose_structural_singularity(&dae, &options)
@@ -75,7 +180,9 @@ fn structural_inspection_preserves_a_reduction_refusal() {
         diagnosis.to_string(),
     ] {
         assert!(
-            message.contains("would discard the stated initial value of `x`"),
+            message.contains("conflicting stated initial values")
+                && message.contains("`x`")
+                && message.contains("`y`"),
             "{message}"
         );
     }

@@ -153,7 +153,21 @@ fn exact_function_exposure(
             &mut exposures,
         );
         if exposures.is_empty() {
-            collect_selected_package_exposures(ctx, owner, implementation, &mut exposures);
+            // MLS 7.3: the prefix names a replaceable package alias whose
+            // redeclaration provides the selected implementation.
+            for package in ctx
+                .override_packages
+                .iter()
+                .filter(|package| package.alias == prefix.ident.as_str())
+            {
+                collect_function_exposures_for_implementation(
+                    ctx.class_index,
+                    package.def_id,
+                    implementation,
+                    &mut FxHashSet::default(),
+                    &mut exposures,
+                );
+            }
         }
         if exposures.is_empty() {
             return Err(FlattenError::missing_function_selection_identity(
@@ -178,41 +192,6 @@ fn exact_function_exposure(
             span,
         )),
     }
-}
-
-/// Exposures of a function selected through a replaceable package alias.
-///
-/// `Medium.f(x)` written against `replaceable package Medium = PM` keeps the
-/// lexical alias as the prefix identity, while Instantiate has already
-/// retargeted the call to the implementation of the package this instance
-/// selected (`redeclare package Medium = Air` -> `Air.f`). The alias's own
-/// hierarchy cannot expose `Air.f`, so the owner that exposes it is the
-/// package declaring the selected implementation. Only a replaceable alias
-/// has an instance-dependent selection; any other owner keeps the strict
-/// check.
-fn collect_selected_package_exposures(
-    ctx: &FunctionOverrideRewriteContext<'_>,
-    owner: rumoca_core::DefId,
-    implementation: rumoca_core::DefId,
-    exposures: &mut FxHashSet<rumoca_core::DefId>,
-) {
-    if !ctx
-        .class_index
-        .get(owner)
-        .is_some_and(|class| class.is_replaceable)
-    {
-        return;
-    }
-    let Some(selected_package) = ctx.class_index.parent_def_id(implementation) else {
-        return;
-    };
-    collect_function_exposures_for_implementation(
-        ctx.class_index,
-        selected_package,
-        implementation,
-        &mut FxHashSet::default(),
-        exposures,
-    );
 }
 
 fn resolved_function_rewrite(
@@ -267,10 +246,33 @@ pub(super) fn exact_override_package_for_source_package<'a>(
             }
         }
     }
+    // MLS 7.3: a call spelled through a package alias selects that alias's
+    // package in this instance, even when the instance's redeclaration keeps
+    // the alias name (`redeclare package Medium = Medium`) and so is not an
+    // active override of its own; an enclosing scope's alias selecting the
+    // same source package is a different binding.
+    let prefix_alias = reference
+        .component_ref()
+        .and_then(|component_ref| component_ref.component_scope().prefix_parts().last())
+        .map(|prefix| prefix.ident.as_str());
+    let mut by_alias = inherited
+        .iter()
+        .filter(|package| Some(package.alias.as_str()) == prefix_alias);
+    if let (Some(package), None) = (by_alias.next(), by_alias.next()) {
+        return Ok(Some(*package));
+    }
     let has_active = !active.is_empty();
     let mut candidates = if has_active { active } else { inherited };
+    // MLS §4.5.1: a short class definition without modifications
+    // (`package Medium = ConstantPropertyLiquidWater`) denotes the class it
+    // names, so selections that reach one package through its aliases are one.
     let mut seen = FxHashSet::default();
-    candidates.retain(|package| seen.insert(package.def_id));
+    candidates.retain(|package| {
+        seen.insert(
+            resolve_package_alias_chain(ctx.tree, ctx.class_index, package.def_id)
+                .map_or(package.def_id, |selected| selected.def_id),
+        )
+    });
     if !has_active
         && let Some(lexical_package) = ctx.lexical_package_def_id
         && candidates
@@ -344,10 +346,14 @@ fn exact_redeclared_function_rewrite(
     ctx: &FunctionOverrideRewriteContext<'_>,
     span: rumoca_core::Span,
 ) -> Result<Option<ResolvedFunctionRewrite>, FlattenError> {
-    let mut matches = ctx.override_functions.values().filter(|target| {
-        target.class_type == rumoca_core::ClassType::Function
-            && target.function_slot == FunctionSlot::Exact(selection.exposure)
-    });
+    let (overrides, _) = ctx.function_override_scope(reference);
+    let mut matches = overrides
+        .into_iter()
+        .flat_map(|map| map.values())
+        .filter(|target| {
+            target.class_type == rumoca_core::ClassType::Function
+                && target.function_slot == FunctionSlot::Exact(selection.exposure)
+        });
     let target = matches.next();
     if matches.next().is_some() {
         return Err(FlattenError::missing_function_selection_identity(
@@ -415,10 +421,13 @@ fn refuse_unresolved_function_redeclare(
     else {
         return Ok(());
     };
-    let governs = ctx.override_functions.get(leaf).is_some_and(|target| {
-        target.class_type == rumoca_core::ClassType::Function
-            && target.function_slot == FunctionSlot::Unresolved
-    });
+    let (overrides, _) = ctx.function_override_scope(reference);
+    let governs = overrides
+        .and_then(|map| map.get(leaf))
+        .is_some_and(|target| {
+            target.class_type == rumoca_core::ClassType::Function
+                && target.function_slot == FunctionSlot::Unresolved
+        });
     if governs {
         return Err(FlattenError::unhonored_function_redeclare(
             reference.as_str(),
@@ -480,17 +489,35 @@ fn exact_package_function_rewrite(
         exposure,
         implementation,
     };
-    // An inherited, non-redeclared function keeps its implementation, but its
-    // body still resolves sibling members (`f(x)` in `PartialMedium`'s
-    // `specificEnthalpy_pTX`) in the package it is an element of (MLS §5.3).
-    // When the call is written through the replaceable alias this package
-    // is selected for, a package other than the declaring one (or a pure
-    // alias of it) therefore re-exposes the call, so the body is converted in
-    // the selected package's scope.
-    if projected == selection
-        && (is_pure_package_alias_of(ctx.class_index, package.def_id, source_owner)
-            || !prefix_is_replaceable_alias_for(reference, package, ctx))
-    {
+    // Instantiation may already have retargeted a call spelled through a
+    // package alias to the alias's redeclaration while the alias's own class
+    // (the replaceable slot's default) does not expose that implementation. The
+    // occurrence is then respelled through the redeclaring package so its
+    // function is converted in that package's scope, where the formal types
+    // resolve to the redeclared classes.
+    let prefix_part = reference
+        .component_ref()
+        .and_then(|component_ref| component_ref.component_scope().prefix_parts().last());
+    let alias_exposes_selection = prefix_part
+        .and_then(|prefix| exact_prefix_owner_def_id(ctx.class_index, prefix.def_id))
+        .is_some_and(|owner| {
+            let mut exposures = FxHashSet::default();
+            collect_function_exposures_for_implementation(
+                ctx.class_index,
+                owner,
+                projected.implementation,
+                &mut FxHashSet::default(),
+                &mut exposures,
+            );
+            !exposures.is_empty()
+        });
+    // An instance scope selects the package per instance, so a call there is
+    // respelled through that instance's concrete package even when the alias's
+    // default also exposes the implementation.
+    let instance_selects_package = package.active && !ctx.active_scope.is_root();
+    let respell_through_package = (instance_selects_package || !alias_exposes_selection)
+        && prefix_part.is_some_and(|prefix| prefix.ident == package.alias);
+    if projected == selection && !respell_through_package {
         return Ok(None);
     }
     let mut rewrite = resolved_function_rewrite(
@@ -503,57 +530,6 @@ fn exact_package_function_rewrite(
     )?;
     rewrite.exposed_package = Some((package.name.clone(), package.def_id));
     Ok(Some(rewrite))
-}
-
-/// True when the call's owner prefix is the replaceable class alias that
-/// `package` was selected for (`Medium.f` with `redeclare package Medium =
-/// W`).
-fn prefix_is_replaceable_alias_for(
-    reference: &rumoca_core::Reference,
-    package: &OverrideTarget,
-    ctx: &FunctionOverrideRewriteContext<'_>,
-) -> bool {
-    let Some(component_ref) = reference.component_ref() else {
-        return false;
-    };
-    let scope = component_ref.component_scope();
-    let Some(prefix) = scope.prefix_parts().last() else {
-        return false;
-    };
-    prefix.ident == package.alias
-        && ctx
-            .class_index
-            .get(prefix.def_id)
-            .is_some_and(|class| class.is_replaceable)
-}
-
-/// True when `package` is `owner` or a chain of unmodified short aliases of it
-/// (`package Medium = Owner`), which select exactly `owner`'s members.
-fn is_pure_package_alias_of(
-    class_index: &rumoca_ir_ast::ClassDefIndex<'_>,
-    mut package: rumoca_core::DefId,
-    owner: rumoca_core::DefId,
-) -> bool {
-    let mut visited = FxHashSet::default();
-    while package != owner {
-        if !visited.insert(package) {
-            return false;
-        }
-        let Some(class_def) = class_index.get(package) else {
-            return false;
-        };
-        let [base] = class_def.extends.as_slice() else {
-            return false;
-        };
-        let pure = class_def.components.is_empty()
-            && class_def.classes.is_empty()
-            && base.modifications.is_empty();
-        let Some(base_def_id) = base.base_def_id.filter(|_| pure) else {
-            return false;
-        };
-        package = base_def_id;
-    }
-    true
 }
 
 pub(super) fn resolve_exact_function_rewrite(

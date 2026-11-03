@@ -6,7 +6,7 @@ REFERENCE
 ## Summary
 
 Lookup catalog of single-source helper owners, session-owned state, session
-persistence, and layer ownership referenced by
+persistence, layer ownership, and the process allocator referenced by
 [SPEC_0029](SPEC_0029_CRATE_BOUNDARIES.md).
 
 ## How To Use This Catalog
@@ -33,6 +33,11 @@ import that path.
 | nearest named tool-config discovery and `ToolConfigError` | `rumoca-core::tool_config` | One parent-directory walk and one typed read/parse error shape shared by fmt/lint; each tool owns only its accepted filenames and config schema. |
 | `eval_ast_integer_binary` | `rumoca-core` | Checked MLS integer arithmetic shared by AST/Flat structural evaluators; `/` folds only when its Real result is exactly integral. |
 | AST scalar constant evaluation (`AstScalarContext`, `eval_integer`, `eval_real`, `eval_boolean`) | `rumoca-eval-ast::ast_scalar` | One syntax dispatch; compiler phases provide lookup, function-call, coercion, and diagnostic policy through adapters. |
+| Flat constant evaluation and scoped value lookup (`EvalEnvironment`, `EvalContext`) | `rumoca-eval-flat::constant` | Owned and borrowed inventories use the same expression interpreter and scoped lookup order. Inventory adapters supply values, dimensions, and function definitions; they do not duplicate expression semantics. |
+| Checked DAE function substitution and static branch selection (`FunctionCallContext`) | `rumoca-eval-dae::function_context` | Value and differentiation proofs share exact caller substitutions and selected source expressions. Selection follows literal/constant scalar selectors with exact Integer arithmetic; tunable parameters and runtime coordinates remain unknown. Tensor projections borrow existing source elements without enumeration, and source calls/assertions remain owned by the DAE. |
+| DAE scalar dependency projection | `rumoca-eval-dae::projection` | One query visits a shared model expression once per scalar, record field, and lexical domain point. Query-local visitation cannot suppress a later query; function summaries and actual argument environments remain distinct. |
+| Declared scalar-component dimensions | `rumoca-eval-ast::eval::DeclaredDimensions` | Typecheck and Flatten share value-independent declaration proofs and universal scalar facts over the current overlay; every prefix must prove a namespace or scalar component. An array occurrence (including an empty one) or unapplied redeclaration vetoes a universal scalar fact. |
+| AST/Flat array-constructor dimension compatibility for fully known operand extents | `rumoca-core::ArrayConstructor::checked_dimensions` | Local shape construction validates element uniformity, promoted concatenation, and extent arithmetic; phase owners supply operand shapes and retain unknown-shape policy. Canonical DAE builtin construction independently checks its typed operands. |
 | `dependency_first_sccs`, `DependencyScc` | `rumoca-core::dependency_graph` | Deterministic, iterative dependency-first SCC decomposition shared by checked recursive-owner construction. |
 | `InstanceId` | `rumoca-core` | Compact concrete-occurrence identity shared by Instanced and Flat reference vocabulary; source declarations continue to use `DefId`. |
 | UTF-8 byte offset ↔ UTF-16 text position/range helpers | `rumoca-core::text_position` | Protocol-neutral `TextPosition`/`TextRange`; LSP crates convert to/from `lsp_types` locally. No `rumoca-lsp-position` micro-crate. |
@@ -40,6 +45,7 @@ import that path.
 | `expr_contains_var` | `rumoca-ir-dae::expr_query` | Handles every `Expression` variant |
 | `expr_refers_to_var` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
 | `expr_contains_der_of` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
+| `ValueType::accepts_value_type` | `rumoca-ir-dae::expression::value_types` | Read-only assignment compatibility: identical types or same-shape Integer-to-Real coercion (MLS §10.6.13), shared by checked storage construction and causal-definition analysis. |
 | `DaeView::record_field_layout`, `RecordFieldLayout` | `rumoca-ir-dae::model::view` | Read-only element-major packing query shared by explicit DAE evaluation and Solve scalar-projection boundaries; compact record arrays remain owned by DAE-IR. |
 | `derive_target_assignment_shapes`, `derive_target_assignment_shape_for_output`, `ScalarProgramYDependency` | `rumoca-ir-solve` (`refresh::{assignment_shape, dependency}` internally) | One structural interpretation of checked Solve scalar programs shared by refresh-owner construction/wire replay and reference evaluation; the public helpers are re-exported from the crate root, and backend admissibility remains outside IR. |
 | Solve structural presence queries (`solve_has_events`, `solve_has_runtime_events`, `solve_has_clocks`, `solve_has_initialization`) and the event-class composition (`solve_event_class`, `SolveEventClass`) | `rumoca-ir-solve` (`feature_query` internally) | One reading of which partitions a checked `SolveProblem` contains, re-exported from the crate root and shared by `rumoca-compile`'s target-capability gate and the checked FMI event-free narrowing, so a class cannot be recognised by one and missed by the other. These are SPEC_0029 §3 read-only IR queries: presence only. Admissibility (comparing a class against a declared target capability, or against what a template can render) stays with the consumer and MUST NOT move here. |
@@ -54,6 +60,7 @@ import that path.
 | Solver pre-parameter snapshot helpers (`write_pre_params_from_sources`, `update_slot`, `commit_pre_params_after_event`) | `rumoca-solver::runtime::pre_params` | Shared `pre(...)` snapshot mechanics. |
 | Component-private algebraic settle helpers (`project_algebraics`, `project_algebraics_and_detect_changes`, `project_initial_*`) | `rumoca-solver::runtime::projection` | Used only while evaluating or initializing the FMI component; numerical plugins cannot import this policy. |
 | Component-private Solve evaluation state (`SolveRuntime`, event/discrete row application, algebraic settle, Jacobian/sensitivity reports) | `rumoca-solver::runtime::solve_runtime` | Used only behind the FMI component projection; the common host reaches it solely through the FMI ME kernel. |
+| Process global allocator and its startup configuration (`ProcessAllocator`, `ProcessAllocatorError`, `MIMALLOC_ARENA_RESERVE_KIB`, `GLIBC_MALLOC_ARENA_MAX`) | `rumoca-allocator` | Rules in §6. The only production crate that implements `GlobalAlloc` or sets mimalloc/glibc allocator options; it has no workspace dependencies. `xtask` stays free of every Rumoca workspace dependency (row below) and installs no global allocator. |
 | MSL parity observation-grid policy (`msl_sim_output_dt`, `MSL_SIM_OUTPUT_INTERVALS`) | `rumoca-worker` | A valid Modelica experiment interval owns the grid; otherwise Rumoca uses the same scale-invariant uniform base grid as the OMC oracle. Solver event instants remain additional output points. |
 
 ### 2. Session-Owned Source-Root And Class-Graph Catalog (SPEC_0029 §10)
@@ -87,6 +94,10 @@ import that path.
 | Typed executable programs plus distinct `SolveProblem` and `SolveAlgorithmBlock` (pending: 2026-08-08 plan, M3-4) roots | `rumoca-ir-solve` | Backend-neutral numerical and controller execution IR |
 | DAE → `SolveProblem`; checked Algorithm Code → `SolveAlgorithmBlock` lowering (pending: 2026-08-08 plan, M3-4) | `rumoca-phase-solve` | Exhaustive semantic lowering only, not structural mutation or rendering |
 | Checked DAE pure-function graph → numerical `SolveProblem` typed program regions and pure-call owners | `rumoca-phase-solve` | Numerical Solve lowering is distinct from the GALEC-first Algorithm Code refinement path |
+| Formal derivative stage residual kernels and directional AD | `rumoca-phase-solve` shared typed expression lowering | Bound to formal source owners; numerical analysis alone cannot admit an executable model |
+| Source-bound static coordinate proposals from formal stage kernels | `rumoca-phase-solve` | Composes checked stage semantics with numerical evaluation; structural reconstruction remains in `rumoca-phase-structural` |
+| Finite dense trial corrections and preference-constrained numerical basis pivoting | `rumoca-eval-solve::dense_basis` | Numeric payloads use `nalgebra`; minimum-norm trial corrections use a sequential `faer` thin SVD, tested against the `nalgebra` pseudo-inverse and for run-to-run determinism; source semantics and equation ownership stay with the compiler |
+| Model-Exchange algebraic projection numerical policy (refresh tolerance, iteration budgets, trust fraction, torn caps, finite-difference step rule) | `rumoca-eval-solve::projection_policy` | Read by the linked ME kernel and by every generated C component, so neither converges under a private policy (SPEC_0044 ME-PROJ-001) |
 | Checked FMI component aggregate (pending: SPEC_0038 both-crate absorption) | `rumoca-ir-solve::fmi` | Private invariant-bearing binding of DAE metadata/shape/provenance to one executable checked kernel; no parallel IR crate, ABI text, or runtime behavior |
 | DAE + Solve → checked FMI component lowering (pending: SPEC_0038 both-crate absorption) | `rumoca-phase-solve::fmi` behind its `fmi` feature | One target-neutral semantic projection shared by FMI 2 and FMI 3; non-FMI consumers do not acquire its phase dependencies |
 | Linked FMI component execution (pending: SPEC_0038 both-crate absorption) | `rumoca-solver` | Runtime reads `rumoca_ir_solve::fmi` through its existing Solve-IR dependency, never a phase crate |
@@ -139,23 +150,41 @@ Simulation composition:
   runtime counters, and constants. The signal-reference language must stay in the
   simulation/config layer and MUST NOT leak into compiler IR.
 
-### 6. Analysis Pass Ownership Catalog (SPEC_0029 §3)
+### 6. Process Allocator Catalog (SPEC_0029 §12)
+
+A process's reserved address space, not only its resident memory, counts
+against an address-space limit (`RLIMIT_AS`). `rumoca-allocator` owns the one
+process allocator (row in §1).
+
+| Rule | Brief Justification |
+|---|---|
+| Every workspace executable except `xtask` installs `rumoca_allocator::ProcessAllocator` as its `#[global_allocator]`; production code has no other global allocator, and `xtask`, which carries no Rumoca workspace dependency (§1), uses the platform allocator | One configuration, enforced by architecture test; the orchestration tool keeps its dependency-light boundary |
+| `rumoca-allocator` is an audited `unsafe` boundary: its crate-local `unsafe_code` allowance covers only the `GlobalAlloc` forwarding and the mimalloc/glibc option calls, and the review scan treats `unsafe` added there as audit, not forbidden | The C allocator ABI cannot be crossed without `unsafe`; every other non-execution crate stays under the default deny |
+| On Linux the allocator applies its configuration inside its first allocation, before the Rust runtime reaches `main` and before any thread exists | mimalloc reserves its first arena before `main`; configuring from `main` is too late |
+| The mimalloc arena reserve is `MIMALLOC_ARENA_RESERVE_KIB` = 64 MiB (mimalloc default: 1 GiB) | The smallest reservation mimalloc makes for a regular page; later arenas keep its geometric growth |
+| On Linux glibc the malloc arena bound is `GLIBC_MALLOC_ARENA_MAX` = 1 (`mallopt(M_ARENA_MAX)`) | glibc malloc serves only libc/std internals; one 64 MiB arena per thread made address space grow with the pool |
+| Both values are compile-time constants, independent of environment variables (`MIMALLOC_*`, `MALLOC_ARENA_MAX`) and of the core count | The bound holds on every host |
+| An option the platform does not accept aborts the process with the typed `ProcessAllocatorError` diagnostic; nothing falls back to the defaults | A silently unapplied bound hides the failure it prevents |
+| Off Linux, where reserved address space is not charged against a limit, `ProcessAllocator` is plain mimalloc | Behavior is unchanged where the bound buys nothing |
+| Library bindings (Python, WASM) install no global allocator; the host process owns its allocator | A library must not reconfigure its embedder |
+
+### 7. Analysis Pass Ownership Catalog (SPEC_0029 §3)
 
 Crate placement for the pass framework governed by
-[SPEC_0052](SPEC_0052_MODEL_ANALYSIS_PASSES.md).
+[SPEC_0054](SPEC_0054_MODEL_ANALYSIS_PASSES.md).
 
 | Owner | Tier | Owns | MUST NOT |
 |---|---|---|---|
 | `rumoca-pass` | 2 | Pass identity, `AnalysisPass`, `AnalysisContext`, the manager, requirement resolution and result caching | Depend on any `rumoca-ir-*`, `rumoca-phase-*`, or `rumoca-eval-*` crate; the framework is IR-generic and reaches only `rumoca-core` |
 | `rumoca-analysis` | 4 | Concrete IR analyses and their owned result types; the analysis facade the CLI consumes | Own Modelica semantics, mutate IR, emit artifacts, or depend on any consumer of its results |
-| `rumoca-pass-abi` | 2 | The versioned WIT interface definition and generated host/guest bindings for SPEC_0052 §5 | Contain analysis logic, IR types, or a wasm runtime; it is the contract, not an implementation |
+| `rumoca-pass-abi` | 2 | The versioned WIT interface definition and generated host/guest bindings for SPEC_0054 §5 | Contain analysis logic, IR types, or a wasm runtime; it is the contract, not an implementation |
 | `rumoca-pass-host` | 5 | Wasm runtime embedding, plugin discovery/loading, query-service implementation over live IR, capability and resource enforcement, request validation | Be a default dependency of `rumoca-bind-wasm`, or hand a plugin any pointer, handle, or serialized IR root |
 | `rumoca` (`analyze`, `diff`, plugin commands) | 6 | Argument parsing, pipeline and plugin selection, result rendering | Depend on a phase crate directly; it reaches analyses through `rumoca-analysis` and plugins through `rumoca-pass-host` |
 
 `rumoca-analysis` is Tier 4 because it consumes `rumoca-eval-dae` and
 `rumoca-phase-structural` — two Tier 3 crates, which a Tier 3 crate may not do.
 `rumoca-pass-host` is Tier 5 because it embeds a runtime; its plugin support is
-opt-in and is excluded from the default wasm binding graph (SPEC_0052 §5.5).
+opt-in and is excluded from the default wasm binding graph (SPEC_0054 §5.5).
 
 A pass-author SDK is deliberately absent from this catalog: plugin authors
 depend on `rumoca-pass-abi`'s published interface or on WIT bindings generated

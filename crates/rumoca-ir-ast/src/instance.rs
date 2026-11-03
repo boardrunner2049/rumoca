@@ -574,18 +574,9 @@ pub struct InstanceData {
     /// (e.g., `redeclare package Medium = Medium`) that is remapped to an active
     /// enclosing override during instantiation (MLS §7.3).
     pub has_forwarding_class_redeclare: bool,
-    /// True when a redeclare modification was consumed for this component —
-    /// either an `extends` modification that redeclared it
-    /// (`extends Base(redeclare C a[2])`) or a redeclare modifier written on
-    /// its own declaration (`Holder h(redeclare C a[2])`), MLS §7.3.
-    ///
-    /// Instantiation consumes only the redeclared *type*; the redeclaration's
-    /// array dimensions are dropped. `dims` on such an instance (and on
-    /// anything instantiated underneath it) is therefore this compiler's
-    /// residue of the *original* declaration, not a statement about the model,
-    /// and must never be reported to the user as one.
-    #[serde(default)]
-    pub had_redeclare: bool,
+    /// This occurrence or an enclosing occurrence retains an unapplied
+    /// component redeclaration. Its dimensions cannot establish a shape proof.
+    pub has_unapplied_redeclare: bool,
 
     // Type prefixes (MLS §4.4.2, SPEC_0022 §3.19-3.20)
     /// Variability (constant, parameter, discrete, continuous).
@@ -600,8 +591,10 @@ pub struct InstanceData {
     // Resolved attribute values (MLS §4.4)
     /// Start value attribute.
     pub start: Option<Expression>,
-    /// Fixed attribute.
-    pub fixed: Option<bool>,
+    /// Fixed attribute, scalarized per component element (MLS §4.8, §4.8.6). A
+    /// single value broadcasts over every element; an array carries one value
+    /// per element.
+    pub fixed: Option<Vec<bool>>,
     /// Minimum value attribute.
     pub min: Option<Expression>,
     /// Maximum value attribute.
@@ -621,12 +614,11 @@ pub struct InstanceData {
 
     /// Binding equation value (resolved).
     pub binding: Option<Expression>,
-    /// Optional symbolic binding source expression for modification-derived bindings.
+    /// Symbolic binding before evaluation for structural queries.
     ///
-    /// MLS §7.2.4: component modifications are written in an outer scope and may
-    /// intentionally reference outer parameters (e.g., `gain(g = k)`).
-    /// We retain this source form for flat-output rendering while keeping `binding`
-    /// available as a resolved value for semantic passes.
+    /// Declarations and modifications retain their binding equation here when
+    /// instantiation resolves a different value into `binding`. Flattening uses
+    /// this source to preserve dependencies on changeable parent parameters.
     pub binding_source: Option<Expression>,
     /// Lexical scope where a modification-derived binding was written.
     ///
@@ -652,6 +644,10 @@ pub struct InstanceData {
     /// Structural parameters can be evaluated at compile time for if-equation
     /// branch selection (MLS §18.3).
     pub evaluate: bool,
+    /// True if the declaration writes `annotation(Evaluate = false)`, which
+    /// makes the parameter non-evaluable (MLS §4.5, §18.6).
+    #[serde(default)]
+    pub evaluate_refused: bool,
     /// True if this component declaration has the `final` prefix (MLS §7.2.6).
     /// Used for preserving flat-output declaration qualifiers.
     pub is_final: bool,
@@ -700,7 +696,7 @@ impl Default for InstanceData {
             declaration_source_scope: None,
             class_overrides: IndexMap::default(),
             has_forwarding_class_redeclare: false,
-            had_redeclare: false,
+            has_unapplied_redeclare: false,
             variability: Variability::Empty,
             causality: Causality::Empty,
             flow: false,
@@ -724,6 +720,7 @@ impl Default for InstanceData {
             is_discrete_type: false,
             from_expandable_connector: false,
             evaluate: false,
+            evaluate_refused: false,
             is_final: false,
             is_overconstrained: false,
             is_protected: false,
@@ -778,6 +775,10 @@ pub struct ClassInstanceData {
     /// `Modelica.Constants.pi`) instead of incorrectly qualifying them with
     /// the component instance prefix.
     pub resolved_imports: Vec<(String, String)>,
+    /// If-equations whose branch instantiation selected by evaluating
+    /// component references (SPEC_0040 DAE-C22).
+    #[serde(default)]
+    pub parameter_branch_selections: Vec<InstanceBranchSelection>,
 }
 
 /// An equation in the instance tree.
@@ -792,6 +793,18 @@ pub struct InstanceEquation {
     /// Resolved lexical source scope containing this equation.
     pub source_scope_id: Option<ScopeId>,
     /// Source span for error reporting. Never loses source location.
+    pub span: Span,
+}
+
+/// An if-equation whose branch instantiation selected by evaluating
+/// component references in its conditions (SPEC_0040 DAE-C22).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceBranchSelection {
+    /// The conditions evaluated, up to and including the one that held.
+    pub conditions: Vec<Expression>,
+    /// Qualified name of the class instance the if-equation came from.
+    pub origin: QualifiedName,
+    /// The selected if-equation.
     pub span: Span,
 }
 
@@ -887,6 +900,10 @@ pub struct InstanceOverlay {
     /// (`plug_p.pin[1]`, `plug_p.pin[2]`, `plug_p.pin[3]`), this map stores the parent
     /// path `plug_p.pin` with dimensions `[3]` for use in array equation expansion.
     pub array_parent_dims: IndexMap<ComponentPath, Vec<i64>>,
+    /// Declarations with at least one array occurrence, including empty arrays
+    /// that produce no component instances. This only vetoes universal scalar
+    /// proofs; it does not identify or merge runtime occurrences.
+    pub array_component_declarations: IndexSet<DefId>,
     /// Mapping from outer-prefixed paths to their corresponding inner paths (MLS §5.4).
     /// When an outer component `initialStep.stateGraphRoot` references inner `stateGraphRoot`,
     /// equations/connections using the outer prefix are redirected to the inner path.
@@ -901,6 +918,11 @@ pub struct InstanceOverlay {
     /// Populated when `outer` components had no matching `inner` and automatic
     /// synthesis succeeded.
     pub synthesized_inners: Vec<String>,
+    /// Diagnostic messages attached to synthesized inner classes (MLS §5.4).
+    /// Populated from each synthesized class's `missingInnerMessage` annotation
+    /// when present, so the synthesized-inner warning can surface the class
+    /// author's own guidance instead of a generic notice.
+    pub synthesized_inner_messages: Vec<String>,
     /// Canonical type roots for compatibility checks (alias/enumeration normalization).
     /// Keys are resolved type identities and values are canonical root type identities.
     /// Populated by typecheck_instanced for flatten-time type compatibility.

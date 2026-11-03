@@ -1,24 +1,32 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rumoca_ir_solve as solve;
 
 use super::{AlgebraicRefreshRow, RefreshRowSelection, RefreshStage};
 
-pub fn build_refresh_stages(
+pub(super) fn build_refresh_stages(
     plan: &solve::AlgebraicProjectionPlan,
     block_indices: &[usize],
     rows: &[AlgebraicRefreshRow],
     static_rows: &RefreshRowSelection,
     causal_solution_certified: bool,
+    mut dependencies: impl FnMut(&AlgebraicRefreshRow, &BTreeMap<usize, usize>) -> Option<Vec<usize>>,
 ) -> Result<Vec<RefreshStage>, solve::ContinuousRefreshConstructionError> {
     let exact_rows = rows
         .iter()
         .enumerate()
-        .filter(|(_, row)| causal_solution_certified && row.exact_assignment_certified())
+        .filter(|(_, row)| row.exact_assignment_certified())
         .map(|(index, row)| ((row.equation_index(), row.target_index()), index))
         .collect::<BTreeMap<_, _>>();
     let mut stages = Vec::new();
     let mut assignments = Vec::new();
+    let targets = plan
+        .blocks
+        .iter()
+        .flat_map(|block| block.y_indices.iter().copied())
+        .map(|target| (target, target))
+        .collect::<BTreeMap<_, _>>();
+    let mut available = BTreeSet::new();
     let static_targets = static_rows
         .indices()
         .iter()
@@ -30,11 +38,22 @@ pub fn build_refresh_stages(
         push_causal_seed_sweep(&mut stages, rows, &static_targets)?;
     }
     for (local_block_index, block) in plan.blocks.iter().enumerate() {
-        if let Some(row) = exact_singleton_row(block, &exact_rows) {
+        if let Some(row) = exact_singleton_row(block, &exact_rows)
+            && (causal_solution_certified
+                || dependencies(&rows[row], &targets)
+                    .is_some_and(|inputs| inputs.iter().all(|input| available.contains(input))))
+        {
             assignments.push(row);
+            available.insert(rows[row].target_index());
             continue;
         }
-        flush_assignments(&mut stages, &mut assignments, rows, &static_targets)?;
+        flush_assignments(
+            &mut stages,
+            &mut assignments,
+            rows,
+            &static_targets,
+            causal_solution_certified,
+        )?;
         stages.push(RefreshStage::ProjectionBlock {
             seed_sequence: Default::default(),
             block_index: block_indices
@@ -46,8 +65,15 @@ pub fn build_refresh_stages(
             },
             seed_rows: projection_seed_rows(block, rows)?,
         });
+        available.extend(block.y_indices.iter().copied());
     }
-    flush_assignments(&mut stages, &mut assignments, rows, &static_targets)?;
+    flush_assignments(
+        &mut stages,
+        &mut assignments,
+        rows,
+        &static_targets,
+        causal_solution_certified,
+    )?;
     Ok(stages)
 }
 
@@ -78,6 +104,13 @@ fn push_causal_seed_sweep(
     Ok(())
 }
 
+/// The warm-start rows of a projection stage: the certified exact assignments
+/// of its block unknowns whose coefficient is a construction constant. A row
+/// that isolates its target through a solver-value
+/// coefficient (`frame_b.R.T = R_rel.T*frame_a.R.T` solved for `R_rel.T[1,1]`
+/// through `frame_a.R.T[1,1]`) is no seed: that coefficient can vanish, which
+/// would make the seed singular on every call. Its target keeps its incoming
+/// value for the block's projection.
 fn projection_seed_rows(
     block: &solve::AlgebraicProjectionBlock,
     rows: &[AlgebraicRefreshRow],
@@ -91,7 +124,13 @@ fn projection_seed_rows(
         rows.len(),
         rows.iter()
             .enumerate()
-            .filter(|(_, row)| block_targets.contains(&row.target_index()))
+            .filter(|(_, row)| {
+                block_targets.contains(&row.target_index())
+                    && row.exact_assignment_certified()
+                    && row
+                        .assignment_shape()
+                        .is_some_and(solve::TargetAssignmentShape::constant_coefficient)
+            })
             .map(|(index, _)| index),
     )
 }
@@ -114,16 +153,18 @@ fn flush_assignments(
     assignments: &mut Vec<usize>,
     rows: &[AlgebraicRefreshRow],
     static_targets: &std::collections::BTreeSet<usize>,
+    causal_solution_certified: bool,
 ) -> Result<(), solve::ContinuousRefreshConstructionError> {
     if assignments.is_empty() {
         return Ok(());
     }
     let mut ordered_assignments = std::mem::take(assignments);
-    // `rows` is already the construction-issued topological order. The
-    // simultaneous BLT can order scalar outputs of one compact pure call more
-    // loosely than the exact-assignment dependency certificate, so retain the
-    // canonical row order inside each uninterrupted exact run.
-    ordered_assignments.sort_unstable();
+    // A certified seed order can be stricter than the simultaneous BLT order
+    // for outputs of one compact call. Otherwise admission proved each row's
+    // inputs available in BLT order, and that proved order must be retained.
+    if causal_solution_certified {
+        ordered_assignments.sort_unstable();
+    }
     let (static_rows, dynamic_rows) = ordered_assignments
         .into_iter()
         .partition::<Vec<_>, _>(|index| static_targets.contains(&rows[*index].target_index()));
@@ -187,16 +228,19 @@ mod tests {
                     rows: vec![0],
                     y_indices: vec![0],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
                 solve::AlgebraicProjectionBlock {
                     rows: vec![1, 2],
                     y_indices: vec![1, 2],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
                 solve::AlgebraicProjectionBlock {
                     rows: vec![3],
                     y_indices: vec![3],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
             ],
         };
@@ -211,6 +255,7 @@ mod tests {
             ],
             &RefreshRowSelection::default(),
             true,
+            |_, _| None,
         )
         .unwrap();
 
@@ -223,10 +268,73 @@ mod tests {
                 RefreshStage::ExactAssignments { dynamic_rows: after, .. },
             ] if dynamic_rows.indices() == [0, 1, 2, 3]
                 && before.indices() == [0]
-                && seed_rows.len() == 2
-                && seed_rows.indices() == [1, 2]
+                && seed_rows.is_empty()
                 && after.indices() == [3]
         ));
+    }
+
+    /// Only a construction literal certifies a seed coefficient: a register,
+    /// whether it holds a solver value or a tunable parameter (MLS 3.7 §4.5, whose
+    /// value can change between runs), is refused even when its value is nonzero
+    /// now. An evaluable parameter reaches the shape as a literal once folded.
+    #[test]
+    fn a_seed_coefficient_is_certified_only_as_a_construction_literal() {
+        let direct = solve::TargetAssignmentShape::Direct {
+            target_y_index: 0,
+            expr_reg: 0,
+            target_scale: -2.0,
+            expr_eval_len: 1,
+        };
+        let literal = solve::TargetAssignmentShape::Affine {
+            target_y_index: 0,
+            offset_reg: 0,
+            coefficient_reg: None,
+            offset_scale: 1.0,
+            coefficient_scale: 3.0,
+            expr_eval_len: 1,
+        };
+        let register = solve::TargetAssignmentShape::Affine {
+            target_y_index: 0,
+            offset_reg: 0,
+            coefficient_reg: Some(1),
+            offset_scale: 1.0,
+            coefficient_scale: 1.0,
+            expr_eval_len: 2,
+        };
+        assert!(direct.constant_coefficient() && literal.constant_coefficient());
+        assert!(!register.constant_coefficient());
+    }
+
+    #[test]
+    fn only_constant_coefficient_assignments_seed_a_projection() {
+        let block = solve::AlgebraicProjectionBlock {
+            rows: vec![0, 1],
+            y_indices: vec![0, 1],
+            tearing: None,
+            alternate_charts: Vec::new(),
+        };
+        // Row 1 isolates its target exactly, but divides by a solver value.
+        let solver_coefficient = AlgebraicRefreshRow::checked(solve::AlgebraicRefreshRowDraft {
+            owner_id: super::super::RefreshRowOwnerId::checked(1).unwrap(),
+            source: solve::RefreshScalarProgramSource::checked(0, 1).unwrap(),
+            equation_index: 1,
+            output_offset: 0,
+            target_index: 1,
+            assignment_target: Some(1),
+            assignment_shape: Some(solve::TargetAssignmentShape::Affine {
+                target_y_index: 1,
+                offset_reg: 0,
+                coefficient_reg: Some(1),
+                offset_scale: 1.0,
+                coefficient_scale: 1.0,
+                expr_eval_len: 2,
+            }),
+            direct_assignment_certified: false,
+            exact_assignment_certified: true,
+        })
+        .unwrap();
+        let seeds = projection_seed_rows(&block, &[exact_row(0), solver_coefficient]).unwrap();
+        assert_eq!(seeds.indices(), [0]);
     }
 
     #[test]
@@ -237,19 +345,27 @@ mod tests {
                     rows: vec![0],
                     y_indices: vec![0],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
                 solve::AlgebraicProjectionBlock {
                     rows: vec![1],
                     y_indices: vec![1],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
             ],
         };
 
         let rows = [exact_row(1), exact_row(0)];
-        let stages =
-            build_refresh_stages(&plan, &[0, 1], &rows, &RefreshRowSelection::default(), true)
-                .unwrap();
+        let stages = build_refresh_stages(
+            &plan,
+            &[0, 1],
+            &rows,
+            &RefreshRowSelection::default(),
+            true,
+            |_, _| None,
+        )
+        .unwrap();
 
         assert!(matches!(
             stages.as_slice(),
@@ -279,6 +395,7 @@ mod tests {
                     rows: vec![equation],
                     y_indices: vec![target],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 })
                 .collect(),
         };
@@ -289,6 +406,7 @@ mod tests {
             &rows,
             &RefreshRowSelection::default(),
             true,
+            |_, _| None,
         )
         .unwrap();
 
@@ -311,11 +429,13 @@ mod tests {
                     rows: vec![0],
                     y_indices: vec![0],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
                 solve::AlgebraicProjectionBlock {
                     rows: vec![1],
                     y_indices: vec![1],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
             ],
         };
@@ -326,6 +446,7 @@ mod tests {
             &rows,
             &RefreshRowSelection::default(),
             false,
+            |_, _| None,
         )
         .unwrap();
 
@@ -339,5 +460,63 @@ mod tests {
                 },
             ]
         ));
+    }
+
+    #[test]
+    fn local_dependency_proof_retains_blt_order_instead_of_uncertified_seed_order() {
+        let rows = [exact_row(2), exact_row(1), exact_row(0)];
+        let plan = solve::AlgebraicProjectionPlan {
+            blocks: (0..3)
+                .map(|target| solve::AlgebraicProjectionBlock {
+                    rows: vec![target],
+                    y_indices: vec![target],
+                    tearing: None,
+                    alternate_charts: Vec::new(),
+                })
+                .collect(),
+        };
+        let stages = build_refresh_stages(
+            &plan,
+            &[0, 1, 2],
+            &rows,
+            &RefreshRowSelection::default(),
+            false,
+            |row, _| Some(row.target_index().checked_sub(1).into_iter().collect()),
+        )
+        .unwrap();
+        assert!(matches!(
+            stages.as_slice(),
+            [RefreshStage::ExactAssignments { dynamic_rows, .. }]
+                if dynamic_rows.indices() == [2, 1, 0]
+        ));
+    }
+
+    #[test]
+    fn local_assignment_cannot_read_a_dependency_from_a_later_projection() {
+        let rows = [exact_row(0), numerical_seed_row(1)];
+        let plan = solve::AlgebraicProjectionPlan {
+            blocks: (0..2)
+                .map(|target| solve::AlgebraicProjectionBlock {
+                    rows: vec![target],
+                    y_indices: vec![target],
+                    tearing: None,
+                    alternate_charts: Vec::new(),
+                })
+                .collect(),
+        };
+        let stages = build_refresh_stages(
+            &plan,
+            &[0, 1],
+            &rows,
+            &RefreshRowSelection::default(),
+            false,
+            |_, _| Some(vec![1]),
+        )
+        .unwrap();
+        assert!(
+            stages
+                .iter()
+                .all(|stage| matches!(stage, RefreshStage::ProjectionBlock { .. }))
+        );
     }
 }

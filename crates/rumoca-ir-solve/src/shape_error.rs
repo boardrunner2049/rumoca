@@ -18,6 +18,10 @@ impl std::fmt::Display for AffineTensorNodeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolveProblemShapeContractError {
+    InitializationOwnership {
+        detail: &'static str,
+    },
+
     SchemaVersion {
         actual: u16,
         expected: u16,
@@ -96,6 +100,11 @@ pub enum SolveProblemShapeContractError {
         span: Option<Span>,
     },
     ContinuousRefreshOwner {
+        detail: String,
+    },
+    /// A derivative-only problem whose layout does not name exactly one `Y`
+    /// coordinate per state.
+    DerivativeStateStorage {
         detail: String,
     },
     ZeroTensorDimension {
@@ -223,7 +232,7 @@ pub enum SolveProblemShapeContractError {
 impl SolveProblemShapeContractError {
     pub fn source_span(&self) -> Option<Span> {
         match self {
-            Self::SchemaVersion { .. } => None,
+            Self::SchemaVersion { .. } | Self::InitializationOwnership { .. } => None,
             Self::Layout(err) => err.source_span(),
             Self::ScalarProgramSpanMismatch { span, .. }
             | Self::ScalarProgramOutputIndexMismatch { span, .. }
@@ -244,7 +253,7 @@ impl SolveProblemShapeContractError {
             | Self::DuplicateProjectionUnknown { span, .. }
             | Self::InvalidProjectionUnknown { span, .. }
             | Self::InvalidScheduledRootTiming { span, .. } => *span,
-            Self::ContinuousRefreshOwner { .. } => None,
+            Self::ContinuousRefreshOwner { .. } | Self::DerivativeStateStorage { .. } => None,
             Self::ScalarProgramMissingProvenance { .. } => None,
             Self::ZeroTensorDimension { span, .. }
             | Self::StructuredIndexDomain { span, .. }
@@ -262,6 +271,9 @@ impl SolveProblemShapeContractError {
 impl std::fmt::Display for SolveProblemShapeContractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InitializationOwnership { detail } => {
+                write!(f, "invalid initialization ownership: {detail}")
+            }
             Self::SchemaVersion { actual, expected } => write!(
                 f,
                 "Solve schema version {actual} does not match expected {expected}"
@@ -269,6 +281,9 @@ impl std::fmt::Display for SolveProblemShapeContractError {
             Self::Layout(err) => write!(f, "Solve layout shape contract failed: {err}"),
             Self::ContinuousRefreshOwner { detail } => {
                 write!(f, "continuous refresh owner is invalid: {detail}")
+            }
+            Self::DerivativeStateStorage { detail } => {
+                write!(f, "derivative state storage is invalid: {detail}")
             }
             error @ (Self::ZeroTensorDimension { .. }
             | Self::StructuredIndexDomain { .. }

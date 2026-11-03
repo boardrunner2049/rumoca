@@ -514,9 +514,16 @@ where
             match statement {
                 dae::FunctionStatementView::Assignment { .. }
                 | dae::FunctionStatementView::AssignmentGroup { .. } => {}
+                // A warning-level assertion never aborts an evaluation and has
+                // no influence on any value (MLS §8.3.7).
+                dae::FunctionStatementView::Assertion {
+                    level: dae::AssertionLevel::Warning,
+                    ..
+                } => {}
                 dae::FunctionStatementView::Assertion {
                     condition,
                     message: _,
+                    level: dae::AssertionLevel::Error,
                     provenance,
                 } => self.function_assertion(condition, provenance.span())?,
                 dae::FunctionStatementView::For {
@@ -725,12 +732,7 @@ where
         expression: dae::ExprId<'dae>,
     ) -> Result<Vec<f64>, NumericEvaluationError> {
         let mut values = self.expression(expression)?;
-        // A scalar applies to every element, including to none: `Xi[nXi]`
-        // with `nXi = 0` and a scalar `nominal` has nothing to apply it to,
-        // which is not a shape error.
-        if values.len() == 1 && variable.scalar_count() != 1 {
-            values.resize(variable.scalar_count(), values[0]);
-        }
+        variable.broadcast_values(&mut values);
         if values.len() != variable.scalar_count() {
             return Err(failure(
                 NumericEvaluationErrorKind::ShapeMismatch,
@@ -998,34 +1000,25 @@ where
         if subscripts.len() > dimensions.len() {
             return Err(failure(
                 NumericEvaluationErrorKind::UnsupportedOperation,
-                "numeric evaluation requires at most one subscript per array dimension",
+                "numeric evaluation received more subscripts than array dimensions",
                 span,
             ));
         }
 
-        // MLS §10.5: an omitted trailing subscript selects the whole axis
-        // (`m[1]` of a matrix is its first row).
         let mut flats = vec![0usize];
         for (axis, extent) in dimensions.iter().copied().enumerate() {
-            let Some(subscript) = subscripts.get(axis) else {
-                flats = expand_flat_indices(
-                    flats,
-                    &(0..extent as usize).collect::<Vec<_>>(),
-                    extent,
-                    span,
-                )?;
-                continue;
-            };
-            let selected = match subscript {
-                dae::SubscriptView::Index {
+            // MLS §10.5: omitted trailing subscripts select the whole axes,
+            // as already certified by DAE's shared index/update constructor.
+            let selected = match subscripts.get(axis) {
+                Some(dae::SubscriptView::Index {
                     expression,
                     provenance,
-                } => self.validated_indices(expression, extent, provenance.span())?,
-                dae::SubscriptView::Whole { .. } => (0..extent as usize).collect(),
-                dae::SubscriptView::Slice {
+                }) => self.validated_indices(expression, extent, provenance.span())?,
+                Some(dae::SubscriptView::Whole { .. }) | None => (0..extent as usize).collect(),
+                Some(dae::SubscriptView::Slice {
                     expression,
                     provenance,
-                } => self.validated_indices(expression, extent, provenance.span())?,
+                }) => self.validated_indices(expression, extent, provenance.span())?,
             };
 
             flats = expand_flat_indices(flats, &selected, extent, span)?;
@@ -1113,6 +1106,13 @@ where
             dae::PureBuiltin::NoEvent => {}
             dae::PureBuiltin::Homotopy => {}
             dae::PureBuiltin::Vector => {}
+            dae::PureBuiltin::LinearSolve => {
+                return Err(failure(
+                    NumericEvaluationErrorKind::UnsupportedOperation,
+                    "linear solve requires the Solve tensor execution kernel",
+                    span,
+                ));
+            }
             dae::PureBuiltin::Transpose => values = transpose_values(&values, result_dimensions),
             B::Diagonal | B::OuterProduct | B::Skew => {
                 values = self.matrix_product(builtin, arguments, values)?;
@@ -1619,7 +1619,7 @@ fn literal_value(literal: &dae::DaeLiteral, span: Span) -> Result<f64, NumericEv
     }
 }
 
-fn binary(operator: dae::BinaryOperator, lhs: f64, rhs: f64) -> f64 {
+pub(crate) fn binary(operator: dae::BinaryOperator, lhs: f64, rhs: f64) -> f64 {
     match operator {
         dae::BinaryOperator::Add | dae::BinaryOperator::ElementwiseAdd => lhs + rhs,
         dae::BinaryOperator::Subtract | dae::BinaryOperator::ElementwiseSubtract => lhs - rhs,

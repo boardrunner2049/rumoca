@@ -148,7 +148,7 @@ end Cy;
     let stderr = String::from_utf8_lossy(&bad.stderr);
     assert!(!bad.status.success(), "the unbroken cycle is rejected");
     assert!(
-        stderr.contains("ED023") && stderr.contains("p.totLen -> p.segLen"),
+        stderr.contains("ED025") && stderr.contains("p.totLen -> p.segLen"),
         "the cycle is named on the instance: {stderr}"
     );
 }

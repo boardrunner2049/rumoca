@@ -42,7 +42,8 @@ pub fn run(
         root,
     )?);
     let artifact = MeModelArtifact::new(component);
-    let options_host = crate::me_backend::batch_options(options).map_err(|e| e.to_string())?;
+    let options_host = crate::me_backend::batch_options(&artifact.root_location(), options)
+        .map_err(|e| e.to_string())?;
     let mut cursor = rumoca_solver::fmi_me::driver::batch_output_cursor(&options_host)
         .map_err(|e| e.to_string())?;
     let retained = MeRetainedComponent::instantiate(
@@ -61,7 +62,10 @@ pub fn run(
     let plugin = crate::me_backend::plugin_for_host(
         &host,
         options,
-        rumoca_solver_rk45::model_exchange_integrator,
+        crate::me_backend::IntegratorFactory {
+            method: "rk45",
+            build: rumoca_solver_rk45::model_exchange_integrator,
+        },
     )
     .map_err(|e| e.to_string())?;
     let mut session = host.into_session(plugin).map_err(|e| e.to_string())?;

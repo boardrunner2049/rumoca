@@ -70,11 +70,7 @@ fn plan_staged_record(
             })
             .collect::<Vec<_>>();
         let first = *field_indices.first().ok_or_else(|| {
-            ToDaeError::unsupported_flat(
-                "record output assembly",
-                format!("`{target}.{}` is left undefined", field.name),
-                field.span,
-            )
+            undefined_record_field(context.function, target.as_str(), field, None)
         })?;
         if field_indices.windows(2).any(|pair| pair[1] != pair[0] + 1) {
             return Err(ToDaeError::unsupported_flat(
@@ -150,13 +146,14 @@ pub(super) fn validate_record_output_assembly(
     let group = &statements[start..start + count];
     let constructor = record_constructor(target, context)?;
     let mut fields = Vec::with_capacity(constructor.inputs.len());
+    let writes = |statement: &rumoca_core::Statement, field: &str| {
+        record_assignment_target(statement, context.function)
+            .is_some_and(|(_, part)| part_matches_record_field(part, field, &constructor.inputs))
+    };
     for field in &constructor.inputs {
         let first = group
             .iter()
-            .position(|statement| {
-                record_assignment_target(statement, context.function)
-                    .is_some_and(|(_, part)| part_matches_record_field(part, &field.name))
-            })
+            .position(|statement| writes(statement, &field.name))
             .unwrap_or(group.len());
         let available_fields = constructor
             .inputs
@@ -165,11 +162,7 @@ pub(super) fn validate_record_output_assembly(
                 group
                     .iter()
                     .enumerate()
-                    .filter(|(_, statement)| {
-                        record_assignment_target(statement, context.function).is_some_and(
-                            |(_, part)| part_matches_record_field(part, &candidate.name),
-                        )
-                    })
+                    .filter(|(_, statement)| writes(statement, &candidate.name))
                     .map(|(index, _)| index)
                     .max()
                     .is_some_and(|last| last < first)
@@ -195,11 +188,36 @@ pub(super) fn validate_record_output_assembly(
     )))
 }
 
-fn part_matches_record_field(part: &rumoca_core::ComponentRefPart, field: &str) -> bool {
-    part.ident == field
-        || field
-            .strip_prefix(part.ident.as_str())
-            .is_some_and(|suffix| suffix.starts_with('_'))
+fn part_matches_record_field(
+    part: &rumoca_core::ComponentRefPart,
+    field: &str,
+    fields: &[rumoca_core::FunctionParam],
+) -> bool {
+    assigned_field_projection(part, field, fields).is_some()
+}
+
+/// How an assignment to `record.<part>` writes constructor field `field`:
+/// `Some(None)` when it names the field itself, `Some(Some(nested))` when the
+/// part names a decomposed nested record whose field `nested` is spelled
+/// `<part>_<nested>` in the constructor, and `None` otherwise. A part that is
+/// itself a constructor field names only that field, so `zeta1` never writes
+/// a sibling such as `zeta1_at_a`.
+fn assigned_field_projection(
+    part: &rumoca_core::ComponentRefPart,
+    field: &str,
+    fields: &[rumoca_core::FunctionParam],
+) -> Option<Option<VarName>> {
+    if part.ident == field {
+        return Some(None);
+    }
+    if fields.iter().any(|candidate| candidate.name == part.ident) {
+        return None;
+    }
+    field
+        .strip_prefix(part.ident.as_str())
+        .and_then(|suffix| suffix.strip_prefix('_'))
+        .filter(|suffix| !suffix.is_empty())
+        .map(|nested| Some(VarName::new(nested)))
 }
 
 fn record_assignment_target<'scope>(
@@ -320,7 +338,7 @@ fn validate_field_assembly(
         scalar_count,
         available_fields,
     )?;
-    let scalars = require_total_field_scalars(scalars, output, field)?;
+    let scalars = require_total_field_scalars(context.function, scalars, output, field)?;
     Ok(FunctionRecordFieldAssembly {
         name: VarName::new(&field.name),
         scalar_type: Some(
@@ -355,19 +373,12 @@ fn collect_field_scalar_sources(
         let rumoca_core::Statement::Assignment { value, span, .. } = statement else {
             unreachable!("record assembly group contains assignments")
         };
-        let Some((_, target)) = record_assignment_target(statement, context.function) else {
+        let Some((record, target)) = record_assignment_target(statement, context.function) else {
             unreachable!("record assembly group has validated two-part record targets")
         };
-        let value_field = if target.ident == field.name {
-            None
-        } else if let Some(nested) = field
-            .name
-            .strip_prefix(target.ident.as_str())
-            .and_then(|suffix| suffix.strip_prefix('_'))
-            .filter(|suffix| !suffix.is_empty())
-        {
-            Some(VarName::new(nested))
-        } else {
+        let constructor = record_constructor(record, context)?;
+        let Some(value_field) = assigned_field_projection(target, &field.name, &constructor.inputs)
+        else {
             continue;
         };
         require_span(*span, "record field assignment")?;
@@ -438,6 +449,7 @@ fn collect_field_scalar_sources(
 }
 
 fn require_total_field_scalars(
+    function: &rumoca_core::Function,
     scalars: Vec<Option<FunctionRecordScalarSource>>,
     output: &str,
     field: &rumoca_core::FunctionParam,
@@ -446,17 +458,7 @@ fn require_total_field_scalars(
         .into_iter()
         .enumerate()
         .map(|(scalar, source)| {
-            source.ok_or_else(|| {
-                ToDaeError::unsupported_flat(
-                    "record output assembly",
-                    format!(
-                        "`{output}.{}` leaves scalar {} undefined",
-                        field.name,
-                        scalar + 1
-                    ),
-                    field.span,
-                )
-            })
+            source.ok_or_else(|| undefined_record_field(function, output, field, Some(scalar + 1)))
         })
         .collect()
 }
@@ -505,13 +507,8 @@ fn validate_aggregate_field_assembly(
             ));
         }
     }
-    let aggregate_statement = source.ok_or_else(|| {
-        ToDaeError::unsupported_flat(
-            "record output assembly",
-            format!("`{output}.{}` is left undefined", field.name),
-            field.span,
-        )
-    })?;
+    let aggregate_statement =
+        source.ok_or_else(|| undefined_record_field(context.function, output, field, None))?;
     Ok(FunctionRecordFieldAssembly {
         name: VarName::new(&field.name),
         scalar_type: None,
@@ -675,4 +672,88 @@ impl RecordSelfReadChecker<'_> {
                 .get_or_insert_with(|| reference.to_string());
         }
     }
+}
+
+/// The refusal for a record field the assembly finds no value for.
+///
+/// MLS 3.7 §12.4.4: "it is an error to use or return an uninitialized
+/// variable". Flattening already assigns every field default the algorithm
+/// does not overwrite, so a field no statement anywhere in the body writes is
+/// returned uninitialized: a model error. A field the body does write, only in
+/// a form the assembly does not represent (inside a loop, for example), stays
+/// an unsupported construct.
+fn undefined_record_field(
+    function: &rumoca_core::Function,
+    output: &str,
+    field: &rumoca_core::FunctionParam,
+    scalar: Option<usize>,
+) -> ToDaeError {
+    let place = match scalar {
+        Some(scalar) => format!("scalar {scalar} of `{output}.{}`", field.name),
+        None => format!("`{output}.{}`", field.name),
+    };
+    if statements_write_field(&function.body, output, &field.name) {
+        return ToDaeError::unsupported_flat(
+            "record output assembly",
+            format!("{place} has no value the record assembly represents"),
+            field.span,
+        );
+    }
+    ToDaeError::UninitializedFunctionValue {
+        detail: format!(
+            "{place} of `{}` is never assigned and its record field has no default",
+            function.name
+        ),
+        span: field.span,
+    }
+}
+
+fn statements_write_field(
+    statements: &[rumoca_core::Statement],
+    output: &str,
+    field: &str,
+) -> bool {
+    let writes = |comp: &rumoca_core::ComponentReference| match comp.parts() {
+        [root] => root.ident == output,
+        [root, part, ..] => root.ident == output && part_names_field(&part.ident, field),
+        _ => false,
+    };
+    statements.iter().any(|statement| match statement {
+        rumoca_core::Statement::Assignment { comp, .. } => writes(comp),
+        rumoca_core::Statement::FunctionCall { outputs, .. } => {
+            outputs.iter().flatten().any(&writes)
+        }
+        rumoca_core::Statement::For { equations, .. } => {
+            statements_write_field(equations, output, field)
+        }
+        rumoca_core::Statement::While { block, .. } => {
+            statements_write_field(&block.stmts, output, field)
+        }
+        rumoca_core::Statement::If {
+            cond_blocks,
+            else_block,
+            ..
+        } => {
+            cond_blocks
+                .iter()
+                .any(|block| statements_write_field(&block.stmts, output, field))
+                || else_block
+                    .as_deref()
+                    .is_some_and(|block| statements_write_field(block, output, field))
+        }
+        rumoca_core::Statement::When { blocks, .. } => blocks
+            .iter()
+            .any(|block| statements_write_field(&block.stmts, output, field)),
+        _ => false,
+    })
+}
+
+/// Whether an assigned path segment names `field` itself or a record that a
+/// decomposed `field` lies in (`state` for `state_p`); a conservative test, so
+/// a field it cannot rule out is never reported uninitialized.
+fn part_names_field(assigned: &str, field: &str) -> bool {
+    assigned == field
+        || field
+            .strip_prefix(assigned)
+            .is_some_and(|suffix| suffix.starts_with('_'))
 }

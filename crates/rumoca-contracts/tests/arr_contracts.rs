@@ -1,6 +1,6 @@
 //! ARR (Array) contract tests - MLS §10
 //!
-//! Tests for the 42 array contracts defined in SPEC_0022.
+//! Tests for the 44 array contracts defined in SPEC_0022.
 
 use rumoca_compile::compile::FailedPhase;
 use rumoca_contracts::test_support::{
@@ -798,6 +798,51 @@ fn arr_040_min_of_strings_rejected() {
     );
 }
 
+/// Booleans are ordered `false < true`, so `min` and `max` of Booleans are the
+/// conjunction and disjunction, as reductions, as binary calls, and inside a
+/// function body (the `Modelica.Math.BooleanVectors.allTrue` form).
+#[test]
+fn arr_040_boolean_min_max_order_false_before_true() {
+    let trace = rumoca_contracts::test_support::simulate_model(
+        r#"
+        model M
+            function allTrue
+                input Boolean b[:];
+                output Boolean result = size(b, 1) == 0 or min(b);
+            algorithm
+            end allTrue;
+            function anyTrue
+                input Boolean b[:];
+                output Boolean result = max(b);
+            algorithm
+            end anyTrue;
+            Boolean v[2] = {time > 0.5, time > 2.0};
+            Boolean all = allTrue(v);
+            Boolean any = anyTrue(v);
+            Boolean lo = min(v[1], v[2]);
+            Boolean hi = max(v[1], v[2]);
+            Boolean least = min(v);
+            Boolean greatest = max(v);
+            Real t(start = 0, fixed = true);
+        equation
+            der(t) = 1;
+        end M;
+    "#,
+        "M",
+        1.0,
+    );
+    for (name, expected) in [
+        ("all", 0.0),
+        ("any", 1.0),
+        ("lo", 0.0),
+        ("hi", 1.0),
+        ("least", 0.0),
+        ("greatest", 1.0),
+    ] {
+        assert_eq!(trace.final_value(name), expected, "{name} at t = 1");
+    }
+}
+
 // =============================================================================
 // ARR-020: All arguments of array() must be type compatible expressions
 // =============================================================================
@@ -960,6 +1005,36 @@ fn arr_036_zero_sized_array_operations_accepted() {
     "#,
         "M",
     );
+}
+
+#[test]
+fn arr_036_zero_sized_generator_argument_simulates() {
+    let trace = rumoca_contracts::test_support::simulate_model(
+        r#"
+        model M
+            function g
+                input Real p;
+                input Real X[:];
+                output Real y;
+            algorithm
+                y := 2*p + sum(X);
+            end g;
+            function f
+                input Real p;
+                output Real y;
+            algorithm
+                y := g(p, fill(0, 0)) + g(p, zeros(0)) - g(p, ones(0));
+            end f;
+            Real y = f(1 + time);
+            Real t(start = 0, fixed = true);
+        equation
+            der(t) = 1;
+        end M;
+    "#,
+        "M",
+        1.0,
+    );
+    assert!((trace.final_value("y") - 4.0).abs() < 1e-9);
 }
 
 // =============================================================================
@@ -1609,5 +1684,108 @@ fn arr_042_outer_product_of_matrix_rejected() {
         FailedPhase::ToDae,
         "ED020",
         "expression shape mismatch",
+    );
+}
+
+// =============================================================================
+// ARR-043: Record array equality element-wise
+// "Equality a=b ... of scalars, vectors, matrices, and arrays is defined
+// element-wise" (§10.6.1), so each element pair of an equation between arrays
+// of records is one whole-record equality.
+// =============================================================================
+
+#[test]
+fn arr_043_record_array_equality_is_element_wise() {
+    let trace = rumoca_contracts::test_support::simulate_model(
+        r#"
+        model M
+            record S
+                Real p;
+                Real T;
+            end S;
+            model V
+                Real p;
+                Real T;
+                S state;
+            equation
+                state.p = p;
+                state.T = T;
+            end V;
+            parameter Integer n = 2;
+            V volumes[n];
+            S sliced[n];
+            S whole[n];
+            S looped[n];
+            Real x(start = 1, fixed = true);
+        equation
+            sliced[1:n] = volumes[1:n].state;
+            whole = volumes.state;
+            for i in 1:n loop
+                looped[i] = volumes[n + 1 - i].state;
+            end for;
+            for i in 1:n loop
+                volumes[i].p = i*x;
+                volumes[i].T = 300 + i;
+            end for;
+            der(x) = -x;
+        end M;
+    "#,
+        "M",
+        1.0,
+    );
+    let x = trace.final_value("x");
+    for (name, expected) in [
+        ("sliced[1].p", x),
+        ("sliced[2].p", 2.0 * x),
+        ("sliced[2].T", 302.0),
+        ("whole[1].T", 301.0),
+        ("whole[2].p", 2.0 * x),
+        ("looped[1].p", 2.0 * x),
+        ("looped[2].T", 301.0),
+    ] {
+        let actual = trace.final_value(name);
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "{name} = {actual}, expected {expected}"
+        );
+    }
+}
+
+// =============================================================================
+// ARR-044: der and pre element-wise shape
+// "If expr is an array, the operator is applied to all elements" (§3.7.4)
+// =============================================================================
+
+#[test]
+fn arr_044_zero_sized_der_equation_has_no_scalars() {
+    expect_balanced(
+        r#"
+        package P
+            partial package Medium
+                constant String names[:] = fill("", 0);
+                constant Integer nC = size(names, 1);
+                constant Real C_nominal[nC] = 1e-6*ones(nC);
+            end Medium;
+            package Water
+                extends Medium;
+            end Water;
+            model Volumes
+                replaceable package Medium = P.Medium;
+                parameter Integer n = 2;
+                Real mC[n, Medium.nC];
+                Real mbC[n, Medium.nC];
+                Real x(start = 1, fixed = true);
+            equation
+                for i in 1:n loop
+                    der(mC[i, :]) = mbC[i, :]./Medium.C_nominal;
+                end for;
+                der(x) = -x;
+            end Volumes;
+            model Test
+                Volumes volumes(redeclare package Medium = Water);
+            end Test;
+        end P;
+    "#,
+        "P.Test",
     );
 }

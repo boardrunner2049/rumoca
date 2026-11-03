@@ -10,13 +10,16 @@ mod causal_discrete;
 mod dae_transform;
 pub mod diagnostic_codes;
 mod diagnostics;
+mod differential_structure;
 pub mod incidence;
 mod matching;
 pub mod report;
+mod residual_normalization;
 pub mod runtime_defined;
 mod same_tick;
 mod tarjan;
 pub mod tearing;
+mod time_invariant;
 mod types;
 
 use std::collections::HashSet;
@@ -26,13 +29,25 @@ use rumoca_ir_dae as dae;
 pub use causal_definitions::CausalDefinitions;
 pub use causal_discrete::{CausalDiscreteError, CausalDiscretePlan, DiscreteRealDefinition};
 pub use dae_transform::{
-    InitialValuePin, InitialValueRole, PinTerm, PreparedDae, PreparedStructuralAnalysis,
-    PreparedSystem, ReductionCandidateGroup, ReductionIdentity, ReductionLane, ReductionOutcome,
-    ReductionRecord, ReductionReport, ReductionStop, UnmatchedKind, UnmatchedName,
-    inspect_prepare_for_solve, prepare_for_solve,
+    AliasClassReport, AliasMemberReport, AliasQuotientReport, AliasQuotientScope, AliasRefusal,
+    FormalDerivativeStage, FormalDerivativeSystem, FormalDerivativeView, FormalStageCoordinate,
+    FormalStageEquation, FormalStateCandidate, FormalStateCandidateView, FormalStateCoordinate,
+    InitialValuePin, InitialValueRole, PinTerm, PreparedDae, PreparedReducedChart,
+    PreparedStructuralAnalysis, PreparedSystem, ReducedSelectionChart, ReductionCandidateGroup,
+    ReductionIdentity, ReductionLane, ReductionOutcome, ReductionRecord, ReductionReport,
+    ReductionSnapshot, ReductionStop, StateSelection, UnlocalizableGuard, UnmatchedKind,
+    UnmatchedName, alias_quotient_report, construct_formal_derivatives, fold_constant_values,
+    fold_evaluable_parameters, formal_alias_quotient_report, inline_annotated_calls,
+    inline_formal_calls, inspect_prepare_for_solve, inspect_quotient_aliases,
+    own_loop_guarded_relations, prepare_for_solve, quotient_aliases, quotient_formal_aliases,
+    unlocalizable_loop_guards,
 };
 pub use diagnostic_codes::STRUCTURAL_DIAGNOSTIC_CODES;
 pub use diagnostics::{AlgebraicLoop, StructuralDiagnostics};
+pub use differential_structure::{
+    DifferentialCoordinate, DifferentialStructure, PreferredAdmission, TensorDifferentialOffsets,
+    analyze_differential_structure,
+};
 pub use incidence::{Incidence, solver_incidence};
 pub use report::{BlockReport, StructuralReport, TearingReport};
 pub use runtime_defined::{
@@ -62,29 +77,30 @@ pub fn sort<'dae>(view: dae::DaeView<'dae>) -> Result<SortedDae<'dae>, Structura
         unknowns = incidence.n_var,
         "built scalar incidence"
     );
+    sort_from_incidence(view, &incidence)
+}
+
+/// BLT-sort a DAE whose scalar incidence is already built.
+///
+/// The reduction pipeline builds the incidence of a demoted system by reusing
+/// the untouched rows of the prior round (see
+/// [`incidence::build_incidence_reusing`]); it then finishes the analysis
+/// through this tail so the matching, singularity check, and BLT run on that
+/// incidence exactly as they would on a freshly built one.
+pub(crate) fn sort_from_incidence<'dae>(
+    view: dae::DaeView<'dae>,
+    incidence: &Incidence<'dae>,
+) -> Result<SortedDae<'dae>, StructuralError> {
     if incidence.n_eq == 0 && incidence.n_var == 0 {
         return Err(StructuralError::EmptySystem);
     }
-    let preferences = explicit_derivative_preferences(view, &incidence);
-    let (match_eq, match_var) = maximum_matching(&incidence, &preferences);
-    #[cfg(feature = "tracing")]
-    tracing::debug!(
-        target: "rumoca_phase_structural::timing",
-        elapsed_seconds = stage_start.elapsed().as_secs_f64(),
-        "completed structural matching"
-    );
-    require_perfect_matching(view, &incidence, &match_eq, &match_var)?;
+    let preferences = explicit_derivative_preferences(view, incidence);
+    let (match_eq, match_var) = maximum_matching(incidence, &preferences);
+    require_perfect_matching(view, incidence, &match_eq, &match_var)?;
     let adjacency =
         incidence::build_dependency_graph(&incidence.eq_unknowns, &match_var, incidence.n_eq);
-    let diagnostics = diagnostics::collect_warnings(view, &incidence, &match_eq, &adjacency);
-    let blocks = blt::build_blt_blocks(&incidence, &match_eq, &adjacency);
-    #[cfg(feature = "tracing")]
-    tracing::debug!(
-        target: "rumoca_phase_structural::timing",
-        elapsed_seconds = stage_start.elapsed().as_secs_f64(),
-        blocks = blocks.len(),
-        "completed BLT analysis"
-    );
+    let diagnostics = diagnostics::collect_warnings(view, incidence, &match_eq, &adjacency);
+    let blocks = blt::build_blt_blocks(incidence, &match_eq, &adjacency);
     let matching = match_eq
         .iter()
         .enumerate()
@@ -232,6 +248,9 @@ fn structural_report_from_sorted<'dae>(
         n_unknowns: sorted.matching.len(),
         matching,
         blocks,
+        aliases: AliasQuotientReport::default(),
+        formal_aliases: AliasQuotientReport::default(),
+        notes: Vec::new(),
     }
 }
 

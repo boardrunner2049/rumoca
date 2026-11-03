@@ -69,7 +69,7 @@ impl Serialize for FrozenStorage {
         S: serde::Serializer,
     {
         let projection = verify_owner_projection(self).map_err(serde::ser::Error::custom)?;
-        let mut state = serializer.serialize_struct("DaeStorage", 25)?;
+        let mut state = serializer.serialize_struct("DaeStorage", 26)?;
         state.serialize_field(
             "predefined_string_declaration",
             &self.predefined_string_declaration,
@@ -109,6 +109,7 @@ impl Serialize for FrozenStorage {
             ),
         )?;
         state.serialize_field("initial_discrete_values", &self.initial_discrete_values)?;
+        state.serialize_field("initial_parameter_values", &self.initial_parameter_values)?;
         state.serialize_field("discrete_real_equations", &self.discrete_real_equations)?;
         state.serialize_field("discrete_value_owners", &discrete_value_owner_output(self))?;
         state.serialize_field("model_event_transactions", &self.model_event_transactions)?;
@@ -172,7 +173,8 @@ struct StorageWire {
     expressions: ExpressionArenaWire,
     continuous_equation_operations: Vec<EquationOperationInput>,
     initialization_equation_operations: Vec<EquationOperationInput>,
-    initial_discrete_values: Vec<InitialDiscreteValueWire>,
+    initial_discrete_values: Vec<InitialValueWire>,
+    initial_parameter_values: Vec<InitialValueWire>,
     discrete_real_equations: Vec<DiscreteRealEquationWire>,
     discrete_value_owners: Vec<DiscreteValueOwnerWire>,
     model_event_transactions: Vec<ModelEventTransactionWire>,
@@ -332,6 +334,7 @@ fn reconstruct<'dae>(
     reconstruct_events(wire, dae, &ids)?;
     reconstruct_equation_systems(wire, dae, &ids)?;
     reconstruct_initial_discrete_values(wire, dae, &ids)?;
+    reconstruct_initial_parameter_values(wire, dae, &ids)?;
     reconstruct_discrete_value_owners(wire, dae, &ids)?;
     reconstruct_model_event_transactions(wire, dae, &ids)
 }
@@ -404,6 +407,27 @@ fn map_model_event_target<'dae>(
             crate::ModelEventTarget::DiscreteValue(DiscreteValueId::from_raw(variable.index()))
         }
     })
+}
+
+fn reconstruct_initial_parameter_values<'dae>(
+    wire: &StorageWire,
+    dae: &mut DaeConstruction<'dae>,
+    ids: &WireIds<'dae>,
+) -> Result<(), DaeConstructionError> {
+    for (index, definition) in wire.initial_parameter_values.iter().enumerate() {
+        let at = definition.provenance;
+        let variable = mapped(&ids.variables, definition.target, "variable", at)?;
+        let value = mapped_expression(ids, definition.value, at)?;
+        let id = dae.initialization(|initialization| {
+            initialization.parameter_initial_value(
+                crate::ParameterId::from_raw(variable.index()),
+                value,
+                at,
+            )
+        })?;
+        expect_ordinal("initial parameter value", index, id.index(), at)?;
+    }
+    Ok(())
 }
 
 /// Replay every MLS §8.6 discrete initial-value definition through the same
@@ -918,12 +942,8 @@ fn rebuild_node<'dae>(
             at.enumeration_literal(*ordinal)
         }
         ExprNodeWire::Literal(value) => at.literal(value.as_literal()),
-        ExprNodeWire::Coordinate(CoordinateWire::Binder { domain, ordinal }) => {
-            let domain = mapped(&ids.domains, *domain, "domain", provenance)?;
-            at.binder(DomainBinderId::from_raw(domain.index(), *ordinal))
-        }
         ExprNodeWire::Coordinate(coordinate) => {
-            at.coordinate(rebuild_coordinate(ids, coordinate, provenance)?)
+            rebuild_coordinate_expression(ids, at, coordinate, provenance)
         }
         ExprNodeWire::Unary { operator, operand } => at.unary(
             *operator,
@@ -993,10 +1013,12 @@ fn rebuild_node<'dae>(
             function,
             output,
             operand_count,
+            derivative,
         } => {
             let function = mapped(&ids.functions, *function, "function", provenance)?;
             let arguments = map_expression_operands(wire, ids, *operand_count, provenance)?;
-            rebuild_call(ids, at, *owner, function, *output, arguments, provenance)
+            let links = (*owner, *derivative);
+            rebuild_call(ids, at, links, (function, *output), arguments, provenance)
         }
         node @ ExprNodeWire::StringConversion { .. } => {
             rebuild_string_conversion(ids, at, WireStringConversion::from_node(node), provenance)
@@ -1016,6 +1038,20 @@ fn rebuild_node<'dae>(
     }
 }
 
+fn rebuild_coordinate_expression<'dae>(
+    ids: &WireIds<'dae>,
+    at: ExpressionAt<'_, 'dae>,
+    coordinate: &CoordinateWire,
+    provenance: DaeProvenance,
+) -> Result<ExprId<'dae>, DaeConstructionError> {
+    if let CoordinateWire::Binder { domain, ordinal } = coordinate {
+        let domain = mapped(&ids.domains, *domain, "domain", provenance)?;
+        at.binder(DomainBinderId::from_raw(domain.index(), *ordinal))
+    } else {
+        at.coordinate(rebuild_coordinate(ids, coordinate, provenance)?)
+    }
+}
+
 /// Rebuild one call node from its already-mapped function and arguments.
 ///
 /// A node that owns its own call replays those arguments; any other owner is a
@@ -1025,22 +1061,38 @@ fn rebuild_node<'dae>(
 fn rebuild_call<'dae>(
     ids: &WireIds<'dae>,
     at: ExpressionAt<'_, 'dae>,
-    owner: u32,
-    function: FunctionId<'dae>,
-    output: u32,
+    (owner, derivative): (u32, Option<(u32, u32)>),
+    target: (FunctionId<'dae>, u32),
     arguments: Vec<ExprId<'dae>>,
     provenance: DaeProvenance,
 ) -> Result<ExprId<'dae>, DaeConstructionError> {
+    let derivative = derivative
+        .map(|(source, ordinal)| {
+            mapped(
+                &ids.expressions,
+                source,
+                "derivative source call",
+                provenance,
+            )
+            .map(|source| (source, ordinal))
+        })
+        .transpose()?;
     if owner as usize == ids.expressions.len() {
-        return at.call(function, output as usize, arguments);
+        return match derivative {
+            Some((source, ordinal)) => {
+                at.replay_differentiated_call(source, ordinal, arguments, Some(target))
+            }
+            None => at.call(target.0, target.1 as usize, arguments),
+        };
     }
     if !arguments.is_empty() {
         return Err(malformed("expressions.nodes.call.operand_count"));
     }
     at.replay_call_projection(
         mapped(&ids.expressions, owner, "function call owner", provenance)?,
-        function,
-        output as usize,
+        target.0,
+        target.1 as usize,
+        derivative,
     )
 }
 
@@ -1344,7 +1396,7 @@ fn define_variables<'dae>(
             component_ref: attributes.component_ref.clone(),
             binding: attributes.binding.map(mapped_expression).transpose()?,
             start: attributes.start.map(mapped_expression).transpose()?,
-            fixed: attributes.fixed,
+            fixed: attributes.fixed.clone(),
             min: attributes.min.map(mapped_expression).transpose()?,
             max: attributes.max.map(mapped_expression).transpose()?,
             nominal: attributes.nominal.map(mapped_expression).transpose()?,
@@ -1352,8 +1404,10 @@ fn define_variables<'dae>(
             state_select: attributes.state_select,
             description: attributes.description.clone(),
             causality: attributes.causality,
+            declared_causality: attributes.declared_causality,
             is_tunable: attributes.is_tunable,
             is_held: attributes.is_held,
+            evaluable: attributes.evaluable,
             origin: attributes.origin,
         };
         dae.variables(|variables| variables.define(reservation, attributes, variable.declaration))?;
@@ -1556,13 +1610,17 @@ fn reconstruct_events<'dae>(
             action.provenance,
         )?;
         let id = dae.events(|events| match action.kind {
-            EventActionKindWire::Assert { message, level } => events.assert_with_level(
+            EventActionKindWire::Assert { message } => events.assert(
                 trigger,
                 guard,
                 mapped(&ids.expressions, message, "expression", action.provenance)?,
-                level
-                    .map(|level| mapped(&ids.expressions, level, "expression", action.provenance))
-                    .transpose()?,
+                action.provenance,
+            ),
+            EventActionKindWire::Warning { message, condition } => events.warning(
+                trigger,
+                guard,
+                mapped(&ids.expressions, condition, "expression", action.provenance)?,
+                mapped(&ids.expressions, message, "expression", action.provenance)?,
                 action.provenance,
             ),
             EventActionKindWire::Terminate { message } => events.terminate(
@@ -1636,6 +1694,9 @@ fn replay_discrete_value_owner<'dae>(
         Ok(())
     };
     match owner.structure {
+        Some(_) if owner.observed => Err(DaeConstructionError::InvalidObservedDiscreteOwner {
+            span: owner.provenance.span(),
+        }),
         Some(structure) => topology.structured_owner(
             owner.provenance,
             mapped(&ids.domains, structure.domain, "domain", owner.provenance)?,
@@ -1643,6 +1704,7 @@ fn replay_discrete_value_owner<'dae>(
             targets,
             replay,
         ),
+        None if owner.observed => topology.observed_owner(owner.provenance, targets, replay),
         None => topology.owner(owner.provenance, targets, replay),
     }
 }
@@ -1690,6 +1752,18 @@ fn reconstruct_clocks<'dae>(
                 .map(WireClockId::Periodic),
             ClockKindWire::Triggered(condition) => clocks
                 .triggered(
+                    mapped(&ids.conditions, condition, "condition", clock.provenance)?,
+                    clock.provenance,
+                )
+                .map(WireClockId::Triggered),
+            ClockKindWire::Shifted {
+                base,
+                counter,
+                condition,
+            } => clocks
+                .shifted(
+                    mapped(&ids.clocks, base, "clock", clock.provenance)?.clock_id(),
+                    counter,
                     mapped(&ids.conditions, condition, "condition", clock.provenance)?,
                     clock.provenance,
                 )

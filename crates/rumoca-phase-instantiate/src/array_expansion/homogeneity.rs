@@ -25,7 +25,7 @@
 use rumoca_ir_ast as ast;
 use rumoca_ir_ast::AstIndexMap as IndexMap;
 
-use super::index_modification_for_element;
+use super::{index_nested_modification_for_element, indexed_modifier_for_element};
 use crate::InstantiateResult;
 
 /// Whether an array component's elements are index-independent.
@@ -98,11 +98,17 @@ fn modification_probe(
     expr: &ast::Expression,
     tuple: &[i64],
 ) -> InstantiateResult<Option<HomogeneityVerdict>> {
-    // The same rule `distribute_component_ref_mods_for_element` applies: an
-    // element whose value differs from the written modifier is not a copy.
-    let indexed = index_modification_for_element(input.tree, input.parent_components, expr, tuple)?;
-    if indexed.is_some_and(|indexed| indexed != *expr) {
-        return Ok(Some(HomogeneityVerdict::Scalar("indexed modifier")));
+    let nested =
+        index_nested_modification_for_element(input.tree, input.parent_components, expr, tuple)?;
+    if nested.is_some() {
+        return Ok(Some(HomogeneityVerdict::Scalar("indexed nested modifier")));
+    }
+    if indexed_modifier_for_element(input.tree, input.parent_components, expr, tuple)?
+        .is_some_and(|indexed| indexed != *expr)
+    {
+        return Ok(Some(HomogeneityVerdict::Scalar(
+            "indexed component-reference modifier",
+        )));
     }
     Ok(None)
 }

@@ -346,6 +346,9 @@ pub fn flatten_ref_with_options(
     options: FlattenOptions,
 ) -> Result<flat::Model, FlattenError> {
     let mut ctx = Context::new();
+    ctx.declared_dimensions = std::sync::Arc::new(
+        rumoca_eval_ast::eval::DeclaredDimensions::from_instanced(tree, overlay),
+    );
     ctx.predefined_string_declaration = tree
         .scope_tree
         .predefined_member(&rumoca_core::ComponentPath::from_flat_path("String"));
@@ -356,6 +359,16 @@ pub fn flatten_ref_with_options(
     }
     let class_index = ast::ClassDefIndex::from_tree(tree);
     ctx.class_def_ids = std::sync::Arc::new(class_index.def_ids().collect());
+    ctx.package_def_ids = std::sync::Arc::new(
+        class_index
+            .def_ids()
+            .filter(|&def_id| {
+                class_index
+                    .get(def_id)
+                    .is_some_and(|class| class.class_type == rumoca_core::ClassType::Package)
+            })
+            .collect(),
+    );
     ctx.target_def_names = tree
         .def_map
         .iter()
@@ -415,7 +428,47 @@ pub fn flatten_ref_with_options(
         component_override_map: &component_override_map,
     })?;
 
+    reject_nonuniform_parameter_fixed(&flat)?;
+
     Ok(flat)
+}
+
+/// Reject a parameter or constant whose `fixed` array elements disagree.
+///
+/// Per-element `fixed` is representable for continuous coordinates because each
+/// state scalar is pinned independently (MLS §8.6). A parameter's `fixed`,
+/// however, selects one initialization role for the whole declaration: every
+/// downstream reader (`unbound_fixed_parameters`, the deferred-parameter and
+/// constant folds, and the initial-parameter projection) asks a single
+/// question of it. Reducing a non-uniform array to one Boolean would silently
+/// misclassify the differing elements, so this is refused explicitly at the
+/// phase that finalizes the resolved attribute.
+fn reject_nonuniform_parameter_fixed(flat: &flat::Model) -> Result<(), FlattenError> {
+    for variable in flat.variables.values() {
+        if !matches!(
+            variable.variability,
+            rumoca_core::Variability::Parameter(_) | rumoca_core::Variability::Constant(_)
+        ) {
+            continue;
+        }
+        let Some(values) = variable.fixed.as_ref() else {
+            continue;
+        };
+        let first = values.first().copied();
+        if values.iter().any(|value| Some(*value) != first) {
+            let rendered = values
+                .iter()
+                .map(|value| if *value { "true" } else { "false" })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(FlattenError::NonUniformParameterFixed {
+                name: variable.name.to_string(),
+                values: format!("{{{rendered}}}"),
+                span: variable.source_span,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Connection-set construction is intentionally scalar today, but the
@@ -1021,7 +1074,7 @@ mod nested_class_constant_scope_tests {
                         unsigned_integer("4"),
                         unsigned_integer("5"),
                     ],
-                    is_matrix: false,
+                    kind: rumoca_core::ArrayConstructor::Array,
                     span: test_span(),
                 }),
                 has_explicit_binding: true,

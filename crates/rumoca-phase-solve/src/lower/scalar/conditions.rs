@@ -44,6 +44,61 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         Ok(self.ops)
     }
 
+    /// A warning-level action (MLS §8.3.7): `edge(trigger) and guard and not
+    /// holds`, where `holds` is an ordinary Boolean expression evaluated
+    /// without events.
+    pub(in crate::lower) fn warning_condition_program(
+        mut self,
+        trigger: dae::ConditionId<'dae>,
+        guard: dae::ConditionId<'dae>,
+        trigger_memory: usize,
+        holds: dae::ExprId<'dae>,
+        span: Span,
+    ) -> Result<Vec<solve::LinearOp>, LowerError> {
+        let edge = self.trigger_edge(trigger, trigger_memory, span)?;
+        let guard = self.condition(guard)?;
+        let active = self.binary(dae::BinaryOperator::And, edge, guard, span)?;
+        let output = self.violated(active, holds, span)?;
+        self.ops.push(solve::LinearOp::StoreOutput { src: output });
+        Ok(self.ops)
+    }
+
+    /// A warning-level action owned by a clock: active on its ticks.
+    pub(in crate::lower) fn clocked_warning_condition_program(
+        mut self,
+        clock: dae::ClockId<'dae>,
+        guard: dae::ConditionId<'dae>,
+        holds: dae::ExprId<'dae>,
+        span: Span,
+    ) -> Result<Vec<solve::LinearOp>, LowerError> {
+        self.active_clock = Some(clock);
+        let guard = self.condition(guard)?;
+        let activation = self
+            .layout
+            .clock_activations
+            .get(clock.index() as usize)
+            .copied()
+            .ok_or_else(|| {
+                LowerError::contract("clocked action has no activation parameter", span)
+            })?;
+        let activation = self.load_slot(solve::scalar_slot_p(activation), span)?;
+        let active = self.binary(dae::BinaryOperator::And, activation, guard, span)?;
+        let output = self.violated(active, holds, span)?;
+        self.ops.push(solve::LinearOp::StoreOutput { src: output });
+        Ok(self.ops)
+    }
+
+    fn violated(
+        &mut self,
+        active: solve::Reg,
+        holds: dae::ExprId<'dae>,
+        span: Span,
+    ) -> Result<solve::Reg, LowerError> {
+        let holds = self.expression(holds, 0)?;
+        let violated = self.unary(dae::UnaryOperator::Not, holds, span)?;
+        self.binary(dae::BinaryOperator::And, active, violated, span)
+    }
+
     pub(in crate::lower) fn clocked_action_condition_program(
         mut self,
         clock: dae::ClockId<'dae>,
@@ -146,7 +201,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                 self.inclusive_root(operator == dae::BinaryOperator::GreaterEqual, root, span)?
             }
             _ => {
-                let condition = self.expression(expression, 0)?;
+                let condition = self.unbuffered_expression(expression, 0)?;
                 let when_true = self.constant(-1.0, span)?;
                 let when_false = self.constant(1.0, span)?;
                 self.select(condition, when_true, when_false, span)?
@@ -174,7 +229,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         let mut prior = Vec::with_capacity(branch_count);
         for ordinal in 0..branch_count {
             let branch = self.dynamic_guarded_branches(&targets[0])[ordinal];
-            let owner = Self::guarded_activation_owner(clock, branch);
+            let owner = Self::guarded_activation_owner(clock, targets[0].clock.is_some(), branch);
             let condition =
                 self.guarded_assignment_condition_region(&prior, owner, targets[0].span)?;
             let mut selected = prior.clone();
@@ -246,13 +301,21 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             .and_then(|index| target.branches.get(index).copied())
     }
 
+    /// A periodic clock ticks once per instant, so its partition's rows are
+    /// active at the level of their guard. An unclocked `when` and an MLS
+    /// §16.3 event clock activate on the rise of their trigger instead: an
+    /// event clock ticks when `edge(pre(condition))` becomes true, and a
+    /// condition that stays true through later iterations or events does not
+    /// tick it again.
     const fn guarded_activation_owner(
         clock: Option<dae::ClockId<'dae>>,
+        periodic: bool,
         branch: super::super::events::GuardedAssignment<'dae>,
     ) -> ActivationCondition<'dae> {
         let (trigger, guard, _, trigger_memory) = branch;
         ActivationCondition::GuardedAssignment {
             clock,
+            periodic,
             trigger,
             guard,
             trigger_memory,
@@ -350,6 +413,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             ActivationCondition::Expression(expression) => self.expression(expression, 0),
             ActivationCondition::GuardedAssignment {
                 clock,
+                periodic,
                 trigger,
                 guard,
                 trigger_memory,
@@ -360,7 +424,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                         span,
                     ));
                 }
-                if clock.is_some() {
+                if periodic {
                     return self.condition(guard);
                 }
                 let edge = self.trigger_edge(trigger, trigger_memory, span)?;

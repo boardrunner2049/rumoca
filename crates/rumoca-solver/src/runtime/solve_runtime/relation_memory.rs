@@ -107,8 +107,8 @@ impl SolveRuntime {
         max_iters: usize,
     ) -> Result<bool, RuntimeSolveError> {
         solve_eval::eval_and_apply_update_rows(solve_eval::UpdateRowApplication {
-            block: &self.model.problem.initialization.update_rhs,
-            targets: &self.model.problem.initialization.update_targets,
+            block: self.model.problem.initialization.update_rhs(),
+            targets: self.model.problem.initialization.update_targets(),
             y,
             p,
             t,
@@ -215,7 +215,9 @@ impl SolveRuntime {
         // view before any row evaluates; row-wide clock owners are only an
         // execution filter and cannot stand in for these expression leaves.
         write_clock_activation_params(&self.model, p, t);
-        for event_iteration in 0..max_iters {
+        let window = self.event_schedule().relation_surface_window();
+        let mut history = std::collections::VecDeque::with_capacity(window + 1);
+        for event_iteration in 0..self.event_schedule().fixed_point_cap() {
             // Appendix B fixes `pre` for one complete equation pass, then
             // advances ordinary event history atomically from that pass before
             // starting the next one.  Capture the source before any runtime
@@ -240,75 +242,381 @@ impl SolveRuntime {
                     p,
                 )?
             };
-            changed |=
-                self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
-            changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
-            changed |= project_algebraics(y, p)?;
-            changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
-            // Relation memory is an input to discrete equations and algorithm
-            // transactions at this same event instant.  Refresh it from the
-            // just-projected coordinate before those consumers take their one
-            // whole-event pass; updating it only afterward lets fixed/clocked
-            // owners consume the stale side and they are not permitted to run
-            // again merely because relation memory changed later in the pass.
-            let relation_changed_before_discrete = self
-                .update_relation_memory_from_solver_y_except_overrides(
-                    t,
-                    y,
-                    p,
-                    tol,
-                    root_relation_overrides,
-                )?;
-            changed |= relation_changed_before_discrete;
-            if relation_changed_before_discrete {
-                changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
-            }
-            let snapshot = DiscretePreSnapshot {
-                row_filter,
-                root_relation_overrides,
-                event_iteration,
-            };
-            {
-                let mut settle_input = DiscreteRowsSettleInput {
+            changed |= self.run_event_pass(
+                &mut DiscreteRowsSettleInput {
                     y,
                     p,
                     t,
                     tol,
                     max_iters,
-                };
-                let discrete_changed = self.settle_discrete_rows_for_pre_snapshot(
-                    &snapshot,
-                    &mut settle_input,
-                    &mut project_algebraics,
-                )?;
-                changed |= discrete_changed;
-            }
-            let relation_changed = self.update_relation_memory_from_solver_y_except_overrides(
-                t,
-                y,
-                p,
-                tol,
+                },
+                row_filter,
+                event_iteration,
                 root_relation_overrides,
+                &mut project_algebraics,
             )?;
-            changed |= relation_changed;
-            let overrides_changed =
-                self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
-            changed |= overrides_changed;
-            // The discrete settle returns from a projected coordinate with
-            // runtime assignments stable. Reproject only if relation-memory
-            // writes changed an input after that certificate; an unconditional
-            // second full projection doubled unchanged clock ticks.
-            if relation_changed || overrides_changed {
-                changed |= project_algebraics(y, p)?;
-                changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
-            }
             if !changed && event_iteration_plan_settled(&self.model, y, p)? {
+                return self.eval_event_actions(y, p, event_pre_p, t, row_filter);
+            }
+            if !on_relation_surface(&mut history, window, y, p, tol) {
+                continue;
+            }
+            let resumed = self.resolve_relation_cycle(
+                &history,
+                &mut DiscreteRowsSettleInput {
+                    y,
+                    p,
+                    t,
+                    tol,
+                    max_iters,
+                },
+                root_relation_overrides,
+                &mut project_algebraics,
+            )?;
+            if resumed {
+                history.clear();
+            } else {
                 return self.eval_event_actions(y, p, event_pre_p, t, row_filter);
             }
         }
         Err(RuntimeSolveError::solve_ir(format!(
             "event update iteration did not converge at t={t}"
         )))
+    }
+
+    /// The event iteration schedule this model's Solve IR carries
+    /// (SPEC_0044 ME-EVENT-006).
+    pub(super) fn event_schedule(&self) -> &solve::EventIterationSchedule {
+        &self.model.problem.discrete.event_iteration_plan.schedule
+    }
+
+    /// Walk one event pass of the schedule under this pass's fixed `pre`.
+    fn run_event_pass(
+        &self,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        row_filter: EventUpdateRowFilter,
+        event_iteration: usize,
+        root_relation_overrides: &mut Vec<(usize, f64)>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
+        let mut changed = false;
+        for step in self.event_schedule().event_pass() {
+            changed |= match step {
+                solve::EventPassStep::RelationOverrides => self
+                    .apply_root_relation_memory_overrides(
+                        root_relation_overrides,
+                        input.y,
+                        input.p,
+                        input.tol,
+                    )?,
+                solve::EventPassStep::RuntimeAssignments => self.run_runtime_assignments(input)?,
+                solve::EventPassStep::AlgebraicProjection => project_algebraics(input.y, input.p)?,
+                // Relation memory is an input to discrete equations and
+                // algorithm transactions at this same event instant. Refresh
+                // it from the just-projected coordinate before those consumers
+                // take their one whole-event pass; updating it only afterward
+                // lets fixed/clocked owners consume the stale side, and they
+                // may not run again merely because relation memory changed.
+                solve::EventPassStep::RelationRefresh => {
+                    self.refresh_relations_then_assign(input, root_relation_overrides)?
+                }
+                solve::EventPassStep::RelationSettle => self
+                    .settle_event_equations_with_fixed_pre(
+                        input,
+                        row_filter,
+                        event_iteration,
+                        root_relation_overrides,
+                        project_algebraics,
+                    )?,
+            };
+        }
+        Ok(changed)
+    }
+
+    /// Refresh relation memory; when it changed, rerun the runtime
+    /// assignments so discrete consumers read the refreshed side.
+    fn refresh_relations_then_assign(
+        &self,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        root_relation_overrides: &mut Vec<(usize, f64)>,
+    ) -> Result<bool, RuntimeSolveError> {
+        let refreshed = self.refresh_event_relation_memory(
+            input.t,
+            input.y,
+            input.p,
+            input.tol,
+            root_relation_overrides,
+        )?;
+        if refreshed {
+            self.run_runtime_assignments(input)?;
+        }
+        Ok(refreshed)
+    }
+
+    fn run_runtime_assignments(
+        &self,
+        input: &mut DiscreteRowsSettleInput<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
+        self.apply_runtime_assignments_until_stable(
+            input.y,
+            input.p,
+            input.t,
+            input.tol,
+            input.max_iters,
+        )
+    }
+
+    fn settle_event_equations_with_fixed_pre(
+        &self,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        row_filter: EventUpdateRowFilter,
+        event_iteration: usize,
+        root_relation_overrides: &mut Vec<(usize, f64)>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
+        let mut changed_any = false;
+        let window = self.event_schedule().relation_surface_window();
+        let mut history = std::collections::VecDeque::with_capacity(window + 1);
+        for relation_iteration in 0..self.event_schedule().fixed_point_cap() {
+            let pass = self.run_relation_pass(
+                input,
+                row_filter,
+                event_iteration.max(relation_iteration),
+                root_relation_overrides,
+                project_algebraics,
+            )?;
+            changed_any |= pass.changed;
+            if pass.settled {
+                return Ok(changed_any);
+            }
+            if !on_relation_surface(&mut history, window, input.y, input.p, input.tol) {
+                continue;
+            }
+            // A cycle cannot leave on its own; a consistent mode of the
+            // cycling relations, when one exists, is the event's answer.
+            let resumed = self.resolve_relation_cycle(
+                &history,
+                input,
+                root_relation_overrides,
+                project_algebraics,
+            )?;
+            if !resumed {
+                return Ok(changed_any);
+            }
+            history.clear();
+            changed_any = true;
+        }
+        Err(RuntimeSolveError::solve_ir(format!(
+            "event condition equations did not converge with fixed pre at t={}",
+            input.t
+        )))
+    }
+
+    /// Search the modes of the relations a cycle alternates, together with
+    /// every relation reading a coordinate one of them reads, for one whose
+    /// projected coordinate gives each relation the side it was assigned
+    /// (ME-EVENT-008). The first such mode is pinned through the relation
+    /// overrides; the coordinate and parameters of a rejected mode are
+    /// restored.
+    fn search_consistent_mode(
+        &self,
+        history: &std::collections::VecDeque<(Vec<f64>, Vec<f64>)>,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        root_relation_overrides: &mut Vec<(usize, f64)>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<ModeSearch, RuntimeSolveError> {
+        let limit = self.event_schedule().mode_search_relations();
+        let candidates = self.mode_candidates(history, input.p)?;
+        let mut roots = Vec::with_capacity(candidates.len());
+        for (root, _) in &candidates {
+            roots.push(*root);
+        }
+        if candidates.is_empty() || candidates.len() > limit {
+            return Ok(ModeSearch::Unsearched { roots, limit });
+        }
+        let (base_y, base_p) = (input.y.to_vec(), input.p.to_vec());
+        for mode in 0..(1usize << candidates.len()) {
+            let sides = mode_sides(mode, candidates.len());
+            if self.mode_is_consistent(&candidates, &sides, input, project_algebraics)? {
+                drop_overrides_of(root_relation_overrides, &roots);
+                root_relation_overrides.extend(roots.iter().copied().zip(sides));
+                return Ok(ModeSearch::Found);
+            }
+            input.y.copy_from_slice(&base_y);
+            input.p.copy_from_slice(&base_p);
+        }
+        Ok(ModeSearch::NoneConsistent { roots })
+    }
+
+    /// Resolve an iteration that entered a cycle (ME-EVENT-008): `true` when
+    /// a consistent mode was pinned and the iteration continues; `false` when
+    /// every joint mode was searched and none is consistent, so every state
+    /// of the cycle is a fixed point and the current side is kept, counted as
+    /// a relation-surface settle. A cycle the bounded search cannot cover is
+    /// refused, naming its relations.
+    fn resolve_relation_cycle(
+        &self,
+        history: &std::collections::VecDeque<(Vec<f64>, Vec<f64>)>,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        root_relation_overrides: &mut Vec<(usize, f64)>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
+        let search = self.search_consistent_mode(
+            history,
+            input,
+            root_relation_overrides,
+            project_algebraics,
+        )?;
+        match search {
+            ModeSearch::Found => Ok(true),
+            ModeSearch::NoneConsistent { roots } => {
+                crate::runtime::fallbacks::note_relation_surface(&roots);
+                Ok(false)
+            }
+            ModeSearch::Unsearched { roots, limit } => Err(RuntimeSolveError::solve_ir(format!(
+                "event iteration at t={} cycles among relations {roots:?}, which the \
+                 mode search (limit {limit} relations) cannot cover",
+                input.t
+            ))),
+        }
+    }
+
+    /// Roots whose relation memory differs across the cycle, and every root
+    /// with relation memory that reads a coordinate one of them reads, with
+    /// their memory parameters.
+    fn mode_candidates(
+        &self,
+        history: &std::collections::VecDeque<(Vec<f64>, Vec<f64>)>,
+        p: &[f64],
+    ) -> Result<Vec<(usize, usize)>, RuntimeSolveError> {
+        let events = &self.model.problem.events;
+        let targets = events
+            .root_relation_memory_targets
+            .iter()
+            .enumerate()
+            .filter_map(|(root, target)| match target {
+                Some(solve::ScalarSlot::P { index, .. }) => Some((root, *index)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let cycling = targets
+            .iter()
+            .filter(|(_, index)| history.iter().any(|(_, prior)| prior[*index] != p[*index]))
+            .map(|(root, _)| *root)
+            .collect::<Vec<_>>();
+        let neighborhoods = match solve::root_neighborhoods(&events.root_conditions) {
+            Ok(neighborhoods) => neighborhoods,
+            Err(error) => return Err(RuntimeSolveError::solve_ir(error.to_string())),
+        };
+        let joined = cycling
+            .iter()
+            .filter_map(|root| neighborhoods.get(*root))
+            .flatten()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok(targets
+            .into_iter()
+            .filter(|(root, _)| joined.contains(root))
+            .collect())
+    }
+
+    /// Project with `sides` assigned to `candidates` and report whether every
+    /// candidate relation then takes its assigned side. A mode whose
+    /// projection does not converge is not a solution.
+    fn mode_is_consistent(
+        &self,
+        candidates: &[(usize, usize)],
+        sides: &[f64],
+        input: &mut DiscreteRowsSettleInput<'_>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<bool, RuntimeSolveError> {
+        for ((_, index), side) in candidates.iter().zip(sides) {
+            input.p[*index] = *side;
+        }
+        if project_algebraics(input.y, input.p).is_err() {
+            return Ok(false);
+        }
+        let roots = self.eval_root_conditions_from_solver_y(input.t, input.y, input.p)?;
+        let domains = &self.model.problem.events.root_zero_domains;
+        Ok(candidates.iter().zip(sides).all(|((root, _), side)| {
+            let value =
+                crate::runtime::solve_ops::orient_typed_root_zero(roots[*root], domains[*root]);
+            value == 0.0 || relation_memory_value_from_root(value) == *side
+        }))
+    }
+
+    /// Walk one relation pass, stopping where its relations settled.
+    fn run_relation_pass(
+        &self,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        row_filter: EventUpdateRowFilter,
+        event_iteration: usize,
+        root_relation_overrides: &mut Vec<(usize, f64)>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<RelationPassOutcome, RuntimeSolveError> {
+        let mut changed_any = false;
+        for step in self.event_schedule().relation_pass() {
+            let Some(changed) = self.run_relation_step(
+                *step,
+                input,
+                row_filter,
+                event_iteration,
+                root_relation_overrides,
+                project_algebraics,
+            )?
+            else {
+                return Ok(RelationPassOutcome {
+                    changed: changed_any,
+                    settled: true,
+                });
+            };
+            changed_any |= changed;
+        }
+        Ok(RelationPassOutcome {
+            changed: changed_any,
+            settled: false,
+        })
+    }
+
+    /// Run one relation-pass step; `None` when the pass has settled.
+    fn run_relation_step(
+        &self,
+        step: solve::RelationPassStep,
+        input: &mut DiscreteRowsSettleInput<'_>,
+        row_filter: EventUpdateRowFilter,
+        event_iteration: usize,
+        root_relation_overrides: &mut Vec<(usize, f64)>,
+        project_algebraics: &mut ProjectAlgebraics<'_>,
+    ) -> Result<Option<bool>, RuntimeSolveError> {
+        let changed = match step {
+            solve::RelationPassStep::DiscreteSettle => {
+                let snapshot = DiscretePreSnapshot {
+                    row_filter,
+                    root_relation_overrides,
+                    event_iteration,
+                };
+                self.settle_discrete_rows_for_pre_snapshot(&snapshot, input, project_algebraics)?
+            }
+            // MLS Appendix B: condition equations belong to the same solve as
+            // current discrete values. Advancing pre before these relations
+            // settle would preserve a transient latch value in event history.
+            solve::RelationPassStep::SettledIfRelationsUnchanged => {
+                let refreshed = self.refresh_event_relation_memory(
+                    input.t,
+                    input.y,
+                    input.p,
+                    input.tol,
+                    root_relation_overrides,
+                )?;
+                if !refreshed {
+                    return Ok(None);
+                }
+                true
+            }
+            solve::RelationPassStep::AlgebraicProjection => project_algebraics(input.y, input.p)?,
+            solve::RelationPassStep::RuntimeAssignments => self.run_runtime_assignments(input)?,
+        };
+        Ok(Some(changed))
     }
 
     pub(super) fn validate_discrete_event_rows(&self) -> Result<(), RuntimeSolveError> {
@@ -364,13 +672,13 @@ impl SolveRuntime {
         Ok(changed)
     }
 
-    pub(crate) fn update_relation_memory_from_solver_y_except_overrides(
+    pub(crate) fn refresh_event_relation_memory(
         &self,
         t: f64,
         y: &[f64],
         p: &mut [f64],
         _tol: f64,
-        root_relation_overrides: &[(usize, f64)],
+        root_relation_overrides: &mut Vec<(usize, f64)>,
     ) -> Result<bool, RuntimeSolveError> {
         if self
             .model
@@ -383,7 +691,11 @@ impl SolveRuntime {
             return Ok(false);
         }
         let roots = self.eval_root_conditions_from_solver_y(t, y, p)?;
-        self.update_root_relation_memory_from_values(&roots, p, root_relation_overrides)
+        let released =
+            self.release_reversed_relation_overrides(&roots, root_relation_overrides, |_| true)?;
+        let changed =
+            self.update_root_relation_memory_from_values(&roots, p, root_relation_overrides)?;
+        Ok(released || changed)
     }
 
     pub(crate) fn update_algebraic_relation_memory_from_solver_y_except_overrides(
@@ -391,22 +703,53 @@ impl SolveRuntime {
         t: f64,
         y: &[f64],
         p: &mut [f64],
-        root_relation_overrides: &[(usize, f64)],
+        root_relation_overrides: &mut Vec<(usize, f64)>,
     ) -> Result<bool, RuntimeSolveError> {
         let roots = self.eval_root_conditions_from_solver_y(t, y, p)?;
-        self.update_root_relation_memory_from_values_where(
+        let algebraic = |root_index| {
+            self.model
+                .problem
+                .events
+                .root_relation_refresh_roles
+                .get(root_index)
+                .is_some_and(|role| *role == solve::RootRelationRefreshRole::AlgebraicDependent)
+        };
+        let released =
+            self.release_reversed_relation_overrides(&roots, root_relation_overrides, algebraic)?;
+        let changed = self.update_root_relation_memory_from_values_where(
             &roots,
             p,
             root_relation_overrides,
-            |root_index| {
-                self.model
-                    .problem
-                    .events
-                    .root_relation_refresh_roles
-                    .get(root_index)
-                    .is_some_and(|role| *role == solve::RootRelationRefreshRole::AlgebraicDependent)
-            },
-        )
+            algebraic,
+        )?;
+        Ok(released || changed)
+    }
+
+    /// A located side seeds event iteration; it cannot constrain a relation
+    /// whose inputs subsequently move to the opposite side (MLS Appendix B).
+    /// Keep the selection at an exact zero and carry released selections out
+    /// to post-commit canonicalization so they cannot be reintroduced there.
+    fn release_reversed_relation_overrides<F>(
+        &self,
+        roots: &[f64],
+        overrides: &mut Vec<(usize, f64)>,
+        mut include: F,
+    ) -> Result<bool, RuntimeSolveError>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        if let Some((index, _)) = overrides.iter().find(|(index, _)| *index >= roots.len()) {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "event relation override {index} is outside the root vector"
+            )));
+        }
+        let before = overrides.len();
+        overrides.retain(|(index, selected)| {
+            !include(*index)
+                || roots[*index] == 0.0
+                || relation_memory_value_from_root(roots[*index]) == *selected
+        });
+        Ok(overrides.len() != before)
     }
 
     pub(super) fn update_root_relation_memory_from_values(
@@ -466,13 +809,17 @@ impl SolveRuntime {
                     "root relation-memory parameter index {parameter_index} is out of bounds"
                 ))
             })?;
-            let value = relation_memory_value_from_root(*root);
+            let root = crate::runtime::solve_ops::orient_typed_root_zero(
+                *root,
+                self.model.problem.events.root_zero_domains[root_index],
+            );
+            let value = relation_memory_value_from_root(root);
             let before = *slot;
             tracing::trace!(
                 target: "rumoca_solver::relation_memory",
                 root_index,
                 parameter_index,
-                root = *root,
+                root,
                 before,
                 value,
                 "refresh root relation memory"
@@ -570,6 +917,7 @@ impl SolveRuntime {
             &mut values,
         )?;
         self.project_event_transaction_action_values(t, row_filter, &mut values)?;
+        self.report_violated_warnings(&values, y, &action_p, t)?;
         match solve_eval::event_action_request_from_values(
             events,
             y,
@@ -829,5 +1177,87 @@ impl SolveRuntime {
             }
         }
         Ok(())
+    }
+}
+
+/// What one relation pass did: whether it changed the coordinate, and whether
+/// it stopped because its relations settled.
+struct RelationPassOutcome {
+    changed: bool,
+    settled: bool,
+}
+
+/// Whether an event or relation iteration has returned to a state of one of
+/// its last `window` passes: its discrete values and relation memory repeat
+/// exactly while the coordinate stays within the solve tolerance. Every state
+/// of such a cycle is a fixed point for the coordinate: its alternating
+/// relations sit on a surface where their expression is continuous, as a
+/// relation inside `smooth` does (ME-EVENT-008), so the current side is kept.
+/// A window of zero disables the rule.
+fn on_relation_surface(
+    history: &mut std::collections::VecDeque<(Vec<f64>, Vec<f64>)>,
+    window: usize,
+    y: &[f64],
+    p: &[f64],
+    tol: f64,
+) -> bool {
+    if window == 0 {
+        return false;
+    }
+    let repeats = history.iter().any(|(prior_y, prior_p)| {
+        prior_p
+            .iter()
+            .zip(p)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+            && !crate::runtime_values_changed(prior_y, y, tol)
+    });
+    history.push_back((y.to_vec(), p.to_vec()));
+    if history.len() > window {
+        history.pop_front();
+    }
+    repeats
+}
+
+/// What a mode search over a relation cycle found.
+enum ModeSearch {
+    /// A consistent joint mode, now pinned through the relation overrides.
+    Found,
+    /// Every joint mode of these roots was projected and none was consistent.
+    NoneConsistent { roots: Vec<usize> },
+    /// The cycle has no relation candidates, or more than `limit`, so it was
+    /// not searched.
+    Unsearched { roots: Vec<usize>, limit: usize },
+}
+
+/// Remove the pinned sides of every root in `roots`, keeping the others in order.
+fn drop_overrides_of(overrides: &mut Vec<(usize, f64)>, roots: &[usize]) {
+    let mut kept = Vec::with_capacity(overrides.len());
+    for entry in overrides.drain(..) {
+        if !roots.contains(&entry.0) {
+            kept.push(entry);
+        }
+    }
+    *overrides = kept;
+}
+
+/// The relation sides one joint mode assigns: bit `k` of `mode` picks the
+/// upper side for candidate `k`.
+fn mode_sides(mode: usize, count: usize) -> Vec<f64> {
+    let mut sides = Vec::with_capacity(count);
+    for bit in 0..count {
+        sides.push(if mode >> bit & 1 == 1 { 1.0 } else { 0.0 });
+    }
+    sides
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_overrides_keeps_only_the_other_roots_in_order() {
+        let mut overrides = vec![(3, 1.0), (1, 0.0), (5, 1.0), (1, 1.0)];
+        drop_overrides_of(&mut overrides, &[1, 4]);
+        assert_eq!(overrides, vec![(3, 1.0), (5, 1.0)]);
     }
 }

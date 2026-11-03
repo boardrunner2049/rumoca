@@ -24,6 +24,15 @@ pub(super) fn export_clocks(view: dae::DaeView<'_>, ctx: &mut Ctx<'_>) -> Vec<Rb
                         }
                     },
                 },
+                dae::ClockOperation::Shifted {
+                    base,
+                    counter,
+                    condition,
+                } => RbcClockNode::Shifted {
+                    base: ClockId(base.index()),
+                    counter,
+                    condition: ConditionId(condition.index()),
+                },
                 dae::ClockOperation::Triggered(condition) => RbcClockNode::Triggered {
                     condition: ConditionId(condition.index()),
                 },

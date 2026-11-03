@@ -47,6 +47,7 @@ fn projection_coupled_state_model(k: f64) -> solve::SolveModel {
             rows: vec![1],
             y_indices: vec![1],
             tearing: None,
+            alternate_charts: Vec::new(),
         }],
     };
     // full_jacobian_v: JVP of der(x)=a → d(der) = seed[a]
@@ -128,15 +129,10 @@ fn exact_dependency_owner_keeps_primal_and_jvp_consistent_below_projection_toler
     );
 
     let x = 3.0;
-    let step = 1.0e-7;
     let tolerance = 1.0e-6;
-    let base = runtime
+    let primal = runtime
         .eval_state_derivatives(0.0, &[x], &[], tolerance, 8)
-        .expect("base primal should evaluate");
-    let perturbed = runtime
-        .eval_state_derivatives(0.0, &[x + step], &[], tolerance, 8)
-        .expect("perturbed primal should evaluate");
-    let finite_difference = (perturbed[0] - base[0]) / step;
+        .expect("the primal should evaluate");
 
     let mut jvp = [0.0];
     runtime
@@ -155,8 +151,10 @@ fn exact_dependency_owner_keeps_primal_and_jvp_consistent_below_projection_toler
         )
         .expect("exact projection-owner JVP should evaluate");
 
-    assert!((finite_difference - k).abs() <= 1.0e-8);
-    assert!((jvp[0] - finite_difference).abs() <= 1.0e-8);
+    // The exact owner a = k*x settles the primal to roundoff and gives the
+    // JVP k, far inside the projection tolerance.
+    assert!((primal[0] - k * x).abs() <= 1.0e-12, "primal {}", primal[0]);
+    assert!((jvp[0] - k).abs() <= 1.0e-12, "jvp {}", jvp[0]);
 }
 
 fn parameter_projection_residual() -> solve::ComputeBlock {
@@ -261,6 +259,7 @@ fn parameter_projection_model() -> solve::SolveModel {
             rows: vec![1],
             y_indices: vec![1],
             tearing: None,
+            alternate_charts: Vec::new(),
         }],
     };
     model.artifacts.continuous.implicit_jacobian_v_scalar = parameter_projection_jvp(true);
@@ -347,6 +346,7 @@ fn linear_algebraic_loop_state_model() -> solve::SolveModel {
             rows: vec![1, 2],
             y_indices: vec![1, 2],
             tearing: None,
+            alternate_charts: Vec::new(),
         }],
     };
     // full_jacobian_v: JVP of der = a + b.
@@ -489,7 +489,6 @@ fn seed_refresh_directly_solves_coupled_algebraic_loop() {
         .expect("valid runtime should prepare");
     let solver_y = [1.0, 2.0 / 15.0, 7.0 / 15.0];
     let mut seed = [1.0, 0.0, 0.0];
-    let mut unit_seed = [0.0, 0.0, 0.0];
 
     runtime
         .seed_refresh_with_plan(
@@ -504,7 +503,6 @@ fn seed_refresh_directly_solves_coupled_algebraic_loop() {
             },
             &solver_y,
             &mut seed,
-            &mut unit_seed,
         )
         .expect("direct seed refresh should not depend on fixed-point iterations");
 
@@ -527,7 +525,6 @@ fn seed_refresh_reports_singular_coupled_algebraic_loop() {
     let solver_y = [1.0, 0.5, 0.5];
     let mut seed = [1.0, 9.0, -4.0];
     let original_seed = seed;
-    let mut unit_seed = [0.0, 0.0, 0.0];
 
     let error = runtime
         .seed_refresh_with_plan(
@@ -542,7 +539,6 @@ fn seed_refresh_reports_singular_coupled_algebraic_loop() {
             },
             &solver_y,
             &mut seed,
-            &mut unit_seed,
         )
         .expect_err("singular seed system should report an invalid gradient");
 

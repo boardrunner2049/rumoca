@@ -5,6 +5,11 @@
 //! extension. FMI lifecycle, roots, events, output cadence, and trace policy
 //! remain in the common host.
 
+#[cfg(test)]
+mod convergence_tests;
+#[cfg(test)]
+mod failure_budget_tests;
+
 use std::{cell::Cell, rc::Rc};
 
 use diffsol::{
@@ -15,13 +20,16 @@ use diffsol::{
 use rumoca_solver::fmi_me::{
     MeAdvanceRequest, MeContinuousPoint, MeDerivativeHandle, MeIntegrationError,
     MeIntegratorBackend, MeNumericalFailure, MeNumericalSetup, MeStepCandidate,
-    accepted_interval_contains,
+    accepted_interval_contains, accepted_step_roundoff,
 };
 use self_cell::self_cell;
 
 use crate::{LinearSolver, Matrix, Scalar, Vector};
 
 const METHOD: &str = "diffsol-bdf";
+
+#[cfg(test)]
+mod tests;
 
 type RhsFn = Box<dyn Fn(&Vector, &Vector, Scalar, &mut Vector)>;
 type JacobianFn = Box<dyn Fn(&Vector, &Vector, Scalar, &Vector, &mut Vector)>;
@@ -263,6 +271,13 @@ impl MeIntegratorBackend for DiffsolBdfIntegrator {
             }
             let state = method.state();
             let states = try_copy(state.y.as_slice(), "BDF accepted endpoint")?;
+            if !states.iter().all(|value| value.is_finite()) {
+                return Err(MeIntegrationError::numerical(
+                    METHOD,
+                    MeNumericalFailure::AdvanceExhausted,
+                    "Diffsol accepted a non-finite endpoint",
+                ));
+            }
             let order = u32::try_from(method.order()).map_err(|_| {
                 MeIntegrationError::numerical(
                     METHOD,
@@ -279,11 +294,16 @@ impl MeIntegratorBackend for DiffsolBdfIntegrator {
         {
             return Err(MeIntegrationError::DerivativeRefused);
         }
+        // A discarded trial filled its callback with NaN, which failed that
+        // Newton iteration and made the method retry a smaller step; the step it
+        // accepted converged on finite values, so the discard was a rejected
+        // trial and is acknowledged here.
+        if let Some(derivatives) = self.derivatives.as_ref() {
+            derivatives.take_discard();
+        }
         self.accepted_interval = Some(AcceptedInterval {
             start_time: request.current().time(),
-            start_states: try_copy(request.current().states(), "BDF interval start")?,
             end_time: candidate.accepted_time(),
-            end_states: try_copy(candidate.accepted_states(), "BDF interval end")?,
         });
         Ok(candidate)
     }
@@ -313,18 +333,10 @@ impl MeIntegratorBackend for DiffsolBdfIntegrator {
                 ),
             ));
         }
-        // The BDF state vectors are the native extension's endpoint values.
-        // Diffsol's polynomial evaluator is intended for the open interval and
-        // can accumulate a different endpoint rounding path, so preserve the
-        // exact accepted points the host is validating.
-        if time.to_bits() == interval.start_time.to_bits() || time < interval.start_time {
-            states.copy_from_slice(&interval.start_states);
-            return Ok(());
-        }
-        if time.to_bits() == interval.end_time.to_bits() || time > interval.end_time {
-            states.copy_from_slice(&interval.end_states);
-            return Ok(());
-        }
+        // Roundoff-admitted neighbors use the native endpoint. Endpoint and
+        // interior values come from the same extension, so the host can check
+        // its consistency with the accepted state without an overriding copy.
+        let time = time.clamp(interval.start_time, interval.end_time);
         self.require_solver()?.with_dependent(|_, method| {
             let sampled = method
                 .interpolate(time)
@@ -348,9 +360,7 @@ impl MeIntegratorBackend for DiffsolBdfIntegrator {
 
 struct AcceptedInterval {
     start_time: f64,
-    start_states: Vec<f64>,
     end_time: f64,
-    end_states: Vec<f64>,
 }
 
 fn build_problem(
@@ -361,6 +371,13 @@ fn build_problem(
     initial_step: f64,
 ) -> Result<BdfProblem, MeIntegrationError> {
     let initial = try_copy(point.states(), "BDF initial point")?;
+    if derivatives.state_jacobian_columns().is_none() {
+        return Err(numerical(
+            MeNumericalFailure::Construction,
+            "the component carries no certified state-Jacobian relation to color the BDF \
+             Jacobian with",
+        ));
+    }
     let rhs_derivatives = Rc::clone(&derivatives);
     let rhs: RhsFn = Box::new(move |state, _parameters, time, output| {
         rhs_derivatives.derivatives_into(time, state.as_slice(), output.as_mut_slice());
@@ -368,10 +385,19 @@ fn build_problem(
     let jacobian_derivatives = derivatives;
     let probing = Rc::new(Cell::new(true));
     let jacobian_probe = Rc::clone(&probing);
+    // Diffsol finds the Jacobian's nonzeros by probing the action with one
+    // seeded column at a time. The probe answers from the component's
+    // certified state-Jacobian relation (Solve IR), so the coloring is as
+    // sparse as the model and this backend derives no structure itself.
     let jacobian: JacobianFn = Box::new(move |state, _parameters, time, seed, output| {
         if jacobian_probe.get() {
-            let magnitude = seed.as_slice().iter().copied().map(f64::abs).sum();
-            output.as_mut_slice().fill(magnitude);
+            probe_pattern(
+                jacobian_derivatives
+                    .state_jacobian_columns()
+                    .unwrap_or_default(),
+                seed.as_slice(),
+                output.as_mut_slice(),
+            );
             return;
         }
         jacobian_derivatives.directional_derivative_into(
@@ -384,7 +410,7 @@ fn build_problem(
     let initialize: InitialFn = Box::new(move |_parameters, _time, output| {
         output.as_mut_slice().copy_from_slice(&initial);
     });
-    let problem = OdeBuilder::<Matrix>::new()
+    let mut problem = OdeBuilder::<Matrix>::new()
         .t0(point.time())
         .h0(initial_step)
         .rtol(relative_tolerance)
@@ -394,8 +420,43 @@ fn build_problem(
         .init(initialize, point.width())
         .build()
         .map_err(|error| numerical(MeNumericalFailure::Construction, error));
+    if let Ok(problem) = problem.as_mut() {
+        problem.ode_options.min_timestep = scaled_step_floor(point.time(), initial_step);
+    }
     probing.set(false);
     problem
+}
+
+/// The structural Jacobian action the sparsity probe observes: each seeded
+/// column reaches the rows `columns` lists for it, so a NaN seed marks exactly
+/// the relation's rows.
+fn probe_pattern(columns: &[Vec<usize>], seed: &[f64], output: &mut [f64]) {
+    output.fill(0.0);
+    for (column, value) in seed.iter().copied().enumerate() {
+        if value == 0.0 {
+            continue;
+        }
+        for &row in columns.get(column).map_or(&[][..], Vec::as_slice) {
+            output[row] += value.abs();
+        }
+    }
+}
+
+/// diffsol's absolute minimum step.
+const ABSOLUTE_STEP_FLOOR: f64 = 1e-13;
+
+/// The smallest step BDF may take from `time`: diffsol's absolute floor,
+/// lowered to what the time coordinate can still resolve. A nanosecond-scale
+/// circuit needs first steps far below `1e-13` and failed at its start under
+/// the absolute floor although every step it takes is resolvable. The floor
+/// never drops below twice the host's accepted-step roundoff at `time`, so a
+/// step the solver may still take is one the host accepts as progress, and
+/// four units of roundoff in the requested first step bound it from below
+/// where `time` is zero (the DASSL `hmin` rule).
+fn scaled_step_floor(time: f64, initial_step: f64) -> f64 {
+    (2.0 * accepted_step_roundoff(time, 0.0))
+        .max(4.0 * f64::EPSILON * initial_step.abs())
+        .min(ABSOLUTE_STEP_FLOOR)
 }
 
 fn initial_state(

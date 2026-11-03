@@ -359,8 +359,8 @@ fn unsupported_external_annotation(expression: &ast::Expression, reason: &str) -
     ))
 }
 
-/// Read the MLS §18.3 `Inline`/`LateInline` annotation off a function
-/// declaration.
+/// Read the MLS §18.3 `Inline`/`LateInline`/`InlineAfterIndexReduction`
+/// annotation off a function declaration.
 ///
 /// Both spellings are recognized because both ask the same question of a
 /// compiler that substitutes bodies at one point: whether this call should
@@ -376,15 +376,19 @@ pub(super) fn extract_inline_annotation(
     annotations: &[ast::Expression],
 ) -> rumoca_core::InlineAnnotation {
     let mut requested = false;
+    let mut after_index_reduction = false;
     for annotation in annotations {
         match inline_clause(annotation) {
             Some(("Inline", false)) => return rumoca_core::InlineAnnotation::Never,
             Some(("Inline" | "LateInline", true)) => requested = true,
+            Some(("InlineAfterIndexReduction", true)) => after_index_reduction = true,
             _ => {}
         }
     }
     if requested {
         rumoca_core::InlineAnnotation::Requested
+    } else if after_index_reduction {
+        rumoca_core::InlineAnnotation::AfterIndexReduction
     } else {
         rumoca_core::InlineAnnotation::Unstated
     }
@@ -412,223 +416,6 @@ fn inline_clause(annotation: &ast::Expression) -> Option<(&str, bool)> {
         "true" => Some((name, true)),
         "false" => Some((name, false)),
         _ => None,
-    }
-}
-
-/// Extract derivative annotations from function annotation expressions (MLS §12.7.1).
-///
-/// Looks for annotations like:
-/// - `derivative = funcName`
-/// - `derivative(order=2) = funcName`
-/// - `derivative(zeroDerivative=x, zeroDerivative=y) = funcName`
-/// - `derivative(noDerivative=u) = funcName`
-pub(super) fn extract_derivative_annotations(
-    annotations: &[ast::Expression],
-) -> Vec<rumoca_core::DerivativeAnnotation> {
-    let mut derivatives = Vec::new();
-
-    for expr in annotations {
-        if let Some(deriv) = extract_single_derivative(expr) {
-            derivatives.push(deriv);
-        }
-    }
-
-    derivatives
-}
-
-/// Extract a single derivative annotation from an expression.
-pub(super) fn extract_single_derivative(
-    expr: &ast::Expression,
-) -> Option<rumoca_core::DerivativeAnnotation> {
-    // Pattern 1: NamedArgument { name: "derivative", value: ... }
-    // This handles: derivative = funcName
-    if let ast::Expression::NamedArgument { name, value, .. } = expr
-        && name.text.as_ref() == "derivative"
-    {
-        let func_name = extract_function_name(value)?;
-        return Some(rumoca_core::DerivativeAnnotation {
-            derivative_function: func_name,
-            order: 1,
-            zero_derivative: Vec::new(),
-            no_derivative: Vec::new(),
-        });
-    }
-
-    // Pattern 2: Modification { target: derivative(...), value: funcName }
-    // This handles: derivative(order=2) = funcName, derivative(zeroDerivative=x) = funcName
-    if let ast::Expression::Modification { target, value, .. } = expr
-        && let Some(annotation) = try_extract_modification_derivative(target, value)
-    {
-        return Some(annotation);
-    }
-
-    // Pattern 3: ClassModification { target: derivative, modifications: [...] }
-    // This handles more complex cases where derivative has modifications
-    if let ast::Expression::ClassModification {
-        target,
-        modifications,
-        ..
-    } = expr
-        && let Some(annotation) = try_extract_class_mod_derivative(target, modifications)
-    {
-        return Some(annotation);
-    }
-
-    None
-}
-
-/// Try to extract a derivative annotation from a Modification expression.
-pub(super) fn try_extract_modification_derivative(
-    target: &rumoca_ir_ast::ComponentReference,
-    value: &ast::Expression,
-) -> Option<rumoca_core::DerivativeAnnotation> {
-    // Check if target is "derivative"
-    if target.parts.len() != 1 || target.parts[0].ident.text.as_ref() != "derivative" {
-        return None;
-    }
-
-    let func_name = extract_function_name(value)?;
-    let mut annotation = rumoca_core::DerivativeAnnotation {
-        derivative_function: func_name,
-        order: 1,
-        zero_derivative: Vec::new(),
-        no_derivative: Vec::new(),
-    };
-
-    extract_modifiers_from_subscripts(&target.parts[0].subs, &mut annotation);
-    Some(annotation)
-}
-
-/// Try to extract a derivative annotation from a ClassModification expression.
-pub(super) fn try_extract_class_mod_derivative(
-    target: &rumoca_ir_ast::ComponentReference,
-    modifications: &[ast::Expression],
-) -> Option<rumoca_core::DerivativeAnnotation> {
-    // Check if target is "derivative"
-    if target.parts.len() != 1 || target.parts[0].ident.text.as_ref() != "derivative" {
-        return None;
-    }
-
-    let mut annotation = rumoca_core::DerivativeAnnotation {
-        derivative_function: String::new(),
-        order: 1,
-        zero_derivative: Vec::new(),
-        no_derivative: Vec::new(),
-    };
-
-    for mod_expr in modifications {
-        extract_derivative_modifier(mod_expr, &mut annotation);
-        // Check if this is the function name (ComponentReference without assignment)
-        if let Some(name) = extract_function_name(mod_expr) {
-            annotation.derivative_function = name;
-        }
-    }
-
-    if annotation.derivative_function.is_empty() {
-        None
-    } else {
-        Some(annotation)
-    }
-}
-
-/// Extract modifiers from subscripts (used in derivative(order=2) style).
-pub(super) fn extract_modifiers_from_subscripts(
-    subs: &Option<Vec<rumoca_ir_ast::Subscript>>,
-    annotation: &mut rumoca_core::DerivativeAnnotation,
-) {
-    let Some(subs) = subs else { return };
-    for sub in subs {
-        if let rumoca_ir_ast::Subscript::Expression(sub_expr) = sub {
-            extract_derivative_modifier(sub_expr, annotation);
-        }
-    }
-}
-
-/// Extract derivative modifiers like order, zeroDerivative, noDerivative from an expression.
-pub(super) fn extract_derivative_modifier(
-    expr: &ast::Expression,
-    annotation: &mut rumoca_core::DerivativeAnnotation,
-) {
-    // Handle NamedArgument { name: "order"|"zeroDerivative"|"noDerivative", value: ... }
-    if let ast::Expression::NamedArgument { name, value, .. } = expr {
-        apply_modifier(name.text.as_ref(), value, annotation);
-    }
-
-    // Handle Modification { target: "order"|..., value: ... }
-    if let ast::Expression::Modification { target, value, .. } = expr
-        && target.parts.len() == 1
-    {
-        apply_modifier(target.parts[0].ident.text.as_ref(), value, annotation);
-    }
-}
-
-/// Apply a derivative modifier by name to the annotation.
-pub(super) fn apply_modifier(
-    name: &str,
-    value: &ast::Expression,
-    annotation: &mut rumoca_core::DerivativeAnnotation,
-) {
-    match name {
-        "order" => {
-            if let Some(order) = extract_integer_value(value) {
-                annotation.order = order as u32;
-            }
-        }
-        "zeroDerivative" => {
-            if let Some(var_name) = extract_variable_name(value) {
-                annotation.zero_derivative.push(var_name);
-            }
-        }
-        "noDerivative" => {
-            if let Some(var_name) = extract_variable_name(value) {
-                annotation.no_derivative.push(var_name);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Extract a function name from an expression (ComponentReference).
-pub(super) fn extract_function_name(expr: &ast::Expression) -> Option<String> {
-    if let ast::Expression::ComponentReference(cr) = expr {
-        Some(
-            cr.parts
-                .iter()
-                .map(|p| p.ident.text.to_string())
-                .collect::<Vec<_>>()
-                .join("."),
-        )
-    } else {
-        None
-    }
-}
-
-/// Extract an integer value from an expression (Terminal with UnsignedInteger).
-pub(super) fn extract_integer_value(expr: &ast::Expression) -> Option<i64> {
-    if let ast::Expression::Terminal {
-        terminal_type: rumoca_ir_ast::TerminalType::UnsignedInteger,
-        token,
-        ..
-    } = expr
-    {
-        token.text.parse().ok()
-    } else {
-        None
-    }
-}
-
-/// Extract a variable name from an expression (ComponentReference).
-pub(super) fn extract_variable_name(expr: &ast::Expression) -> Option<String> {
-    if let ast::Expression::ComponentReference(cr) = expr {
-        Some(
-            cr.parts
-                .iter()
-                .map(|p| p.ident.text.to_string())
-                .collect::<Vec<_>>()
-                .join("."),
-        )
-    } else {
-        None
     }
 }
 
@@ -738,7 +525,9 @@ pub(super) fn convert_component_to_param(
         let shape_expr = component
             .shape_expr
             .iter()
-            .map(|sub| lower_function_shape_subscript(sub, imports, locals, expressions, span))
+            .map(|sub| {
+                lower_function_shape_subscript(sub, class_index, imports, locals, expressions, span)
+            })
             .collect::<Result<Vec<_>, FlattenError>>()?;
         param_dims = shape_expr.iter().map(function_shape_dim).collect();
         Some(shape_expr)
@@ -878,6 +667,7 @@ fn function_shape_dim(subscript: &rumoca_core::Subscript) -> i64 {
 
 pub(super) fn lower_function_shape_subscript(
     subscript: &ast::Subscript,
+    class_index: &ast::ClassDefIndex<'_>,
     imports: &qualify::ImportMap,
     locals: &HashSet<String>,
     expressions: FunctionExpressionContext<'_>,
@@ -886,10 +676,7 @@ pub(super) fn lower_function_shape_subscript(
     match subscript {
         ast::Subscript::Expression(expr) => {
             let span = expr.span();
-            // Package constants may be modified in the callable's exposure.
-            // Keep their exact reference until package specialization; only
-            // syntax-local integer arithmetic can be folded at this point.
-            if let Some(value) = crate::static_subscripts::try_constant_integer(expr) {
+            if let Some(value) = resolve_compile_time_integer_expr(expr, class_index) {
                 return Ok(rumoca_core::Subscript::index(value, span));
             }
             let qualified = qualify_function_expr(expr, imports, locals);
@@ -909,6 +696,100 @@ pub(super) fn lower_function_shape_subscript(
             .map_err(|err| FlattenError::missing_source_context(err.to_string()))?)
         }
     }
+}
+
+pub(super) fn resolve_compile_time_integer_expr(
+    expr: &ast::Expression,
+    class_index: &ast::ClassDefIndex<'_>,
+) -> Option<i64> {
+    let mut visiting = FxHashSet::default();
+    resolve_compile_time_integer_expr_inner(expr, class_index, &mut visiting)
+}
+
+pub(super) fn resolve_compile_time_integer_expr_inner(
+    expr: &ast::Expression,
+    class_index: &ast::ClassDefIndex<'_>,
+    visiting: &mut FxHashSet<rumoca_core::DefId>,
+) -> Option<i64> {
+    match expr {
+        ast::Expression::Terminal {
+            terminal_type: ast::TerminalType::UnsignedInteger,
+            token,
+            ..
+        } => token.text.parse().ok(),
+        ast::Expression::Unary {
+            op: rumoca_core::OpUnary::Plus | rumoca_core::OpUnary::DotPlus,
+            rhs,
+            ..
+        } => resolve_compile_time_integer_expr_inner(rhs, class_index, visiting),
+        ast::Expression::Unary {
+            op: rumoca_core::OpUnary::Minus | rumoca_core::OpUnary::DotMinus,
+            rhs,
+            ..
+        } => resolve_compile_time_integer_expr_inner(rhs, class_index, visiting)
+            .and_then(i64::checked_neg),
+        ast::Expression::Binary { op, lhs, rhs, .. } => {
+            let lhs = resolve_compile_time_integer_expr_inner(lhs, class_index, visiting)?;
+            let rhs = resolve_compile_time_integer_expr_inner(rhs, class_index, visiting)?;
+            match op {
+                rumoca_core::OpBinary::Add | rumoca_core::OpBinary::AddElem => lhs.checked_add(rhs),
+                rumoca_core::OpBinary::Sub | rumoca_core::OpBinary::SubElem => lhs.checked_sub(rhs),
+                rumoca_core::OpBinary::Mul | rumoca_core::OpBinary::MulElem => lhs.checked_mul(rhs),
+                rumoca_core::OpBinary::Div | rumoca_core::OpBinary::DivElem
+                    if rhs != 0 && lhs % rhs == 0 =>
+                {
+                    Some(lhs / rhs)
+                }
+                _ => None,
+            }
+        }
+        ast::Expression::ComponentReference(reference) => reference
+            .target_def_id()
+            .and_then(|def_id| resolve_component_constant_integer(def_id, class_index, visiting)),
+        _ => None,
+    }
+}
+
+pub(super) fn resolve_component_constant_integer(
+    def_id: rumoca_core::DefId,
+    class_index: &ast::ClassDefIndex<'_>,
+    visiting: &mut FxHashSet<rumoca_core::DefId>,
+) -> Option<i64> {
+    if !visiting.insert(def_id) {
+        return None;
+    }
+    let result = component_by_def_id(class_index, def_id)
+        .filter(|component| {
+            // MLS 3.7 §7.2: a public non-final declaration can be modified by
+            // the package that exposes it (`package M extends PM(nS = 2)`), so
+            // only a final or protected one (a protected element cannot be
+            // modified) fixes its value here; any other stays a shape
+            // expression that the exposing package settles (FLAT-C02).
+            (component.is_final || component.is_protected)
+                && matches!(
+                    component.variability,
+                    rumoca_core::Variability::Constant(_) | rumoca_core::Variability::Parameter(_)
+                )
+        })
+        .and_then(|component| component.binding.as_ref())
+        .and_then(|binding| {
+            resolve_compile_time_integer_expr_inner(binding, class_index, visiting)
+        });
+    visiting.remove(&def_id);
+    result
+}
+
+pub(super) fn component_by_def_id<'a>(
+    class_index: &'a ast::ClassDefIndex<'_>,
+    def_id: rumoca_core::DefId,
+) -> Option<&'a ast::Component> {
+    let parent_def_id = class_index.parent_def_id(def_id)?;
+    let local_name = class_index.local_name(def_id)?;
+    let parent = class_index.get(parent_def_id)?;
+    parent
+        .components
+        .get(local_name)
+        .filter(|component| component.def_id == Some(def_id))
 }
 
 const FUNCTION_QUALIFY_OPTS: qualify::QualifyOptions = qualify::QualifyOptions { skip_local: true };

@@ -1,6 +1,6 @@
 //! EQN (Equation) contract tests - MLS §8
 //!
-//! Tests for the 38 equation contracts defined in SPEC_0022.
+//! Tests for the 40 equation contracts defined in SPEC_0022.
 
 use rumoca_compile::compile::{ExpressionOperation, FailedPhase, VariableRole};
 use rumoca_compile::{Session, SessionConfig};
@@ -1176,6 +1176,30 @@ fn eqn_036_assert_level_not_evaluable_rejected() {
     );
 }
 
+#[test]
+fn eqn_036_violated_warning_level_assertion_never_aborts() {
+    let trace = rumoca_contracts::test_support::simulate_model(
+        r#"
+        model M
+            function F
+                input Real u;
+                output Real y;
+            algorithm
+                assert(u < 0.5, "u beyond range", level = AssertionLevel.warning);
+                y := 2 * u;
+            end F;
+            Real x(start = 0, fixed = true);
+        equation
+            der(x) = F(time);
+            assert(x < 0.1, "x beyond range", level = AssertionLevel.warning);
+        end M;
+    "#,
+        "M",
+        1.0,
+    );
+    assert!((trace.final_value("x") - 1.0).abs() < 1e-6);
+}
+
 // =============================================================================
 // EQN-038: Connections.branch/root/potentialRoot same restrictions as connect
 // in for/if-equations
@@ -1324,4 +1348,346 @@ fn eqn_matrix_constructor_equation_counts_every_element() {
     let trace = rumoca_contracts::test_support::simulate_model(source, "MatrixEquation", 0.1);
     assert!((trace.final_value("a") + 5.0).abs() < 1e-9);
     assert!((trace.final_value("b") + 11.0).abs() < 1e-9);
+}
+
+// =============================================================================
+// Discrete-valued array assignment inside a for-equation
+// MLS 3.6 §8.3.3 (for-equations) and §8.5 (discrete-time variables): a
+// for-equation may assign the elements of a discrete-valued (Boolean or
+// Integer) output array. Each domain point defines one element from the
+// element-assignment body, and the family lowers to canonical DAE without a
+// spurious shape mismatch.
+// =============================================================================
+
+#[test]
+fn discrete_for_loop_element_assignment_succeeds() {
+    expect_success(
+        r#"
+        model DiscreteForLoop
+            parameter Integer n = 3;
+            Boolean moving[n];
+            Boolean motion_ref;
+            parameter Real q_begin[n] = {0, 1, 2};
+            parameter Real q_end[n] = {1, 1, 3};
+            constant Real eps = 1e-15;
+        equation
+            motion_ref = time < 0.5;
+            for i in 1:n loop
+                moving[i] = if abs(q_begin[i] - q_end[i]) > eps then motion_ref else false;
+            end for;
+        end DiscreteForLoop;
+    "#,
+        "DiscreteForLoop",
+    );
+}
+
+#[test]
+fn discrete_for_loop_element_shape_mismatch_rejected() {
+    // A scalar discrete element cannot be assigned a vector value. The
+    // for-equation lowering must still reject this shape mismatch rather than
+    // accept every discrete element for-equation.
+    expect_failure_in_phase_with_code(
+        r#"
+        model BadDiscreteForLoop
+            parameter Integer n = 2;
+            Boolean moving[n];
+        equation
+            for i in 1:n loop
+                moving[i] = {true, false};
+            end for;
+        end BadDiscreteForLoop;
+    "#,
+        "BadDiscreteForLoop",
+        FailedPhase::ToDae,
+        "ED020",
+    );
+}
+
+// =============================================================================
+// EQN-039: If-equation evaluable conditions
+// "The if-equations which do not have exclusively evaluable expressions as
+// switching conditions shall ... Have the same number of equations in each
+// branch"
+// =============================================================================
+
+/// The evaluability of parameter `name` in the compiled DAE.
+fn parameter_is_evaluable(source: &str, model: &str, name: &str) -> bool {
+    let result = expect_success(source, model);
+    let mut evaluable = None;
+    result.dae.inspect(|view| {
+        evaluable = view
+            .variables()
+            .find(|(_, variable)| variable.name().as_str() == name)
+            .map(|(_, variable)| variable.is_evaluable());
+    });
+    evaluable.unwrap_or_else(|| panic!("{name} is declared"))
+}
+
+/// Whether compiling `model` warns WD001 naming `name`.
+fn warns_translation_selection(source: &str, model: &str, name: &str) -> bool {
+    let mut session = Session::new(SessionConfig::default());
+    session
+        .add_document("test.mo", source)
+        .expect("contract source parses");
+    session
+        .compile_model_diagnostics(model)
+        .diagnostics
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("WD001")
+                && diagnostic.message.contains(&format!("parameter {name} "))
+        })
+}
+
+#[test]
+fn eqn_039_parameter_guard_over_equal_branches_stays_run_time() {
+    let source = r#"
+        model Test
+            parameter Boolean on = true;
+            Real x(start = 1, fixed = true);
+            Real y;
+        equation
+            der(x) = -x;
+            if on then
+                y = x;
+            else
+                y = 2 * x;
+            end if;
+        end Test;
+    "#;
+    assert!(!parameter_is_evaluable(source, "Test", "on"));
+    assert!(!warns_translation_selection(source, "Test", "on"));
+}
+
+#[test]
+fn eqn_039_mismatched_branch_counts_fix_the_parameter() {
+    let source = r#"
+        model Test
+            parameter Boolean two = true;
+            Real a;
+            Real b;
+        equation
+            if two then
+                a = 1;
+                b = 2;
+            else
+                a = 1;
+            end if;
+        end Test;
+    "#;
+    assert!(parameter_is_evaluable(source, "Test", "two"));
+    assert!(warns_translation_selection(source, "Test", "two"));
+}
+
+#[test]
+fn eqn_039_differentiated_branches_fix_the_parameter() {
+    let source = r#"
+        model Test
+            parameter Boolean dynamic = true;
+            Real z(start = 1);
+        equation
+            if dynamic then
+                der(z) = -z;
+            else
+                z = 0;
+            end if;
+        end Test;
+    "#;
+    assert!(parameter_is_evaluable(source, "Test", "dynamic"));
+    assert!(warns_translation_selection(source, "Test", "dynamic"));
+}
+
+/// Whether a target without dynamic derivative subscripts admits `model`;
+/// any refusal must be for dynamic derivative subscripts.
+fn admits_static_derivative_subscripts(source: &str, model: &str) -> bool {
+    use rumoca_compile::codegen::targets::{
+        parse_target_manifest, validate_dae_target_capabilities,
+    };
+    let manifest = parse_target_manifest(
+        r#"
+version = 1
+ir = "dae"
+name = "static-derivative-subscripts"
+readiness_level = 1
+
+[capabilities]
+continuous_states = true
+residual_equations = true
+events = true
+structured_equation_families = true
+dynamic_derivative_subscripts = false
+
+[[files]]
+path = "model.out"
+template = "model.out.jinja"
+"#,
+    )
+    .expect("parse the target manifest");
+    let capabilities = manifest.capabilities.as_ref().expect("capabilities");
+    let result = expect_success(source, model);
+    match validate_dae_target_capabilities(&result.dae, &manifest, capabilities) {
+        Ok(()) => true,
+        Err(error) => {
+            assert!(
+                error.to_string().contains("dynamic_derivative_subscripts"),
+                "{error}"
+            );
+            // Issue #360: the refusal names the manifest capability, not a
+            // `rumoca targets` column that does not exist.
+            assert!(
+                error.to_string().contains(
+                    "declares `[capabilities] dynamic_derivative_subscripts` unsupported"
+                ),
+                "{error}"
+            );
+            false
+        }
+    }
+}
+
+/// MLS §8.3.2: a for-equation's range is evaluable, so each binder value, and
+/// a derivative subscript built from binders, is fixed at translation; a
+/// target without dynamic derivative subscripts admits the family.
+#[test]
+fn eqn_009_binder_derivative_subscripts_are_static() {
+    assert!(admits_static_derivative_subscripts(
+        r#"
+        model Test
+            parameter Integer n = 3;
+            Real x[n](each start = 0, each fixed = true);
+        equation
+            der(x[1]) = sin(time) - x[1];
+            for i in 2:n loop
+                der(x[i]) = x[i - 1] - x[i];
+            end for;
+        end Test;
+    "#,
+        "Test",
+    ));
+}
+
+/// A derivative subscript read from a discrete variable changes at run time,
+/// so the same target still refuses it.
+#[test]
+fn eqn_009_variable_derivative_subscripts_stay_dynamic() {
+    assert!(!admits_static_derivative_subscripts(
+        r#"
+        model Test
+            Real x[2](each start = 0, each fixed = true);
+            Real y;
+            discrete Integer k(start = 1, fixed = true);
+        equation
+            der(x) = {1, 2};
+            y = der(x[k]);
+            when time > 0.5 then
+                k = 2;
+            end when;
+        end Test;
+    "#,
+        "Test",
+    ));
+}
+
+#[test]
+fn eqn_039_evaluate_false_guard_with_unequal_counts_rejected() {
+    // MLS 3.7 section 4.5: `Evaluate = false` makes the parameter
+    // non-evaluable, so branches with different equation counts are illegal.
+    expect_failure_in_phase_with_code(
+        r#"
+        model Test
+            parameter Boolean two = true annotation(Evaluate = false);
+            Real a;
+            Real b;
+        equation
+            if two then
+                a = 1;
+                b = 2;
+            else
+                a = 1;
+            end if;
+        end Test;
+    "#,
+        "Test",
+        FailedPhase::Flatten,
+        "EF004",
+    );
+}
+
+#[test]
+fn eqn_039_fixed_false_guard_with_unequal_counts_rejected() {
+    expect_failure_in_phase_with_code(
+        r#"
+        model Test
+            parameter Boolean two(fixed = false, start = true);
+            Real a;
+            Real b;
+        initial equation
+            two = true;
+        equation
+            if two then
+                a = 1;
+                b = 2;
+            else
+                a = 1;
+            end if;
+        end Test;
+    "#,
+        "Test",
+        FailedPhase::Flatten,
+        "EF004",
+    );
+}
+
+// =============================================================================
+// EQN-040: Initial discrete definitions read the initialization solution
+// "The initialization uses all equations and algorithms that are utilized in
+// the intended operation"; pre-variables are unknowns of that system.
+// =============================================================================
+
+#[test]
+fn eqn_040_initial_pre_reads_a_bound_continuous_variable() {
+    let trace = rumoca_contracts::test_support::simulate_model(
+        r#"
+        model M
+            parameter Real h = 0.5;
+            Real hIn = h;
+            Real level(start = 1, fixed = true);
+            Boolean above;
+        equation
+            der(level) = -0.1;
+            above = level >= hIn + 0.1 or pre(above) and level >= hIn - 0.1;
+        initial equation
+            pre(above) = level >= hIn;
+        end M;
+    "#,
+        "M",
+        1.0,
+    );
+    assert_eq!(trace.channel("above")[0], 1.0);
+    assert_eq!(trace.final_value("above"), 1.0);
+}
+
+#[test]
+fn eqn_040_initial_pre_reads_the_initialized_state() {
+    let trace = rumoca_contracts::test_support::simulate_model(
+        r#"
+        model M
+            parameter Real l0 = 0.45;
+            Real level(start = 1, fixed = false);
+            Boolean above;
+        equation
+            der(level) = -0.1;
+            above = level >= 0.6 or pre(above) and level >= 0.4;
+        initial equation
+            level = l0;
+            pre(above) = level >= 0.5;
+        end M;
+    "#,
+        "M",
+        1.0,
+    );
+    // The projection settles level = 0.45 before the definition reads it, so
+    // the start guess of 1 never selects the initial branch.
+    assert_eq!(trace.channel("above")[0], 0.0);
+    assert_eq!(trace.final_value("above"), 0.0);
 }

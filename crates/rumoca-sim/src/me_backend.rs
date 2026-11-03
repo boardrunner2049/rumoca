@@ -16,7 +16,12 @@ use rumoca_solver::{SimResult, fmi_me::driver::batch_output_cursor};
 
 use crate::SimError;
 
-pub(crate) type IntegratorFactory = fn(MeNumericalSetup) -> Box<dyn MeIntegratorBackend + 'static>;
+/// An integrator plugin factory with the method name a run records.
+#[derive(Clone, Copy)]
+pub(crate) struct IntegratorFactory {
+    pub(crate) method: &'static str,
+    pub(crate) build: fn(MeNumericalSetup) -> Box<dyn MeIntegratorBackend + 'static>,
+}
 
 pub(crate) struct BackendSimulationSession {
     session: MeSimulationSession<'static, 'static>,
@@ -42,6 +47,7 @@ impl BackendSimulationSession {
             execution_backend,
         )?;
         let options = live_session_options(
+            &artifact.root_location(),
             opts.t_start,
             opts.rtol,
             opts.atol,
@@ -118,7 +124,7 @@ pub(crate) fn simulate_artifact(
 ) -> Result<SimResult, SimError> {
     let execution_backend =
         rumoca_solver::fmi_me::admit_execution_backend(opts.execution_policy, execution_backend)?;
-    let options = batch_options(opts)?;
+    let options = batch_options(&artifact.root_location(), opts)?;
     let mut cursor = batch_output_cursor(&options)?;
     let retained = MeRetainedComponent::instantiate(
         artifact.source(),
@@ -148,10 +154,12 @@ pub(crate) fn plugin_for_host(
     integrator: IntegratorFactory,
 ) -> Result<Option<Box<dyn MeIntegratorBackend>>, SimError> {
     if host.state_count() == 0 {
+        rumoca_solver::note_integrator("none (no continuous states)");
         return Ok(None);
     }
     let setup = host.numerical_setup(Some(default_step_size(opts)))?;
-    Ok(Some(integrator(setup)))
+    rumoca_solver::note_integrator(integrator.method);
+    Ok(Some((integrator.build)(setup)))
 }
 
 pub(crate) fn instance_config(
@@ -168,9 +176,11 @@ fn default_output_dt(opts: &SimOptions) -> f64 {
 }
 
 pub(crate) fn batch_options(
+    plan: &rumoca_ir_solve::fmi::RootLocationPlan,
     opts: &SimOptions,
 ) -> Result<rumoca_solver::fmi_me::session::MeSessionOptions, SimError> {
     batch_session_options(
+        plan,
         opts.t_start,
         opts.t_end,
         opts.rtol,

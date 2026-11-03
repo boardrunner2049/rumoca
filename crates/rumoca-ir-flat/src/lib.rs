@@ -5,6 +5,7 @@
 //!
 //! The Flat Model is produced by the flatten phase from the Instance Tree.
 
+mod assertion_levels;
 pub mod clocks;
 pub mod connections;
 pub mod name_utils;
@@ -80,6 +81,7 @@ pub use visitor::{
     StateVariableCollector, StatementScope, StatementVisitor, VarRefCollector,
 };
 
+pub use assertion_levels::{AssertionLevel, AssertionLevelLiterals};
 pub use when_equations::{WhenBranch, WhenChain, WhenEquation};
 
 /// MLS §5.6: "flat equation system with globally unique variable names"
@@ -190,6 +192,11 @@ pub struct Model {
     /// Potential roots from Connections.potentialRoot(a, priority) calls (MLS §9.4).
     #[serde(default)]
     pub potential_roots: Vec<(String, i64)>,
+    /// Branch selections flatten made by evaluating a parameter guard at
+    /// translation (SPEC_0040 DAE-C22): an if-equation whose branches differ
+    /// in equation count or in the variables they differentiate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameter_branch_selections: Vec<ParameterBranchSelection>,
     /// Names of public top-level components whose class type is `connector` (MLS §4.7).
     /// Per MLS §4.7, only flow variables in top-level public connector components
     /// count toward the local equation size for balance checking. Components of
@@ -346,8 +353,11 @@ impl Model {
         self.variables
             .iter()
             .filter_map(|(name, var)| {
+                // A parameter's `fixed` is uniform (flatten refuses non-uniform
+                // parameter arrays, EF033), so the whole-declaration reduction
+                // is exact and the default is `fixed = true` when absent.
                 if matches!(var.variability, Variability::Parameter(_))
-                    && var.fixed.unwrap_or(true)
+                    && var.fixed_uniform().unwrap_or(true)
                     && var.binding.is_none()
                     && !matches!(var.shape_size(), Ok(0))
                 {
@@ -362,8 +372,11 @@ impl Model {
     /// True if any fixed parameter has no binding equation.
     pub fn has_unbound_fixed_parameters(&self) -> bool {
         self.variables.values().any(|var| {
+            // Parameter `fixed` is uniform (non-uniform parameter arrays are
+            // refused in flatten, EF033), so this whole-declaration reduction
+            // is exact.
             matches!(var.variability, Variability::Parameter(_))
-                && var.fixed.unwrap_or(true)
+                && var.fixed_uniform().unwrap_or(true)
                 && var.binding.is_none()
                 && !matches!(var.shape_size(), Ok(0))
         })
@@ -778,8 +791,10 @@ pub struct Variable {
     // Resolved attributes
     /// Start value attribute.
     pub start: Option<Expression>,
-    /// Fixed attribute.
-    pub fixed: Option<bool>,
+    /// Fixed attribute, scalarized per array element (MLS §4.8, §4.8.6). A
+    /// single value broadcasts over every element; an array carries one value
+    /// per element.
+    pub fixed: Option<Vec<bool>>,
     /// Minimum value attribute.
     pub min: Option<Expression>,
     /// Maximum value attribute.
@@ -812,6 +827,10 @@ pub struct Variable {
     /// constant must read neither — a `final parameter` may still be bound to
     /// an expression over parameters a user can set.
     pub evaluate: bool,
+    /// True if the declaration writes `annotation(Evaluate = false)`, which
+    /// makes the parameter non-evaluable (MLS §4.5, §18.6).
+    #[serde(default)]
+    pub evaluate_refused: bool,
 
     /// True if the declaration carries the `final` prefix (MLS §7.2.6).
     ///
@@ -889,6 +908,39 @@ impl Variable {
     pub fn validate_shape_contract(&self) -> Result<(), VariableShapeContractError> {
         self.shape_size().map(|_| ())
     }
+
+    /// The `fixed` attribute reduced to a single Boolean when every element
+    /// agrees (MLS §4.8): `None` when the attribute is absent or the element
+    /// values differ, which a whole-declaration decision cannot represent.
+    pub fn fixed_uniform(&self) -> Option<bool> {
+        uniform_bool(self.fixed.as_deref())
+    }
+
+    /// The `fixed` value that governs one scalar element (MLS §4.8, §4.8.6). A
+    /// single stored value broadcasts over every element; an array indexes by
+    /// element position.
+    pub fn fixed_scalar(&self, scalar: usize) -> Option<bool> {
+        scalar_bool(self.fixed.as_deref(), scalar)
+    }
+}
+
+/// Reduce a scalarized Boolean attribute to a single value when every element
+/// agrees. Absent attributes and differing elements both yield `None`.
+pub fn uniform_bool(values: Option<&[bool]>) -> Option<bool> {
+    let values = values?;
+    let first = *values.first()?;
+    values.iter().all(|&value| value == first).then_some(first)
+}
+
+/// Select the scalarized Boolean value for one element, broadcasting a single
+/// stored value over every element (MLS §4.8.6).
+pub fn scalar_bool(values: Option<&[bool]>, scalar: usize) -> Option<bool> {
+    let values = values?;
+    if values.len() == 1 {
+        values.first().copied()
+    } else {
+        values.get(scalar).copied()
+    }
 }
 
 fn shape_size(
@@ -944,6 +996,7 @@ impl Variable {
             binding: None,
             binding_from_modification: false,
             evaluate: false,
+            evaluate_refused: false,
             is_final: false,
             is_discrete_type: false,
             is_primitive: false,
@@ -1476,6 +1529,37 @@ pub struct StructuredEquationFamily {
     pub interiors_materialized: bool,
 }
 
+impl StructuredEquationFamily {
+    /// The flat equation rows this family's materialized interior occupies.
+    ///
+    /// A template projected row-major (an array equation `x = e` over its
+    /// element domain) materializes as its `equations_per_point` whole rows; a
+    /// binder-prefix projection materializes one row block per prefix point;
+    /// every other family materializes `equations_per_point` rows per domain
+    /// point. `None` when the count overflows or the domain is invalid.
+    pub fn materialized_rows(&self) -> Option<std::ops::Range<usize>> {
+        let points = self.domain.scalar_count().ok()?;
+        let count = match self.template.as_ref().map(|template| template.scalar_view) {
+            Some(rumoca_core::ComprehensionScalarView::RowMajorProjection) => {
+                self.equations_per_point
+            }
+            Some(rumoca_core::ComprehensionScalarView::BinderPrefixProjection { binder_count }) => {
+                let extents = self.domain.extents().ok()?;
+                extents
+                    .get(..usize::try_from(binder_count).ok()?)?
+                    .iter()
+                    .try_fold(self.equations_per_point, |count, extent| {
+                        count.checked_mul(*extent)
+                    })?
+            }
+            Some(rumoca_core::ComprehensionScalarView::BinderSubstitution) | None => {
+                points.checked_mul(self.equations_per_point)?
+            }
+        };
+        Some(self.first_equation_index..self.first_equation_index.checked_add(count)?)
+    }
+}
+
 /// Default scalar count for equations (1 for serde deserialization).
 fn default_scalar_count() -> usize {
     1
@@ -1572,4 +1656,29 @@ impl Algorithm {
             origin: origin.into(),
         }
     }
+}
+
+/// What a structural parameter read fixes at translation (SPEC_0040 DAE-C22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StructuralParameterUse {
+    /// A guard selecting between structurally different branches (MLS §8.3.4).
+    BranchSelection,
+    /// A declared array dimension (MLS §10.1).
+    ArrayDimension,
+    /// A for-equation range (MLS §8.3.3).
+    ForRange,
+}
+
+/// One flatten use that evaluated parameter values at translation
+/// (SPEC_0040 DAE-C22): a branch selection, an array dimension, or a
+/// for-equation range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterBranchSelection {
+    /// The selected if-equation, the declaration, or the for-equation.
+    pub span: Span,
+    /// The structural use the read parameters fix.
+    pub kind: StructuralParameterUse,
+    /// Per component reference its evaluated conditions read, the flat names
+    /// it can denote, the innermost enclosing scope first.
+    pub references: Vec<Vec<String>>,
 }

@@ -117,12 +117,21 @@ pub struct FmiVariable {
     pub(super) minimum: Option<Vec<f64>>,
     pub(super) maximum: Option<Vec<f64>>,
     pub(super) nominal: Option<Vec<f64>>,
+    /// The per-scalar literal start of a `String` entry, absent for every
+    /// other kind and for a `String` whose declaration gives no literal.
+    pub(super) text_start: Option<Vec<String>>,
     pub(super) unit: Option<String>,
     pub(super) description: Option<String>,
     pub(super) causality: FmiCausality,
+    /// The source `input`/`output` prefix, present only where it differs from
+    /// the exported causality (a nested declaration exported `local`).
+    pub(super) declared_causality: Option<FmiDeclaredCausality>,
     pub(super) variability: FmiVariability,
     pub(super) initial: Option<FmiInitial>,
     pub(super) tunable: bool,
+    /// A parameter whose value is fixed at translation (MLS §4.5, §18.3:
+    /// `final`, `Evaluate = true`, or a binding of such values alone).
+    pub(super) evaluable: bool,
     pub(super) declaration: Option<Span>,
     pub(super) value_reference_fmi3: u32,
 }
@@ -199,6 +208,11 @@ impl FmiVariable {
     }
 
     #[must_use]
+    pub fn text_start(&self) -> Option<&[String]> {
+        self.text_start.as_deref()
+    }
+
+    #[must_use]
     pub fn unit(&self) -> Option<&str> {
         self.unit.as_deref()
     }
@@ -211,6 +225,13 @@ impl FmiVariable {
     #[must_use]
     pub const fn causality(&self) -> FmiCausality {
         self.causality
+    }
+
+    /// The declared `input`/`output` prefix where the exported causality does
+    /// not already state it, absent otherwise.
+    #[must_use]
+    pub const fn declared_causality(&self) -> Option<FmiDeclaredCausality> {
+        self.declared_causality
     }
 
     #[must_use]
@@ -255,17 +276,19 @@ impl FmiVariable {
 /// The only construction site is [`super::FmiEventFreeCodegenView`]'s
 /// `Serialize`, which is reachable only after the narrowing proved the
 /// component event-free.
-pub(super) struct SerializedFmiVariables<'inventory>(&'inventory [FmiVariable]);
+pub(super) struct SerializedFmiVariables<'inventory> {
+    variables: &'inventory [FmiVariable],
+}
 
 impl<'inventory> SerializedFmiVariables<'inventory> {
     pub(super) const fn borrowing(variables: &'inventory [FmiVariable]) -> Self {
-        Self(variables)
+        Self { variables }
     }
 }
 
 impl Serialize for SerializedFmiVariables<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter().map(SerializedFmiVariable))
+        serializer.collect_seq(self.variables.iter().map(SerializedFmiVariable))
     }
 }
 
@@ -291,9 +314,11 @@ impl Serialize for SerializedFmiVariable<'_> {
         entry.serialize_entry("minimum", &variable.minimum)?;
         entry.serialize_entry("maximum", &variable.maximum)?;
         entry.serialize_entry("nominal", &variable.nominal)?;
+        entry.serialize_entry("text_start", &variable.text_start)?;
         entry.serialize_entry("unit", &variable.unit)?;
         entry.serialize_entry("description", &variable.description)?;
         entry.serialize_entry("causality", &variable.causality)?;
+        entry.serialize_entry("declared_causality", &variable.declared_causality)?;
         entry.serialize_entry("variability", &variable.variability)?;
         entry.serialize_entry("initial", &variable.initial)?;
         entry.serialize_entry("initial_unknown", &variable.is_initial_unknown())?;
@@ -313,6 +338,27 @@ pub enum FmiCausality {
     CalculatedParameter,
     Independent,
     Local,
+}
+
+/// A Modelica `input`/`output` prefix (MLS §4.4.2.2) that the exported
+/// [`FmiCausality`] does not carry. Targets render it as a namespaced
+/// per-variable annotation; it never changes the standard causality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FmiDeclaredCausality {
+    Input,
+    Output,
+}
+
+impl FmiDeclaredCausality {
+    /// The exported causality that already states this prefix.
+    #[must_use]
+    pub const fn exported(self) -> FmiCausality {
+        match self {
+            Self::Input => FmiCausality::Input,
+            Self::Output => FmiCausality::Output,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,7 +431,17 @@ pub struct FmiVariableInput {
     pub unit: Option<String>,
     pub description: Option<String>,
     pub causality: FmiCausality,
+    /// The declared prefix where it differs from `causality`; construction
+    /// refuses one the exported causality already states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_causality: Option<FmiDeclaredCausality>,
     pub variability: FmiVariability,
     pub tunable: bool,
+    /// A parameter whose value is fixed at translation (MLS §4.5, §18.3).
+    #[serde(default)]
+    pub evaluable: bool,
     pub declaration: Span,
+    /// The literal start of each scalar of a `String` declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_start: Option<Vec<String>>,
 }

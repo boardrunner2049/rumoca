@@ -98,14 +98,25 @@ pub(super) struct GeneratedBooleanDefinition {
     pub(super) span: Span,
 }
 
+/// MLS 3.7 §11.2.6: a top-level `return` ends the algorithm, so the statements
+/// before it are exactly the sequence that runs (a trailing `return;` in
+/// `Basic.OpAmpDetailed`'s limiters).
+fn reachable_prefix(statements: &[rumoca_core::Statement]) -> &[rumoca_core::Statement] {
+    statements
+        .iter()
+        .position(|statement| matches!(statement, rumoca_core::Statement::Return { .. }))
+        .map_or(statements, |end| &statements[..end])
+}
+
 pub(super) fn normalize_function_returns(
     statements: &[rumoca_core::Statement],
 ) -> Result<NormalizedFunctionReturns, ToDaeError> {
+    let statements = reachable_prefix(statements);
     let has_returns = contains_return(statements);
     let mut normalized = Vec::new();
     let mut guards = Vec::new();
     let mut active: Option<Expression> = None;
-    for statement in statements {
+    for (position, statement) in statements.iter().enumerate() {
         if let Some((cond_blocks, span)) = guarded_return(statement) {
             let return_condition = disjoin_conditions(cond_blocks, span);
             let guard_span = cond_blocks
@@ -165,13 +176,11 @@ pub(super) fn normalize_function_returns(
             }));
             continue;
         }
-        if contains_return(std::slice::from_ref(statement)) {
-            let span = required_statement_span(statement, "nested function return")?;
-            return Err(ToDaeError::unsupported_flat(
-                "function return",
-                "a non-guarded nested return requires a checked control-flow owner",
-                span,
-            ));
+        if let Some(continued) =
+            continue_branch_return(statement, &statements[position + 1..], active.as_ref())?
+        {
+            normalized.push(continued);
+            break;
         }
         if let Some(expanded) = snapshot_loop_conditional(statement, active.as_ref(), &mut guards) {
             normalized.extend(expanded);
@@ -259,22 +268,72 @@ fn snapshot_loop_conditional(
         );
         branch_guards.push(guard);
     }
-    for (block, guard) in cond_blocks.iter().zip(branch_guards) {
-        expanded.extend(
-            block
-                .stmts
-                .iter()
-                .map(|statement| guarded_statement(statement, guard.clone())),
-        );
+    // Each branch runs exactly when its immutable guard holds, so the prefix
+    // through its last loop runs as guarded statements (the loop owner cannot
+    // sit inside a value conditional), and the loop-free remainder stays one
+    // conditional over the same guards. That keeps a value every remainder
+    // defines defined on every path, as the source conditional did.
+    let mut remainders = Vec::with_capacity(cond_blocks.len());
+    for (block, guard) in cond_blocks.iter().zip(&branch_guards) {
+        let remainder = hoist_loop_prefix(&block.stmts, guard, guards, &mut expanded);
+        remainders.push(rumoca_core::StatementBlock {
+            cond: guard.clone(),
+            stmts: remainder.to_vec(),
+        });
     }
-    if let Some(fallback) = else_block {
-        expanded.extend(
+    let fallback = else_block
+        .as_deref()
+        .map(|fallback| hoist_loop_prefix(fallback, &remaining, guards, &mut expanded).to_vec());
+    let fallback = fallback.filter(|statements| !statements.is_empty());
+    let complete = remainders.iter().all(|block| !block.stmts.is_empty());
+    remainders.retain(|block| !block.stmts.is_empty());
+    // An else part may stand for the remaining case only while every guarded
+    // branch is still listed; otherwise it names its own guard.
+    let fallback = match fallback {
+        Some(statements) if !complete && !remainders.is_empty() => {
+            remainders.push(rumoca_core::StatementBlock {
+                cond: remaining.clone(),
+                stmts: statements,
+            });
+            None
+        }
+        fallback => fallback,
+    };
+    match (remainders.is_empty(), fallback) {
+        (true, None) => {}
+        (true, Some(fallback)) => expanded.extend(
             fallback
                 .iter()
                 .map(|statement| guarded_statement(statement, remaining.clone())),
-        );
+        ),
+        (false, fallback) => expanded.push(rumoca_core::Statement::If {
+            cond_blocks: remainders,
+            else_block: fallback,
+            span: *span,
+        }),
     }
     Some(expanded)
+}
+
+/// Emit `statements` through their last loop as statements guarded by
+/// `guard`, and return the loop-free remainder.
+fn hoist_loop_prefix<'a>(
+    statements: &'a [rumoca_core::Statement],
+    guard: &Expression,
+    guards: &mut Vec<GeneratedBooleanDefinition>,
+    expanded: &mut Vec<rumoca_core::Statement>,
+) -> &'a [rumoca_core::Statement] {
+    let split = statements
+        .iter()
+        .rposition(|statement| statements_contain_loop(std::slice::from_ref(statement)))
+        .map_or(0, |last| last + 1);
+    for statement in &statements[..split] {
+        match snapshot_loop_conditional(statement, Some(guard), guards) {
+            Some(nested) => expanded.extend(nested),
+            None => expanded.push(guarded_statement(statement, guard.clone())),
+        }
+    }
+    &statements[split..]
 }
 
 fn statements_contain_loop(statements: &[rumoca_core::Statement]) -> bool {
@@ -513,4 +572,113 @@ fn unsupported_return_shape<T>(
         ),
         span,
     ))
+}
+
+/// An `if` statement some of whose branches end in `return` (MLS 3.7
+/// §11.2.6), with no other `return` inside it: the else part of IF97-style
+/// dispatch (`Modelica.Fluid.Utilities.regRoot2_utility` returns from its
+/// else branch).
+struct BranchReturn<'statement> {
+    cond_blocks: &'statement [rumoca_core::StatementBlock],
+    else_block: Option<&'statement [rumoca_core::Statement]>,
+    span: Span,
+}
+
+/// MLS 3.7 §11.2.6: the statements after a partially returning conditional
+/// run exactly on its non-returning branches, so they continue each of those
+/// branches; the result runs under the guard of earlier returns. Any other
+/// nested `return` is refused.
+fn continue_branch_return(
+    statement: &rumoca_core::Statement,
+    rest: &[rumoca_core::Statement],
+    active: Option<&Expression>,
+) -> Result<Option<rumoca_core::Statement>, ToDaeError> {
+    let Some(branches) = branch_return(statement) else {
+        if contains_return(std::slice::from_ref(statement)) {
+            let span = required_statement_span(statement, "nested function return")?;
+            return Err(ToDaeError::unsupported_flat(
+                "function return",
+                "a non-guarded nested return requires a checked control-flow owner",
+                span,
+            ));
+        }
+        return Ok(None);
+    };
+    if contains_return(rest) {
+        let span = required_statement_span(statement, "nested function return")?;
+        return Err(ToDaeError::unsupported_flat(
+            "function return",
+            "a return after a partially returning conditional requires a checked control-flow owner",
+            span,
+        ));
+    }
+    let continued = branches.continued_by(rest);
+    Ok(Some(match active {
+        Some(active) => guarded_statement(&continued, active.clone()),
+        None => continued,
+    }))
+}
+
+fn ends_in_return(statements: &[rumoca_core::Statement]) -> bool {
+    matches!(
+        statements.last(),
+        Some(rumoca_core::Statement::Return { .. })
+    ) && !contains_return(&statements[..statements.len() - 1])
+}
+
+fn branch_return(statement: &rumoca_core::Statement) -> Option<BranchReturn<'_>> {
+    let rumoca_core::Statement::If {
+        cond_blocks,
+        else_block,
+        span,
+    } = statement
+    else {
+        return None;
+    };
+    let branches = cond_blocks
+        .iter()
+        .map(|block| block.stmts.as_slice())
+        .chain(else_block.as_deref());
+    let mut returning = false;
+    for statements in branches {
+        if ends_in_return(statements) {
+            returning = true;
+        } else if contains_return(statements) {
+            return None;
+        }
+    }
+    returning.then_some(BranchReturn {
+        cond_blocks,
+        else_block: else_block.as_deref(),
+        span: *span,
+    })
+}
+
+impl BranchReturn<'_> {
+    /// The conditional whose returning branches end at their `return` and
+    /// whose other branches, including an absent else part, continue with
+    /// `rest`.
+    fn continued_by(&self, rest: &[rumoca_core::Statement]) -> rumoca_core::Statement {
+        let continue_with = |statements: &[rumoca_core::Statement]| {
+            if ends_in_return(statements) {
+                statements[..statements.len() - 1].to_vec()
+            } else {
+                statements.iter().chain(rest).cloned().collect()
+            }
+        };
+        let cond_blocks = self
+            .cond_blocks
+            .iter()
+            .map(|block| rumoca_core::StatementBlock {
+                cond: block.cond.clone(),
+                stmts: continue_with(&block.stmts),
+            })
+            .collect();
+        let else_block = continue_with(self.else_block.unwrap_or_default());
+        rumoca_core::Statement::If {
+            cond_blocks,
+            else_block: (!else_block.is_empty()).then_some(else_block),
+            span: self.span,
+        }
+    }
 }

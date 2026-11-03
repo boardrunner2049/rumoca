@@ -56,7 +56,7 @@ pub(super) struct VariableAttributesInput {
     pub(super) component_ref: Option<rumoca_core::ComponentReference>,
     pub(super) binding: Option<u32>,
     pub(super) start: Option<u32>,
-    pub(super) fixed: Option<bool>,
+    pub(super) fixed: Option<Vec<bool>>,
     pub(super) min: Option<u32>,
     pub(super) max: Option<u32>,
     pub(super) nominal: Option<u32>,
@@ -64,8 +64,10 @@ pub(super) struct VariableAttributesInput {
     pub(super) state_select: rumoca_core::StateSelect,
     pub(super) description: Option<String>,
     pub(super) causality: VariableCausality,
+    pub(super) declared_causality: DeclaredCausality,
     pub(super) is_tunable: bool,
     pub(super) is_held: bool,
+    pub(super) evaluable: bool,
     pub(super) origin: VariableOrigin,
 }
 
@@ -79,8 +81,22 @@ pub(super) struct FunctionEntryWire<Name = rumoca_core::VarName> {
     pub(super) statements: Vec<FunctionStatementInput>,
     /// MLS §12.9 external interface; mutually exclusive with `statements`.
     pub(super) external: Option<ExternalBodyInput<Name>>,
+    pub(super) derivatives: Vec<FunctionDerivativeWire>,
+    /// MLS §18.3 inline request of the declaration.
+    pub(super) inline: rumoca_core::InlineAnnotation,
     #[serde(deserialize_with = "deserialize_provenance")]
     pub(super) declaration: DaeProvenance,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FunctionDerivativeWire {
+    pub(super) target: u32,
+    pub(super) inputs: Vec<rumoca_core::FunctionDerivativeInput>,
+    pub(super) previous: Option<(u32, u32)>,
+    pub(super) priority: u32,
+    #[serde(deserialize_with = "deserialize_provenance")]
+    pub(super) provenance: DaeProvenance,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +135,8 @@ pub(super) enum FunctionStatementInput {
     Assertion {
         condition: u32,
         message: u32,
+        #[serde(default)]
+        level: crate::AssertionLevel,
         #[serde(deserialize_with = "deserialize_provenance")]
         provenance: DaeProvenance,
     },
@@ -207,7 +225,7 @@ pub(super) struct ModelEventTransactionWire {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct InitialDiscreteValueWire {
+pub(super) struct InitialValueWire {
     pub(super) target: u32,
     pub(super) value: u32,
     #[serde(deserialize_with = "deserialize_provenance")]
@@ -244,6 +262,7 @@ pub(super) struct DiscreteValueOwnerWire<Targets = Vec<u32>> {
     pub(super) targets: Targets,
     pub(super) branches: Vec<DiscreteValueBranchWire>,
     pub(super) structure: Option<StructuredDiscreteValueWire>,
+    pub(super) observed: bool,
     #[serde(deserialize_with = "deserialize_provenance")]
     pub(super) provenance: DaeProvenance,
 }
@@ -322,6 +341,7 @@ pub(super) fn discrete_value_owner_output(
                         domain: structure.domain,
                         scalar_view: structure.scalar_view,
                     }),
+                observed: owner.observed,
                 provenance: owner.provenance,
             }
         })
@@ -408,7 +428,8 @@ pub(super) struct TimeEventEntryWire {
 #[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum EventActionKindWire {
-    Assert { message: u32, level: Option<u32> },
+    Assert { message: u32 },
+    Warning { message: u32, condition: u32 },
     Terminate { message: u32 },
     Reinitialize { state: u32, value: u32 },
 }
@@ -428,6 +449,11 @@ pub(super) struct EventActionEntryWire {
 pub(super) enum ClockKindWire {
     Periodic(PeriodicClockScheduleWire),
     Triggered(u32),
+    Shifted {
+        base: u32,
+        counter: u32,
+        condition: u32,
+    },
 }
 
 #[derive(Deserialize, Clone, Copy)]

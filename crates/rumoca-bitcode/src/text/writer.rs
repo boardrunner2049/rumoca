@@ -233,6 +233,7 @@ fn needs_record(function: &RbcFunction) -> bool {
         || external_abi
         || !function.values.is_empty()
         || !function.folds.is_empty()
+        || !function.derivatives.is_empty()
         || !function.calls.is_empty()
         || function.parameters.iter().any(|p| p.declaration.is_some())
 }
@@ -317,6 +318,15 @@ pub fn print_text_with(file: &RbcFile, options: TextOptions) -> Result<String, T
     write_families(&mut out, model);
     write_discrete_real_equations(&mut out, model);
     write_initial_discrete_values(&mut out, model);
+    for entry in &model.initial_parameter_values {
+        let _ = writeln!(
+            out,
+            "ipval %{} ^{} {}",
+            entry.target.0,
+            entry.value.0,
+            provenance(&entry.provenance)
+        );
+    }
     write_relations(&mut out, model);
     write_records(&mut out, model)?;
     write_conditions(&mut out, model);
@@ -444,6 +454,7 @@ fn function_line(function: &RbcFunction) -> String {
         RbcInline::Unstated => "",
         RbcInline::Requested => " inline",
         RbcInline::Never => " noinline",
+        RbcInline::AfterIndexReduction => " lateinline",
     };
     format!(
         "~{} fn {} params {} {parameters} results {} {results} \
@@ -523,6 +534,28 @@ fn variable_line(variable: &RbcVariable) -> String {
     }
     if let Some(fixed) = variable.fixed {
         let _ = write!(line, " fixed {fixed}");
+    }
+    if let Some(values) = &variable.fixed_elements {
+        let value = serde_json::to_string(values).expect("boolean list serializes");
+        let _ = write!(line, " fixed_elements {}", quote(&value));
+    }
+    if let Some(causality) = variable.declared_causality {
+        let name = match causality {
+            RbcDeclaredCausality::Input => "input",
+            RbcDeclaredCausality::Output => "output",
+            RbcDeclaredCausality::None => "none",
+        };
+        let _ = write!(line, " declared {name}");
+    }
+    if variable.held {
+        let _ = write!(line, " held");
+    }
+    if variable.state_select != RbcStateSelect::Default {
+        let value = serde_json::to_string(&variable.state_select).expect("enum serializes");
+        let _ = write!(line, " state_select {}", quote(&value));
+    }
+    if variable.evaluable {
+        let _ = write!(line, " evaluable");
     }
     if variable.tunable {
         let _ = write!(line, " tunable");
@@ -1034,6 +1067,9 @@ fn write_events(out: &mut String, model: &RbcModel) {
                 Some(level) => format!("assert ^{} level ^{}", message.0, level.0),
                 None => format!("assert ^{}", message.0),
             },
+            RbcAction::Warning { condition, message } => {
+                format!("warning ^{} ^{}", condition.0, message.0)
+            }
             RbcAction::Terminate { message } => format!("terminate ^{}", message.0),
         };
         let _ = writeln!(
@@ -1139,7 +1175,13 @@ fn write_discrete_definitions(out: &mut String, model: &RbcModel) {
     let _ = writeln!(out, "\n; discrete definitions");
     for definition in &model.discrete_definitions {
         let targets = variable_refs(&definition.targets);
-        let _ = writeln!(out, "disc {} targets {}", definition.targets.len(), targets);
+        let _ = writeln!(
+            out,
+            "disc {} targets {}{}",
+            definition.targets.len(),
+            targets,
+            if definition.observed { " observed" } else { "" }
+        );
         for branch in &definition.branches {
             write_discrete_branch(out, branch);
         }

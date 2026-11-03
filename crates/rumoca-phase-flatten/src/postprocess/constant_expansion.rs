@@ -13,6 +13,12 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SemanticConstantId {
     Occurrence(ConstantOccurrenceId),
+    /// A declaration as an element of the package a component's type is
+    /// selected from (MLS §7.1, §7.3).
+    Exposure {
+        package: rumoca_core::DefId,
+        declaration: rumoca_core::DefId,
+    },
     Declaration(rumoca_core::DefId),
 }
 
@@ -66,6 +72,10 @@ pub(super) struct ConstantSubstitutionEnv<'a> {
     pub(super) scope: &'a str,
     pub(super) prefer_scoped_parameters: bool,
     pub(super) expanding: Option<&'a ConstantExpansion<'a>>,
+    /// The packages that expose the function whose body is being folded
+    /// (see `function_exposures`), or the package a constant was read
+    /// through; empty otherwise.
+    pub(super) exposures: &'a [String],
 }
 
 impl<'a> ConstantSubstitutionEnv<'a> {
@@ -77,6 +87,7 @@ impl<'a> ConstantSubstitutionEnv<'a> {
             scope,
             prefer_scoped_parameters: self.prefer_scoped_parameters,
             expanding: self.expanding,
+            exposures: self.exposures,
         }
     }
 

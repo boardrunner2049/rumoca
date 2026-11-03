@@ -1,136 +1,158 @@
+{%- set model_identifier = "Rumoca_" ~ (artifact.identities.fmu | replace("-", "_")) %}
 //! FMI-LS-Wasm Co-Simulation component generated from Rumoca's checked FMI IR.
+//!
+//! The component is a thin adapter: every WIT call is forwarded through the C
+//! ABI to the FMI 3 Co-Simulation kernel that the `fmi3` target renders from
+//! the same Solve IR facts. Initialization projection, algebraic projection,
+//! and scalar state-event location all execute inside that C kernel; this crate
+//! holds no solve decision and only marshals WIT values to and from the ABI.
 //!
 //! The WIT package is pinned to modelica/fmi-ls-wasm commit
 //! c1aac17d392bec989fe2d059db3cc57bb7a0fff5. The draft is non-normative.
 
-mod model;
-
-// ---------------------------------------------------------------------------
-// WIT bindings
-// ---------------------------------------------------------------------------
 wit_bindgen::generate!({
     world: "co-simulation-fmu",
     path: "wit",
 });
 
-use std::cell::RefCell;
+use core::ffi::{c_char, c_int, c_void};
+use std::ffi::CString;
 
-use exports::fmi::fmi3::{
-    co_simulation::{
-        DoStepResult, Guest as CoSimulationGuest, GuestCoSimulationInstance,
-    },
-    common::Guest as CommonGuest,
-};
 use exports::fmi::fmi3::co_simulation::{
-    DiscreteStatesInfo, IntervalFraction, IntervalQualifier, Status, VariableDependency,
+    DiscreteStatesInfo, DoStepResult, Guest as CoSimulationGuest, GuestCoSimulationInstance,
+    IntervalFraction, IntervalQualifier, Status, VariableDependency,
 };
-const Y_LEN: usize = {{ solve.layout.y_scalars if solve.layout.y_scalars > 0 else 1 }};
-const P_LEN: usize = {{ solve.layout.p_scalars if solve.layout.p_scalars > 0 else 1 }};
-const STATE_LEN: usize = {{ solve.solve_layout.state_scalar_count if solve.solve_layout.state_scalar_count > 0 else 1 }};
+use exports::fmi::fmi3::common::Guest as CommonGuest;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lifecycle {
-    Instantiated,
-    Initialization,
-    Step,
-    Terminated,
+// ---------------------------------------------------------------------------
+// FMI 3 C ABI of the shared kernel
+//
+// The kernel is compiled with `FMI3_FUNCTION_PREFIX {{ model_identifier }}_`,
+// so each entry point carries that prefix. Only the Co-Simulation lifecycle and
+// the Float64 accessors are bound; the remaining ABI stays in the object for
+// the kernel's own use.
+// ---------------------------------------------------------------------------
+
+type FmiInstance = *mut c_void;
+
+const FMI3_OK: c_int = 0;
+const FMI3_WARNING: c_int = 1;
+const FMI3_DISCARD: c_int = 2;
+const FMI3_FATAL: c_int = 4;
+
+unsafe extern "C" {
+    #[link_name = "{{ model_identifier }}_fmi3GetVersion"]
+    fn kernel_get_version() -> *const c_char;
+
+    #[link_name = "{{ model_identifier }}_fmi3InstantiateCoSimulation"]
+    #[allow(clippy::too_many_arguments)]
+    fn kernel_instantiate_cs(
+        instance_name: *const c_char,
+        instantiation_token: *const c_char,
+        resource_path: *const c_char,
+        visible: bool,
+        logging_on: bool,
+        event_mode_used: bool,
+        early_return_allowed: bool,
+        required_intermediate_variables: *const u32,
+        n_required_intermediate_variables: usize,
+        instance_environment: *mut c_void,
+        log_message: Option<extern "C" fn()>,
+        intermediate_update: Option<extern "C" fn()>,
+    ) -> FmiInstance;
+
+    #[link_name = "{{ model_identifier }}_fmi3FreeInstance"]
+    fn kernel_free_instance(instance: FmiInstance);
+
+    #[link_name = "{{ model_identifier }}_fmi3SetDebugLogging"]
+    fn kernel_set_debug_logging(
+        instance: FmiInstance,
+        logging_on: bool,
+        n_categories: usize,
+        categories: *const *const c_char,
+    ) -> c_int;
+
+    #[link_name = "{{ model_identifier }}_fmi3EnterInitializationMode"]
+    fn kernel_enter_initialization_mode(
+        instance: FmiInstance,
+        tolerance_defined: bool,
+        tolerance: f64,
+        start_time: f64,
+        stop_time_defined: bool,
+        stop_time: f64,
+    ) -> c_int;
+
+    #[link_name = "{{ model_identifier }}_fmi3ExitInitializationMode"]
+    fn kernel_exit_initialization_mode(instance: FmiInstance) -> c_int;
+
+    #[link_name = "{{ model_identifier }}_fmi3Terminate"]
+    fn kernel_terminate(instance: FmiInstance) -> c_int;
+
+    #[link_name = "{{ model_identifier }}_fmi3Reset"]
+    fn kernel_reset(instance: FmiInstance) -> c_int;
+
+    #[link_name = "{{ model_identifier }}_fmi3GetFloat64"]
+    fn kernel_get_float64(
+        instance: FmiInstance,
+        value_references: *const u32,
+        n_value_references: usize,
+        values: *mut f64,
+        n_values: usize,
+    ) -> c_int;
+
+    #[link_name = "{{ model_identifier }}_fmi3SetFloat64"]
+    fn kernel_set_float64(
+        instance: FmiInstance,
+        value_references: *const u32,
+        n_value_references: usize,
+        values: *const f64,
+        n_values: usize,
+    ) -> c_int;
+
+    #[link_name = "{{ model_identifier }}_fmi3DoStep"]
+    #[allow(clippy::too_many_arguments)]
+    fn kernel_do_step(
+        instance: FmiInstance,
+        current_communication_point: f64,
+        communication_step_size: f64,
+        no_set_fmu_state_prior_to_current_point: bool,
+        event_handling_needed: *mut bool,
+        terminate_simulation: *mut bool,
+        early_return: *mut bool,
+        last_successful_time: *mut f64,
+    ) -> c_int;
 }
 
-#[derive(Clone)]
-struct ComponentData {
-    lifecycle: Lifecycle,
-    time: f64,
-    y: [f64; Y_LEN],
-    p: [f64; P_LEN],
-}
-
-impl Default for ComponentData {
-    fn default() -> Self {
-        let mut data = Self {
-            lifecycle: Lifecycle::Instantiated,
-            time: 0.0,
-            y: [0.0; Y_LEN],
-            p: [0.0; P_LEN],
-        };
-{%- for variable in fmi.variables %}{% for scalar in range(variable.storage.scalar_count) %}
-        data.{{ variable.storage.column }}[{{ variable.storage.base + scalar }}] = {{ variable.start[scalar] }};
-{%- endfor %}{% endfor %}
-        data
+fn status_from(code: c_int) -> Status {
+    match code {
+        FMI3_OK => Status::Ok,
+        FMI3_WARNING => Status::Warning,
+        FMI3_DISCARD => Status::Discard,
+        FMI3_FATAL => Status::Fatal,
+        _ => Status::Error,
     }
 }
 
-thread_local! {
-    static STORE: RefCell<Vec<Option<ComponentData>>> = const { RefCell::new(Vec::new()) };
-}
-
-fn store_alloc() -> usize {
-    STORE.with_borrow_mut(|s| {
-        if let Some((index, slot)) = s.iter_mut().enumerate().find(|(_, slot)| slot.is_none()) {
-            *slot = Some(ComponentData::default());
-            index
-        } else {
-            s.push(Some(ComponentData::default()));
-            s.len() - 1
-        }
-    })
-}
-
-fn store_get<R>(idx: usize, f: impl FnOnce(&ComponentData) -> R) -> R {
-    STORE.with_borrow(|s| f(s[idx].as_ref().expect("live FMI-LS resource has storage")))
-}
-
-fn store_set<R>(idx: usize, f: impl FnOnce(&mut ComponentData) -> R) -> R {
-    STORE.with_borrow_mut(|s| {
-        f(s[idx]
-            .as_mut()
-            .expect("live FMI-LS resource has storage"))
-    })
-}
-
-fn store_release(idx: usize) {
-    STORE.with_borrow_mut(|s| s[idx] = None);
-}
-
-fn derivative(data: &ComponentData) -> Result<[f64; STATE_LEN], Status> {
-    let mut result = [0.0; STATE_LEN];
-    model::derivative_rhs(data.time, &data.y, &data.p, &mut result)
-        .map_err(|_| Status::Error)?;
-    if result[..{{ solve.solve_layout.state_scalar_count }}]
-        .iter()
-        .all(|value| value.is_finite())
-    {
-        Ok(result)
-    } else {
-        Err(Status::Error)
+/// The number of scalar Float64 slots one value reference addresses in the
+/// kernel's flat storage, or `None` when the reference names no readable
+/// Float64 quantity. Derived from the same checked variable inventory the
+/// kernel numbers its references from: time, then the variables in inventory
+/// order, then one derivative per state, then the event indicators.
+fn value_scalar_count(value_reference: u32) -> Option<usize> {
+    match value_reference {
+        0 => Some(1),
+{%- for variable in fmi.variables %}
+        {{ variable.value_reference_fmi3 }} => Some({{ variable.storage.scalar_count }}),
+{%- endfor %}
+{%- set deriv = namespace(ordinal=0) %}
+{%- for variable in fmi.variables %}{% if variable.role == "State" %}
+        {{ fmi.derivative_value_reference_base_fmi3 + deriv.ordinal }} => Some({{ variable.storage.scalar_count }}),
+{%- set deriv.ordinal = deriv.ordinal + 1 %}{% endif %}{% endfor %}
+{%- for root in fmi.event_indicator_roots %}
+        {{ fmi.derivative_value_reference_base_fmi3 + deriv.ordinal + loop.index0 }} => Some(1),
+{%- endfor %}
+        _ => None,
     }
-}
-
-fn integrate_rk4(data: &mut ComponentData, start: f64, step: f64) -> Result<(), Status> {
-    let initial = data.y;
-    data.time = start;
-    let k1 = derivative(data)?;
-    for index in 0..{{ solve.solve_layout.state_scalar_count }} {
-        data.y[index] = initial[index] + 0.5 * step * k1[index];
-    }
-    data.time = start + 0.5 * step;
-    let k2 = derivative(data)?;
-    for index in 0..{{ solve.solve_layout.state_scalar_count }} {
-        data.y[index] = initial[index] + 0.5 * step * k2[index];
-    }
-    let k3 = derivative(data)?;
-    for index in 0..{{ solve.solve_layout.state_scalar_count }} {
-        data.y[index] = initial[index] + step * k3[index];
-    }
-    data.time = start + step;
-    let k4 = derivative(data)?;
-    for index in 0..{{ solve.solve_layout.state_scalar_count }} {
-        data.y[index] = initial[index]
-            + step * (k1[index] + 2.0 * k2[index] + 2.0 * k3[index] + k4[index]) / 6.0;
-        if !data.y[index].is_finite() {
-            return Err(Status::Error);
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -138,80 +160,79 @@ fn integrate_rk4(data: &mut ComponentData, start: f64, step: f64) -> Result<(), 
 // ---------------------------------------------------------------------------
 
 pub struct RumocaCoSimulationInstance {
-    idx: usize,
+    instance: FmiInstance,
 }
 
 impl Drop for RumocaCoSimulationInstance {
     fn drop(&mut self) {
-        store_release(self.idx);
+        unsafe { kernel_free_instance(self.instance) };
     }
 }
 
 impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
-
-    // ── Static factory ───────────────────────────────────────────────────────
-
     fn instantiate_co_simulation(
-        _instance_name:                   String,
-        instantiation_token:              String,
-        _resource_path:                   String,
-        _visible:                         bool,
-        _logging_on:                      bool,
-        event_mode_used:                  bool,
-        early_return_allowed:             bool,
-        required_intermediate_variables:  Vec<u32>,
+        instance_name: String,
+        instantiation_token: String,
+        resource_path: String,
+        visible: bool,
+        logging_on: bool,
+        event_mode_used: bool,
+        early_return_allowed: bool,
+        required_intermediate_variables: Vec<u32>,
     ) -> Option<exports::fmi::fmi3::co_simulation::CoSimulationInstance> {
-        if instantiation_token != "{{ artifact.identities.fmu }}"
-            || event_mode_used
-            || early_return_allowed
-            || !required_intermediate_variables.is_empty()
-        {
+        let name = CString::new(instance_name).ok()?;
+        let token = CString::new(instantiation_token).ok()?;
+        let resources = CString::new(resource_path).ok()?;
+        let instance = unsafe {
+            kernel_instantiate_cs(
+                name.as_ptr(),
+                token.as_ptr(),
+                resources.as_ptr(),
+                visible,
+                logging_on,
+                event_mode_used,
+                early_return_allowed,
+                required_intermediate_variables.as_ptr(),
+                required_intermediate_variables.len(),
+                core::ptr::null_mut(),
+                None,
+                None,
+            )
+        };
+        if instance.is_null() {
             return None;
         }
-        let idx = store_alloc();
         Some(exports::fmi::fmi3::co_simulation::CoSimulationInstance::new(
-            RumocaCoSimulationInstance { idx },
+            RumocaCoSimulationInstance { instance },
         ))
     }
 
-    // ── Debug logging ────────────────────────────────────────────────────────
-
-    fn set_debug_logging(&self, _logging_on: bool, _categories: Vec<String>) -> Status {
-        Status::Ok
+    fn set_debug_logging(&self, logging_on: bool, _categories: Vec<String>) -> Status {
+        status_from(unsafe {
+            kernel_set_debug_logging(self.instance, logging_on, 0, core::ptr::null())
+        })
     }
-
-    // ── Lifecycle ────────────────────────────────────────────────────────────
 
     fn enter_initialization_mode(
         &self,
-        tolerance:  Option<f64>,
+        tolerance: Option<f64>,
         start_time: f64,
-        stop_time:  Option<f64>,
+        stop_time: Option<f64>,
     ) -> Status {
-        if !start_time.is_finite()
-            || tolerance.is_some_and(|value| !value.is_finite() || value < 0.0)
-            || stop_time.is_some_and(|stop| !stop.is_finite() || stop < start_time)
-        {
-            return Status::Error;
-        }
-        store_set(self.idx, |data| {
-            if data.lifecycle != Lifecycle::Instantiated {
-                return Status::Error;
-            }
-            data.time = start_time;
-            data.lifecycle = Lifecycle::Initialization;
-            Status::Ok
+        status_from(unsafe {
+            kernel_enter_initialization_mode(
+                self.instance,
+                tolerance.is_some(),
+                tolerance.unwrap_or(0.0),
+                start_time,
+                stop_time.is_some(),
+                stop_time.unwrap_or(0.0),
+            )
         })
     }
 
     fn exit_initialization_mode(&self) -> Status {
-        store_set(self.idx, |data| {
-            if data.lifecycle != Lifecycle::Initialization || derivative(data).is_err() {
-                return Status::Error;
-            }
-            data.lifecycle = Lifecycle::Step;
-            Status::Ok
-        })
+        status_from(unsafe { kernel_exit_initialization_mode(self.instance) })
     }
 
     fn enter_event_mode(&self) -> Status {
@@ -223,18 +244,11 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
     }
 
     fn terminate(&self) -> Status {
-        store_set(self.idx, |data| {
-            if data.lifecycle != Lifecycle::Step {
-                return Status::Error;
-            }
-            data.lifecycle = Lifecycle::Terminated;
-            Status::Ok
-        })
+        status_from(unsafe { kernel_terminate(self.instance) })
     }
 
     fn reset(&self) -> Status {
-        store_set(self.idx, |data| *data = ComponentData::default());
-        Status::Ok
+        status_from(unsafe { kernel_reset(self.instance) })
     }
 
     fn enter_configuration_mode(&self) -> Status {
@@ -245,71 +259,41 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
         Status::Error
     }
 
-    // ── Float64 getter / setter ──────────────────────────────────────────────
-
     fn get_float64(&self, value_references: Vec<u32>) -> Result<Vec<f64>, Status> {
-        store_get(self.idx, |data| {
-            let mut values = Vec::new();
-            for vr in value_references {
-                match vr {
-                    0 => values.push(data.time),
-{%- for variable in fmi.variables %}
-                    {{ variable.value_reference_fmi3 }} => values.extend_from_slice(
-                        &data.{{ variable.storage.column }}[{{ variable.storage.base }}..{{ variable.storage.base + variable.storage.scalar_count }}],
-                    ),
-{%- endfor %}
-                    _ => return Err(Status::Error),
-                }
-            }
+        let mut total = 0usize;
+        for reference in &value_references {
+            total += value_scalar_count(*reference).ok_or(Status::Error)?;
+        }
+        let mut values = vec![0.0f64; total];
+        let status = unsafe {
+            kernel_get_float64(
+                self.instance,
+                value_references.as_ptr(),
+                value_references.len(),
+                values.as_mut_ptr(),
+                total,
+            )
+        };
+        if status == FMI3_OK {
             Ok(values)
-        })
+        } else {
+            Err(status_from(status))
+        }
     }
 
     fn set_float64(&self, value_references: Vec<u32>, values: Vec<f64>) -> Status {
-        store_set(self.idx, |data| {
-            if !matches!(data.lifecycle, Lifecycle::Instantiated | Lifecycle::Initialization | Lifecycle::Step) {
-                return Status::Error;
-            }
-            // Apply into a candidate so an invalid value reference, length, or
-            // non-finite value cannot leave a partially updated component.
-            let mut candidate = data.clone();
-            let mut cursor = 0;
-            for vr in value_references {
-                match vr {
-{%- for variable in fmi.variables %}{% if variable.role == "State" or variable.causality == "input" or variable.causality == "parameter" %}
-                    {{ variable.value_reference_fmi3 }} => {
-{%- if variable.role == "State" %}
-                        if data.lifecycle == Lifecycle::Step {
-                            return Status::Error;
-                        }
-{%- elif variable.causality == "parameter" and not variable.tunable %}
-                        if data.lifecycle == Lifecycle::Step {
-                            return Status::Error;
-                        }
-{%- endif %}
-                        let end = cursor + {{ variable.storage.scalar_count }};
-                        if end > values.len()
-                            || values[cursor..end].iter().any(|value| !value.is_finite())
-                        {
-                            return Status::Error;
-                        }
-                        candidate.{{ variable.storage.column }}[{{ variable.storage.base }}..{{ variable.storage.base + variable.storage.scalar_count }}]
-                            .copy_from_slice(&values[cursor..end]);
-                        cursor = end;
-                    }
-{%- endif %}{% endfor %}
-                    _ => return Status::Error,
-                }
-            }
-            if cursor != values.len() {
-                return Status::Error;
-            }
-            *data = candidate;
-            Status::Ok
+        status_from(unsafe {
+            kernel_set_float64(
+                self.instance,
+                value_references.as_ptr(),
+                value_references.len(),
+                values.as_ptr(),
+                values.len(),
+            )
         })
     }
 
-    // ── All other typed getters – not supported ──────────────────────────────
+    // ── All other typed getters – outside this draft's mapped profile ────────
 
     fn get_float32(&self, _: Vec<u32>) -> Result<Vec<f32>,      Status> { Err(Status::Error) }
     fn get_int8   (&self, _: Vec<u32>) -> Result<Vec<i8>,       Status> { Err(Status::Error) }
@@ -325,7 +309,7 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
     fn get_binary (&self, _: Vec<u32>) -> Result<Vec<Vec<u8>>,  Status> { Err(Status::Error) }
     fn get_clock  (&self, _: Vec<u32>) -> Result<Vec<bool>,     Status> { Err(Status::Error) }
 
-    // ── All other typed setters – not supported ──────────────────────────────
+    // ── All other typed setters – outside this draft's mapped profile ────────
 
     fn set_float32(&self, _: Vec<u32>, _: Vec<f32>)     -> Status { Status::Error }
     fn set_int8   (&self, _: Vec<u32>, _: Vec<i8>)      -> Status { Status::Error }
@@ -341,8 +325,6 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
     fn set_binary (&self, _: Vec<u32>, _: Vec<Vec<u8>>) -> Status { Status::Error }
     fn set_clock  (&self, _: Vec<u32>, _: Vec<bool>)    -> Status { Status::Error }
 
-    // ── Variable dependencies ────────────────────────────────────────────────
-
     fn get_number_of_variable_dependencies(&self, _vr: u32) -> Result<u64, Status> {
         Err(Status::Error)
     }
@@ -354,8 +336,6 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
         Err(Status::Error)
     }
 
-    // ── FMU state serialisation ──────────────────────────────────────────────
-
     fn get_fmu_state(&self) -> Result<Vec<u8>, Status> {
         Err(Status::Error)
     }
@@ -363,8 +343,6 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
     fn set_fmu_state(&self, _state: Vec<u8>) -> Status {
         Status::Error
     }
-
-    // ── Directional / adjoint derivatives ───────────────────────────────────
 
     fn get_directional_derivative(
         &self,
@@ -383,8 +361,6 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
     ) -> Result<Vec<f64>, Status> {
         Err(Status::Error)
     }
-
-    // ── Clock interval / shift queries – not applicable ──────────────────────
 
     fn get_interval_decimal(&self, _: Vec<u32>) -> Result<Vec<(f64, IntervalQualifier)>, Status> {
         Err(Status::Error)
@@ -414,44 +390,38 @@ impl GuestCoSimulationInstance for RumocaCoSimulationInstance {
         Status::Error
     }
 
-    // ── Co-simulation-specific methods ──────────────────────────────────────
-
     fn do_step(
         &self,
-        current_communication_point:             f64,
-        communication_step_size:                 f64,
-        _no_set_fmu_state_prior_to_current_point: bool,
+        current_communication_point: f64,
+        communication_step_size:     f64,
+        no_set_fmu_state_prior_to_current_point: bool,
     ) -> Result<DoStepResult, Status> {
-        if !current_communication_point.is_finite()
-            || !communication_step_size.is_finite()
-            || communication_step_size <= 0.0
-        {
-            return Err(Status::Error);
+        let mut event_handling_needed = false;
+        let mut terminate_simulation = false;
+        let mut early_return = false;
+        let mut last_successful_time = current_communication_point;
+        let status = unsafe {
+            kernel_do_step(
+                self.instance,
+                current_communication_point,
+                communication_step_size,
+                no_set_fmu_state_prior_to_current_point,
+                &mut event_handling_needed,
+                &mut terminate_simulation,
+                &mut early_return,
+                &mut last_successful_time,
+            )
+        };
+        if status == FMI3_OK {
+            Ok(DoStepResult {
+                last_successful_time,
+                event_handling_needed,
+                terminate_simulation,
+                early_return,
+            })
+        } else {
+            Err(status_from(status))
         }
-        let next_time = current_communication_point + communication_step_size;
-        if !next_time.is_finite() {
-            return Err(Status::Error);
-        }
-        store_set(self.idx, |data| {
-            if data.lifecycle != Lifecycle::Step
-                || (data.time - current_communication_point).abs()
-                    > 1e-12 * data.time.abs().max(current_communication_point.abs()).max(1.0)
-            {
-                return Err(Status::Error);
-            }
-            let previous = data.clone();
-            if integrate_rk4(data, current_communication_point, communication_step_size).is_err() {
-                *data = previous;
-                return Err(Status::Error);
-            }
-            Ok(())
-        })?;
-        Ok(DoStepResult {
-            last_successful_time:  next_time,
-            event_handling_needed: false,
-            terminate_simulation:  false,
-            early_return:          false,
-        })
     }
 
     fn set_input_derivatives(
@@ -482,7 +452,8 @@ struct RumocaFmu;
 
 impl CommonGuest for RumocaFmu {
     fn get_version() -> String {
-        "3.0".to_string()
+        let version = unsafe { core::ffi::CStr::from_ptr(kernel_get_version()) };
+        version.to_string_lossy().into_owned()
     }
 }
 

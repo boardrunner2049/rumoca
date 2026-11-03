@@ -5,6 +5,8 @@
 //! It is not a second owner: `MeHostState` is private to the session module and
 //! every operation here is reached only from the one master algorithm.
 
+mod saved_observation;
+
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -139,6 +141,7 @@ fn read_outputs(kernel: &SolveMeKernel) -> Result<Vec<f64>, MeError> {
     let observation = kernel.observe()?;
     let mut values = Vec::new();
     kernel.get_outputs(&observation, observation.time(), &mut values)?;
+    kernel.report_warnings(&observation)?;
     Ok(values)
 }
 
@@ -448,7 +451,8 @@ impl MeHostState {
 
     pub(super) fn finish_trace(self) -> SimResult {
         let termination = self.termination.clone();
-        self.trace.finish(termination)
+        let diagnostics = self.kernel.borrow().diagnostics();
+        self.trace.finish(termination, diagnostics)
     }
 
     // -- component compositions --------------------------------------------

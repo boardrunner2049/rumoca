@@ -52,7 +52,7 @@ pub(super) fn validate_when_chains(
             // guards: `pre()` of a continuous coordinate has no left limit to
             // read there. OMC rejects the shape for the same reason
             // ("Argument 1 of pre must be a discrete expression").
-            validate_when_activation_condition(
+            validate_condition_expression(
                 &branch.condition,
                 scope.expression_roles,
                 scope.states,

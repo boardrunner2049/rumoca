@@ -21,9 +21,10 @@ impl<'dae> ExpressionAt<'_, 'dae> {
         self,
         builtin: PureBuiltin,
         arguments: [ExprId<'dae>; 2],
+        scope: QuotientScope,
     ) -> Result<ExprId<'dae>, DaeConstructionError> {
         let result = builtin_result(self.storage, builtin, &arguments, self.provenance)?;
-        validate_runtime_quotient(self.storage, builtin, &arguments, self.provenance)?;
+        validate_runtime_quotient(self.storage, builtin, &arguments, scope, self.provenance)?;
         self.insert_builtin(builtin, arguments.into(), result)
     }
 
@@ -33,7 +34,14 @@ impl<'dae> ExpressionAt<'_, 'dae> {
         arguments: Vec<ExprId<'dae>>,
         result: ValueType,
     ) -> Result<ExprId<'dae>, DaeConstructionError> {
-        let variability = max_variability(self.storage, &arguments, self.provenance)?;
+        // `size(a, k)` reads only the shape of `a`, which MLS §10.1 fixes at
+        // translation, so its variability is the dimension index's alone.
+        let read = if builtin == PureBuiltin::Size {
+            &arguments[1.min(arguments.len())..]
+        } else {
+            &arguments[..]
+        };
+        let variability = max_variability(self.storage, read, self.provenance)?;
         let binder_domain =
             merged_binder_domain(self.storage, arguments.iter().copied(), self.provenance)?;
         let ty = self.storage.intern_type(result, self.provenance)?;
@@ -69,10 +77,20 @@ impl<'dae> ExpressionAt<'_, 'dae> {
     /// projection shares both that identity and the one packed argument range.
     /// No later phase has to rediscover that the projections name one call.
     pub fn call_results(
+        self,
+        function: FunctionId<'dae>,
+        outputs: impl IntoIterator<Item = usize>,
+        arguments: impl IntoIterator<Item = ExprId<'dae>>,
+    ) -> Result<Vec<ExprId<'dae>>, DaeConstructionError> {
+        self.insert_call_results(function, outputs, arguments, None)
+    }
+
+    pub(super) fn insert_call_results(
         mut self,
         function: FunctionId<'dae>,
         outputs: impl IntoIterator<Item = usize>,
         arguments: impl IntoIterator<Item = ExprId<'dae>>,
+        derivative: Option<(u32, u32)>,
     ) -> Result<Vec<ExprId<'dae>>, DaeConstructionError> {
         let outputs = outputs.into_iter().collect::<Vec<_>>();
         if outputs.is_empty() {
@@ -128,6 +146,7 @@ impl<'dae> ExpressionAt<'_, 'dae> {
                         owner,
                         function: function.index(),
                         output,
+                        derivative,
                         operands,
                     },
                     ValueTypeId::from_raw(ty),
@@ -185,7 +204,16 @@ impl<'dae> ExpressionAt<'_, 'dae> {
         owner: ExprId<'dae>,
         function: FunctionId<'dae>,
         output: usize,
+        derivative: Option<(ExprId<'dae>, u32)>,
     ) -> Result<ExprId<'dae>, DaeConstructionError> {
+        if !matches!(self.storage.expressions.nodes.get(owner.index() as usize),
+            Some(ExprNode::Call { derivative: expected, .. })
+            if *expected == derivative.map(|(source, ordinal)| (source.index(),ordinal)))
+        {
+            return Err(DaeConstructionError::InvalidCallProjectionOwner {
+                span: self.provenance.span(),
+            });
+        }
         self.insert_call_projection(owner, function, output)
     }
 
@@ -196,13 +224,16 @@ impl<'dae> ExpressionAt<'_, 'dae> {
         output: usize,
     ) -> Result<ExprId<'dae>, DaeConstructionError> {
         let owner_index = owner.index() as usize;
-        let operands = match self.storage.expressions.nodes.get(owner_index) {
+        let (operands, derivative) = match self.storage.expressions.nodes.get(owner_index) {
             Some(ExprNode::Call {
                 owner: root,
                 function: owner_function,
                 operands,
+                derivative,
                 ..
-            }) if *root == owner.index() && *owner_function == function.index() => *operands,
+            }) if *root == owner.index() && *owner_function == function.index() => {
+                (*operands, *derivative)
+            }
             _ => {
                 return Err(DaeConstructionError::InvalidCallProjectionOwner {
                     span: self.provenance.span(),
@@ -239,6 +270,7 @@ impl<'dae> ExpressionAt<'_, 'dae> {
                 owner: owner.index(),
                 function: function.index(),
                 output,
+                derivative,
                 operands,
             },
             ValueTypeId::from_raw(ty),

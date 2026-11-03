@@ -1,0 +1,115 @@
+//! Shared registration of nested calls and their assertion ownership.
+
+use super::{AssertionSlot, PureCallRegistry, RegisteredAssertion, RegisteredCall};
+use crate::lower::call_scoped_actions::CallAssertionProjection;
+use rumoca_ir_dae as dae;
+use rumoca_ir_solve as solve;
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
+
+#[derive(Clone)]
+pub(super) struct RegisteredExpressionAssertion<'dae, Scope> {
+    pub(super) assertion: RegisteredAssertion<'dae>,
+    pub(super) projection: CallAssertionProjection,
+    pub(super) scope: Scope,
+}
+
+/// Whether a call targets a native `ModelicaStandardTables` interpolation
+/// operator, which lowers to a solver table operator rather than a pure call.
+fn is_native_table_operator<'dae>(
+    view: dae::DaeView<'dae>,
+    function: dae::FunctionId<'dae>,
+) -> bool {
+    view.function(function)
+        .and_then(|definition| definition.external())
+        .is_some_and(|external| {
+            dae::NativeTableOperator::from_symbol(external.symbol().as_str()).is_some()
+        })
+}
+
+type RegisteredExpressionCalls<'dae, Scope> = (
+    HashMap<dae::ExprId<'dae>, RegisteredCall<'dae>>,
+    HashMap<dae::ExprId<'dae>, Range<usize>>,
+    Vec<RegisteredExpressionAssertion<'dae, Scope>>,
+    std::sync::Arc<[AssertionSlot]>,
+);
+
+impl<'dae> PureCallRegistry<'dae> {
+    // SPEC_0021: Exception - exhaustive expression-tree walk for nested call ownership.
+    #[allow(clippy::excessive_nesting)]
+    pub(super) fn register_expression_calls<Scope: Copy + Eq>(
+        &mut self,
+        view: dae::DaeView<'dae>,
+        expressions: impl IntoIterator<Item = (dae::ExprId<'dae>, Scope)>,
+    ) -> Result<RegisteredExpressionCalls<'dae, Scope>, solve::SolveProgramConstructionError> {
+        let mut roots = Vec::new();
+        let mut seen = HashMap::new();
+        let mut conflicts = HashSet::new();
+        for (expression, scope) in expressions {
+            dae::for_each_expression(view, expression, |projection, node| {
+                let dae::ExpressionOperation::Call {
+                    owner, function, ..
+                } = node.operation()
+                else {
+                    return;
+                };
+                if is_native_table_operator(view, function) {
+                    // A native table interpolation (MLS §12.9) lowers to a
+                    // solver table operator, not a pure call, so it is never
+                    // registered in the pure-call table.
+                    return;
+                }
+                match seen.insert(owner, scope) {
+                    None => roots.push((owner, projection, scope)),
+                    Some(previous) if previous != scope => {
+                        conflicts.insert(owner);
+                    }
+                    Some(_) => {}
+                }
+            });
+        }
+        for (_, expression, scope) in &roots {
+            let dae::ExpressionOperation::Call { owner, .. } = view
+                .expression(*expression)
+                .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
+                .operation()
+            else {
+                return Err(solve::SolveProgramConstructionError::WireMismatch);
+            };
+            if conflicts.contains(&owner) || seen.get(&owner) != Some(scope) {
+                return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
+                    provenance: view
+                        .expression(*expression)
+                        .expect("checked call projection resolves")
+                        .provenance()
+                        .span(),
+                });
+            }
+        }
+        let mut callees = HashMap::new();
+        let mut predicate_ranges = HashMap::new();
+        let mut slots = Vec::new();
+        let mut assertions = Vec::new();
+        for (owner, projection, scope) in roots {
+            let registered = self.register_root(view, projection)?;
+            let start = slots.len();
+            slots.extend(registered.assertion_slots.iter().cloned());
+            let end = slots.len();
+            predicate_ranges.insert(owner, start..end);
+            assertions.extend(registered.assertions.iter().cloned().enumerate().map(
+                |(output_offset, assertion)| RegisteredExpressionAssertion {
+                    assertion,
+                    projection: CallAssertionProjection {
+                        owner: registered.owner,
+                        output_offset,
+                    },
+                    scope,
+                },
+            ));
+            callees.insert(owner, registered);
+        }
+        Ok((callees, predicate_ranges, assertions, slots.into()))
+    }
+}

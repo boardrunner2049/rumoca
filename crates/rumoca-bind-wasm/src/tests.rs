@@ -14,6 +14,7 @@ mod scenario_config_tests;
 mod simulation_runtime_tests;
 mod source_modelica_roundtrip_tests;
 mod source_root_api_tests;
+mod user_guide_examples_tests;
 mod wasm_cache_tests;
 mod workspace_config_api_tests;
 
@@ -1670,7 +1671,6 @@ fn test_compile_to_json_uses_native_only_shape() {
 
 #[test]
 fn test_lsp_document_symbols_wrapper_returns_nested_outline() {
-    // The singleton session is process-wide; see `session_test_guard`.
     let _guard = session_test_guard();
     let source = r#"
 model Outline
@@ -1712,7 +1712,6 @@ end Outline;
 
 #[test]
 fn test_lsp_semantic_token_legend_wrapper_exposes_expected_entries() {
-    // The singleton session is process-wide; see `session_test_guard`.
     let _guard = session_test_guard();
     let legend_json =
         lsp_semantic_token_legend().expect("semantic token legend wrapper should serialize");
@@ -1740,7 +1739,6 @@ fn test_lsp_semantic_token_legend_wrapper_exposes_expected_entries() {
 
 #[test]
 fn test_lsp_semantic_tokens_wrapper_highlights_keywords_and_functions() {
-    // The singleton session is process-wide; see `session_test_guard`.
     let _guard = session_test_guard();
     let source = r#"
 model Ball
@@ -1795,7 +1793,6 @@ end Ball;
 
 #[test]
 fn test_compile_to_json_recovers_after_syntax_diagnostics() {
-    // The singleton session is process-wide; see `session_test_guard`.
     let _guard = session_test_guard();
     let mut session = Session::default();
     let invalid = r#"

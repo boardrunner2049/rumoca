@@ -1,5 +1,7 @@
 use super::*;
 
+mod staged_execution;
+
 fn source_block() -> ComputeBlock {
     let span = rumoca_core::Span::from_offsets(
         rumoca_core::SourceId::from_source_name("refresh_owner_test.mo"),
@@ -41,6 +43,30 @@ fn canonical_assignment_shape_preserves_cross_algebraic_dependencies() {
     let shape = canonical_assignment_shape_for_output(&program, 0, 1)
         .expect("the row is locally isolable before system-level validation");
     assert!(matches!(shape, TargetAssignmentShape::Direct { .. }));
+}
+
+#[test]
+fn exact_zero_materialization_preserves_the_complete_tensor_register_range() {
+    let mut operations = vec![LinearOp::TensorLoad {
+        dst_start: 0,
+        input: crate::TensorInputKind::Y,
+        input_start: 0,
+        count: 3,
+        seed_start: None,
+        lanes: 1,
+    }];
+    let (result, _) = materialize_target_assignment(
+        &TargetAssignmentShape::Zero {
+            target_y_index: 0,
+            expr_eval_len: 1,
+        },
+        &mut operations,
+    )
+    .unwrap();
+    assert_eq!(
+        result, 3,
+        "the constant must not overwrite another tensor lane"
+    );
 }
 
 #[test]
@@ -214,6 +240,7 @@ fn mixed_projection_exact_plan(projection_first: bool) -> RefreshPlan {
         rows: vec![0],
         y_indices: vec![0],
         tearing: None,
+        alternate_charts: Vec::new(),
     };
     let seed = RefreshStage::CausalSeedSweep {
         static_sequence: Default::default(),
@@ -248,6 +275,7 @@ fn mixed_projection_exact_plan(projection_first: bool) -> RefreshPlan {
                     rows: vec![1],
                     y_indices: vec![1],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
             ],
         },
@@ -255,6 +283,52 @@ fn mixed_projection_exact_plan(projection_first: bool) -> RefreshPlan {
         rows,
         value_stages,
         ..RefreshPlan::default()
+    }
+}
+
+#[test]
+fn affine_projection_seeds_are_omitted_from_all_owners_and_remainders() {
+    let source = two_output_source(true);
+    let plan = mixed_projection_exact_plan(true);
+    // Empty predecessors preserve the projection in the remainder. Full
+    // predecessors exercise the derivative and event owners themselves.
+    for predecessor in [RefreshPlan::default(), plan.clone()] {
+        let owners = ContinuousRefreshOwners::checked_for_source(
+            &source,
+            plan.clone(),
+            predecessor.clone(),
+            plan.clone(),
+            predecessor,
+            vec![plan.clone()],
+        )
+        .unwrap();
+        assert!(owners.algebraic_projection_block_is_affine(0));
+        for owner in [
+            owners.algebraic(),
+            owners.derivative(),
+            owners.root(),
+            owners.event(),
+            &owners.clock_events()[0],
+            owners.root_after_derivative().unwrap().remainder(),
+            owners.algebraic_after_derivative().unwrap().remainder(),
+            owners.clock_events_after_event()[0].remainder(),
+        ] {
+            assert_affine_projection_has_no_seed(&owners, owner);
+        }
+    }
+}
+
+fn assert_affine_projection_has_no_seed(owners: &ContinuousRefreshOwners, plan: &RefreshPlan) {
+    for stage in &plan.value_stages {
+        if let RefreshStage::ProjectionBlock {
+            seed_rows,
+            seed_sequence,
+            ..
+        } = stage
+        {
+            assert!(seed_rows.is_empty());
+            assert!(owners.exact_assignment_schedule(*seed_sequence).is_none());
+        }
     }
 }
 
@@ -337,6 +411,7 @@ fn exact_assignment_completeness_requires_full_blt_coverage() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
         simultaneous_block_indices: vec![0],
@@ -392,6 +467,105 @@ fn exact_assignment_rejects_a_dependency_settled_by_a_later_projection() {
     .expect_err("a causal seed does not settle a dependency before its projection block");
 
     assert!(error.to_string().contains("non-causal"));
+}
+
+#[test]
+fn every_refresh_purpose_requires_settled_assignment_dependencies() {
+    for purpose in 0..5 {
+        for settled in [true, false] {
+            let mut plans = std::array::from_fn::<_, 4, _>(|_| RefreshPlan::default());
+            let plan = mixed_projection_exact_plan(settled);
+            let clocks = if purpose == 4 {
+                vec![plan]
+            } else {
+                plans[purpose] = plan;
+                Vec::new()
+            };
+            let [algebraic, derivative, root, event] = plans;
+            let result = ContinuousRefreshOwners::checked_for_source(
+                &two_output_source(true),
+                algebraic,
+                derivative,
+                root,
+                event,
+                clocks,
+            );
+            assert_eq!(
+                result.is_ok(),
+                settled,
+                "purpose {purpose}, dependency settled={settled}: {:?}",
+                result.as_ref().err()
+            );
+        }
+    }
+}
+
+#[test]
+fn refresh_proofs_require_the_same_canonical_rows_and_unknowns_for_every_purpose() {
+    let canonical = mixed_projection_exact_plan(true).simultaneous_plan;
+    let mut changed_rows = canonical.clone();
+    changed_rows.blocks[0].rows[0] = 1;
+    let mut changed_unknowns = canonical.clone();
+    changed_unknowns.blocks[0].y_indices[0] = 1;
+    for purpose in 0..5 {
+        let mut plans = std::array::from_fn::<_, 4, _>(|_| RefreshPlan::default());
+        let plan = mixed_projection_exact_plan(true);
+        let clocks = if purpose == 4 {
+            vec![plan]
+        } else {
+            plans[purpose] = plan;
+            Vec::new()
+        };
+        let [algebraic, derivative, root, event] = plans;
+        let owners = ContinuousRefreshOwners::checked_for_source(
+            &two_output_source(true),
+            algebraic,
+            derivative,
+            root,
+            event,
+            clocks,
+        )
+        .unwrap();
+        owners.validate_projection_ownership(&canonical).unwrap();
+        for changed in [&changed_rows, &changed_unknowns] {
+            let error = owners.validate_projection_ownership(changed).unwrap_err();
+            assert!(error.to_string().contains("canonical projection block"));
+        }
+    }
+}
+
+#[test]
+fn ordered_remainder_consumes_dependencies_settled_by_its_predecessor() {
+    let algebraic = mixed_projection_exact_plan(true);
+    let mut derivative = algebraic.clone();
+    derivative.rows.truncate(1);
+    derivative.simultaneous_plan.blocks.truncate(1);
+    derivative.simultaneous_block_indices.truncate(1);
+    derivative
+        .value_stages
+        .retain(|stage| matches!(stage, RefreshStage::ProjectionBlock { .. }));
+    let owners = ContinuousRefreshOwners::checked_for_source(
+        &two_output_source(true),
+        algebraic,
+        derivative,
+        RefreshPlan::default(),
+        RefreshPlan::default(),
+        Vec::new(),
+    )
+    .expect("the exact remainder consumes the preceding derivative projection");
+    let remainder = owners.algebraic_after_derivative().unwrap().remainder();
+    assert!(
+        remainder
+            .value_stages
+            .iter()
+            .all(|stage| !matches!(stage, RefreshStage::ProjectionBlock { .. }))
+    );
+    assert!(
+        remainder
+            .value_stages
+            .iter()
+            .any(|stage| matches!(stage, RefreshStage::ExactAssignments { .. }))
+    );
 }
 
 #[test]
@@ -711,6 +885,7 @@ fn derivative_settle_relation_keeps_only_uncovered_root_stages() {
                 rows: vec![1, 2],
                 y_indices: vec![1, 2],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
         seed_rows: RefreshRowSelection::default(),

@@ -1,5 +1,13 @@
 //! Host-owned event-indicator scanning and root application (SPEC_0044 §6).
 //!
+//! The sign-change classification and the domains it uses are FMI 3.0 section
+//! 3. The method of locating the event by sampling the integrator's own
+//! continuous extension across the accepted step, rather than by rejecting and
+//! reducing the step, is L. F. Shampine, I. Gladwell and R. W. Brankin,
+//! "Reliable solution of special event location problems for ODEs", ACM
+//! Transactions on Mathematical Software 17(1):11-25, 1991,
+//! doi:10.1145/103147.103149.
+//!
 //! No root result crosses the numerical-plugin boundary. The host retains the
 //! full standard event-indicator vector from the previous completed step,
 //! samples the plugin's native continuous extension monotonically across each
@@ -55,6 +63,9 @@ impl IndicatorDomain {
 pub(super) struct MeRootSearchPolicy {
     scan_resolution: f64,
     location_tolerance: f64,
+    /// Bisection steps a bracket may take, from the component's
+    /// `RootLocationPlan` (SPEC_0044 ME-EVENT-004).
+    refinement_iteration_cap: usize,
     state_abs_tolerance: f64,
     state_rel_tolerance: f64,
     nominals: Vec<f64>,
@@ -73,6 +84,7 @@ impl MeRootSearchPolicy {
         state_rel_tolerance: f64,
         nominals: Vec<f64>,
         state_count: usize,
+        refinement_iteration_cap: usize,
     ) -> Result<Self, MeSessionError> {
         if nominals.len() != state_count {
             return Err(MeSessionError::Options {
@@ -108,6 +120,7 @@ impl MeRootSearchPolicy {
         Ok(Self {
             scan_resolution,
             location_tolerance,
+            refinement_iteration_cap,
             state_abs_tolerance,
             state_rel_tolerance,
             nominals,
@@ -156,6 +169,7 @@ impl MeRootSearchPolicy {
             self.state_rel_tolerance,
             nominals,
             state_count,
+            self.refinement_iteration_cap,
         )
     }
 
@@ -702,7 +716,7 @@ fn refine_indicator<T: RootScanTarget>(
     let mut indicators = Vec::new();
     // A bisection to the location tolerance over a bracket that is already at
     // most one scan resolution wide terminates in a bounded, host-owned count.
-    for _ in 0..MAX_REFINEMENT_ITERATIONS {
+    for _ in 0..policy.refinement_iteration_cap {
         target.check_budget()?;
         if high - low <= policy.location_tolerance() {
             return Ok(RefinedBracket {
@@ -736,14 +750,13 @@ fn refine_indicator<T: RootScanTarget>(
     Err(MeSessionError::RootApplicationUnavailable {
         time: high,
         reason: format!(
-            "indicator {index} was not localized to {} within {MAX_REFINEMENT_ITERATIONS} \
+            "indicator {index} was not localized to {} within {} \
              refinements; the bracket is still [{low}, {high}]",
-            policy.location_tolerance()
+            policy.location_tolerance(),
+            policy.refinement_iteration_cap
         ),
     })
 }
-
-const MAX_REFINEMENT_ITERATIONS: usize = 128;
 
 /// `2^53`: the largest integer whose `f64` image is exact, hence the largest
 /// scan-step count the host can both index as a `u64` and divide as an `f64`
@@ -756,7 +769,7 @@ mod tests {
     use super::*;
 
     fn policy() -> MeRootSearchPolicy {
-        MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![1.0], 1)
+        MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![1.0], 1, 128)
             .expect("fixture policy is checked")
     }
 
@@ -823,12 +836,15 @@ mod tests {
 
     #[test]
     fn the_policy_rejects_a_non_positive_or_incomplete_nominal_vector() {
-        assert!(MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![0.0], 1).is_err());
+        assert!(MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![0.0], 1, 128).is_err());
         assert!(
-            MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![f64::INFINITY], 1).is_err()
+            MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![f64::INFINITY], 1, 128)
+                .is_err()
         );
-        assert!(MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, Vec::new(), 1).is_err());
-        assert!(MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![1.0, 1.0], 1).is_err());
+        assert!(MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, Vec::new(), 1, 128).is_err());
+        assert!(
+            MeRootSearchPolicy::new(0.1, 1.0e-9, 1.0e-8, 1.0e-6, vec![1.0, 1.0], 1, 128).is_err()
+        );
     }
 
     #[test]

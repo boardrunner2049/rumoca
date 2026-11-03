@@ -20,6 +20,7 @@ mod component_class_overrides;
 mod component_redeclare_validation;
 mod component_type_selection;
 mod deferred_references;
+mod occurrence_selections;
 mod override_collection;
 mod override_map;
 mod post_materialization;
@@ -30,7 +31,9 @@ mod selected_class_members;
 #[cfg(test)]
 mod tests;
 
-pub(super) use class_hierarchy::find_nested_class_in_hierarchy;
+pub(super) use class_hierarchy::{
+    find_all_nested_classes_in_hierarchy, find_nested_class_in_hierarchy,
+};
 pub(super) use component_class_overrides::extract_component_class_overrides;
 pub(super) use component_redeclare_validation::validate_component_class_redeclare_target;
 pub(super) use component_type_selection::apply_type_override;

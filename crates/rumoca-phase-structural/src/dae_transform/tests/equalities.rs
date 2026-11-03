@@ -7,6 +7,8 @@
 //! in the closure shows up as a system that stops reducing rather than as a
 //! wrong number deep inside a real machine model.
 
+mod coordinate_definitions;
+
 use super::*;
 use crate::dae_transform::constraints::{
     direct_state_constraints, explicit_derivative_definitions,
@@ -42,7 +44,7 @@ impl<'dae> Declared<'dae> {
 }
 
 /// Declare `names` in order, reading the role off a one-character prefix:
-/// `p` parameter, `s` state, `a` algebraic.
+/// `p` parameter, `s` state, `S` always-selected state, `a` algebraic.
 fn declare<'dae>(
     model: &mut dae::DaeConstruction<'dae>,
     real: dae::ValueTypeId<'dae>,
@@ -55,7 +57,14 @@ fn declare<'dae>(
             .map(|entry| {
                 let (role, name) = entry.split_at(1);
                 let name = VarName::new(name);
-                let attributes = dae::VariableAttributes::default();
+                let attributes = dae::VariableAttributes {
+                    state_select: if role == "S" {
+                        rumoca_core::StateSelect::Always
+                    } else {
+                        rumoca_core::StateSelect::Default
+                    },
+                    ..dae::VariableAttributes::default()
+                };
                 Ok(match role {
                     "p" => Declared::Parameter(variables.parameter(
                         name,
@@ -63,7 +72,9 @@ fn declare<'dae>(
                         declaration,
                         attributes,
                     )?),
-                    "s" => Declared::State(variables.state(name, real, declaration, attributes)?),
+                    "s" | "S" => {
+                        Declared::State(variables.state(name, real, declaration, attributes)?)
+                    }
                     _ => Declared::Algebraic(variables.algebraic(
                         name,
                         real,
@@ -216,9 +227,9 @@ fn alias_chain_model() -> dae::Dae {
 /// The position constraint is written entirely in connector algebraics. The
 /// two adjacent component equations prove which state each endpoint names,
 /// while the acceleration equations make the second derivative exact.
-const HIDDEN_HOLONOMIC_TEXT: &str = "Real phi1; Real w1; Real phi2; Real w2; Real angle1; Real angle2; Real acc1; Real acc2; equation phi1 = angle1; phi2 = angle2; angle1 = 2*angle2; der(phi1) = w1; der(phi2) = w2; der(w1) = acc1; der(w2) = acc2; acc1 = 1;";
+const HIDDEN_HOLONOMIC_TEXT: &str = "Real phi1(stateSelect=StateSelect.always); Real w1(stateSelect=StateSelect.always); Real phi2(stateSelect=StateSelect.always); Real w2(stateSelect=StateSelect.always); Real angle1; Real angle2; Real acc1; Real acc2; equation phi1 = angle1; phi2 = angle2; angle1 = 2*angle2; der(phi1) = w1; der(phi2) = w2; der(w1) = acc1; der(w2) = acc2; acc1 = 1;";
 const HIDDEN_HOLONOMIC_NAMES: &[&str] = &[
-    "sphi1", "sw1", "sphi2", "sw2", "aangle1", "aangle2", "aacc1", "aacc2",
+    "Sphi1", "Sw1", "Sphi2", "Sw2", "aangle1", "aangle2", "aacc1", "aacc2",
 ];
 const HIDDEN_HOLONOMIC_EQUATIONS: &[&str] = &[
     "phi1 = angle1",
@@ -304,12 +315,12 @@ fn hidden_holonomic_model() -> dae::Dae {
 
 /// Two independent connector-hidden position constraints. Replacing either
 /// one alone cuts the unmatched residue from four to two; only the accumulated
-/// pair is sortable. The non-unit scale keeps either constraint out of the
-/// direct state-equality demotion lane.
-const INDEPENDENT_HOLONOMIC_TEXT: &str = "Real phi1; Real w1; Real phi2; Real w2; Real angle1; Real angle2; Real acc1; Real acc2; Real phi3; Real w3; Real phi4; Real w4; Real angle3; Real angle4; Real acc3; Real acc4; equation phi1 = angle1; phi2 = angle2; angle1 = 2*angle2; der(phi1) = w1; der(phi2) = w2; der(w1) = acc1; der(w2) = acc2; acc1 = 1; phi3 = angle3; phi4 = angle4; angle3 = 2*angle4; der(phi3) = w3; der(phi4) = w4; der(w3) = acc3; der(w4) = acc4; acc3 = 1;";
+/// pair is sortable. Explicit StateSelect.always declarations preserve coverage
+/// of the holonomic path even when the direct lane can follow connector aliases.
+const INDEPENDENT_HOLONOMIC_TEXT: &str = "Real phi1(stateSelect=StateSelect.always); Real w1(stateSelect=StateSelect.always); Real phi2(stateSelect=StateSelect.always); Real w2(stateSelect=StateSelect.always); Real angle1; Real angle2; Real acc1; Real acc2; Real phi3(stateSelect=StateSelect.always); Real w3(stateSelect=StateSelect.always); Real phi4(stateSelect=StateSelect.always); Real w4(stateSelect=StateSelect.always); Real angle3; Real angle4; Real acc3; Real acc4; equation phi1 = angle1; phi2 = angle2; angle1 = 2*angle2; der(phi1) = w1; der(phi2) = w2; der(w1) = acc1; der(w2) = acc2; acc1 = 1; phi3 = angle3; phi4 = angle4; angle3 = 2*angle4; der(phi3) = w3; der(phi4) = w4; der(w3) = acc3; der(w4) = acc4; acc3 = 1;";
 const INDEPENDENT_HOLONOMIC_NAMES: &[&str] = &[
-    "sphi1", "sw1", "sphi2", "sw2", "aangle1", "aangle2", "aacc1", "aacc2", "sphi3", "sw3",
-    "sphi4", "sw4", "aangle3", "aangle4", "aacc3", "aacc4",
+    "Sphi1", "Sw1", "Sphi2", "Sw2", "aangle1", "aangle2", "aacc1", "aacc2", "Sphi3", "Sw3",
+    "Sphi4", "Sw4", "aangle3", "aangle4", "aacc3", "aacc4",
 ];
 const INDEPENDENT_HOLONOMIC_EQUATIONS: &[&str] = &[
     "phi1 = angle1",
@@ -1023,10 +1034,8 @@ struct ProjectedAlgebraicVariables<'dae> {
     v: dae::AlgebraicId<'dae>,
 }
 
-/// A projected algebraic may be equality-anchored on a state, but this slice
-/// owns differentiation of projected states only. Admitting `w[1]` as the RHS
-/// of the `x` demotion would make reconstruction reach an unsupported Index
-/// differentiator arm and panic.
+/// The scalar state anchors the singleton aggregate's payload. Substitution
+/// must retain the aggregate's shape before applying its checked `[1]` index.
 fn projected_algebraic_definition_model() -> dae::Dae {
     const TEXT: &str =
         "Real s; Real x; Real w[1]; Real v; equation der(s) = -s; der(x) = v; x = w[1]; w[1] = s;";
@@ -1153,6 +1162,7 @@ fn function_defined_vector_state_model() -> dae::Dae {
                 model.functions(|functions| functions.define(body, at))
             },
         )?;
+        attach_spin_derivative(model, spin, vector, scalar, at)?;
         let (axis, omega, w, alpha, a) = model.variables(|variables| {
             let attributes = dae::VariableAttributes::default;
             Ok((
@@ -1187,6 +1197,51 @@ fn function_defined_vector_state_model() -> dae::Dae {
         register(model, &[at, at, at, at], residuals)
     })
     .expect("function-defined vector state fixture is valid")
+}
+
+fn attach_spin_derivative<'dae>(
+    model: &mut dae::DaeConstruction<'dae>,
+    spin: dae::FunctionId<'dae>,
+    vector: dae::ValueTypeId<'dae>,
+    scalar: dae::ValueTypeId<'dae>,
+    at: dae::DaeProvenance,
+) -> Result<(), dae::DaeConstructionError> {
+    let signature = dae::FunctionSignature::new(
+        VarName::new("spin_der"),
+        [vector, scalar, scalar],
+        [vector],
+        at,
+    );
+    let (derivative, ()) = model.function(signature, |model, reservation| {
+        let axis = model.functions(|functions| {
+            functions.parameter(&reservation, VarName::new("axis"), 0, at)
+        })?;
+        model.functions(|functions| {
+            functions.parameter(&reservation, VarName::new("rate"), 1, at)
+        })?;
+        let tangent = model.functions(|functions| {
+            functions.parameter(&reservation, VarName::new("der_rate"), 2, at)
+        })?;
+        let output = model.functions(|functions| {
+            functions.output(&reservation, VarName::new("der_result"), 0, at)
+        })?;
+        let value = model.expressions(|expressions| {
+            let axis = expressions.at(at).function_parameter(axis)?;
+            let tangent = expressions.at(at).function_parameter(tangent)?;
+            expressions
+                .at(at)
+                .binary(dae::BinaryOperator::Multiply, axis, tangent)
+        })?;
+        let mut body = model.functions(|functions| functions.begin(reservation, at))?;
+        model.functions(|functions| functions.assign(&mut body, output, value, at))?;
+        model.functions(|functions| functions.define(body, at))
+    })?;
+    use rumoca_core::FunctionDerivativeInput::{Differentiate, ZeroDerivative};
+    model.functions(|functions| {
+        functions
+            .first_derivative(spin, derivative, [ZeroDerivative, Differentiate], 0, at)
+            .map(|_| ())
+    })
 }
 
 fn projected_algebraic_residuals<'dae>(
@@ -1414,7 +1469,7 @@ fn derivative_definitions_are_read_in_either_orientation() {
         let phi_definition = definitions[phi].expect("`w = der(phi)` defines d/dt phi");
         let definition = view
             .expression(
-                view.expression_id(phi_definition as usize)
+                view.expression_id(phi_definition.expression as usize)
                     .expect("definition ordinal resolves"),
             )
             .expect("definition identity resolves");
@@ -1474,14 +1529,30 @@ fn a_displaced_body_chain_supplies_the_derivative_a_demotion_needs() {
     );
     model.inspect(|view| {
         let equalities = SystemEqualities::collect(view);
-        let anchored = variable_index(view, "s");
+        let anchored = variable_index(view, "hold");
         for member in [variable_index(view, "port"), variable_index(view, "flange")] {
             assert_eq!(
                 equalities.anchor_of(member),
+                Some((
+                    EqualityAnchor::State(variable_index(view, "s")),
+                    EqualitySign::Same
+                )),
+                "the derivative class retains the independent body state across displacement"
+            );
+            assert_eq!(
+                equalities.value_anchor_of(member),
                 Some((EqualityAnchor::State(anchored), EqualitySign::Same)),
-                "the connector chain reaches the body state across the displacement"
+                "zero support proves the connector's exact held-position value"
             );
         }
+        assert_eq!(
+            equalities.value_anchor_of(variable_index(view, "s")),
+            Some((
+                EqualityAnchor::State(variable_index(view, "s")),
+                EqualitySign::Same
+            )),
+            "the displaced body position retains a separate value anchor"
+        );
         assert!(
             equalities.redundant_states().next().is_none(),
             "no state is proven equal in value to another one here"
@@ -1650,8 +1721,9 @@ fn independent_holonomic_constraints_accumulate_before_the_dae_escapes() {
         "candidate order is the continuous-owner order"
     );
     for candidate in &candidates {
-        let (single, manifold) = rebuild_holonomic_constraint(&model, candidate, &[])
-            .expect("each proved constraint reconstructs independently");
+        let (single, manifold) =
+            rebuild_holonomic_constraint(&ReductionSource::new(&model), candidate, &[])
+                .expect("each proved constraint reconstructs independently");
         assert_eq!(manifold.len(), 2);
         let error = single
             .inspect(|view| sort(view).map(|_| ()))
@@ -1770,162 +1842,6 @@ fn contradicting_equalities_prove_nothing_about_their_class() {
                 .collect::<Vec<_>>(),
             Vec::<u32>::new(),
             "and offers no state as redundant"
-        );
-    });
-}
-
-#[test]
-fn a_static_one_projection_of_a_singleton_state_payload_is_an_exact_anchor() {
-    for subscript in [
-        ProjectionSubscript::LiteralOne,
-        ProjectionSubscript::BoundParameter,
-    ] {
-        let model = projected_state_model(1, subscript);
-        assert!(
-            model.inspect(|view| sort(view).is_err()),
-            "the two equal state payloads are singular before demotion"
-        );
-        model.inspect(|view| {
-            let equalities = SystemEqualities::collect(view);
-            let x = variable_index(view, "x");
-            let q = variable_index(view, "q");
-            assert_eq!(
-                equalities.anchor_of(x),
-                Some((EqualityAnchor::State(q), EqualitySign::Same)),
-                "the singleton aggregate wins the construction-capability tie"
-            );
-            assert_eq!(
-                equalities.redundant_states().collect::<Vec<_>>(),
-                vec![(x, EqualityAnchor::State(q), EqualitySign::Same)]
-            );
-        });
-        let prepared = prepare_for_solve(&model).expect("singleton projection is reducible");
-        let transformed = match prepared {
-            PreparedDae::Transformed { dae, .. } => dae,
-            PreparedDae::Borrowed { .. } => panic!("singleton projection requires state demotion"),
-        };
-        assert_eq!(role(&transformed, "x"), dae::VariableRole::Algebraic);
-        assert_eq!(role(&transformed, "q"), dae::VariableRole::State);
-        transformed
-            .inspect(|view| assert!(sort(view).is_ok(), "replacement DAE matches perfectly"));
-    }
-}
-
-#[test]
-fn row_major_vector_pin_demotes_the_complete_state_payload() {
-    let model = pinned_vector_state_model();
-    let source_error = model
-        .inspect(|view| sort(view).map(|_| ()))
-        .expect_err("the pinned vector is high-index before demotion");
-    assert!(matches!(source_error, StructuralError::Singular { .. }));
-    let prepared = prepare_for_solve(&model).expect("the complete vector pin is reducible");
-    let transformed = match prepared {
-        PreparedDae::Transformed { dae, .. } => dae,
-        PreparedDae::Borrowed { .. } => panic!("the pinned vector requires a demotion"),
-    };
-    assert_eq!(role(&transformed, "q"), dae::VariableRole::Algebraic);
-    transformed.inspect(|view| {
-        assert!(sort(view).is_ok(), "the rebuilt vector system matches");
-        let q = view
-            .variables()
-            .find(|(_, variable)| variable.name().as_str() == "q")
-            .map(|(_, variable)| variable)
-            .expect("the demoted vector survives");
-        assert_eq!(q.value_type().dimensions(), [3]);
-    });
-}
-
-#[test]
-fn checked_function_body_proves_vector_state_derivative() {
-    let model = function_defined_vector_state_model();
-    let source_error = model
-        .inspect(|view| sort(view).map(|_| ()))
-        .expect_err("the function-defined vector state is high-index before demotion");
-    assert!(matches!(source_error, StructuralError::Singular { .. }));
-    let prepared = prepare_for_solve(&model).expect("checked call body is differentiable");
-    let transformed = match prepared {
-        PreparedDae::Transformed { dae, .. } => dae,
-        PreparedDae::Borrowed { .. } => panic!("the redundant vector state requires demotion"),
-    };
-    assert_eq!(role(&transformed, "w"), dae::VariableRole::Algebraic);
-    transformed.inspect(|view| {
-        assert!(sort(view).is_ok(), "the rebuilt vector system matches");
-        let w = view
-            .variables()
-            .find(|(_, variable)| variable.name().as_str() == "w")
-            .map(|(_, variable)| variable)
-            .expect("the demoted vector survives");
-        assert_eq!(w.value_type().dimensions(), [3]);
-    });
-}
-
-#[test]
-fn non_singleton_and_dynamic_projections_fail_closed() {
-    for model in [
-        projected_state_model(2, ProjectionSubscript::LiteralOne),
-        projected_state_model(1, ProjectionSubscript::Parameter),
-    ] {
-        model.inspect(|view| {
-            let equalities = SystemEqualities::collect(view);
-            assert!(
-                equalities.redundant_states().next().is_none(),
-                "a partial or dynamically selected payload proves no state redundancy"
-            );
-        });
-    }
-}
-
-#[test]
-fn projected_algebraic_definition_fails_closed_before_differentiation() {
-    let model = projected_algebraic_definition_model();
-    let candidate = model.inspect(|view| {
-        let x = variable_index(view, "x");
-        let candidates = direct_state_constraints(view);
-        assert!(
-            candidates
-                .admissible
-                .iter()
-                .chain(&candidates.conditional)
-                .filter(|candidate| candidate.state == x)
-                .all(|candidate| {
-                    let rhs = view
-                        .expression_id(candidate.rhs as usize)
-                        .expect("candidate RHS resolves");
-                    !matches!(
-                        singleton_real_projection(view, rhs),
-                        Some(SingletonRealProjection::Algebraic(_))
-                    )
-                }),
-            "an unsupported projected-algebraic RHS must not reach reconstruction",
-        );
-        candidates
-            .admissible
-            .into_iter()
-            .chain(candidates.conditional)
-            .find(|candidate| candidate.state == x)
-            .expect("the equality closure retains the safe bare-state anchor")
-    });
-    rebuild_with_state_demotion(&model, candidate)
-        .expect("the admitted bare-state anchor reconstructs without a panic");
-}
-
-#[test]
-fn an_opposed_pin_proves_constancy_without_naming_the_pinned_value() {
-    let model = opposed_pin_model();
-    model.inspect(|view| {
-        let equalities = SystemEqualities::collect(view);
-        let (anchor, sign) = equalities
-            .anchor_of(variable_index(view, "q"))
-            .expect("the opposed pin still proves the class constant");
-        assert_eq!(sign, EqualitySign::Same, "a pinned class carries no sign");
-        assert!(
-            matches!(anchor, EqualityAnchor::Invariant { .. }),
-            "`q + I = 0` pins the class to a time-invariant value"
-        );
-        assert_eq!(
-            equalities.anchor_expression(anchor),
-            None,
-            "the class sits at `-I`, which no source expression names"
         );
     });
 }

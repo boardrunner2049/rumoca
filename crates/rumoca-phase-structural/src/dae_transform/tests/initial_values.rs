@@ -115,7 +115,7 @@ fn aliased_pair_model(x: StatedInitialValue, y: StatedInitialValue) -> dae::Dae 
                 x_reservation,
                 dae::VariableAttributes {
                     start: x_start,
-                    fixed: Some(x.fixed),
+                    fixed: Some(vec![x.fixed]),
                     state_select: x.select,
                     ..dae::VariableAttributes::default()
                 },
@@ -125,7 +125,7 @@ fn aliased_pair_model(x: StatedInitialValue, y: StatedInitialValue) -> dae::Dae 
                 y_reservation,
                 dae::VariableAttributes {
                     start: y_start,
-                    fixed: Some(y.fixed),
+                    fixed: Some(vec![y.fixed]),
                     state_select: y.select,
                     ..dae::VariableAttributes::default()
                 },
@@ -323,7 +323,7 @@ fn asserted_value_model(x: StatedInitialValue, asserted: AssertedValue) -> dae::
                 x_reservation,
                 dae::VariableAttributes {
                     start: x_start,
-                    fixed: Some(x.fixed),
+                    fixed: Some(vec![x.fixed]),
                     state_select: x.select,
                     ..dae::VariableAttributes::default()
                 },
@@ -366,7 +366,7 @@ fn stated_initial_value(dae: &dae::Dae, name: &str) -> (Option<f64>, Option<bool
                 _ => None,
             }
         });
-        (start, variable.fixed())
+        (start, variable.fixed_uniform())
     })
 }
 
@@ -434,7 +434,10 @@ fn the_residual_path_cannot_shadow_the_guarded_closure_candidate() {
         StatedInitialValue::guess(2.0),
     );
     model.inspect(|view| {
-        let candidates = crate::dae_transform::constraints::direct_state_constraints(view);
+        let candidates = crate::dae_transform::constraints::direct_state_constraints(
+            view,
+            &constraints::DifferentiationFacts::collect(view),
+        );
         let demoted = |state: u32| {
             view.variable(
                 view.variable_id(state as usize)
@@ -568,27 +571,10 @@ fn a_pinned_state_is_demoted_when_the_class_carries_its_value_to_the_survivor() 
     reduced.inspect(|view| assert!(sort(view).is_ok(), "replacement DAE matches perfectly"));
 }
 
-/// The same shape with nothing left to carry the value to: `x = time` determines
-/// `x` at every instant but states no value a `start` can be compared against,
-/// so demoting `x` really does discard the MLS 3.6 §8.6 equation `x = 1`.
+/// Direct reduction retains the original time constraint and fixed start.
 #[test]
-fn a_pinned_state_no_surviving_equation_states_is_still_refused() {
-    let model = asserted_value_model(StatedInitialValue::pinned(1.0), AssertedValue::Time);
-    assert!(
-        model.inspect(|view| sort(view).is_err()),
-        "an asserted value that names no unknown is structurally singular"
-    );
-    let error = prepare_for_solve(&model)
-        .err()
-        .expect("a stated initial value nothing reproduces is not silently dropped");
-    let StructuralError::DroppedStatedInitialValue { variable, span } = error else {
-        panic!("expected the refused initial condition, got {error:?}");
-    };
-    assert_eq!(variable, "x");
-    assert!(
-        !span.is_dummy(),
-        "the refusal carries the declaration that states the initial value"
-    );
+fn a_pinned_time_constraint_retains_its_initial_equation() {
+    assert_retained_initial_constraint(AssertedValue::Time);
 }
 
 /// A class the system pins to a time-invariant value states that value at the
@@ -611,23 +597,38 @@ fn an_invariant_class_that_asserts_the_stated_value_admits_the_demotion() {
     reduced.inspect(|view| assert!(sort(view).is_ok(), "replacement DAE matches perfectly"));
 }
 
-/// The same class pinned to a different value. The demotion leaves `x = 5` in
-/// the system and nothing else that mentions `x`, so accepting it would answer
-/// the stated `x = 1` with 5 — which is what an unconditional `Invariant` arm
-/// did before this refusal was proved rather than assumed.
+/// The continuous invariant and fixed start retain their contradiction.
 #[test]
-fn an_invariant_class_that_asserts_another_value_refuses_the_demotion() {
-    let model = asserted_value_model(
-        StatedInitialValue::pinned(1.0),
-        AssertedValue::Invariant(5.0),
-    );
-    let error = prepare_for_solve(&model)
-        .err()
-        .expect("an asserted value that is not the stated one may not replace it");
-    let StructuralError::DroppedStatedInitialValue { variable, .. } = error else {
-        panic!("expected the refused initial condition, got {error:?}");
-    };
-    assert_eq!(variable, "x");
+fn a_conflicting_invariant_retains_its_initial_equation() {
+    assert_retained_initial_constraint(AssertedValue::Invariant(5.0));
+}
+
+fn assert_retained_initial_constraint(asserted: AssertedValue) {
+    let model = asserted_value_model(StatedInitialValue::pinned(1.0), asserted);
+    let prepared =
+        prepare_for_solve(&model).expect("the demoted declaration retains its initial equation");
+    prepared.inspect(|system| {
+        let view = system.view;
+        let (id, x) = view.variables().find(|(_, v)| v.name().as_str() == "x").unwrap();
+        assert_eq!(x.role(), dae::VariableRole::Algebraic);
+        assert_eq!(x.fixed_uniform(), Some(true));
+        assert_eq!(rumoca_eval_dae::NumericEvaluator::new(view).expression(x.start().unwrap()).unwrap(), [1.0]);
+        assert!(!x.declaration().span().is_dummy());
+        assert!(system.manifold.is_empty(), "direct reduction retains the continuous owner");
+        assert!(system.pins.iter().any(|pin| pin.source == id.index() && pin.coordinate == id.index()));
+        let retained = view.expression(view.continuous_equation(0).unwrap().residual()).unwrap();
+        let dae::ExpressionOperation::Binary { operator: dae::BinaryOperator::Subtract, lhs, rhs } = retained.operation() else {
+            panic!("the exact original position residual must survive");
+        };
+        assert!(matches!(view.expression(lhs).unwrap().operation(), dae::ExpressionOperation::Coordinate(dae::CoordinateView::Algebraic(coordinate)) if coordinate.index() == id.index()));
+        match asserted {
+            AssertedValue::Time => assert!(matches!(view.expression(rhs).unwrap().operation(), dae::ExpressionOperation::Coordinate(dae::CoordinateView::Time))),
+            AssertedValue::Invariant(value) => assert_eq!(rumoca_eval_dae::NumericEvaluator::new(view).expression(rhs).unwrap(), [value]),
+            AssertedValue::Parameter => unreachable!(),
+        }
+        assert!(!retained.provenance().span().is_dummy());
+        assert!(sort(view).is_ok());
+    });
 }
 
 /// The same class pinned to a *parameter*. Whether `c` is the stated 1 is a

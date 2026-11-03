@@ -1,0 +1,91 @@
+{
+  "baseline_commit": "0cbfa46000705a577de9fcc5fbcd0f82743d7ba1",
+  "candidate_parents": [
+    "fa911c9a7c8515391afaf78703d052f0928f5cf1",
+    "0cbfa46000705a577de9fcc5fbcd0f82743d7ba1"
+  ],
+  "candidate_working_tree_digest": "0f66a119b35a6d819322ca8f348366130a4f09b6a45e8d20d85687153dc3933f",
+  "scope": "fixed 20-model canary, partial; not full MSL parity",
+  "target_list_sha256": "536004933ce502f7a8a4317e5dd6de2b700a6b176e84d2d6e7bbe0dcdf61eafa",
+  "baseline_counts": {
+    "cohort_models": 20,
+    "compared_models": 12,
+    "high": 12,
+    "near": 0,
+    "deviation": 0,
+    "fallback": 0,
+    "absent": 8,
+    "absent_by_reason": {
+      "not_attempted": 6,
+      "sim_failed": 2
+    }
+  },
+  "candidate_counts": {
+    "cohort_models": 20,
+    "compared_models": 12,
+    "high": 12,
+    "near": 0,
+    "deviation": 0,
+    "fallback": 0,
+    "absent": 8,
+    "absent_by_reason": {
+      "not_attempted": 6,
+      "sim_failed": 2
+    }
+  },
+  "band_changes": [],
+  "row_changes": [
+    {
+      "model": "Modelica.Blocks.Examples.Noise.AutomaticSeed",
+      "before": {
+        "model_name": "Modelica.Blocks.Examples.Noise.AutomaticSeed",
+        "band": "absent",
+        "exit_reason": "not_attempted",
+        "exit_detail": "the run never simulated it (phase_reached ToDae: Modelica.Blocks.Examples.Noise.AutomaticSeed failed in ToDae: unsupported Flat semantic owner `impure call context`: impure function `Modelica.Math.Random.Utilities.initializeImpureRandom.setInternalState` is called from a pure function body; MLS \u00a712.3 permits an impure call only in an impure function, a `when` equation or statement, an initial equation or initial algorithm, or a `parameter` binding)",
+        "compared_variables": 0,
+        "channel_high_count": 0,
+        "channel_minor_count": 0,
+        "channel_deviation_count": 0,
+        "channel_severe_count": 0
+      },
+      "after": {
+        "model_name": "Modelica.Blocks.Examples.Noise.AutomaticSeed",
+        "band": "absent",
+        "exit_reason": "not_attempted",
+        "exit_detail": "the run never simulated it (phase_reached ToDae: Modelica.Blocks.Examples.Noise.AutomaticSeed failed in ToDae: unsupported Flat semantic owner `function shape proof`: dependent extent is not an exact Integer expression over proven shape axes)",
+        "compared_variables": 0,
+        "channel_high_count": 0,
+        "channel_minor_count": 0,
+        "channel_deviation_count": 0,
+        "channel_severe_count": 0
+      }
+    },
+    {
+      "model": "Modelica.Electrical.Analog.Examples.OpAmps.Comparator",
+      "before": {
+        "model_name": "Modelica.Electrical.Analog.Examples.OpAmps.Comparator",
+        "band": "high",
+        "compared_variables": 45,
+        "channel_high_count": 45,
+        "channel_minor_count": 0,
+        "channel_deviation_count": 0,
+        "channel_severe_count": 0,
+        "max_channel_bounded_normalized_l1": 7.108312623821254e-07,
+        "mean_channel_bounded_normalized_l1": 6.35009263007541e-08,
+        "bounded_normalized_l1_score": 0.0
+      },
+      "after": {
+        "model_name": "Modelica.Electrical.Analog.Examples.OpAmps.Comparator",
+        "band": "high",
+        "compared_variables": 45,
+        "channel_high_count": 45,
+        "channel_minor_count": 0,
+        "channel_deviation_count": 0,
+        "channel_severe_count": 0,
+        "max_channel_bounded_normalized_l1": 7.108312623821254e-07,
+        "mean_channel_bounded_normalized_l1": 6.35009262998264e-08,
+        "bounded_normalized_l1_score": 0.0
+      }
+    }
+  ]
+}

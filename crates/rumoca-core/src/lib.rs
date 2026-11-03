@@ -146,6 +146,7 @@ pub fn source_dae_forbidden_builtin_name(function: BuiltinFunction) -> Option<&'
         BuiltinFunction::Hold => Some("hold"),
         BuiltinFunction::Previous => Some("previous"),
         BuiltinFunction::Interval => Some("interval"),
+        BuiltinFunction::FirstTick => Some("firstTick"),
         BuiltinFunction::SubSample => Some("subSample"),
         BuiltinFunction::SuperSample => Some("superSample"),
         BuiltinFunction::ShiftSample => Some("shiftSample"),

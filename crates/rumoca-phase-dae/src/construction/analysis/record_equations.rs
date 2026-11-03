@@ -1,13 +1,57 @@
+use super::record_equation_elements::{RecordElement, record_array_operand_elements};
 use super::*;
 use rumoca_core::DefId;
+
+/// The system that owns one field equation of a record equation.
+///
+/// A record equation is the set of its field equations (MLS 3.7 §8.3.1
+/// expands an equality of records member-wise), and each field equation belongs to the
+/// system its target's role selects: an Integer, Boolean, or enumeration
+/// field such as `state.phase` of `Modelica.Media.Water` is a discrete-valued
+/// assignment (Appendix B), a discrete Real field a discrete Real equation,
+/// and every other field a continuous residual.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::construction) enum RecordFieldSystem {
+    Continuous,
+    DiscreteReal,
+    DiscreteValue,
+}
+
+impl RecordEquationPlan {
+    /// The system each field equation belongs to, in field order.
+    pub(in crate::construction) fn field_systems<'plan>(
+        &'plan self,
+        roles: &'plan HashMap<VarName, PlannedRole>,
+    ) -> impl Iterator<Item = (&'plan RecordEquationFieldPlan, RecordFieldSystem)> + 'plan {
+        self.fields.iter().map(move |field| {
+            let system = match roles.get(&field.target) {
+                Some(PlannedRole::DiscreteValue) => RecordFieldSystem::DiscreteValue,
+                Some(PlannedRole::DiscreteReal) => RecordFieldSystem::DiscreteReal,
+                _ => RecordFieldSystem::Continuous,
+            };
+            (field, system)
+        })
+    }
+
+    /// The discrete-valued field targets, which one B.1c owner defines.
+    pub(in crate::construction) fn discrete_value_targets<'plan>(
+        &'plan self,
+        roles: &'plan HashMap<VarName, PlannedRole>,
+    ) -> impl Iterator<Item = &'plan VarName> + 'plan {
+        self.field_systems(roles)
+            .filter(|(_, system)| *system == RecordFieldSystem::DiscreteValue)
+            .map(|(field, _)| &field.target)
+    }
+}
 
 pub(super) fn analyze_record_equations(
     flat: &flat::Model,
     equations: &[flat::Equation],
+    values: &ShapeEnvironment,
 ) -> Result<HashMap<usize, RecordEquationPlan>, ToDaeError> {
     let mut plans = HashMap::new();
     for (row, equation) in equations.iter().enumerate() {
-        if let Some(plan) = analyze_record_equation(flat, equation)? {
+        if let Some(plan) = analyze_record_equation(flat, equation, values)? {
             plans.insert(row, plan);
         }
     }
@@ -17,9 +61,10 @@ pub(super) fn analyze_record_equations(
 fn analyze_record_equation(
     flat: &flat::Model,
     equation: &flat::Equation,
+    values: &ShapeEnvironment,
 ) -> Result<Option<RecordEquationPlan>, ToDaeError> {
     let Some((target, target_name, value)) = record_equation(flat, equation) else {
-        return Ok(None);
+        return analyze_record_array_equation(flat, equation, values);
     };
     if !target.dims.is_empty() {
         return Err(ToDaeError::unsupported_flat(
@@ -28,9 +73,9 @@ fn analyze_record_equation(
             equation.span,
         ));
     }
-    let target_leaves = record_leaves(flat, target, target_name, equation.span)?;
     let fields = match value {
         RecordEquationValue::Aggregate(call) => {
+            let target_leaves = record_leaves(flat, target, target_name.var_name(), equation.span)?;
             validate_constructor_layout(flat, target, call, equation.span)?;
             target_leaves
                 .into_iter()
@@ -40,42 +85,110 @@ fn analyze_record_equation(
                 })
                 .collect()
         }
-        RecordEquationValue::Record(source, source_name) => {
-            if !source.dims.is_empty() || source.type_def_id != target.type_def_id {
-                return Err(ToDaeError::unsupported_flat(
-                    "record equation",
-                    "record equality operands have distinct resolved type identities or shapes",
-                    equation.span,
-                ));
-            }
-            let source_leaves = record_leaves(flat, source, source_name, equation.span)?;
-            if target_leaves.len() != source_leaves.len()
-                || target_leaves
-                    .iter()
-                    .zip(&source_leaves)
-                    .any(|(target, source)| {
-                        target.projection != source.projection
-                            || flat.variables[&target.coordinate].dims
-                                != flat.variables[&source.coordinate].dims
-                    })
-            {
-                return Err(ToDaeError::unsupported_flat(
-                    "record equation",
-                    "record equality operands have distinct resolved field layouts",
-                    equation.span,
-                ));
-            }
-            target_leaves
-                .into_iter()
-                .zip(source_leaves)
-                .map(|(target, source)| RecordEquationFieldPlan {
-                    target: target.coordinate,
-                    value: RecordEquationFieldValue::Coordinate(source.coordinate),
-                })
-                .collect()
-        }
+        RecordEquationValue::Record(source, source_name) => record_pair_fields(
+            flat,
+            &RecordElement {
+                record: target,
+                name: target_name.var_name().clone(),
+            },
+            &RecordElement {
+                record: source,
+                name: source_name.var_name().clone(),
+            },
+            equation.span,
+        )?,
     };
     Ok(Some(RecordEquationPlan { fields }))
+}
+
+/// MLS §10.6.1: an equation between two arrays of records is the element-wise
+/// whole-record equality of each element pair, in order.
+fn analyze_record_array_equation(
+    flat: &flat::Model,
+    equation: &flat::Equation,
+    values: &ShapeEnvironment,
+) -> Result<Option<RecordEquationPlan>, ToDaeError> {
+    let Expression::Binary {
+        op: OpBinary::Sub,
+        lhs,
+        rhs,
+        ..
+    } = &equation.residual
+    else {
+        return Ok(None);
+    };
+
+    let (Some(targets), Some(sources)) = (
+        record_array_operand_elements(flat, lhs, values),
+        record_array_operand_elements(flat, rhs, values),
+    ) else {
+        return Ok(None);
+    };
+    if targets.len() != sources.len() {
+        return Err(ToDaeError::unsupported_flat(
+            "record equation",
+            format!(
+                "record array equality operands have {} and {} elements",
+                targets.len(),
+                sources.len()
+            ),
+            equation.span,
+        ));
+    }
+    let mut fields = Vec::new();
+    for (target, source) in targets.iter().zip(&sources) {
+        if !target.record.dims.is_empty() {
+            return Err(ToDaeError::unsupported_flat(
+                "record equation",
+                "arrays of records require a compact record-family owner",
+                equation.span,
+            ));
+        }
+        fields.extend(record_pair_fields(flat, target, source, equation.span)?);
+    }
+    Ok(Some(RecordEquationPlan { fields }))
+}
+
+/// Leaf owners of the whole-record equality `target = source`.
+fn record_pair_fields(
+    flat: &flat::Model,
+    target: &RecordElement<'_>,
+    source: &RecordElement<'_>,
+    span: Span,
+) -> Result<Vec<RecordEquationFieldPlan>, ToDaeError> {
+    if !source.record.dims.is_empty() || source.record.type_def_id != target.record.type_def_id {
+        return Err(ToDaeError::unsupported_flat(
+            "record equation",
+            "record equality operands have distinct resolved type identities or shapes",
+            span,
+        ));
+    }
+    let target_leaves = record_leaves(flat, target.record, &target.name, span)?;
+    let source_leaves = record_leaves(flat, source.record, &source.name, span)?;
+    if target_leaves.len() != source_leaves.len()
+        || target_leaves
+            .iter()
+            .zip(&source_leaves)
+            .any(|(target, source)| {
+                target.projection != source.projection
+                    || flat.variables[&target.coordinate].dims
+                        != flat.variables[&source.coordinate].dims
+            })
+    {
+        return Err(ToDaeError::unsupported_flat(
+            "record equation",
+            "record equality operands have distinct resolved field layouts",
+            span,
+        ));
+    }
+    Ok(target_leaves
+        .into_iter()
+        .zip(source_leaves)
+        .map(|(target, source)| RecordEquationFieldPlan {
+            target: target.coordinate,
+            value: RecordEquationFieldValue::Coordinate(source.coordinate),
+        })
+        .collect())
 }
 
 fn validate_constructor_layout(
@@ -120,7 +233,7 @@ struct RecordLeaf {
 fn record_leaves(
     flat: &flat::Model,
     record: &flat::RecordInstance,
-    name: &rumoca_core::Reference,
+    name: &VarName,
     span: Span,
 ) -> Result<Vec<RecordLeaf>, ToDaeError> {
     let layout = flat.record_types.get(&record.type_def_id).ok_or_else(|| {

@@ -1,5 +1,8 @@
 mod calls;
+mod clock_transfer;
+pub(super) mod conditional_guards;
 mod discontinuities;
+mod integer_steps;
 mod operators;
 mod temporal;
 
@@ -7,6 +10,10 @@ use super::*;
 
 use calls::*;
 pub(super) use calls::{FunctionCallLowering, classify_function_call};
+use clock_transfer::{lower_clock_transfer, lower_event_interval};
+use conditional_guards::{
+    attribute_conditional_folds, guard_reads_tunable_parameter, retains_equation_guard,
+};
 use discontinuities::*;
 use operators::*;
 use temporal::*;
@@ -42,14 +49,14 @@ pub(super) struct LoweringSymbols<'symbols, 'dae> {
     pub(super) shapes: &'symbols ShapeEnvironment,
     pub(super) function_body: Option<&'symbols dae::FunctionBody<'dae>>,
     pub(super) values: Option<&'symbols HashMap<VarName, dae::ExprId<'dae>>>,
-    pub(super) owner_clock: Option<dae::PeriodicClockId<'dae>>,
+    pub(super) owner_clock: Option<dae::ClockId<'dae>>,
 }
 
 pub(super) fn lower_clocked_expression<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     coordinates: &HashMap<VarName, Coordinate<'dae>>,
     functions: &FunctionRegistry<'_, 'dae>,
-    owner_clock: dae::PeriodicClockId<'dae>,
+    owner_clock: dae::ClockId<'dae>,
     expression: &Expression,
     generated_root: Option<dae::DaeGeneration>,
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
@@ -92,7 +99,7 @@ pub(super) fn lower_clocked_model_algorithm_expression<'dae>(
     coordinates: &HashMap<VarName, Coordinate<'dae>>,
     functions: &FunctionRegistry<'_, 'dae>,
     values: &HashMap<VarName, dae::ExprId<'dae>>,
-    owner_clock: dae::PeriodicClockId<'dae>,
+    owner_clock: dae::ClockId<'dae>,
     expression: &Expression,
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
     lower_scoped_model_algorithm_expression(
@@ -111,7 +118,7 @@ pub(super) fn lower_scoped_model_algorithm_expression<'dae>(
     coordinates: &HashMap<VarName, Coordinate<'dae>>,
     functions: &FunctionRegistry<'_, 'dae>,
     values: &HashMap<VarName, dae::ExprId<'dae>>,
-    owner_clock: Option<dae::PeriodicClockId<'dae>>,
+    owner_clock: Option<dae::ClockId<'dae>>,
     binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
     expression: &Expression,
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
@@ -295,16 +302,14 @@ fn lower_expression_event<'dae>(
         .expression_events
         .plan(span, &[lhs.as_ref(), rhs.as_ref()]);
     let provenance = dae::DaeProvenance::source(span)?;
-    if !binders.is_empty() {
-        let variability =
-            construction.expressions(|expressions| expressions.variability(lowered, provenance))?;
-        // A compact binder is a compile-time Integer coordinate. Relations
-        // used only to select parameter/comprehension values are therefore
-        // settled before simulation and own no MLS §8.5 event, even when
-        // their source span is shared by materialized runtime occurrences.
-        if variability < dae::ExpressionVariability::Continuous {
-            return Ok(());
-        }
+    let variability =
+        construction.expressions(|expressions| expressions.variability(lowered, provenance))?;
+    // Constructed variability includes resolved enumeration literals and
+    // compact binders; Flat's preliminary occurrence plan cannot refine it.
+    if variability <= dae::ExpressionVariability::Parameter
+        || (!binders.is_empty() && variability < dae::ExpressionVariability::Continuous)
+    {
+        return Ok(());
     }
     if !binders.is_empty()
         && plan.is_none()
@@ -428,26 +433,35 @@ fn lower_expression_node<'dae>(
         Expression::If {
             branches,
             else_branch,
-            ..
+            span,
         } => lower_conditional_expression(
             construction,
             symbols,
             binders,
-            branches,
-            else_branch,
+            (branches, else_branch, *span),
             provenance,
         ),
-        Expression::Array {
-            elements,
-            is_matrix,
-            ..
-        } => {
-            if *is_matrix {
-                lower_matrix_expression(construction, symbols, binders, elements, provenance)
-            } else {
+        Expression::Array { elements, kind, .. } => match kind {
+            rumoca_core::ArrayConstructor::Array => {
                 lower_array_expression(construction, symbols, binders, elements, provenance)
             }
-        }
+            rumoca_core::ArrayConstructor::Horizontal => lower_promoted_matrix_concatenation(
+                construction,
+                symbols,
+                binders,
+                elements,
+                dae::PureBuiltin::PromotedCat2,
+                provenance,
+            ),
+            rumoca_core::ArrayConstructor::Vertical => lower_promoted_matrix_concatenation(
+                construction,
+                symbols,
+                binders,
+                elements,
+                dae::PureBuiltin::PromotedCat1,
+                provenance,
+            ),
+        },
         Expression::ArrayComprehension {
             expr,
             indices,
@@ -522,7 +536,7 @@ fn lower_builtin_expression<'dae>(
             let Some(value) = clocked_value_sample(symbols.functions.flat, arguments) else {
                 return lower_sample_event_operator(construction, symbols, arguments, provenance);
             };
-            lower_temporal_identity(construction, symbols, binders, value, provenance)
+            lower_value_sample(construction, symbols, binders, value, provenance)
         }
         BuiltinFunction::Hold => lower_hold(construction, symbols, binders, arguments, provenance),
         BuiltinFunction::Previous => {
@@ -539,10 +553,39 @@ fn lower_builtin_expression<'dae>(
             let owner_clock = symbols
                 .owner_clock
                 .ok_or(dae::DaeConstructionError::MissingClockDomainOwner { span })?;
+            match symbols.functions.clocks.periodic(owner_clock) {
+                Some(periodic) => construction.expressions(|expressions| {
+                    expressions
+                        .at(provenance)
+                        .coordinate(dae::CoordinateInput::ClockInterval(periodic))
+                }),
+                None => {
+                    lower_event_interval(construction, symbols, binders, owner_clock, provenance)
+                }
+            }
+        }
+        BuiltinFunction::FirstTick => {
+            if arguments.len() > 1 {
+                return Err(dae::DaeConstructionError::InvalidArity {
+                    expected: 1,
+                    found: arguments.len(),
+                    span,
+                });
+            }
+            let owner_clock = symbols
+                .owner_clock
+                .ok_or(dae::DaeConstructionError::MissingClockDomainOwner { span })?;
+            let previous = symbols.functions.clocks.first_tick(owner_clock, span)?;
             construction.expressions(|expressions| {
+                let indicator = expressions
+                    .at(provenance)
+                    .coordinate(dae::CoordinateInput::Previous(previous))?;
+                let half = expressions
+                    .at(provenance)
+                    .literal(dae::DaeLiteral::Real(0.5))?;
                 expressions
                     .at(provenance)
-                    .coordinate(dae::CoordinateInput::ClockInterval(owner_clock))
+                    .binary(dae::BinaryOperator::Greater, indicator, half)
             })
         }
         BuiltinFunction::Clock | BuiltinFunction::NoClock => {
@@ -674,172 +717,6 @@ fn lower_cat<'dae>(
         }
     }
     construction.expressions(|expressions| expressions.at(provenance).array(elements))
-}
-
-fn lower_clock_transfer<'dae>(
-    construction: &mut dae::DaeConstruction<'dae>,
-    symbols: LoweringSymbols<'_, 'dae>,
-    binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
-    function: BuiltinFunction,
-    arguments: &[Expression],
-    provenance: dae::DaeProvenance,
-) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
-    let (source, kind) = clock_transfer_input(
-        function,
-        arguments,
-        symbols.functions.constants,
-        provenance.span(),
-    )?;
-    let source_plan = expression_clock_plan(source, symbols.functions).ok_or(
-        dae::DaeConstructionError::MissingClockDomainOwner {
-            span: provenance.span(),
-        },
-    )?;
-    let source_clock = symbols
-        .functions
-        .clocks
-        .id(&source_plan, provenance.span())?;
-    let target_clock =
-        symbols
-            .owner_clock
-            .ok_or(dae::DaeConstructionError::MissingClockDomainOwner {
-                span: provenance.span(),
-            })?;
-    let mut source_symbols = symbols;
-    source_symbols.owner_clock = Some(source_clock);
-    let source = lower_expression_scoped(construction, source_symbols, binders, source, None)?;
-    construction.expressions(|expressions| {
-        expressions.at(provenance).clock_transfer(
-            kind,
-            source,
-            source_clock.into(),
-            target_clock.into(),
-        )
-    })
-}
-
-fn clock_transfer_input<'expression>(
-    function: BuiltinFunction,
-    arguments: &'expression [Expression],
-    constants: &EvalContext,
-    span: Span,
-) -> Result<(&'expression Expression, dae::ClockTransferKind), dae::DaeConstructionError> {
-    let invalid = || dae::DaeConstructionError::InvalidClockedOperand {
-        operator: function.name(),
-        span,
-    };
-    let integer = |expression: &Expression| {
-        eval_expr(expression, constants)
-            .ok()
-            .and_then(|value| value.as_integer())
-            .ok_or_else(invalid)
-    };
-    match (function, arguments) {
-        (BuiltinFunction::SubSample, [source, factor]) => Ok((
-            source,
-            dae::ClockTransferKind::SubSample {
-                factor: integer(factor)?,
-            },
-        )),
-        (BuiltinFunction::SuperSample, [source, factor]) => Ok((
-            source,
-            dae::ClockTransferKind::SuperSample {
-                factor: integer(factor)?,
-            },
-        )),
-        (BuiltinFunction::ShiftSample, [source, counter]) => Ok((
-            source,
-            dae::ClockTransferKind::ShiftSample {
-                counter: integer(counter)?,
-                resolution: 1,
-            },
-        )),
-        (BuiltinFunction::ShiftSample, [source, counter, resolution]) => Ok((
-            source,
-            dae::ClockTransferKind::ShiftSample {
-                counter: integer(counter)?,
-                resolution: integer(resolution)?,
-            },
-        )),
-        (BuiltinFunction::BackSample, [source, counter]) => Ok((
-            source,
-            dae::ClockTransferKind::BackSample {
-                counter: integer(counter)?,
-                resolution: 1,
-            },
-        )),
-        (BuiltinFunction::BackSample, [source, counter, resolution]) => Ok((
-            source,
-            dae::ClockTransferKind::BackSample {
-                counter: integer(counter)?,
-                resolution: integer(resolution)?,
-            },
-        )),
-        _ => Err(invalid()),
-    }
-}
-
-fn expression_clock_plan(
-    expression: &Expression,
-    functions: &FunctionRegistry<'_, '_>,
-) -> Option<ClockPlan> {
-    if let Expression::BuiltinCall {
-        function,
-        args,
-        span,
-        ..
-    } = expression
-        && matches!(
-            function,
-            BuiltinFunction::SubSample
-                | BuiltinFunction::SuperSample
-                | BuiltinFunction::ShiftSample
-                | BuiltinFunction::BackSample
-        )
-    {
-        let (source, kind) =
-            clock_transfer_input(*function, args, functions.constants, *span).ok()?;
-        let source = expression_clock_plan(source, functions)?;
-        let lattice = match kind {
-            dae::ClockTransferKind::SubSample { factor } => source.lattice.sub_sample(factor),
-            dae::ClockTransferKind::SuperSample { factor } => source.lattice.super_sample(factor),
-            dae::ClockTransferKind::ShiftSample {
-                counter,
-                resolution,
-            } => source.lattice.shift_sample(counter, resolution),
-            dae::ClockTransferKind::BackSample {
-                counter,
-                resolution,
-            } => source.lattice.back_sample(counter, resolution),
-        }
-        .ok()?;
-        return Some(ClockPlan {
-            lattice,
-            constructor_span: *span,
-        });
-    }
-    let mut owner = None;
-    collect_expression_clock_plan(expression, functions, &mut owner);
-    owner
-}
-
-fn collect_expression_clock_plan(
-    expression: &Expression,
-    functions: &FunctionRegistry<'_, '_>,
-    owner: &mut Option<ClockPlan>,
-) {
-    if let Expression::VarRef { name, .. } = expression
-        && let Some(variable) = functions.flat.variables.get(name.var_name())
-        && let Some(plan) = functions
-            .clocked_coordinate_owners
-            .get(&variable.instance_id)
-    {
-        debug_assert!(owner.is_none_or(|existing| existing.lattice == plan.lattice));
-        owner.get_or_insert(*plan);
-    }
-    for child in expression_children(expression) {
-        collect_expression_clock_plan(child, functions, owner);
-    }
 }
 
 /// Lower MLS §8.6 `terminal()` to the unique typed terminal coordinate.
@@ -1229,6 +1106,22 @@ pub(super) fn derivative_reference(
     }
 }
 
+/// Whether argument `index` of `function` is one of its MLS §10.3 declared
+/// array extents, which the checked constructor requires as a literal Integer.
+///
+/// `zeros`, `ones` and `identity` take only extents; `fill(s, n1, ...)` reserves
+/// its first argument for the fill value and declares extents from the rest;
+/// `linspace(x1, x2, n)` declares its single extent in the third argument. Every
+/// other builtin argument is an ordinary value and is lowered as written.
+fn is_declared_extent_argument(function: BuiltinFunction, index: usize) -> bool {
+    match function {
+        BuiltinFunction::Zeros | BuiltinFunction::Ones | BuiltinFunction::Identity => true,
+        BuiltinFunction::Fill => index >= 1,
+        BuiltinFunction::Linspace => index == 2,
+        _ => false,
+    }
+}
+
 fn lower_builtin_call<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     symbols: LoweringSymbols<'_, 'dae>,
@@ -1237,25 +1130,22 @@ fn lower_builtin_call<'dae>(
     arguments: &[Expression],
     provenance: dae::DaeProvenance,
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
-    // MLS §10.3: `zeros(n)` declares its own extents, and the checked
-    // constructor types the result from them, so each extent must arrive as the
-    // Integer it denotes. Inside a value-proven specialization `n` denotes one
-    // Integer — the same one the shape proof already read through
+    // MLS §10.3: the array-returning builtins declare their own extents, and the
+    // checked constructor types the result from them, so each extent must arrive
+    // as the Integer it denotes. Inside a value-proven specialization that extent
+    // denotes one Integer — the same one the shape proof already read through
     // `evaluate_shape_integer` — so folding it here is what keeps the two
     // agreeing instead of handing the constructor a coordinate it must refuse.
-    // Only the extent operands are structural (MLS §10.3). A parameter's
-    // declaration binding must retain its dependencies for recalibration.
-    let first_extent = match function {
-        BuiltinFunction::Zeros | BuiltinFunction::Ones | BuiltinFunction::Identity => 0,
-        BuiltinFunction::Fill => 1,
-        BuiltinFunction::Linspace => 2,
-        _ => arguments.len(),
-    };
+    // `fill(s, n1, ...)` keeps its first argument as the fill value and declares
+    // extents only from the trailing arguments, and `linspace(x1, x2, n)`
+    // declares its extent in the third; the extent positions are named per
+    // builtin so a non-extent argument is never mistaken for one.
+    let source_arguments = arguments;
     let arguments = arguments
         .iter()
         .enumerate()
         .map(|(index, argument)| {
-            if index >= first_extent
+            if is_declared_extent_argument(function, index)
                 && !matches!(argument, Expression::Literal { .. })
                 && let Some(extent) = symbols.shapes.proven_extent(argument)
             {
@@ -1276,7 +1166,19 @@ fn lower_builtin_call<'dae>(
     {
         return Ok(lowered);
     }
-    construction.expressions(|expressions| expressions.at(provenance).builtin(builtin, arguments))
+    let lowered = construction.expressions(|expressions| {
+        expressions
+            .at(provenance)
+            .builtin(builtin, arguments.clone())
+    })?;
+    integer_steps::own_integer_step(
+        construction,
+        symbols,
+        source_arguments,
+        &arguments,
+        provenance,
+    )?;
+    Ok(lowered)
 }
 
 fn lower_function_call<'dae>(
@@ -1307,6 +1209,22 @@ fn lower_function_call<'dae>(
             arguments,
             provenance,
         );
+    }
+    // A native table bounds accessor on an in-memory constant table is a
+    // compile-time constant (MLS §12.9); fold it to its Real literal so the
+    // opaque table handle never reaches a numeric path that cannot execute the
+    // foreign C body.
+    if let Some(bound) = super::native_tables::native_table_bounds_literal(
+        symbols.functions.flat,
+        symbols.functions.constants,
+        name,
+        arguments,
+    ) {
+        return construction.expressions(|expressions| {
+            expressions
+                .at(provenance)
+                .literal(dae::DaeLiteral::Real(bound))
+        });
     }
     let call = lower_call_operands(construction, symbols, binders, name, arguments, provenance)?;
     call.result(construction, 0, provenance)
@@ -1585,22 +1503,88 @@ fn lower_empty_function_argument<'dae>(
     construction.expressions(|expressions| expressions.at(provenance).empty_array(value_type))
 }
 
+/// Lower an MLS §3.6.5 conditional expression, folding away any statically dead
+/// arm before it is built.
+///
+/// MLS §11.5 evaluates the branch conditions in declaration order and yields the
+/// value of the first whose condition is `true`, or the else value when none is.
+/// When this scope proves a condition constant, the arms MLS §11.5 would never
+/// reach carry no value the program observes, and their calls were never
+/// certified by shape discovery (`discover_conditional_calls` prunes the same
+/// arms). Building such an arm would hand the checked constructor an operation
+/// with no certificate, so a proven-`false` branch is dropped and the arms after
+/// a proven-`true` branch are never lowered. An unproven condition keeps its arm
+/// exactly as written, and a proven-`true` branch reached only after an earlier
+/// unproven condition becomes the fallback, since MLS §11.5 would still test the
+/// earlier condition first.
 fn lower_conditional_expression<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     symbols: LoweringSymbols<'_, 'dae>,
     binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
-    branches: &[(Expression, Expression)],
-    else_branch: &Expression,
+    (branches, else_branch, span): (&[(Expression, Expression)], &Expression, Span),
     provenance: dae::DaeProvenance,
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
+    // A variable's attribute or binding value keeps a conditional whose guard
+    // reads a tunable parameter unfolded, so a change to that parameter
+    // re-selects the branch after the code is generated (an eFMI `Recalibrate`
+    // runs the same statement). Folding it to the parameter's translation-time
+    // value silently freezes the branch. The conditional is preserved only when
+    // no arm calls a user function and every arm has one proven shape
+    // ([`attribute_conditional_folds`]): shape discovery prunes a dead arm's
+    // calls, so preserving an arm whose call carries no shape certificate could
+    // not be built, and arms of different sizes select structure. A structural
+    // guard, and any such conditional, keep folding.
+    // In an equation, such a guard is kept as a run-time branch when its arms
+    // are structurally equal (SPEC_0040 DAE-C22); only a structural selection
+    // is evaluated at translation.
+    let preserve_tunable_conditional = if symbols.shapes.is_attribute_scope() {
+        !attribute_conditional_folds(branches, else_branch, symbols.shapes)
+            && branches
+                .iter()
+                .any(|(condition, _)| guard_reads_tunable_parameter(symbols.coordinates, condition))
+    } else {
+        !symbols.shapes.is_structural_selection(span)
+            && symbols.shapes.evaluable().is_some_and(|evaluable| {
+                retains_equation_guard(symbols.coordinates, evaluable, branches, else_branch)
+            })
+    };
     let mut lowered = Vec::with_capacity(branches.len());
     for (condition, value) in branches {
-        lowered.push((
-            lower_expression_scoped(construction, symbols, binders, condition, None)?,
-            lower_expression_scoped(construction, symbols, binders, value, None)?,
-        ));
+        let proven = if preserve_tunable_conditional {
+            None
+        } else {
+            symbols.shapes.proven_value(condition)
+        };
+        match proven {
+            // A proven-dead arm is never built; MLS §11.5 skips to the next
+            // condition, so lowering resumes at the following branch.
+            Some(ProvenValue::Boolean(false)) => continue,
+            // The first proven-`true` condition selects its value. With no
+            // undecided earlier branch its value is the whole result; otherwise
+            // it is the fallback the retained conditional falls through to.
+            Some(ProvenValue::Boolean(true)) => {
+                let taken = lower_expression_scoped(construction, symbols, binders, value, None)?;
+                if lowered.is_empty() {
+                    return Ok(taken);
+                }
+                return construction.expressions(|expressions| {
+                    expressions.at(provenance).conditional(lowered, taken)
+                });
+            }
+            // An unproven condition (or a non-Boolean fold, which a well-typed
+            // conditional never produces) keeps its arm exactly as written.
+            _ => {
+                lowered.push((
+                    lower_expression_scoped(construction, symbols, binders, condition, None)?,
+                    lower_expression_scoped(construction, symbols, binders, value, None)?,
+                ));
+            }
+        }
     }
     let fallback = lower_expression_scoped(construction, symbols, binders, else_branch, None)?;
+    if lowered.is_empty() {
+        return Ok(fallback);
+    }
     construction
         .expressions(|expressions| expressions.at(provenance).conditional(lowered, fallback))
 }
@@ -1619,124 +1603,6 @@ fn lower_array_expression<'dae>(
     construction.expressions(|expressions| expressions.at(provenance).array(elements))
 }
 
-/// Lower the MLS §10.4.2.1 `[ ]` concatenation operator.
-///
-/// `[ ]` always denotes a matrix, so its value is built row-major with one
-/// nesting level per dimension: an outer array of rows, each row an array of
-/// its scalar operands. The `;` spelling already arrives with one node per row
-/// and lowers as those rows; the `,` spelling arrives as one flat operand list
-/// and is the single row of a 1 x n matrix, which is the level of nesting that
-/// used to be missing — `[0, 1, 1, 0, 0]` was built as a 5-vector rather than
-/// as the 1 x 5 matrix MLS gives it.
-///
-/// ACCEPTANCE CONTRACT (SPEC_0008): two source shapes change here. A row whose
-/// operands are all syntactically non-array becomes the 1 x n matrix MLS gives
-/// it, and an all-matrix-child node is the parser's unambiguous `;` spelling,
-/// lowered through checked promoted concatenation. Every other `[ ]` keeps the
-/// element nesting it already lowered to, because two different producers
-/// write `is_matrix: true` with different row conventions:
-///
-/// * Parse (`rumoca-phase-parse/src/expressions.rs::convert_range_primary`)
-///   writes the `;` spelling as one `is_matrix: true` row node per row.
-/// * Flatten's comprehension expander
-///   (`rumoca-phase-flatten/src/array_comprehension.rs:145`) sets
-///   `is_matrix = matches!(expr, Array { .. })`, which marks an MLS §10.4.1
-///   `{ }` comprehension whose *body* is an array as though it were an MLS
-///   §10.4.2.1 `[ ]` matrix, over rows that are plain `is_matrix: false`
-///   arrays. `Modelica.Electrical.Machines.SpacePhasors.Blocks.ToSpacePhasor`'s
-///   `InverseTransformation[m, 2] = {{…} for k in 1:m}` arrives that way,
-///   containing no `[ ]` at all. That mislabelling is the root defect (filed as
-///   a board item); this rule only has to survive it.
-///
-/// A row test that accepted only the first convention rewrapped the second into
-/// rank 3 and broke `Modelica.Electrical.Machines.Examples.Transformers.
-/// TransformerTestbench`. A row test that accepted both would silently read the
-/// MLS §10.4.2.1 row-of-vectors `[{1,2,3},{4,5,6}]` (OMC: 3 x 2) as 2 x 3.
-///
-/// The predicate is deliberately *syntactic*, not a scalar-ness proof: a bare
-/// reference operand (`[v1, v2]` over declared vectors) is not an array node,
-/// so it takes the 1 x n branch and is then refused by the checked shape rule
-/// below rather than silently transposed the way the base compiler did.
-fn lower_matrix_expression<'dae>(
-    construction: &mut dae::DaeConstruction<'dae>,
-    symbols: LoweringSymbols<'_, 'dae>,
-    binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
-    elements: &[Expression],
-    provenance: dae::DaeProvenance,
-) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
-    if elements.iter().all(|element| {
-        matches!(
-            element,
-            Expression::Array {
-                is_matrix: true,
-                ..
-            }
-        )
-    }) {
-        // The parser reserves this nesting for the `;` spelling. Each child
-        // row is the MLS §10.4.2.1 promoted dimension-2 concatenation of its
-        // operands; the outer expression concatenates those checked rows along
-        // dimension 1. The DAE constructor derives both result shapes from the
-        // operand types, so lowering supplies no parallel extent metadata.
-        let rows = elements
-            .iter()
-            .map(|row| {
-                let Expression::Array {
-                    elements: operands, ..
-                } = row
-                else {
-                    unreachable!("the semicolon-row predicate proves every row shape")
-                };
-                lower_promoted_matrix_concatenation(
-                    construction,
-                    symbols,
-                    binders,
-                    operands,
-                    dae::PureBuiltin::PromotedCat2,
-                    provenance,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        return construction.expressions(|expressions| {
-            expressions
-                .at(provenance)
-                .builtin(dae::PureBuiltin::PromotedCat1, rows)
-        });
-    }
-    if is_non_array_operand_row(elements) {
-        // Parse gives `[A, B, …]` a unique flat-operand representation when no
-        // operand is itself an array node. The DAE constructor therefore owns
-        // the MLS §10.4.2.1 `promote` and dimension-2 `cat` proof for scalar,
-        // vector, matrix, reference, and function-result operands alike.
-        return lower_promoted_matrix_concatenation(
-            construction,
-            symbols,
-            binders,
-            elements,
-            dae::PureBuiltin::PromotedCat2,
-            provenance,
-        );
-    }
-    // Every remaining shape keeps the nesting it already lowered to. A child that is
-    // itself a scalar-operand row is lowered as its own operand list rather than
-    // through the dispatch above, which would otherwise wrap that row a second
-    // time and turn `[1, 2; 3, 4]` into rank 3.
-    let lowered = elements
-        .iter()
-        .map(|element| match element {
-            Expression::Array {
-                elements: operands,
-                is_matrix: true,
-                ..
-            } if is_non_array_operand_row(operands) => {
-                lower_array_expression(construction, symbols, binders, operands, provenance)
-            }
-            other => lower_expression_scoped(construction, symbols, binders, other, None),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    construction.expressions(|expressions| expressions.at(provenance).array(lowered))
-}
-
 fn lower_promoted_matrix_concatenation<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     symbols: LoweringSymbols<'_, 'dae>,
@@ -1750,20 +1616,6 @@ fn lower_promoted_matrix_concatenation<'dae>(
         .map(|operand| lower_expression_scoped(construction, symbols, binders, operand, None))
         .collect::<Result<Vec<_>, _>>()?;
     construction.expressions(|expressions| expressions.at(provenance).builtin(builtin, operands))
-}
-
-/// Whether `elements` is a non-empty `[ ]` row in which no operand is an array
-/// *node*.
-///
-/// This is a syntactic proof that the node cannot be the array-bodied
-/// comprehension shape currently produced by flatten. The DAE
-/// `PromotedCat2` constructor independently derives and validates every operand
-/// type and extent; this predicate grants no shape fact itself.
-fn is_non_array_operand_row(elements: &[Expression]) -> bool {
-    !elements.is_empty()
-        && !elements
-            .iter()
-            .any(|element| matches!(element, Expression::Array { .. }))
 }
 
 fn lower_array_comprehension<'dae>(

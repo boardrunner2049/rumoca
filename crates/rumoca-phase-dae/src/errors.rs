@@ -44,7 +44,7 @@ pub enum ToDaeError {
 
     #[error("the model requires the derivative of top-level input `{name}`")]
     #[diagnostic(
-        code(rumoca::todae::ED022),
+        code(rumoca::todae::ED024),
         help(
             "a top-level input is supplied by the environment and is not a state (MLS §4.4.2.2); \
              der(...) of it needs the input's derivative, which the canonical DAE does not carry. \
@@ -59,7 +59,7 @@ pub enum ToDaeError {
 
     #[error("cyclic dependency in parameter binding: {cycle}")]
     #[diagnostic(
-        code(rumoca::todae::ED023),
+        code(rumoca::todae::ED025),
         help(
             "MLS §8.6: parameter and constant bindings must be solvable in a sequential order; \
              modify one of the parameters on the cycle to break it"
@@ -162,6 +162,32 @@ pub enum ToDaeError {
         feature: String,
         detail: String,
         #[label("unsupported semantic owner")]
+        span: Span,
+    },
+
+    #[error("function value is used or returned uninitialized: {detail}")]
+    #[diagnostic(
+        code(rumoca::todae::ED022),
+        help(
+            "MLS 3.7 §12.4.4: it is an error to use or return an uninitialized variable; assign the value or give its type a default"
+        )
+    )]
+    UninitializedFunctionValue {
+        detail: String,
+        #[label("never assigned and without a default")]
+        span: Span,
+    },
+
+    #[error("discrete-valued definition is not a discrete-time expression: {detail}")]
+    #[diagnostic(
+        code(rumoca::todae::ED023),
+        help(
+            "MLS 3.7 §3.8.5: a Boolean, Integer, String, or enumeration variable changes only at events; define it from relations, pre(), sample(), or other discrete-time expressions, or inside a when-clause"
+        )
+    )]
+    ContinuousDiscreteDefinition {
+        detail: String,
+        #[label("continuous-time definition of a discrete-valued variable")]
         span: Span,
     },
 
@@ -297,6 +323,8 @@ impl ToDaeError {
             | Self::UnsupportedRuntimeOperator { span, .. }
             | Self::UnresolvedClockSchedule { span, .. }
             | Self::UnsupportedFlatSemantics { span, .. }
+            | Self::UninitializedFunctionValue { span, .. }
+            | Self::ContinuousDiscreteDefinition { span, .. }
             | Self::Construction { span, .. } => std::slice::from_ref(span),
             Self::Unbalanced { .. }
             | Self::Internal { .. }

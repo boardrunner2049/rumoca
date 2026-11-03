@@ -1,4 +1,12 @@
+mod branch_assertions;
+mod path_definedness;
+
 use super::*;
+use branch_assertions::{
+    BranchAssertion, BranchState, guard_branch_assertions, lower_branch_assertion,
+};
+use path_definedness::lower_path_definedness;
+pub(super) use path_definedness::{DefinednessPredicates, PartialTarget};
 
 pub(super) fn lower_generated_boolean_assignment<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
@@ -41,6 +49,7 @@ pub(super) fn lower_integer_reduction<'dae>(
         body,
         &function.body[..initial_count],
         initial_plans,
+        None,
     )?;
     let target = function_value_coordinate(symbols.coordinates, result);
     match reduction {
@@ -272,7 +281,7 @@ pub(super) fn lower_guarded_function_return<'dae>(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    body = lower_function_statements(construction, symbols, body, tail, tail_plans)?;
+    body = lower_function_statements(construction, symbols, body, tail, tail_plans, None)?;
     let provenance =
         dae::DaeProvenance::generated(dae::DaeGeneration::FunctionConditionLowering, *span)?;
     for (target, returned) in targets.iter().zip(returned) {
@@ -326,6 +335,8 @@ pub(super) struct FunctionConditional<'scope, 'statement, 'dae> {
     pub(super) branch_plans: &'statement [Vec<FunctionStatementPlan>],
     pub(super) fallback_plans: Option<&'statement [FunctionStatementPlan]>,
     pub(super) targets: &'statement [VarName],
+    /// Targets this conditional leaves path-partial (top-level sequence only).
+    pub(super) partial: &'scope [PartialTarget<'dae>],
     pub(super) span: Span,
 }
 
@@ -335,15 +346,27 @@ pub(super) struct FunctionConditional<'scope, 'statement, 'dae> {
 /// later assignment reads what an earlier one wrote, and the last write to a
 /// value is the one the branch defines. Each branch therefore builds its own
 /// value environment first, and the join then owns one conditional expression
-/// per value the conditional defines on all of its paths.
+/// per value the conditional defines on all of its paths. Returns the
+/// definedness predicate of every path-partial target.
 pub(super) fn lower_function_conditional<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     body: &mut dae::FunctionBody<'dae>,
     input: FunctionConditional<'_, '_, 'dae>,
-) -> Result<(), dae::DaeConstructionError> {
+) -> Result<Vec<(VarName, dae::ExprId<'dae>)>, dae::DaeConstructionError> {
     let provenance =
         dae::DaeProvenance::generated(dae::DaeGeneration::FunctionConditionLowering, input.span)?;
     let lowered = lower_function_conditional_values(construction, body, input)?;
+    for assertion in &lowered.assertions {
+        construction.functions(|functions| {
+            functions.assertion_with_level(
+                body,
+                assertion.condition,
+                assertion.message,
+                assertion.level,
+                assertion.provenance,
+            )
+        })?;
+    }
     construction.functions(|functions| {
         functions.assign_conditional_all(
             body,
@@ -353,7 +376,8 @@ pub(super) fn lower_function_conditional<'dae>(
             &lowered.fallback,
             provenance,
         )
-    })
+    })?;
+    Ok(lowered.defined)
 }
 
 struct LoweredFunctionConditional<'dae> {
@@ -361,6 +385,12 @@ struct LoweredFunctionConditional<'dae> {
     conditions: Vec<dae::ExprId<'dae>>,
     branches: Vec<Vec<dae::ExprId<'dae>>>,
     fallback: Vec<dae::ExprId<'dae>>,
+    /// Definedness predicate of each path-partial target after the join.
+    defined: Vec<(VarName, dae::ExprId<'dae>)>,
+    /// Branch assertions guarded by their branch selection, in source order;
+    /// the enclosing action owner appends them before the joined commit so
+    /// they read the pre-conditional definitions.
+    assertions: Vec<BranchAssertion<'dae>>,
 }
 
 fn lower_function_conditional_values<'dae>(
@@ -418,35 +448,48 @@ fn lower_function_conditional_values<'dae>(
     // pre-conditional definition (`X[i] := value` while `value := value - L·X[k]`),
     // and those reads can be mutual, so no per-target assignment order keeps
     // every read fact current — only an atomic commit does.
-    let mut targets = Vec::with_capacity(input.targets.len());
-    let mut branches = vec![Vec::with_capacity(input.targets.len()); branch_values.len()];
-    let mut fallback = Vec::with_capacity(input.targets.len());
-    for target in input.targets {
-        let target_id = function_value_coordinate(input.symbols.coordinates, target);
-        targets.push(target_id);
-        for (lowered_branch, branch) in branches.iter_mut().zip(&branch_values) {
-            lowered_branch.push(match branch.get(target) {
-                Some(value) => *value,
-                None => construction
-                    .functions(|functions| functions.read(body, target_id, provenance))?,
-            });
-        }
-        fallback.push(
-            match fallback_values
-                .as_ref()
-                .and_then(|values| values.get(target))
-            {
-                Some(value) => *value,
-                None => construction
-                    .functions(|functions| functions.read(body, target_id, provenance))?,
-            },
-        );
+    let (targets, branches, fallback) = join_branch_targets(
+        construction,
+        body,
+        &input,
+        &branch_values,
+        fallback_values.as_ref(),
+        provenance,
+    )?;
+    let mut assertions = Vec::new();
+    for (ordinal, branch) in branch_values.iter().enumerate() {
+        guard_branch_assertions(
+            construction,
+            &conditions,
+            Some(ordinal),
+            &branch.assertions,
+            &mut assertions,
+        )?;
     }
+    if let Some(branch) = &fallback_values {
+        guard_branch_assertions(
+            construction,
+            &conditions,
+            None,
+            &branch.assertions,
+            &mut assertions,
+        )?;
+    }
+    let defined = lower_path_definedness(
+        construction,
+        &input,
+        &conditions,
+        &branch_values,
+        fallback_values.as_ref(),
+        provenance,
+    )?;
     Ok(LoweredFunctionConditional {
         targets,
         conditions,
         branches,
         fallback,
+        defined,
+        assertions,
     })
 }
 
@@ -468,7 +511,7 @@ fn lower_conditional_branch<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     body: &dae::FunctionBody<'dae>,
     input: ConditionalBranch<'_, '_, 'dae>,
-) -> Result<HashMap<VarName, dae::ExprId<'dae>>, dae::DaeConstructionError> {
+) -> Result<BranchState<'dae>, dae::DaeConstructionError> {
     let ConditionalBranch {
         symbols,
         binders,
@@ -476,7 +519,7 @@ fn lower_conditional_branch<'dae>(
         plans,
     } = input;
     debug_assert_eq!(statements.len(), plans.len());
-    let mut values = HashMap::new();
+    let mut state = BranchState::default();
     lower_conditional_statements(
         construction,
         body,
@@ -484,9 +527,9 @@ fn lower_conditional_branch<'dae>(
         binders,
         statements,
         plans,
-        &mut values,
+        &mut state,
     )?;
-    Ok(values)
+    Ok(state)
 }
 
 fn lower_conditional_statements<'dae>(
@@ -496,7 +539,7 @@ fn lower_conditional_statements<'dae>(
     binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
     statements: &[rumoca_core::Statement],
     plans: &[FunctionStatementPlan],
-    values: &mut HashMap<VarName, dae::ExprId<'dae>>,
+    state: &mut BranchState<'dae>,
 ) -> Result<(), dae::DaeConstructionError> {
     debug_assert_eq!(statements.len(), plans.len());
     let mut index = 0usize;
@@ -507,7 +550,7 @@ fn lower_conditional_statements<'dae>(
             symbols,
             &statements[index..],
             &plans[index],
-            values,
+            &mut state.values,
         )? {
             index += count;
             continue;
@@ -521,7 +564,7 @@ fn lower_conditional_statements<'dae>(
             binders,
             statement,
             plan,
-            values,
+            state,
         )?;
         index += 1;
     }
@@ -535,12 +578,12 @@ fn lower_one_conditional_statement<'dae>(
     binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
     statement: &rumoca_core::Statement,
     plan: &FunctionStatementPlan,
-    values: &mut HashMap<VarName, dae::ExprId<'dae>>,
+    state: &mut BranchState<'dae>,
 ) -> Result<(), dae::DaeConstructionError> {
     match (statement, plan) {
         (_, FunctionStatementPlan::ProvenAssertion) => Ok(()),
-        (_, FunctionStatementPlan::RuntimeAssertion) => {
-            unreachable!("runtime conditional assertions are rejected during planning")
+        (statement, FunctionStatementPlan::RuntimeAssertion) => {
+            lower_branch_assertion(construction, body, symbols, binders, statement, state)
         }
         (
             rumoca_core::Statement::Assignment { value, span, .. },
@@ -555,7 +598,7 @@ fn lower_one_conditional_statement<'dae>(
                 value,
                 span: *span,
             },
-            values,
+            &mut state.values,
         ),
         (
             rumoca_core::Statement::FunctionCall {
@@ -573,7 +616,7 @@ fn lower_one_conditional_statement<'dae>(
                 span: *span,
                 outputs,
             },
-            values,
+            &mut state.values,
         ),
         (
             rumoca_core::Statement::If {
@@ -599,7 +642,7 @@ fn lower_one_conditional_statement<'dae>(
                 targets,
                 span: *span,
             },
-            values,
+            state,
         ),
         (
             rumoca_core::Statement::If {
@@ -618,7 +661,7 @@ fn lower_one_conditional_statement<'dae>(
             binders,
             (cond_blocks, else_block.as_deref(), *selected),
             statements,
-            values,
+            state,
         ),
         _ => unreachable!("analysis accepts only expression-owned statements in a function branch"),
     }
@@ -653,10 +696,10 @@ fn lower_selected_conditional<'dae>(
         Option<usize>,
     ),
     plans: &[FunctionStatementPlan],
-    values: &mut HashMap<VarName, dae::ExprId<'dae>>,
+    state: &mut BranchState<'dae>,
 ) -> Result<(), dae::DaeConstructionError> {
     let source = selected_conditional_statements(conditional.0, conditional.1, conditional.2);
-    lower_conditional_statements(construction, body, symbols, binders, source, plans, values)
+    lower_conditional_statements(construction, body, symbols, binders, source, plans, state)
 }
 
 fn lower_conditional_multi_output_call<'dae>(
@@ -824,7 +867,7 @@ fn lower_nested_conditional<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     body: &dae::FunctionBody<'dae>,
     input: NestedFunctionConditional<'_, '_, 'dae>,
-    values: &mut HashMap<VarName, dae::ExprId<'dae>>,
+    state: &mut BranchState<'dae>,
 ) -> Result<(), dae::DaeConstructionError> {
     let mut conditions = Vec::with_capacity(input.blocks.len());
     for block in input.blocks {
@@ -835,7 +878,7 @@ fn lower_nested_conditional<'dae>(
                 functions: input.symbols.functions,
                 shapes: input.symbols.shapes,
                 function_body: Some(body),
-                values: Some(values),
+                values: Some(&state.values),
                 owner_clock: None,
             },
             input.binders,
@@ -843,34 +886,32 @@ fn lower_nested_conditional<'dae>(
             None,
         )?);
     }
-    let incoming = values.clone();
+    let incoming = state.values.clone();
     let mut branch_values = Vec::with_capacity(input.blocks.len());
-    for (block, plans) in input.blocks.iter().zip(input.branch_plans) {
-        let mut branch = incoming.clone();
-        lower_conditional_statements(
+    for (ordinal, (block, plans)) in input.blocks.iter().zip(input.branch_plans).enumerate() {
+        let branch =
+            lower_nested_branch(construction, body, &input, &block.stmts, plans, &incoming)?;
+        guard_branch_assertions(
             construction,
-            body,
-            input.symbols,
-            input.binders,
-            &block.stmts,
-            plans,
-            &mut branch,
+            &conditions,
+            Some(ordinal),
+            &branch.assertions,
+            &mut state.assertions,
         )?;
-        branch_values.push(branch);
+        branch_values.push(branch.values);
     }
     let fallback_values = match (input.fallback, input.fallback_plans) {
         (Some(statements), Some(plans)) => {
-            let mut branch = incoming.clone();
-            lower_conditional_statements(
+            let branch =
+                lower_nested_branch(construction, body, &input, statements, plans, &incoming)?;
+            guard_branch_assertions(
                 construction,
-                body,
-                input.symbols,
-                input.binders,
-                statements,
-                plans,
-                &mut branch,
+                &conditions,
+                None,
+                &branch.assertions,
+                &mut state.assertions,
             )?;
-            branch
+            branch.values
         }
         (None, None) => incoming.clone(),
         _ => unreachable!("nested function conditional fallback plan matches source shape"),
@@ -908,9 +949,31 @@ fn lower_nested_conditional<'dae>(
         let joined = construction.expressions(|expressions| {
             expressions.at(provenance).conditional(branches, fallback)
         })?;
-        values.insert(target.clone(), joined);
+        state.values.insert(target.clone(), joined);
     }
     Ok(())
+}
+
+/// Lower one arm of a nested runtime conditional from the incoming definitions.
+fn lower_nested_branch<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    body: &dae::FunctionBody<'dae>,
+    input: &NestedFunctionConditional<'_, '_, 'dae>,
+    statements: &[rumoca_core::Statement],
+    plans: &[FunctionStatementPlan],
+    incoming: &HashMap<VarName, dae::ExprId<'dae>>,
+) -> Result<BranchState<'dae>, dae::DaeConstructionError> {
+    let mut branch = BranchState::entering(incoming);
+    lower_conditional_statements(
+        construction,
+        body,
+        input.symbols,
+        input.binders,
+        statements,
+        plans,
+        &mut branch,
+    )?;
+    Ok(branch)
 }
 
 fn conditional_incoming_value<'dae>(
@@ -1126,7 +1189,13 @@ fn lower_total_function_assertions<'dae>(
         )?;
         let provenance = dae::DaeProvenance::source(assertion.span)?;
         construction.functions(|functions| {
-            functions.assertion_loop(loop_body, condition, message, provenance)
+            functions.assertion_loop_with_level(
+                loop_body,
+                condition,
+                message,
+                assertion.level,
+                provenance,
+            )
         })?;
     }
     Ok(())
@@ -1329,6 +1398,7 @@ fn lower_one_function_loop_statement<'dae>(
                 branch_plans: branches,
                 fallback_plans: fallback.as_deref(),
                 targets,
+                partial: &[],
                 span: *span,
             },
         );
@@ -1417,6 +1487,17 @@ fn lower_loop_conditional<'dae>(
             ..conditional
         },
     )?;
+    for assertion in &lowered.assertions {
+        construction.functions(|functions| {
+            functions.assertion_loop_with_level(
+                &mut loop_body,
+                assertion.condition,
+                assertion.message,
+                assertion.level,
+                assertion.provenance,
+            )
+        })?;
+    }
     construction.functions(|functions| {
         functions.assign_conditional_all_loop(
             &mut loop_body,
@@ -1608,8 +1689,15 @@ fn lower_function_loop_assertion<'dae>(
         assertion.message,
     )?;
     let provenance = dae::DaeProvenance::source(assertion.span)?;
-    construction
-        .functions(|functions| functions.assertion_loop(loop_body, condition, message, provenance))
+    construction.functions(|functions| {
+        functions.assertion_loop_with_level(
+            loop_body,
+            condition,
+            message,
+            assertion.level,
+            provenance,
+        )
+    })
 }
 
 fn lower_function_loop_assignment<'dae>(
@@ -1673,4 +1761,127 @@ pub(super) fn function_value_coordinate<'dae>(
         unreachable!("function analysis accepts only mutable function values")
     };
     target
+}
+
+/// The value one completing branch gives `target`, standing in on a branch
+/// that never completes.
+///
+/// A branch ending in `assert(false, ...)` fails its call (MLS §8.3.7), so the
+/// value it would leave is never observed; the analysis certificate admits the
+/// read after the conditional on exactly that ground. The select still needs
+/// an operand on that path, and any defined value is equivalent there.
+fn completed_branch_value<'dae>(
+    branch_values: &[BranchState<'dae>],
+    fallback_values: Option<&BranchState<'dae>>,
+    never_completes: &[bool],
+    target: &VarName,
+) -> Option<dae::ExprId<'dae>> {
+    branch_values
+        .iter()
+        .chain(fallback_values)
+        .zip(never_completes)
+        .filter(|(_, diverges)| !**diverges)
+        .find_map(|(branch, _)| branch.values.get(target).copied())
+}
+
+/// A branch's own value for a target, or the target's pre-conditional
+/// definition when the branch leaves it unchanged.
+///
+/// A path-partial target with no pre-conditional definition takes `dead`, its
+/// typed seed literal: MLS §12.4.4 makes any use of the target on this
+/// path an error, which the top-level definedness assertion owns, so the
+/// operand is never observed.
+fn read_unless_defined<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    body: &dae::FunctionBody<'dae>,
+    value: Option<dae::ExprId<'dae>>,
+    target: dae::FunctionValueId<'dae>,
+    dead: Option<dae::ExprId<'dae>>,
+    provenance: dae::DaeProvenance,
+) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    let read = construction.functions(|functions| functions.read(body, target, provenance));
+    match (read, dead) {
+        (
+            Err(dae::DaeConstructionError::IncompleteDefinition {
+                kind: "function value",
+                index,
+                ..
+            }),
+            Some(dead),
+        ) if index == target.ordinal() => Ok(dead),
+        (read, _) => read,
+    }
+}
+
+/// Joined target operands of one conditional: the target coordinates, each
+/// branch's operand per target, and the fallback's operand per target.
+type JoinedBranchTargets<'dae> = (
+    Vec<dae::FunctionValueId<'dae>>,
+    Vec<Vec<dae::ExprId<'dae>>>,
+    Vec<dae::ExprId<'dae>>,
+);
+
+/// Correlate every branch's value for every target with the shared
+/// pre-conditional definitions; a branch that never completes takes a
+/// completing branch's value (see `completed_branch_value`).
+fn join_branch_targets<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    body: &dae::FunctionBody<'dae>,
+    input: &FunctionConditional<'_, '_, 'dae>,
+    branch_values: &[BranchState<'dae>],
+    fallback_values: Option<&BranchState<'dae>>,
+    provenance: dae::DaeProvenance,
+) -> Result<JoinedBranchTargets<'dae>, dae::DaeConstructionError> {
+    let mut targets = Vec::with_capacity(input.targets.len());
+    let mut branches = vec![Vec::with_capacity(input.targets.len()); branch_values.len()];
+    let mut fallback = Vec::with_capacity(input.targets.len());
+    let never_completes = input
+        .blocks
+        .iter()
+        .map(|block| branch_never_completes(&block.stmts))
+        .chain(input.fallback.map(branch_never_completes))
+        .collect::<Vec<_>>();
+    let fallback_diverges = input.fallback.is_some() && never_completes.last() == Some(&true);
+    for target in input.targets {
+        let target_id = function_value_coordinate(input.symbols.coordinates, target);
+        targets.push(target_id);
+        let completed =
+            completed_branch_value(branch_values, fallback_values, &never_completes, target);
+        let operand = |state: Option<&BranchState<'dae>>, diverges: bool| {
+            state
+                .and_then(|state| state.values.get(target).copied())
+                .or(completed.filter(|_| diverges))
+        };
+        let dead = input
+            .partial
+            .iter()
+            .find(|partial| &partial.name == target)
+            .map(|partial| partial.dead);
+        for ((lowered, branch), diverges) in
+            branches.iter_mut().zip(branch_values).zip(&never_completes)
+        {
+            let value = operand(Some(branch), *diverges);
+            lowered.push(read_unless_defined(
+                construction,
+                body,
+                value,
+                target_id,
+                dead,
+                provenance,
+            )?);
+        }
+        let value = operand(fallback_values, fallback_diverges);
+        fallback.push(read_unless_defined(
+            construction,
+            body,
+            value,
+            target_id,
+            dead,
+            provenance,
+        )?);
+    }
+    Ok((targets, branches, fallback))
 }

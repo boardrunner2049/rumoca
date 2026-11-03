@@ -10,10 +10,15 @@ impl ConstantOccurrenceId {
     pub(crate) fn new(owner: rumoca_core::InstanceId, declaration: rumoca_core::DefId) -> Self {
         Self { owner, declaration }
     }
+
+    pub(crate) fn owner(self) -> rumoca_core::InstanceId {
+        self.owner
+    }
 }
 
 /// Context for flattening.
 pub(crate) struct Context {
+    pub(crate) declared_dimensions: std::sync::Arc<rumoca_eval_ast::eval::DeclaredDimensions>,
     /// Parameter values for evaluating for-equation ranges (name -> integer value).
     pub parameter_values: rustc_hash::FxHashMap<String, i64>,
     /// Real parameter values for evaluating function arguments (name -> real value).
@@ -28,10 +33,17 @@ pub(crate) struct Context {
     /// Constant values keyed by their exact Resolve declaration identity.
     pub constant_values_by_def_id:
         rustc_hash::FxHashMap<rumoca_core::DefId, rumoca_core::Expression>,
-    /// Declarations recorded with differing values: an inherited package
-    /// constant takes a value per extending package (MLS §7.2), so its
-    /// declaration identity alone does not select one.
+    /// Constant values keyed by the package scope that exposes the declaration
+    /// and its exact Resolve declaration identity (MLS §7.3: a package that
+    /// extends another with modifications gives an inherited constant its own
+    /// value, so the declaration identity alone does not determine it).
     pub(crate) ambiguous_constant_def_ids: rustc_hash::FxHashSet<rumoca_core::DefId>,
+    pub(crate) constant_values_by_scope:
+        rustc_hash::FxHashMap<(String, rumoca_core::DefId), rumoca_core::Expression>,
+    /// The value every recorded exposure of a constant declaration agrees on,
+    /// or `None` when two packages give it different values.
+    pub(crate) constant_values_by_declaration:
+        rustc_hash::FxHashMap<rumoca_core::DefId, Option<rumoca_core::Expression>>,
     /// Component-local overrides keyed by exact instantiated occurrence and
     /// exact Resolve declaration identity.
     pub(crate) constant_values_by_occurrence:
@@ -39,6 +51,19 @@ pub(crate) struct Context {
     /// Owning component occurrence for each instantiated class occurrence.
     pub(crate) class_owner_components:
         rustc_hash::FxHashMap<rumoca_core::InstanceId, rumoca_core::InstanceId>,
+    /// Package redeclarations each class occurrence applies: slot to selected
+    /// package (MLS §7.3).
+    pub(crate) class_package_selections: rustc_hash::FxHashMap<
+        rumoca_core::InstanceId,
+        rustc_hash::FxHashMap<rumoca_core::DefId, rumoca_core::DefId>,
+    >,
+    /// The class slot each component occurrence's type is spelled through
+    /// (`Medium` in `Medium.BaseProperties medium`) and its owning class
+    /// occurrence.
+    pub(crate) component_type_slots: rustc_hash::FxHashMap<
+        rumoca_core::InstanceId,
+        (rumoca_core::DefId, Option<rumoca_core::InstanceId>),
+    >,
     /// Instance path of each instantiated component occurrence, as the exact
     /// reference Instantiate proved for it (one part per enclosing component,
     /// each carrying its Resolve declaration identity).
@@ -51,7 +76,7 @@ pub(crate) struct Context {
     pub target_def_names: rustc_hash::FxHashMap<rumoca_core::DefId, String>,
     /// Exact Resolve identity of the predefined `String` declaration.
     pub predefined_string_declaration: Option<rumoca_core::DefId>,
-    /// Exact Resolve identities of synchronous predefined intrinsics.
+    /// Exact Resolve identities of predefined intrinsics and array constructors.
     pub predefined_intrinsics: crate::ast_lower::PredefinedIntrinsicIds,
     /// Fully qualified constant names explicitly modified by extends clauses.
     /// These must not be overwritten by inherited declaration defaults.
@@ -77,9 +102,17 @@ pub(crate) struct Context {
     /// `Evaluate=true`. These must not be folded for structural branch
     /// selection, even when a provisional value is available.
     pub non_structural_params: std::collections::HashSet<String>,
+    /// Ordinary parameters: fixed, without `Evaluate=true` or `final`. A
+    /// branch selection that reads one is not structural (SPEC_0040 DAE-C22).
+    pub tunable_params: std::collections::HashSet<String>,
+    /// Non-evaluable parameters (MLS 3.7 section 4.5): `fixed = false` or
+    /// `Evaluate = false`. No branch is selected at translation on them.
+    pub non_evaluable_params: std::collections::HashSet<String>,
     /// User-defined function definitions for compile-time evaluation (MLS §12.3).
     /// Functions are looked up by qualified name during constant expression evaluation.
     pub functions: rustc_hash::FxHashMap<String, Function>,
+    /// Static array result shapes keyed by their exact source declaration.
+    pub(crate) function_result_shapes: crate::function_precollect::FunctionResultShapes,
     /// Record aliases for resolving field access through record parameter bindings.
     /// Maps record parameter component path -> alias target component path (MLS §7.2.3).
     /// Example: "battery2.cellData" -> "cellData2" allows resolving
@@ -106,6 +139,10 @@ pub(crate) struct Context {
     /// Set of DefIds that correspond to class definitions in the current tree.
     /// Used by qualification to distinguish class/type references from components.
     pub class_def_ids: std::sync::Arc<rustc_hash::FxHashSet<rumoca_core::DefId>>,
+    /// Resolve identities of package classes, including package aliases. A
+    /// constant reference spelled through one of them names the package that
+    /// exposes the constant (MLS §7.1).
+    pub package_def_ids: std::sync::Arc<rustc_hash::FxHashSet<rumoca_core::DefId>>,
     /// Canonical class scope path for the class instance currently being flattened.
     /// Derived from `def_map` via the owning class DefId.
     pub current_class_scope_path: Option<String>,

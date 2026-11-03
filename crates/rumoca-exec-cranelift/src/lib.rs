@@ -35,7 +35,7 @@ impl CompiledPureCallTable {
     /// buffers; aggregate shapes remain in `site` and are not scalar IR.
     pub fn call_scalar_payload(
         &self,
-        site: &rumoca_ir_solve::SolvePureCallSite,
+        site: rumoca_eval_solve::PureCallInvocation<'_>,
         input: &[f64],
         output: &mut [f64],
         input_cells: &mut Vec<u64>,
@@ -164,11 +164,68 @@ impl CompiledInputRequirements {
 }
 
 pub struct CompiledJacobianV {
-    jit: emit::CompiledJacobianRows,
+    jit: Rc<emit::CompiledJacobianRows>,
+    source: ScalarProgramBlock,
     output_placement: Option<OutputPlacement>,
+    /// One JIT module for every projection application prepared from this
+    /// source.
+    projections: emit::SharedProjectionModule,
 }
 
+pub use emit::projection_jacobian::CompiledProjectionJacobian;
+
 impl CompiledJacobianV {
+    /// Retain one exact colored application of this compiled source owner.
+    pub fn prepare_projection(
+        &self,
+        application: &rumoca_ir_solve::ProjectionJacobianApplication,
+    ) -> Result<CompiledProjectionJacobian, CompileError> {
+        if !self
+            .source
+            .shares_program_owner(application.canonical_source())
+        {
+            return Err(CompileError::Input(
+                "projection application belongs to a different scalar-program owner".into(),
+            ));
+        }
+        let jit = if self.source.shares_program_owner(application.source()) {
+            self.jit.clone()
+        } else {
+            Rc::new(self.jit.compile_projection_rows(
+                application.source().programs(),
+                application.block_index(),
+            )?)
+        };
+        CompiledProjectionJacobian::new(jit, application.clone(), &self.projections)
+    }
+    /// Execute one existing program once, retaining all local outputs.
+    pub fn call_program_outputs(
+        &self,
+        program: usize,
+        inputs: rumoca_eval_solve::JacobianEvalInputs<'_>,
+        external_tables: &[ExternalTableData],
+        out: &mut Vec<f64>,
+    ) -> Result<(), CompileError> {
+        self.jit
+            .call_program_outputs(program, inputs, external_tables, out)
+    }
+
+    /// Execute one output of one compiled program, using the prepared scalar
+    /// view's `(program index, output offset)`. Sparse visible-output indices
+    /// do not change this coordinate, and unrelated programs do not execute.
+    pub fn call_program_output(
+        &self,
+        coordinate: (usize, usize),
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        v: &[f64],
+        external_tables: &[ExternalTableData],
+    ) -> Result<f64, CompileError> {
+        self.jit
+            .call_program_output(coordinate, y, p, t, v, external_tables)
+    }
+
     pub fn call(
         &self,
         y: &[f64],
@@ -299,6 +356,35 @@ impl CompiledAssignmentSchedule {
 }
 
 impl CompiledExpressionRows {
+    /// Execute one retained source program and return all its local outputs.
+    /// Products without independent program entries decline before execution.
+    pub fn call_program_outputs(
+        &self,
+        program: usize,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        external_tables: &[ExternalTableData],
+        out: &mut Vec<f64>,
+    ) -> Result<bool, CompileError> {
+        self.jit
+            .call_program_outputs(program, y, p, t, external_tables, out)
+    }
+
+    /// Execute a complete source program and select its local output offset.
+    /// Batched products without an independent program entry return `None`.
+    pub fn call_program_output(
+        &self,
+        coordinate: (usize, usize),
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        external_tables: &[ExternalTableData],
+    ) -> Result<Option<f64>, CompileError> {
+        self.jit
+            .call_program_output(coordinate, y, p, t, external_tables)
+    }
+
     pub fn call(&self, y: &[f64], p: &[f64], t: f64, out: &mut [f64]) -> Result<(), CompileError> {
         self.call_with_external_tables(y, p, t, &[], out)
     }
@@ -331,8 +417,10 @@ pub fn compile_jacobian_scalar_program_block(
 ) -> Result<CompiledJacobianV, CompileError> {
     let jit = emit::compile_jacobian_rows(rows.programs())?;
     Ok(CompiledJacobianV {
-        jit,
+        jit: Rc::new(jit),
+        source: rows.clone(),
         output_placement: OutputPlacement::for_block(rows),
+        projections: emit::SharedProjectionModule::default(),
     })
 }
 
@@ -340,6 +428,23 @@ pub fn compile_expression_scalar_program_block(
     rows: &ScalarProgramBlock,
 ) -> Result<CompiledExpressionRows, CompileError> {
     let jit = emit::compile_residual_rows(rows.programs())?;
+    Ok(CompiledExpressionRows {
+        jit,
+        output_placement: OutputPlacement::for_block(rows),
+    })
+}
+
+/// Compile independent residual program entries for algebraic projection.
+/// Whole-block calls use the same entries, so program bodies are emitted once.
+/// A block with shared conditional owners retains its aggregate batch instead.
+pub fn compile_selectable_expression_scalar_program_block(
+    rows: &ScalarProgramBlock,
+    pure_calls: Option<&CompiledPureCallTable>,
+) -> Result<CompiledExpressionRows, CompileError> {
+    let jit = emit::compile_selectable_residual_rows(
+        rows.programs(),
+        pure_calls.map(|table| table.jit.clone()),
+    )?;
     Ok(CompiledExpressionRows {
         jit,
         output_placement: OutputPlacement::for_block(rows),
@@ -363,8 +468,10 @@ pub fn compile_jacobian_scalar_program_block_with_pure_calls(
 ) -> Result<CompiledJacobianV, CompileError> {
     let jit = emit::compile_jacobian_rows_with_pure_calls(rows.programs(), pure_calls.jit.clone())?;
     Ok(CompiledJacobianV {
-        jit,
+        jit: Rc::new(jit),
+        source: rows.clone(),
         output_placement: OutputPlacement::for_block(rows),
+        projections: emit::SharedProjectionModule::default(),
     })
 }
 
@@ -409,7 +516,15 @@ pub fn compile_exact_assignment_schedule_with_pure_calls(
 }
 
 #[cfg(test)]
+mod tangent_lane_refusal_tests;
+
+#[cfg(test)]
 mod tests {
+    mod projection_jacobian;
+    mod register_constants;
+    mod selected_jvp;
+    mod selected_residual;
+
     use super::*;
     use rumoca_ir_solve::{LinearOp, ScalarProgramBlock};
     use std::num::NonZeroU64;
@@ -633,7 +748,7 @@ mod tests {
 
         compiled
             .call_scalar_payload(
-                &site,
+                rumoca_eval_solve::PureCallInvocation::Primal(&site),
                 &[1.25, -2.5, 1.0],
                 &mut output,
                 &mut input_cells,

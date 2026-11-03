@@ -403,6 +403,7 @@ fn source_root_read_prewarm_state_is_session_owned_and_clears_on_revision_change
 
 #[test]
 fn source_root_read_prewarm_finish_promotes_namespace_cache_to_host_session() {
+    let _guard = session_stats_test_guard();
     let mut session = Session::default();
     session.replace_parsed_source_set(
         "Modelica",

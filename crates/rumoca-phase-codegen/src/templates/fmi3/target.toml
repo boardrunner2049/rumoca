@@ -12,7 +12,7 @@ Advertised profiles: FMI 3 Model Exchange and Co-Simulation."""
 
 [package]
 root = "{{ model_name }}"
-required_files = ["modelDescription.xml", "sources/buildDescription.xml", "sources/model.c"]
+required_files = ["modelDescription.xml", "sources/buildDescription.xml", "sources/model.c", "sources/model.h", "sources/rmc_rows.c", "sources/rmc_isolators.c", "sources/rmc_functions.c", "sources/rmc_assign.c", "sources/rmc_jacobian.c"]
 
 [package.archive]
 path = "{{ model_name }}.fmu"
@@ -23,6 +23,7 @@ root = "flat"
 continuous_states = true
 residual_equations = false
 exact_algebraic_assignments = true
+algebraic_projection = true
 scalar_fallback = true
 external_functions = false
 external_tables = false
@@ -42,7 +43,7 @@ host_callbacks = false
 
 [capabilities.tensor]
 matmul = "scalar"
-linsolve = "unsupported"
+linsolve = "scalar"
 elementwise = "scalar"
 stencil = "scalar"
 reductions = "scalar"
@@ -63,10 +64,45 @@ template = "buildDescription.xml.jinja"
 [[files]]
 path = "sources/model.c"
 template = "model.c.jinja"
+shared_as = "fmi3-model.c.jinja"
+
+[[files]]
+path = "sources/model.h"
+template = "model.h.jinja"
+shared_as = "fmi3-model.h.jinja"
+
+[[files]]
+path = "sources/rmc_rows.c"
+template = "rmc_rows.c.jinja"
+shared_as = "fmi3-rmc_rows.c.jinja"
+
+[[files]]
+path = "sources/rmc_isolators.c"
+template = "rmc_isolators.c.jinja"
+shared_as = "fmi3-rmc_isolators.c.jinja"
+
+[[files]]
+path = "sources/rmc_functions.c"
+template = "rmc_functions.c.jinja"
+shared_as = "fmi3-rmc_functions.c.jinja"
+
+[[files]]
+path = "sources/rmc_assign.c"
+template = "rmc_assign.c.jinja"
+shared_as = "fmi3-rmc_assign.c.jinja"
+
+[[files]]
+path = "sources/rmc_jacobian.c"
+template = "rmc_jacobian.c.jinja"
+shared_as = "fmi3-rmc_jacobian.c.jinja"
 
 [[partials]]
 template = "scalar_kernel.jinja"
 name = "fmi-c-kernel.jinja"
+
+[[partials]]
+template = "me_projection.jinja"
+name = "fmi-me-projection.jinja"
 
 [[partials]]
 template = "typed_functions.jinja"
@@ -79,3 +115,7 @@ name = "fmi-typed-arithmetic.jinja"
 [[partials]]
 template = "typed_tensors.jinja"
 name = "fmi-typed-tensors.jinja"
+
+[[partials]]
+template = "scalar_events.jinja"
+name = "fmi-scalar-events.jinja"

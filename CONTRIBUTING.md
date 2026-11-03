@@ -2,6 +2,30 @@
 
 Contributions are welcome.
 
+## License and sign-off
+
+Rumoca is licensed under the [Apache License 2.0](LICENSE). By contributing you
+agree that your contribution is licensed under those terms, per section 5 of
+that license: a contribution submitted for inclusion in the work is under the
+Apache License 2.0 unless you state otherwise explicitly.
+
+Every commit must carry a `Signed-off-by` line certifying the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/). Use
+`git commit -s`, which adds the line for you from your configured name and
+email. Both must be real; the sign-off is the certification that you have the
+right to submit the work under the project's license.
+
+Do not add third-party code, generated output, or specification text to this
+repository without recording its license. Vendored trees keep their upstream
+license file in place and are listed in
+[infra/licenses/THIRD_PARTY_NOTICES.md](infra/licenses/THIRD_PARTY_NOTICES.md); a new
+runtime dependency shows up there on the next run of
+`cargo xtask licenses`, and its license must be in the accepted list in
+`infra/licenses/about.toml`. Adding a license to that list is a compliance
+decision, not a build fix. `cargo xtask licenses --check` fails when the
+committed file is stale; the command runs `cargo-about` when it is installed
+and `nix run nixpkgs#cargo-about` otherwise.
+
 ## Setup
 
 Install the `xtask` developer CLI launcher once:
@@ -143,6 +167,62 @@ model libraries used by their corpus gates.
 Cargo-native opt-in example-template execution checks such as
 `cargo test -p rumoca --features template-runtime-tests --test suite_template_runtime backend_template_runtime_regression:: -- --nocapture`.
 
+Pre-landing gate over a committed snapshot:
+
+```bash
+cargo xtask verify gate --rev <commit> --coverage
+cargo xtask verify gate --worktree ../my-worktree --crates rumoca-solver xtask
+```
+
+`verify gate` extracts `git archive` of the revision (or of a worktree's
+committed `HEAD`; uncommitted changes are not part of it) into
+`<temp>/rumoca-gate/<rev>/snap` with its own Cargo target directory, links
+`target/msl` and `target/fmi-conformance` from the repository, and runs CI's
+blocking steps in order: `cargo fmt --check`, workspace clippy (without
+`rumoca-phase-instantiate`), `verify lint`, the tests of every workspace crate
+with the `rumoca/msl-sim-tests` regressions, as `verify workspace` runs them
+(`commit_messages` is skipped, since a snapshot has no history), the
+`rumoca-test-msl` harness unit tests (as `verify workspace` runs them on
+Linux), rustdoc of
+the changed crates with warnings denied (default: crates changed relative to
+upstream `main`; `--crates` overrides), and the template runtime tests. The CasADi and JAX template targets need
+Python packages a local shell may lack, so their failures are reported but
+do not fail the gate. `--coverage` adds the coverage run, report, and gate
+(it needs `cargo-llvm-cov`); the gate judges the revision's diff against its
+merge base with upstream `main`, so fetch `main` first. A failing test fails
+the coverage run, as it does in CI. The run stops at the first
+failing step and prints `GATE_OK <rev> (<log>)` or `GATE_FAILED <rev> (<log>)`
+with the failing step; the target directory is removed after a pass unless
+`--keep` is given. The tools (FMPy, CMake, Java, `xmllint`) are taken from the
+current `PATH`.
+
+MSL parity sweeps on a shared host:
+
+```bash
+cargo xtask verify msl-parity --serialize --rerun-timeouts-alone 90 --results-dir target/msl/sweep
+cargo xtask verify msl-parity diff target/msl/sweep/merged_band_table.json reference_band_table.json
+```
+
+`--serialize` holds a host-wide lock (`<temp>/rumoca-msl-parity.lock`) for the
+whole run, so two sweeps never overlap on one machine. `--rerun-timeouts-alone
+<secs>` reruns, after the sweep, every model that missed `high` because a wall
+budget ran out, one model at a time with the given solver and per-phase
+budgets, into `<results>/rerun/<model>`, and writes
+`<results>/merged_band_table.json` with each rerun row replacing its sweep row.
+`msl-parity diff <table> <reference>` prints the strict-high count (`high` with
+no channel deviation) of both tables and the rows lost, gained, or otherwise
+changed.
+
+Watching CI after a landing (read-only; it never pushes):
+
+```bash
+cargo xtask ci watch <sha>
+```
+
+`ci watch` finds the runs of the commit on `main` through the `gh` CLI, waits
+until they complete (`--interval-secs`, or `--once` to report the current
+state), and prints each run's conclusion and the jobs that failed.
+
 Editor validation:
 
 ```bash
@@ -172,6 +252,10 @@ Verification-surface classification:
   `rumoca/msl-sim-tests` MSL simulation regressions. It needs the pinned MSL
   tree at `target/msl/ModelicaStandardLibrary-4.1.0`, which the CI workspace
   job stages before running.
+  On Linux it also runs the `rumoca-test-msl` harness unit tests (checked
+  quality baseline, quality gate, selection, merge, and reporting). They read
+  only checked-in inputs, never an ambient `target/msl/parity-config.json`
+  from another run; only the two cohort drivers are skipped.
 - `backend-stress-tests` is an opt-in 30-model diagnostic survey, not a
   correctness gate: it reports per-model failures and only requires one
   end-to-end comparison for each selected backend.

@@ -5,12 +5,18 @@
 //! contiguous 64-bit-cell range only inside this execution adapter.
 
 mod control;
+mod input_results;
+#[cfg(test)]
+mod input_reuse_tests;
+mod linear_solve;
 #[cfg(test)]
 mod local_store_tests;
 mod storage;
 mod tensor;
+#[cfg(test)]
+mod tensor_product_tests;
 
-use super::host_runtime::register_math_symbols;
+use super::host_runtime::{host_jit_builder, register_math_symbols};
 use super::owned_jit_module::{OwnedJitModule, declare_far_call_in_func};
 use super::status;
 use super::{
@@ -20,11 +26,10 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Type, Value, types,
 };
-use cranelift_codegen::settings;
-use cranelift_codegen::verify_function;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
+use input_results::InputResults;
 use rumoca_ir_solve as solve;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,8 +41,8 @@ static NEXT_TABLE_ID: AtomicUsize = AtomicUsize::new(0);
 /// One typed pure-call body and the native function it is compiled into.
 ///
 /// `input_count` and `output_count` are the body's declared arities, which fix
-/// the tape layout. `directional` selects the tangent-carrying form: it has
-/// its own body, its own native function, and its own invocation-cache layout,
+/// the tape layout. The tangent-carrying form has
+/// its own body, its own native function, and its own input coordinate,
 /// so it is compiled as a separate unit from the primal form of the same
 /// owner.
 #[derive(Clone, Copy)]
@@ -46,7 +51,7 @@ struct TypedProgramCompilation<'a> {
     program: &'a solve::TypedProgram,
     input_count: usize,
     output_count: usize,
-    directional: bool,
+    coordinate: solve::SolvePureCallInputCoordinate,
 }
 
 #[derive(Clone)]
@@ -76,7 +81,20 @@ struct PureCallSymbol {
 pub(crate) struct CompiledPureCallTable {
     symbols: Box<[PureCallSymbol]>,
     directional_symbols: Box<[Option<PureCallSymbol>]>,
+    _input_results: Vec<InputResults>,
     _module: OwnedJitModule,
+}
+
+#[cfg(test)]
+thread_local! {
+    static IMPORT_DECLARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of pure-call import declarations made on this thread since the
+/// last call.
+#[cfg(test)]
+pub(super) fn take_import_declarations() -> usize {
+    IMPORT_DECLARATIONS.with(|count| count.replace(0))
 }
 
 impl CompiledPureCallTable {
@@ -100,6 +118,8 @@ impl CompiledPureCallTable {
         &self,
         module: &mut JITModule,
     ) -> Result<HashMap<solve::SolvePureCallOwnerId, PureCallImport>, CompileError> {
+        #[cfg(test)]
+        IMPORT_DECLARATIONS.with(|count| count.set(count.get() + 1));
         let pointer_type = module.target_config().pointer_type();
         let mut signature = module.make_signature();
         signature.returns.push(AbiParam::new(types::I8));
@@ -132,24 +152,30 @@ impl CompiledPureCallTable {
 
     pub(crate) fn call_cells(
         &self,
-        site: &solve::SolvePureCallSite,
+        site: rumoca_eval_solve::PureCallInvocation<'_>,
         input: &[u64],
         output: &mut [u64],
     ) -> Result<(), CompileError> {
-        let symbol = self
-            .symbols
-            .get(site.owner().index() as usize)
-            .filter(|symbol| {
-                symbol.owner == site.owner()
-                    && symbol.inputs.as_ref() == site.inputs()
-                    && symbol.outputs.as_ref() == site.outputs()
-            })
-            .ok_or_else(|| {
-                CompileError::Input(format!(
-                    "typed call site {} does not match its compiled owner",
-                    site.owner().index()
-                ))
-            })?;
+        let symbol = match site {
+            rumoca_eval_solve::PureCallInvocation::Primal(_) => {
+                self.symbols.get(site.owner().index() as usize)
+            }
+            rumoca_eval_solve::PureCallInvocation::Directional(_) => self
+                .directional_symbols
+                .get(site.owner().index() as usize)
+                .and_then(Option::as_ref),
+        }
+        .filter(|symbol| {
+            symbol.owner == site.owner()
+                && symbol.inputs.as_ref() == site.inputs()
+                && symbol.outputs.as_ref() == site.outputs()
+        })
+        .ok_or_else(|| {
+            CompileError::Input(format!(
+                "typed call site {} does not match its compiled owner",
+                site.owner().index()
+            ))
+        })?;
         let input_count = scalar_type_count(&symbol.inputs, "typed call input")?;
         let output_count = symbol.outputs.iter().try_fold(0usize, |count, value| {
             count
@@ -211,15 +237,12 @@ struct TableCompiler {
     math: MathImports,
     functions: Vec<FuncId>,
     directional_functions: Vec<Option<FuncId>>,
+    input_results: Vec<InputResults>,
 }
 
 impl TableCompiler {
     fn new(table_id: usize, table: &solve::SolvePureCallTable) -> Result<Self, CompileError> {
-        let mut builder = JITBuilder::with_flags(
-            &[("opt_level", "speed")],
-            cranelift_module::default_libcall_names(),
-        )
-        .map_err(to_backend_err)?;
+        let mut builder = host_jit_builder()?;
         register_math_symbols(&mut builder);
         let mut module = OwnedJitModule::new(JITModule::new(builder));
         let pointer_type = module.target_config().pointer_type();
@@ -257,37 +280,33 @@ impl TableCompiler {
             math: MathImports::default(),
             functions,
             directional_functions,
+            input_results: Vec::new(),
         })
     }
 
     fn compile_all(&mut self, table: &solve::SolvePureCallTable) -> Result<(), CompileError> {
         for owner in table.owners() {
-            self.compile_owner(table, owner)?;
+            self.compile_owner(owner)?;
             if owner.directional().is_some() {
-                self.compile_directional_owner(table, owner)?;
+                self.compile_directional_owner(owner)?;
             }
         }
         finalize_jit_module(&mut self.module)
     }
 
-    fn compile_owner(
-        &mut self,
-        table: &solve::SolvePureCallTable,
-        owner: &solve::SolvePureCallOwner,
-    ) -> Result<(), CompileError> {
+    fn compile_owner(&mut self, owner: &solve::SolvePureCallOwner) -> Result<(), CompileError> {
         let function = *self
             .functions
             .get(owner.id().index() as usize)
             .ok_or_else(|| CompileError::Backend("typed owner function is missing".into()))?;
         let functions = self.functions.iter().copied().map(Some).collect::<Vec<_>>();
         self.compile_program(
-            table,
             TypedProgramCompilation {
                 function,
                 program: owner.body(),
                 input_count: owner.inputs().len(),
                 output_count: owner.outputs().len(),
-                directional: false,
+                coordinate: owner.input_coordinate(),
             },
             &functions,
         )
@@ -295,7 +314,6 @@ impl TableCompiler {
 
     fn compile_directional_owner(
         &mut self,
-        table: &solve::SolvePureCallTable,
         owner: &solve::SolvePureCallOwner,
     ) -> Result<(), CompileError> {
         let directional = owner
@@ -309,13 +327,12 @@ impl TableCompiler {
             .ok_or_else(|| CompileError::Backend("typed directional function is missing".into()))?;
         let functions = self.directional_functions.clone();
         self.compile_program(
-            table,
             TypedProgramCompilation {
                 function,
                 program: directional.body(),
                 input_count: directional.inputs().len(),
                 output_count: directional.outputs().len(),
-                directional: true,
+                coordinate: directional.input_coordinate(),
             },
             &functions,
         )
@@ -323,7 +340,6 @@ impl TableCompiler {
 
     fn compile_program(
         &mut self,
-        table: &solve::SolvePureCallTable,
         unit: TypedProgramCompilation<'_>,
         functions: &[Option<FuncId>],
     ) -> Result<(), CompileError> {
@@ -332,9 +348,11 @@ impl TableCompiler {
             program,
             input_count,
             output_count,
-            directional,
+            coordinate,
         } = unit;
-        let pointer_type = self.module.target_config().pointer_type();
+        let config = self.module.target_config();
+        let pointer_type = config.pointer_type();
+        let input_results = InputResults::new(coordinate)?;
         let mut context = self.module.make_context();
         context
             .func
@@ -359,13 +377,9 @@ impl TableCompiler {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
             let parameters = builder.block_params(entry).to_vec();
+            let cache = input_results.enter(&mut builder, config, parameters[0], parameters[1])?;
             let layout = ProgramLayout::new(program, input_count, output_count)?;
             let tape = create_tape(&mut builder, pointer_type, layout.tape_cells)?;
-            let invocation_layout = InvocationCacheLayout::new(table, program, directional)?;
-            let invocation_cache = invocation_layout
-                .has_entries()
-                .then(|| create_invocation_cache(&mut builder, pointer_type, &invocation_layout))
-                .transpose()?;
             let mut lowerer = ProgramLowerer {
                 builder: &mut builder,
                 module: &mut self.module,
@@ -376,20 +390,18 @@ impl TableCompiler {
                 tape,
                 layout: &layout,
                 functions,
-                invocation_cache,
-                invocation_layout: invocation_cache.map(|_| &invocation_layout),
                 flags: MemFlags::new(),
             };
             lowerer.lower(program)?;
+            input_results.publish(&mut builder, config, cache, parameters[0], parameters[1])?;
             status::succeed(&mut builder);
             builder.finalize();
         }
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&context.func, &flags).map_err(to_backend_err)?;
         self.module
             .define_function(function, &mut context)
             .map_err(to_backend_err)?;
         self.module.clear_context(&mut context);
+        self.input_results.push(input_results);
         Ok(())
     }
 
@@ -442,6 +454,7 @@ impl TableCompiler {
         Ok(CompiledPureCallTable {
             symbols: symbols.into_boxed_slice(),
             directional_symbols: directional_symbols.into_boxed_slice(),
+            _input_results: self.input_results,
             _module: self.module,
         })
     }
@@ -489,120 +502,6 @@ struct ProgramLayout {
     slots: Box<[ValueLocation]>,
     registers: Box<[ValueLocation]>,
     tape_cells: u32,
-}
-
-#[derive(Clone, Copy)]
-struct InvocationCacheEntry {
-    flag_cell: u32,
-    output_cell: u32,
-    output_cells: u32,
-}
-
-/// Final-boundary storage for repeated references to one compiler-issued call
-/// invocation in a non-iterative structured scope.
-///
-/// Exact owner ids provide the semantic identity. Conditional descendants
-/// share the scope; compact map/fold bodies are deliberately excluded because
-/// each domain point has a distinct binder coordinate.
-struct InvocationCacheLayout {
-    entries: HashMap<solve::SolvePureCallOwnerId, InvocationCacheEntry>,
-    cells: u32,
-}
-
-impl InvocationCacheLayout {
-    fn new(
-        table: &solve::SolvePureCallTable,
-        program: &solve::TypedProgram,
-        directional: bool,
-    ) -> Result<Self, CompileError> {
-        let mut counts = vec![0u32; table.owners().len()];
-        collect_non_iterative_calls(program, &mut counts)?;
-        let repeated = counts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, count)| (*count > 1).then_some(index))
-            .collect::<Vec<_>>();
-        let flag_cells = u32::try_from(repeated.len())
-            .map_err(|_| CompileError::Backend("typed invocation flags overflow".into()))?;
-        let mut next_output = flag_cells;
-        let mut entries = HashMap::with_capacity(repeated.len());
-        for (flag, index) in repeated.into_iter().enumerate() {
-            let owner = table
-                .owners()
-                .get(index)
-                .ok_or_else(|| CompileError::Backend("typed invocation owner is missing".into()))?;
-            let outputs = invocation_outputs(owner, directional)?;
-            let output_cells = outputs.iter().try_fold(0u32, |count, output| {
-                checked_cells(
-                    count,
-                    output.value_type().scalar_count(),
-                    "typed invocation output",
-                )
-            })?;
-            let flag_cell = u32::try_from(flag)
-                .map_err(|_| CompileError::Backend("typed invocation flag overflows".into()))?;
-            entries.insert(
-                owner.id(),
-                InvocationCacheEntry {
-                    flag_cell,
-                    output_cell: next_output,
-                    output_cells,
-                },
-            );
-            next_output =
-                checked_cells(next_output, output_cells, "typed invocation cache layout")?;
-        }
-        Ok(Self {
-            entries,
-            cells: next_output,
-        })
-    }
-
-    fn has_entries(&self) -> bool {
-        !self.entries.is_empty()
-    }
-}
-
-fn invocation_outputs(
-    owner: &solve::SolvePureCallOwner,
-    directional: bool,
-) -> Result<&[solve::SolvePureCallOutput], CompileError> {
-    if !directional {
-        return Ok(owner.outputs());
-    }
-    owner
-        .directional()
-        .map(solve::SolvePureCallDirectionalOwner::outputs)
-        .ok_or_else(|| {
-            CompileError::Backend("directional invocation references unavailable owner".into())
-        })
-}
-
-fn collect_non_iterative_calls(
-    program: &solve::TypedProgram,
-    counts: &mut [u32],
-) -> Result<(), CompileError> {
-    for operation in program.operations() {
-        match operation.operation() {
-            solve::SolveOperation::Call { owner, .. } => {
-                let count = counts.get_mut(owner.index() as usize).ok_or_else(|| {
-                    CompileError::Backend("typed invocation owner is out of bounds".into())
-                })?;
-                *count = count.checked_add(1).ok_or_else(|| {
-                    CompileError::Backend("typed invocation count overflows".into())
-                })?;
-            }
-            solve::SolveOperation::Conditional {
-                if_true, if_false, ..
-            } => {
-                collect_non_iterative_calls(if_true.body(), counts)?;
-                collect_non_iterative_calls(if_false.body(), counts)?;
-            }
-            solve::SolveOperation::Map { .. } | solve::SolveOperation::Fold { .. } => {}
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 impl ProgramLayout {
@@ -870,24 +769,6 @@ fn create_tape(
     Ok(builder.ins().stack_addr(pointer_type, slot, 0))
 }
 
-fn create_invocation_cache(
-    builder: &mut FunctionBuilder<'_>,
-    pointer_type: Type,
-    layout: &InvocationCacheLayout,
-) -> Result<Value, CompileError> {
-    let cache = create_tape(builder, pointer_type, layout.cells)?;
-    let zero = builder.ins().iconst(types::I64, 0);
-    for entry in layout.entries.values() {
-        builder.ins().store(
-            MemFlags::new(),
-            zero,
-            cache,
-            cell_offset(entry.flag_cell, "typed invocation flag")?,
-        );
-    }
-    Ok(cache)
-}
-
 fn cell_offset(cell: u32, context: &str) -> Result<i32, CompileError> {
     i32::try_from(
         (cell as usize)
@@ -919,8 +800,6 @@ struct ProgramLowerer<'a, 'b> {
     tape: Value,
     layout: &'a ProgramLayout,
     functions: &'a [Option<FuncId>],
-    invocation_cache: Option<Value>,
-    invocation_layout: Option<&'a InvocationCacheLayout>,
     flags: MemFlags,
 }
 
@@ -1003,6 +882,11 @@ impl ProgramLowerer<'_, '_> {
                 lhs,
                 rhs,
             } => self.lower_matrix_multiply(*destination, *lhs, *rhs),
+            solve::SolveOperation::LinearSolve {
+                destination,
+                matrix,
+                rhs,
+            } => self.lower_linear_solve(*destination, *matrix, *rhs),
             solve::SolveOperation::Scale {
                 destination,
                 aggregate,
@@ -1258,70 +1142,6 @@ impl ProgramLowerer<'_, '_> {
         arguments: &[solve::SolveRegisterId],
         destinations: &[solve::SolveRegisterId],
     ) -> Result<(), CompileError> {
-        let cached = self
-            .invocation_layout
-            .and_then(|layout| layout.entries.get(&owner))
-            .copied();
-        if let (Some(cache), Some(entry)) = (self.invocation_cache, cached) {
-            return self.lower_cached_call(owner, arguments, destinations, cache, entry);
-        }
-        self.lower_uncached_call(owner, arguments, destinations)
-    }
-
-    fn lower_cached_call(
-        &mut self,
-        owner: solve::SolvePureCallOwnerId,
-        arguments: &[solve::SolveRegisterId],
-        destinations: &[solve::SolveRegisterId],
-        cache: Value,
-        entry: InvocationCacheEntry,
-    ) -> Result<(), CompileError> {
-        let expected_cells = self.register_cell_count(destinations, "typed cached call outputs")?;
-        if expected_cells != entry.output_cells {
-            return Err(CompileError::Backend(
-                "typed cached call output width mismatch".into(),
-            ));
-        }
-        let flag = self.builder.ins().load(
-            types::I64,
-            self.flags,
-            cache,
-            cell_offset(entry.flag_cell, "typed invocation flag")?,
-        );
-        let output = cell_pointer(
-            self.builder,
-            cache,
-            entry.output_cell,
-            "typed invocation output",
-        )?;
-        let ready = self.builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
-        let miss = self.builder.create_block();
-        let continuation = self.builder.create_block();
-        self.builder.ins().brif(ready, continuation, &[], miss, &[]);
-
-        self.builder.switch_to_block(miss);
-        self.builder.seal_block(miss);
-        self.call_owner_into(owner, arguments, output)?;
-        let one = self.builder.ins().iconst(types::I64, 1);
-        self.builder.ins().store(
-            self.flags,
-            one,
-            cache,
-            cell_offset(entry.flag_cell, "typed invocation flag")?,
-        );
-        self.builder.ins().jump(continuation, &[]);
-
-        self.builder.switch_to_block(continuation);
-        self.builder.seal_block(continuation);
-        self.unpack_registers(output, destinations)
-    }
-
-    fn lower_uncached_call(
-        &mut self,
-        owner: solve::SolvePureCallOwnerId,
-        arguments: &[solve::SolveRegisterId],
-        destinations: &[solve::SolveRegisterId],
-    ) -> Result<(), CompileError> {
         let output_cells = self.register_cell_count(destinations, "nested typed output")?;
         let output = create_tape(self.builder, self.pointer_type, output_cells)?;
         self.call_owner_into(owner, arguments, output)?;
@@ -1408,9 +1228,12 @@ impl ProgramLowerer<'_, '_> {
         count: u32,
         mut body: impl FnMut(&mut Self, Value) -> Result<(), CompileError>,
     ) -> Result<(), CompileError> {
-        if count == 1 {
-            let zero = self.builder.ins().iconst(types::I64, 0);
-            return body(self, zero);
+        if count <= 16 {
+            for index in 0..count {
+                let index = self.builder.ins().iconst(types::I64, i64::from(index));
+                body(self, index)?;
+            }
+            return Ok(());
         }
         let header = self.builder.create_block();
         let loop_body = self.builder.create_block();
@@ -1556,7 +1379,9 @@ impl ProgramLowerer<'_, '_> {
                     self.builder,
                     self.module,
                     self.math,
-                    map_binary(operator),
+                    map_binary(operator).ok_or_else(|| {
+                        CompileError::Backend("invalid typed Real binary operator".into())
+                    })?,
                     lhs,
                     rhs,
                 )?;
@@ -1566,7 +1391,23 @@ impl ProgramLowerer<'_, '_> {
                 solve::SolveBinaryOperator::Add => self.builder.ins().iadd(lhs, rhs),
                 solve::SolveBinaryOperator::Subtract => self.builder.ins().isub(lhs, rhs),
                 solve::SolveBinaryOperator::Multiply => self.builder.ins().imul(lhs, rhs),
-                solve::SolveBinaryOperator::Divide => self.builder.ins().sdiv(lhs, rhs),
+                solve::SolveBinaryOperator::IntegerQuotient => {
+                    // `sdiv` traps on a zero divisor and on `MIN / -1`; both are
+                    // reported through the kernel status instead.
+                    let ty = self.builder.func.dfg.value_type(rhs);
+                    let nonzero = self.builder.ins().icmp_imm(IntCC::NotEqual, rhs, 0);
+                    let minus_one = self.builder.ins().icmp_imm(IntCC::Equal, rhs, -1);
+                    let minimum = self.builder.ins().icmp_imm(
+                        IntCC::Equal,
+                        lhs,
+                        i64::MIN >> (64 - ty.bits()),
+                    );
+                    let overflow = self.builder.ins().band(minus_one, minimum);
+                    let representable = self.builder.ins().bnot(overflow);
+                    let valid = self.builder.ins().band(nonzero, representable);
+                    status::require_integer_quotient(self.builder, valid);
+                    self.builder.ins().sdiv(lhs, rhs)
+                }
                 solve::SolveBinaryOperator::Min | solve::SolveBinaryOperator::Max => {
                     let code = if operator == solve::SolveBinaryOperator::Min {
                         IntCC::SignedLessThan
@@ -1583,8 +1424,14 @@ impl ProgramLowerer<'_, '_> {
                 }
             }),
             solve::SolveScalarType::Boolean => Ok(match operator {
-                solve::SolveBinaryOperator::And => self.builder.ins().band(lhs, rhs),
-                solve::SolveBinaryOperator::Or => self.builder.ins().bor(lhs, rhs),
+                // MLS §10.3.4 orders `false < true`: the least of two Booleans
+                // is their conjunction and the greatest their disjunction.
+                solve::SolveBinaryOperator::And | solve::SolveBinaryOperator::Min => {
+                    self.builder.ins().band(lhs, rhs)
+                }
+                solve::SolveBinaryOperator::Or | solve::SolveBinaryOperator::Max => {
+                    self.builder.ins().bor(lhs, rhs)
+                }
                 _ => {
                     return Err(CompileError::Backend(
                         "invalid typed Boolean binary operator".into(),
@@ -1738,9 +1585,10 @@ fn map_unary(operator: solve::SolveUnaryOperator) -> rumoca_ir_solve::UnaryOp {
     }
 }
 
-fn map_binary(operator: solve::SolveBinaryOperator) -> rumoca_ir_solve::BinaryOp {
+/// The Real binary operation of a typed operator; the Integer quotient has none.
+fn map_binary(operator: solve::SolveBinaryOperator) -> Option<rumoca_ir_solve::BinaryOp> {
     use rumoca_ir_solve::BinaryOp as Target;
-    match operator {
+    Some(match operator {
         solve::SolveBinaryOperator::Add => Target::Add,
         solve::SolveBinaryOperator::Subtract => Target::Sub,
         solve::SolveBinaryOperator::Multiply => Target::Mul,
@@ -1751,7 +1599,8 @@ fn map_binary(operator: solve::SolveBinaryOperator) -> rumoca_ir_solve::BinaryOp
         solve::SolveBinaryOperator::Atan2 => Target::Atan2,
         solve::SolveBinaryOperator::Min => Target::Min,
         solve::SolveBinaryOperator::Max => Target::Max,
-    }
+        solve::SolveBinaryOperator::IntegerQuotient => return None,
+    })
 }
 
 fn map_float_compare(operator: solve::SolveCompareOperator) -> FloatCC {

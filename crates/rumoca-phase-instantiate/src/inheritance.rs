@@ -21,7 +21,10 @@ use rumoca_ir_ast::{
 };
 
 mod duplicate_identity;
+mod function_interfaces;
 mod redeclaration;
+
+pub(crate) use function_interfaces::function_reference_compatible;
 
 use crate::errors::{InstantiateError, InstantiateResult};
 use crate::traversal_adapter::{
@@ -160,7 +163,7 @@ fn extract_redeclare_type_qualified(
 /// * `target_name` - Name of the component being redeclared
 /// * `new_type` - The new type being redeclared to (if known)
 /// * `span` - Source location for error reporting
-fn validate_redeclaration(
+pub(super) fn validate_redeclaration(
     tree: &ast::ClassTree,
     component: &ast::Component,
     target_name: &str,
@@ -196,41 +199,30 @@ fn validate_redeclaration(
     // The redeclared type must be a subtype of the constraining type.
     // If no constrainedby is specified, the original type is the constraint.
     if let Some(new_type_name) = new_type {
-        // Resolve the constraint type to fully qualified name
-        let constraint_type_raw = component
+        // MLS §7.3.2: only an omitted constraining clause uses the default
+        // implementation's type. An explicit clause owns its Resolve identity.
+        let constraint_id = component
             .constrainedby
             .as_ref()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| component.type_name.to_string());
-
-        // Try to resolve constraint type using def_id or tree lookup. An
-        // explicit `constrainedby` clause is the constraint (MLS §7.3.2); the
-        // declared type is only the constraint when that clause is absent.
-        let constraint_def_id = match component.constrainedby.as_ref() {
-            Some(constraint) => constraint.def_id,
-            None => component.type_def_id,
-        };
-        let constraint_type = if let Some(def_id) = constraint_def_id
-            && let Some(qualified) = tree.def_map.get(&def_id)
-        {
-            qualified.clone()
-        } else if let Some(&def_id) = tree.name_map.get(&constraint_type_raw)
-            && let Some(qualified) = tree.def_map.get(&def_id)
-        {
-            qualified.clone()
-        } else {
-            constraint_type_raw.clone()
-        };
+            .map_or(component.type_def_id, |constraint| constraint.def_id);
+        let constraint_type = constraint_id
+            .and_then(|id| tree.def_map.get(&id))
+            .ok_or_else(|| {
+                Box::new(InstantiateError::missing_resolved_identity(
+                    format!("constraining type of {target_name}"),
+                    span,
+                ))
+            })?;
 
         // Try to resolve new type name using the constraint type's package as context
         // This handles cases like GearType1 in the same package as GearType2
-        let resolved_new_type = resolve_type_in_context(tree, new_type_name, &constraint_type);
+        let resolved_new_type = resolve_type_in_context(tree, new_type_name, constraint_type);
 
-        if !is_type_subtype(tree, &resolved_new_type, &constraint_type) {
+        if !is_type_subtype(tree, &resolved_new_type, constraint_type) {
             return Err(Box::new(InstantiateError::redeclare_constraint_violation(
                 target_name,
                 &resolved_new_type,
-                &constraint_type,
+                constraint_type,
                 span,
             )));
         }
@@ -249,6 +241,7 @@ fn validate_class_redeclaration(
     class: &ast::ClassDef,
     target_name: &str,
     new_type: Option<&str>,
+    modifiers: &[ast::Expression],
     span: Span,
 ) -> InstantiateResult<()> {
     if class.is_final {
@@ -323,7 +316,18 @@ fn validate_class_redeclaration(
             });
 
         let resolved_new_type = resolve_type_in_context(tree, new_type_name, &constraint_type);
-        if !is_type_subtype(tree, &resolved_new_type, &constraint_type) {
+        let compatible = if class.class_type == rumoca_core::ClassType::Function {
+            let replacement = find_class_in_tree(tree, &resolved_new_type).and_then(|c| c.def_id);
+            let constraint = find_class_in_tree(tree, &constraint_type).and_then(|c| c.def_id);
+            replacement
+                .zip(constraint)
+                .is_some_and(|(replacement, constraint)| {
+                    function_reference_compatible(tree, replacement, constraint, modifiers)
+                })
+        } else {
+            is_type_subtype(tree, &resolved_new_type, &constraint_type)
+        };
+        if !compatible {
             return Err(Box::new(InstantiateError::redeclare_constraint_violation(
                 target_name,
                 &resolved_new_type,
@@ -1288,52 +1292,11 @@ struct CollectedRedeclarations {
     components: IndexSet<String>,
 }
 
-/// Apply the array dimensions a redeclaration states to the component it
-/// replaces (MLS §7.3).
-///
-/// An element-redeclaration is a whole component declaration (MLS §A.2.5:
-/// `component-clause1` -> `declaration` -> `IDENT [ array-subscripts ]`), so the
-/// subscripts it writes are its own statement of the component's shape and
-/// *replace* the replaced declaration's dimensions — rank and extent alike.
-/// `extends Base(redeclare C a[4])` over `replaceable C a[2]` yields `a[4]`, and
-/// over a scalar `replaceable C a` it yields an array; neither is an error.
-/// OpenModelica agrees on every one of those (probe matrix in the task record:
-/// scalar -> `[3]`, `[3]` -> `[4]`, `[2]` -> `[4]` through `extends`,
-/// scalar -> `[2,2]`, `[2,2]` -> `[4]`), and a redeclaration that writes no
-/// subscripts leaves the replaced dimensions standing — which is why this is
-/// only ever called for a redeclaration that wrote some.
-///
-/// The dimension *expressions* are evaluated later against the class that owns
-/// the `extends` clause, which is the scope the redeclaration was written in, as
-/// MLS §7.3 requires (OMC probe: `Holder h(n = 5, redeclare B a[k])` with a
-/// local `k = 2` yields `h.a[1..2]` while `h.n` stays 5).
-///
-/// ## Latent risk: the subscripts arrive carrying base-scope `def_id`s
-///
-/// These subscripts reach us through the extends modification, whose target
-/// reference Resolve walks in the *base* class's scope
-/// (`resolve_extend_modification`). So a `def_id` already attached to a
-/// dimension expression here may point at a declaration of the base class, not
-/// at the enclosing class the expression must actually be read in. Nothing
-/// consumes those `def_id`s today — `resolve_component_dimensions` re-evaluates
-/// `shape_expr` by name against the enclosing class's effective components,
-/// which is why the two-scope probe above gets the right extent. A future
-/// consumer that trusted them would silently take the base class's binding.
-/// Clearing or re-resolving them belongs with that consumer, which can say what
-/// the right scope is; guessing here would only move the trap.
-///
-/// ## `:` in a redeclaration is not judged here
-///
-/// `extends Base(redeclare C a[:])` leaves a `Subscript::Range`, which states no
-/// extent and no binding follows it, so the component ends up rank-zero and the
-/// model is accepted (probe C15). OpenModelica rejects it — "Failed to deduce
-/// dimension 1 of a due to missing binding equation". This is *not* specific to
-/// redeclarations: the identical declaration `C a[:]` with no binding takes the
-/// same silent rank-zero path in this compiler (probe C14/C15 control), so
-/// rejecting it only for redeclarations would split one gap into two behaviours.
-/// The whole `:`-without-binding rule belongs to whoever closes the declaration
-/// path; this function deliberately matches it rather than diverging.
-fn apply_redeclared_dimensions(comp: &mut ast::Component, dims: &[ast::Subscript]) {
+/// Replace explicitly redeclared dimensions while retaining their source syntax.
+/// The caller preserves inherited dimensions when the redeclaration omits them.
+/// Scope resolution/evaluation and colon inference remain with their respective
+/// owners; this helper only records syntax and syntactically known extents.
+pub(super) fn apply_redeclared_dimensions(comp: &mut ast::Component, dims: &[ast::Subscript]) {
     comp.shape.clear();
     comp.shape_expr.clear();
     // Mirror the parser's declaration convention (`process_component_clause`):
@@ -1413,6 +1376,7 @@ fn collect_redeclarations(
                 redeclared_class,
                 &target_name_owned,
                 new_type.as_deref(),
+                &crate::type_overrides::class_redeclare_modifier_args(&modification.expr),
                 span,
             ) {
                 validation_error = Some(err);
@@ -1519,7 +1483,47 @@ fn merge_class_content(
         }
     }
 
-    apply_collected_redeclarations(tree, target, &redeclarations);
+    // MLS §7.3: record every redeclared inherited component *before* applying
+    // the type changes. The redeclared type and its array dimensions are
+    // consumed below; anything else the redeclaration stated is still lost
+    // here, and the mark keeps later phases from reading the surviving
+    // declaration as evidence about the source.
+    //
+    // Presence remains separate from whether a nested component redeclaration
+    // was actually applied; that uncertainty is marked when nested modifiers
+    // are merged below.
+    for comp_name in &redeclarations.components {
+        if let Some(comp) = target.components.get_mut(comp_name) {
+            comp.redeclared_by_modification = true;
+        }
+    }
+
+    // MLS §7.3: a redeclaration is a whole declaration, so the dimensions it
+    // states replace the replaced declaration's. This is keyed independently of
+    // the type changes below, because a redeclaration states its shape whether
+    // or not this phase could extract its type.
+    for (comp_name, dims) in &redeclarations.dims {
+        if let Some(comp) = target.components.get_mut(comp_name) {
+            apply_redeclared_dimensions(comp, dims);
+        }
+    }
+
+    // MLS §7.3: Apply redeclared types to inherited components
+    // This updates the component's type so that instantiation uses the new type's fields
+    for (comp_name, new_type_name) in &redeclarations.types {
+        if let Some(comp) = target.components.get_mut(comp_name) {
+            comp.type_name = rumoca_ir_ast::Name::from_string(new_type_name);
+            comp.type_def_id = tree.name_map.get(new_type_name).copied().or_else(|| {
+                // Try with shorter name (last segment) for unqualified lookups
+                let short_name = path_utils::class_name_leaf(new_type_name);
+                tree.name_map.get(short_name).copied()
+            });
+
+            // MLS §7.3.2: Activate constraining-clause defaults for redeclared
+            // replaceable components.
+            activate_constrainedby_defaults_for_redeclare(comp);
+        }
+    }
 
     apply_value_modifications(target, value_modifications, extend_span)?;
 
@@ -1696,7 +1700,7 @@ fn validate_break_names(
     Ok(())
 }
 
-fn activate_constrainedby_defaults_for_redeclare(comp: &mut ast::Component) {
+pub(super) fn activate_constrainedby_defaults_for_redeclare(comp: &mut ast::Component) {
     let mut inserts: Vec<(String, ast::Expression)> = Vec::new();
     let mut prefixed_keys: Vec<String> = Vec::new();
 
@@ -1753,6 +1757,11 @@ fn merge_nested_extends_modifications(target: &mut InheritedContent, extend: &as
         let Some(comp) = target.components.get_mut(&target_name) else {
             return;
         };
+        if modifications.iter().any(expression_contains_redeclare)
+            || enclosing_component_of_nested_redeclare(modification).is_some()
+        {
+            comp.has_unapplied_redeclare = true;
+        }
         for nested_mod in modifications {
             insert_nested_modification(comp, nested_mod);
         }

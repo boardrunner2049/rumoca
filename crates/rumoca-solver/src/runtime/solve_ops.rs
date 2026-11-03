@@ -53,6 +53,22 @@ pub enum RuntimeSolveError {
         kind: &'static str,
         span: Option<rumoca_core::Span>,
     },
+
+    /// The projection of a block whose own unknowns a relation under `noEvent`
+    /// switches did not converge (SPEC_0044 ME-EVENT-008, ES016): the branch
+    /// its warm start held ended at a fold of the relation, and MLS 3.7.3
+    /// forbids the event that would continue it.
+    #[error("[ES016] {fold} (t={time})")]
+    UnlocalizableFold { fold: String, time: f64 },
+
+    /// An algebraic block has no unique solution in the branch combination its
+    /// rows currently select (EX004): the structural matching holds over the
+    /// union of every branch, but the active branches leave unknowns of the
+    /// block undetermined.
+    #[error(
+        "[EX004] algebraic block over {unknowns} is singular in its active branch combination {mode}; the model has no unique solution there"
+    )]
+    SingularActiveMode { unknowns: String, mode: String },
 }
 
 fn span_suffix(span: Option<rumoca_core::Span>) -> String {
@@ -452,20 +468,24 @@ pub fn update_relation_memory_slots(
 /// Numerical root finders detect sign changes, so an unqualified `0.0` at an
 /// accepted point cannot represent whether a strict or non-strict relation
 /// owns that point. Solve IR preserves that semantic distinction explicitly;
-/// the smallest ordinary dimensionless perturbation is enough to expose its
+/// the smallest ordinary dimensionless offset is enough to expose its
 /// sign without moving the mathematical root. A nonzero value remains a signed
 /// distance from the root even when it lies inside the solver's convergence
 /// tolerance; changing that sign would contradict the source relation.
 pub fn orient_typed_root_zeros(roots: &mut [f64], zero_domains: &[solve::RootZeroDomain]) {
     for (root, zero_domain) in roots.iter_mut().zip(zero_domains) {
-        if *root != 0.0 {
-            continue;
-        }
-        *root = match zero_domain {
-            solve::RootZeroDomain::Positive => f64::EPSILON,
-            solve::RootZeroDomain::NonPositive => -f64::EPSILON,
-            solve::RootZeroDomain::Previous => continue,
-        };
+        *root = orient_typed_root_zero(*root, *zero_domain);
+    }
+}
+
+pub(crate) fn orient_typed_root_zero(root: f64, zero_domain: solve::RootZeroDomain) -> f64 {
+    if root != 0.0 {
+        return root;
+    }
+    match zero_domain {
+        solve::RootZeroDomain::Positive => f64::EPSILON,
+        solve::RootZeroDomain::NonPositive => -f64::EPSILON,
+        solve::RootZeroDomain::Previous => root,
     }
 }
 

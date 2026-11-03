@@ -56,6 +56,10 @@ pub enum DaeConstructionError {
         "event-generating relation in a structured equation requires a compact structured event owner"
     )]
     UnsupportedStructuredEvent { span: Span },
+    #[error(
+        "an assertion level must name a predefined `AssertionLevel` literal; another evaluable level expression has no checked lowering"
+    )]
+    UnsupportedAssertionLevel { span: Span },
     #[error("clock-domain analysis did not construct the required exact clock owner")]
     MissingClockDomainOwner { span: Span },
     #[error("{arena} exceeded its u32 identity capacity at {attempted_index}")]
@@ -178,10 +182,22 @@ pub enum DaeConstructionError {
         target: u32,
         span: Span,
     },
+    #[error("invalid derivative function: {reason}")]
+    InvalidFunctionDerivative { reason: &'static str, span: Span },
     #[error("reserved recursive functions do not form one strongly connected component")]
     InvalidRecursiveFunctionGroup { span: Span },
     #[error("variable `{name}` has the wrong DAE coordinate role")]
     InvalidVariableRole { name: VarName, span: Span },
+    #[error(
+        "initialization definition for `{name}` requires an unbound non-Real parameter with fixed=false"
+    )]
+    InvalidInitialParameter { name: VarName, span: Span },
+    #[error(
+        "`{name}` is marked evaluable but is not a fixed, non-tunable parameter whose binding reads only constants and evaluable parameters"
+    )]
+    InvalidEvaluableParameter { name: VarName, span: Span },
+    #[error("`{name}` exports an input or output causality its declaration does not carry")]
+    InvalidDeclaredCausality { name: VarName, span: Span },
     #[error("variable `{name}` of type {found:?} cannot be a {role:?} DAE coordinate")]
     InvalidVariableType {
         name: VarName,
@@ -241,6 +257,12 @@ pub enum DaeConstructionError {
     IncompleteModelEventTransaction { span: Span },
     #[error("an unconditional B.1c owner must contain exactly one `always` branch")]
     InvalidDiscreteBranchSet { span: Span },
+    #[error("an observed B.1c owner must be unstructured and contain exactly one `always` branch")]
+    InvalidObservedDiscreteOwner { span: Span },
+    #[error(
+        "separate algorithm statements write different targets of one B.1c owner, so their simultaneous activation has no checked owner"
+    )]
+    UnorderedSimultaneousStatements { span: Span },
     #[error(
         "B.1c target identity {target} reads not-yet-issued current discrete value {dependency}"
     )]
@@ -325,6 +347,7 @@ impl DaeConstructionError {
             | Self::InvalidClockedOperand { span, .. }
             | Self::InvalidExpressionForm { span }
             | Self::UnsupportedStructuredEvent { span }
+            | Self::UnsupportedAssertionLevel { span }
             | Self::MissingClockDomainOwner { span }
             | Self::CapacityExceeded { span, .. }
             | Self::UnknownId { span, .. }
@@ -361,8 +384,12 @@ impl DaeConstructionError {
             | Self::InvalidFunctionValueRead { span, .. }
             | Self::InvalidFunctionCoordinate { span, .. }
             | Self::InvalidFunctionDependency { span, .. }
+            | Self::InvalidFunctionDerivative { span, .. }
             | Self::InvalidRecursiveFunctionGroup { span }
             | Self::InvalidVariableRole { span, .. }
+            | Self::InvalidInitialParameter { span, .. }
+            | Self::InvalidEvaluableParameter { span, .. }
+            | Self::InvalidDeclaredCausality { span, .. }
             | Self::InvalidVariableType { span, .. }
             | Self::DuplicateDefinition { span, .. }
             | Self::DuplicateKey { span, .. }
@@ -374,6 +401,8 @@ impl DaeConstructionError {
             | Self::UndeclaredModelEventTarget { span, .. }
             | Self::IncompleteModelEventTransaction { span }
             | Self::InvalidDiscreteBranchSet { span }
+            | Self::InvalidObservedDiscreteOwner { span }
+            | Self::UnorderedSimultaneousStatements { span }
             | Self::UnissuedDiscreteDependency { span, .. }
             | Self::InvalidExternalSymbol { span, .. }
             | Self::InvalidExternalLinkage { span }

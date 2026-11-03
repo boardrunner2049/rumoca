@@ -343,9 +343,9 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
     /// A state derivative has no Solve storage of its own: it is the output of
     /// the continuous row the structural proof matched to it. Reading one from
     /// a different row therefore recomputes that row's defining right-hand
-    /// side here. A definition may itself read other states' derivatives
-    /// (`der(e2) = ... + der(e1)`), which nest the same substitution; the
-    /// active stack refuses a definition that reaches itself again.
+    /// side here. A definition may itself read another state's derivative,
+    /// which substitutes the same way; the active stack rejects a cycle, so
+    /// the nesting is finite and exact.
     fn derivative_value(
         &mut self,
         state: dae::StateId<'dae>,
@@ -366,8 +366,11 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                 span,
             )
         };
+        // A program compiled without its own index (a discrete owner, a
+        // root, an event condition) reads the layout's matched definitions.
         let definition = self
             .derivative_definitions
+            .or_else(|| self.layout.derivative_definitions.get())
             .ok_or_else(escaped)?
             .definition(state, scalar)
             .ok_or_else(escaped)?;
@@ -389,7 +392,6 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             point,
             state,
             scalar,
-            DerivativeReads::Substituted(state),
         ) {
             Ok(rhs) => rhs,
             Err(error) => {
@@ -412,7 +414,11 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         self.enter_context(ScalarContextFrame::Derivative {
             parent: self.context_id,
             state: state.index(),
-            scalar,
+            definition: definition.expression,
+            domain_point: definition
+                .domain_point
+                .clone()
+                .filter(|_| self.node(definition.expression).binder_domain().is_some()),
         });
         self.active_derivatives.push(key);
         let pushed_point = definition.domain_point.clone();
@@ -434,6 +440,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         span: Span,
     ) -> Result<solve::Reg, LowerError> {
         match rhs {
+            DerivativeRhs::Affine(proof) => proof.lower(self),
             DerivativeRhs::Explicit { expression, scalar } => self.expression(expression, scalar),
             DerivativeRhs::Scaled {
                 numerator,
@@ -444,8 +451,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             } => {
                 let numerator = self.expression(numerator, numerator_scalar)?;
                 let coefficient = self.expression(coefficient, coefficient_scalar)?;
-                self.binary(
-                    dae::BinaryOperator::Divide,
+                self.affine_quotient(
                     numerator,
                     coefficient,
                     if definition_span.is_dummy() {
@@ -455,19 +461,6 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                     },
                 )
             }
-            DerivativeRhs::Summed {
-                numerator,
-                summed,
-                span: definition_span,
-            } => self.summed_derivative_value(
-                numerator,
-                &summed,
-                if definition_span.is_dummy() {
-                    span
-                } else {
-                    definition_span
-                },
-            ),
         }
     }
 }

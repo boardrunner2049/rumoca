@@ -2,12 +2,15 @@ mod clocks;
 mod comprehensions;
 mod delays;
 mod derived_parameters;
+mod discrete_time_definitions;
 mod discrete_values;
 mod equation_partitions;
 mod event_conditions;
 mod expression_events;
 mod expression_semi_linear;
 mod expression_validation;
+mod folded_guards;
+pub use folded_guards::StructuralSelection;
 mod function_array_assemblies;
 mod function_bodies;
 mod function_conditionals;
@@ -15,6 +18,7 @@ mod function_definitions;
 mod function_externals;
 mod function_impurity;
 mod function_loops;
+mod function_native_lapack;
 mod function_ranges;
 mod function_record_assemblies;
 mod function_reductions;
@@ -23,6 +27,7 @@ mod function_static_extents;
 mod function_value_types;
 mod history_operators;
 mod initial_algorithms;
+mod initial_parameter_equations;
 mod loop_compaction;
 mod model_algorithm_calls;
 mod model_algorithm_statements;
@@ -30,8 +35,10 @@ mod model_algorithms;
 mod model_expression_owners;
 mod model_roles;
 mod multi_output_equations;
+mod observed_reads;
 mod parameter_cycles;
 mod record_array_fields;
+mod record_equation_elements;
 mod record_equations;
 mod sample_aliases;
 mod source_balance;
@@ -43,7 +50,9 @@ use super::*;
 use clocks::SampledTarget;
 use clocks::{ClockAnalysis, ClockDomainAnalysis, analyze_clocks};
 pub(super) use clocks::{
-    ClockPlan, ClockedValuePlan, is_inferred_clock_condition, is_whole_clock_coordinate,
+    ClockPlan, ClockSchedule, ClockedValuePlan, EventClockPlan, WhenBranchKey,
+    inferred_clock_transfer, is_inferred_clock_condition, is_whole_clock_coordinate,
+    when_conditional_selects_clock_structure,
 };
 pub(super) use comprehensions::{
     ComprehensionKey, ComprehensionPlans, specialized_comprehension_plan,
@@ -57,7 +66,7 @@ pub(super) use discrete_values::DiscreteValueTopologyPlan;
 use discrete_values::analyze_discrete_value_topology;
 pub(super) use equation_partitions::{
     AggregateDiscreteConnections, DiscreteValueAssignmentPlan, EquationPartition,
-    discrete_value_assignment, equation_partition, row_owned_discrete_family,
+    discrete_element_array_body, discrete_value_assignment, equation_partition,
     structured_discrete_assignments, structured_discrete_element_assignments,
 };
 use equation_partitions::{
@@ -65,8 +74,7 @@ use equation_partitions::{
 };
 use event_conditions::{
     evaluate_clock_seconds, evaluate_sample_schedule, validate_algorithm_condition,
-    validate_assertion_condition, validate_when_activation_condition,
-    validate_when_condition_expression,
+    validate_condition_expression, validate_when_condition_expression,
 };
 use expression_events::analyze_expression_events;
 pub(super) use expression_events::{
@@ -83,12 +91,13 @@ use expression_validation::{
 };
 use function_array_assemblies::coalesce_function_array_assemblies;
 pub(super) use function_bodies::function_assertion;
+pub(super) use function_bodies::validate_function_certificate;
 use function_bodies::{
     plan_function_statements, resolve_function_definitions,
     validate_function_expression_with_roles, validate_function_statements,
     validate_function_subscripts, validate_functions,
 };
-pub(super) use function_conditionals::selected_conditional_statements;
+pub(super) use function_conditionals::{branch_never_completes, selected_conditional_statements};
 use function_conditionals::{plan_function_conditional, resolve_function_conditional};
 use function_definitions::FunctionDefinitions;
 pub(super) use function_definitions::FunctionValueSeed;
@@ -116,7 +125,8 @@ pub(super) use history_operators::HistoryOperatorPlans;
 use history_operators::analyze_history_operators;
 pub(super) use initial_algorithms::InitialDiscreteValue;
 use initial_algorithms::{
-    InitialAlgorithmAnalysis, analyze_initial_algorithms, claim_initial_discrete_equations,
+    InitialAlgorithmAnalysis, analyze_initial_algorithms, assertion_call,
+    claim_initial_discrete_equations, claimed_initial_families,
     reject_unsupported_initial_algorithm_statements,
 };
 use loop_compaction::compact_function_loops;
@@ -139,10 +149,16 @@ pub(super) use record_array_fields::{RecordArrayFieldPlan, RecordArrayFieldPlans
 use record_array_fields::{
     analyze_record_array_fields, validate_record_array_field_runtime_coordinates,
 };
+pub(super) use record_equations::RecordFieldSystem;
 use record_equations::analyze_record_equations;
 use sample_aliases::analyze_sample_aliases;
 use source_balance::{SourceBalanceInput, source_balance};
-use structured_families::validate_structured_families;
+use structured_families::{
+    PartitionFamilies, record_equality_families, validate_structured_families,
+};
+pub(super) use structured_families::{
+    materialized_discrete_real_family, materialized_discrete_value_rows,
+};
 use unexecuted_branches::{check_function_assignment_shapes, check_unexecuted_branches};
 use when_chains::validate_when_chains;
 
@@ -155,9 +171,17 @@ pub(super) struct Analysis {
     pub(super) balance: BalanceDetail,
     pub(super) continuous_family_rows: HashSet<usize>,
     pub(super) initialization_family_rows: HashSet<usize>,
+    /// Families that are a second view of whole-record equality rows, which keep
+    /// their record-equation owners.
+    pub(super) record_equality_families: HashSet<usize>,
+    pub(super) initial_record_equality_families: HashSet<usize>,
     /// Scalar initial-equation rows represented by typed initial discrete-value
     /// definitions rather than numeric initialization residuals.
     pub(super) initial_discrete_equation_rows: HashSet<usize>,
+    /// Initialization families whose rows are all such definitions.
+    pub(super) initial_discrete_families: HashSet<usize>,
+    pub(super) initial_parameter_equations:
+        Vec<initial_parameter_equations::InitialParameterEquation>,
     pub(super) sample_lattices: Vec<(Span, PeriodicClockSchedule)>,
     pub(super) expression_events: ExpressionEventPlans,
     /// Exact scalar Boolean aliases of MLS §3.7.5 `sample(start, interval)`.
@@ -166,16 +190,25 @@ pub(super) struct Analysis {
     /// the typed periodic clock instead of buffering a held B.1c coordinate.
     pub(super) sample_alias_schedules: HashMap<VarName, PeriodicClockSchedule>,
     pub(super) clock_plans: HashMap<InstanceId, ClockPlan>,
+    /// MLS §16.3 event clocks, keyed by the clock coordinate their constructor
+    /// defines.
+    pub(super) event_clocks: HashMap<InstanceId, EventClockPlan>,
     pub(super) clock_equation_rows: HashSet<usize>,
     pub(super) clocked_equation_owners: HashMap<usize, ClockPlan>,
     pub(super) clocked_value_owners: HashMap<InstanceId, ClockedValuePlan>,
-    /// Owning clock of every `when Clock()` branch, keyed by the branch span.
-    pub(super) clocked_when_owners: HashMap<Span, ClockPlan>,
+    /// Owning clock of every `when Clock()` branch, keyed by its position.
+    pub(super) clocked_when_owners: HashMap<WhenBranchKey, ClockPlan>,
     /// Owning clock of every runtime coordinate in a clocked partition.
     pub(super) clocked_coordinate_owners: HashMap<InstanceId, ClockPlan>,
     pub(super) model_algorithm_plans: Vec<ModelAlgorithmPlan>,
     /// `fixed = false` parameters an initial algorithm determines (MLS §8.6).
     pub(super) initial_parameters: HashMap<VarName, Expression>,
+    /// `final` or `Evaluate=true` parameters with evaluable bindings (MLS §18.6).
+    pub(super) evaluable_parameters: HashSet<VarName>,
+    /// The owners whose folded guards fixed parameters at translation.
+    pub(super) structural_selections: Vec<StructuralSelection>,
+    /// The one-based id of each native table handle, computed once.
+    pub(super) native_table_ids: HashMap<VarName, u64>,
     /// Discrete coordinates whose initialization-instant value an initial
     /// algorithm determines (MLS §8.6).
     pub(super) initial_discrete_values: HashMap<VarName, InitialDiscreteValue>,
@@ -209,6 +242,38 @@ struct SourceBalanceAnalysis {
     assigned_discrete_targets: HashSet<VarName>,
 }
 
+/// MLS §12.4.4 definedness assertions of a function's top-level sequence.
+///
+/// "It is an error to use or return an uninitialized variable": a value a
+/// top-level conditional defines on some paths only is joined with a dead
+/// operand on the other paths, and each top-level use of it, or its return
+/// as an output, is preceded by a call-scoped assertion that the executed
+/// path defined it. Indices are positions in the top-level statement
+/// sequence, the same positions construction lowers.
+#[derive(Default)]
+pub(super) struct FunctionDefinednessPlan {
+    /// Path-partial values asserted defined before the statement (or the
+    /// assembly group it leads) at this index runs.
+    pub(super) asserted_reads: HashMap<usize, Vec<VarName>>,
+    /// Targets the conditional at this index leaves path-partial.
+    pub(super) partial_joins: HashMap<usize, Vec<PartialJoinPlan>>,
+    /// Path-partial outputs asserted defined when the function returns.
+    pub(super) returned: Vec<VarName>,
+}
+
+/// One target a top-level conditional leaves path-partial.
+pub(super) struct PartialJoinPlan {
+    pub(super) target: VarName,
+    /// The target was already path-partial before the conditional, so the
+    /// paths that do not write it keep its earlier definedness predicate.
+    pub(super) was_partial: bool,
+    /// The typed value the join takes on paths that never write the target.
+    /// MLS §12.4.4 makes every use of it there an error owned by the
+    /// definedness assertion, so the seed is never observed; a literal
+    /// keeps the dead operand from evaluating any other path's computation.
+    pub(super) seed: FunctionValueSeed,
+}
+
 pub(super) enum FunctionPlan {
     Statements {
         /// The source statements the plans were built from. Exact tensor-native
@@ -217,7 +282,11 @@ pub(super) enum FunctionPlan {
         source: Vec<rumoca_core::Statement>,
         statements: Vec<FunctionStatementPlan>,
         generated_booleans: Vec<(VarName, Span)>,
-        certified_output_seeds: Vec<(VarName, FunctionValueSeed)>,
+        /// Values defined at function entry: outputs a disjoint early-return
+        /// certificate proves total, and values with a zero extent, which have
+        /// no element to write (MLS §12.4.4).
+        entry_seeds: Vec<(VarName, FunctionValueSeed)>,
+        definedness: FunctionDefinednessPlan,
     },
     GuardedReturn {
         branches: Vec<Vec<FunctionStatementPlan>>,
@@ -228,6 +297,13 @@ pub(super) enum FunctionPlan {
         initial: Vec<FunctionStatementPlan>,
         result: VarName,
         reduction: FunctionIntegerReduction,
+    },
+    /// LAPACK `dgesv` with one right-hand side, owned as a checked linear
+    /// solve (see `function_native_lapack`).
+    NativeLinearSolve {
+        matrix: VarName,
+        solution: VarName,
+        info: VarName,
     },
     /// MLS §12.9 external interface; the function has no Modelica body.
     External(ExternalFunctionPlan),
@@ -405,8 +481,8 @@ struct FunctionValidationContext<'scope> {
     /// Record-field coordinates already constructed by an enclosing staged
     /// assembly at this exact source position.
     staged_record_fields: &'scope HashSet<FunctionRecordFieldCoordinate>,
-    /// Whether this source sequence maps directly to the call-scoped action
-    /// sequence rather than a loop or runtime-conditional value owner.
+    /// Whether this source sequence reaches a call-scoped or loop action
+    /// owner, directly or through runtime conditionals that guard its actions.
     call_scoped_actions: bool,
 }
 
@@ -514,9 +590,10 @@ pub(super) fn analyze(flat: &flat::Model) -> Result<Analysis, ToDaeError> {
     // Fold the parameter fixed point before shape analysis: MLS §12.2 array
     // dimensions can depend on the settled parameter values from MLS §4.5.
     let constants = constant_context(flat)?;
-    let function_shapes = FunctionShapeAnalysis::analyze(flat, &constants)?;
+    let evaluable = evaluable_parameters(flat);
+    let function_shapes = FunctionShapeAnalysis::analyze_model(flat, &constants, Some(&evaluable))?;
     let function_plans = validate_functions(flat, &function_shapes)?;
-    let record_equations = analyze_record_equation_sets(flat)?;
+    let record_equations = analyze_record_equation_sets(flat, function_shapes.model_values())?;
     let expression_support = analyze_expression_support(flat, &constants)?;
     let mut analysis = analyze_model_owners(
         flat,
@@ -525,18 +602,25 @@ pub(super) fn analyze(flat: &flat::Model) -> Result<Analysis, ToDaeError> {
         function_plans,
         record_equations,
         expression_support,
+        evaluable,
     )?;
     plan_initial_algorithm_comprehensions(&mut analysis)?;
     Ok(analysis)
 }
 
+// SPEC_0021: Exception - ToDAE analysis entry point assembling every Analysis field
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ToDAE analysis entry point runs each ordered pass once and assembles its result"
+)]
 fn analyze_model_owners(
     flat: &flat::Model,
     constants: EvalContext,
-    function_shapes: FunctionShapeAnalysis,
+    mut function_shapes: FunctionShapeAnalysis,
     function_plans: HashMap<FunctionSpecializationKey, FunctionPlan>,
     record_equations: RecordEquationSets,
     expression_support: ExpressionSupportPlans,
+    mut evaluable: HashSet<VarName>,
 ) -> Result<Analysis, ToDaeError> {
     let record_array_fields = Arc::clone(function_shapes.record_array_fields());
     let clocks = analyze_clocks(flat, &constants)?;
@@ -544,7 +628,13 @@ fn analyze_model_owners(
         states,
         variables: mut roles,
         expressions: mut expression_roles,
-    } = analyze_model_roles(flat, &clocks.sampled_targets)?;
+        structural_selections: folded_conditionals,
+    } = analyze_model_roles(
+        flat,
+        &clocks.sampled_targets,
+        function_shapes.model_values(),
+    )?;
+    function_shapes.add_structural_selections(folded_conditionals);
     validate_runtime_coordinates(flat, &roles, &record_array_fields)?;
     let derived_parameters = analyze_derived_parameters(flat, &roles)?;
     apply_derived_parameter_roles(&derived_parameters.plans, &mut roles, &mut expression_roles);
@@ -553,17 +643,17 @@ fn analyze_model_owners(
     let history_operators = analyze_history_operators(flat, &roles)?;
     let multi_output_equations =
         analyze_multi_output_equation_sets(flat, &expression_roles, &states, &function_shapes)?;
-    let (continuous_family_rows, initialization_family_rows) =
-        validate_expressions_and_structured_rows(ExpressionValidationInput {
-            flat,
-            roles: &roles,
-            expression_roles: &expression_roles,
-            states: &states,
-            record_array_fields: &record_array_fields,
-            values: function_shapes.model_values(),
-            multi_output_equations: &multi_output_equations.continuous,
-            initial_multi_output_equations: &multi_output_equations.initialization,
-        })?;
+    let family_rows = validate_expressions_and_structured_rows(ExpressionValidationInput {
+        flat,
+        roles: &roles,
+        expression_roles: &expression_roles,
+        states: &states,
+        record_array_fields: &record_array_fields,
+        values: function_shapes.model_values(),
+        multi_output_equations: &multi_output_equations.continuous,
+        initial_multi_output_equations: &multi_output_equations.initialization,
+        record_equations: &record_equations,
+    })?;
     let (mut sample_lattices, model_algorithm_plans) = analyze_event_algorithms(
         flat,
         &roles,
@@ -573,15 +663,19 @@ fn analyze_model_owners(
         &function_shapes,
     )?;
     let (discrete_connection_ranks, aggregate_discrete_connections, discrete_value_topology) =
-        analyze_discrete_connections(flat, &roles)?;
-    let assertions = AssertionScope {
-        expression_roles: &expression_roles,
-        states: &states,
-        constants: &constants,
-        model_values: function_shapes.model_values(),
-    };
-    let (initial_algorithms, initial_discrete_equation_rows) =
-        analyze_initial_owners(flat, &expression_roles, assertions, &mut sample_lattices)?;
+        analyze_discrete_connections(flat, &roles, &record_equations.continuous)?;
+    let initial = analyze_initial_owners(
+        flat,
+        &roles,
+        AssertionScope {
+            roles: &expression_roles,
+            enumeration_literals: function_shapes.model_values(),
+        },
+        &states,
+        &constants,
+        function_shapes.model_values(),
+        &mut sample_lattices,
+    )?;
     let balance = analyze_source_balance(SourceBalanceAnalysisInput {
         flat,
         roles: &roles,
@@ -599,28 +693,40 @@ fn analyze_model_owners(
         &discrete_connection_ranks,
         &aggregate_discrete_connections,
     )?;
+    let (folded, structural_selections) =
+        folded_guards::folded_guard_parameters(flat, function_shapes.model_values(), &evaluable);
+    evaluable.extend(folded);
+    function_shapes.set_evaluable_parameters(&evaluable);
     Ok(Analysis {
         constants,
         delay_plans: expression_support.delays,
         history_operators,
         roles,
         balance: balance.detail,
-        continuous_family_rows,
-        initialization_family_rows,
-        initial_discrete_equation_rows,
+        continuous_family_rows: family_rows.continuous,
+        initialization_family_rows: family_rows.initialization,
+        record_equality_families: family_rows.continuous_record_families,
+        initial_record_equality_families: family_rows.initialization_record_families,
+        initial_discrete_families: claimed_initial_families(flat, &initial.discrete_equation_rows),
+        initial_discrete_equation_rows: initial.discrete_equation_rows,
+        initial_parameter_equations: initial.parameter_equations,
         sample_lattices,
         expression_events,
         sample_alias_schedules,
         clock_plans: clocks.plans,
+        event_clocks: clocks.event_clocks,
         clock_equation_rows: clocks.equation_rows,
         clocked_equation_owners: clock_domains.equation_owners,
         clocked_value_owners: clock_domains.value_owners,
         clocked_when_owners: clock_domains.when_owners,
         clocked_coordinate_owners: clock_domains.coordinate_owners,
         model_algorithm_plans,
-        initial_parameters: initial_algorithms.parameters,
-        initial_discrete_values: initial_algorithms.discrete_values,
-        initial_algorithm_assertions: initial_algorithms.assertions,
+        initial_parameters: initial.algorithms.parameters,
+        evaluable_parameters: evaluable,
+        structural_selections,
+        native_table_ids: super::native_tables::native_table_ids(flat),
+        initial_discrete_values: initial.algorithms.discrete_values,
+        initial_algorithm_assertions: initial.algorithms.assertions,
         function_plans,
         function_shapes,
         comprehension_plans: expression_support.comprehensions,
@@ -649,6 +755,7 @@ struct ExpressionValidationInput<'a> {
     values: &'a ShapeEnvironment,
     multi_output_equations: &'a HashMap<usize, MultiOutputEquationPlan>,
     initial_multi_output_equations: &'a HashMap<usize, MultiOutputEquationPlan>,
+    record_equations: &'a RecordEquationSets,
 }
 
 struct ExpressionSupportPlans {
@@ -663,16 +770,17 @@ fn analyze_expression_support(
     Ok(ExpressionSupportPlans {
         // Assertion conditions are lowered through the same comprehension
         // plans (CDL `ExtractSignal`: `assert(andTrue({... for i in 1:n}))`).
-        // A `for`-equation family lowers its template, not the scalar cells,
-        // so an array constructor in its body is planned from the template.
         comprehensions: analyze_comprehensions(
             all_model_expressions(flat)
-                .chain(assertion_expressions(flat))
-                .chain(when_chain_expressions(flat))
+                // SPEC_0032 §1: compact templates are authoritative; their
+                // nested MLS §10.4.1 reductions retain unrolled-loop binders
+                // and therefore need plans distinct from materialized rows.
                 .chain(structured_template_expressions(&flat.structured_equations))
                 .chain(structured_template_expressions(
                     &flat.initial_structured_equations,
-                )),
+                ))
+                .chain(assertion_expressions(flat))
+                .chain(when_chain_expressions(flat)),
             constants,
         )?,
         delays: analyze_delays(flat, constants)?,
@@ -714,24 +822,55 @@ struct RecordEquationSets {
     initialization: HashMap<usize, RecordEquationPlan>,
 }
 
-fn analyze_record_equation_sets(flat: &flat::Model) -> Result<RecordEquationSets, ToDaeError> {
+fn analyze_record_equation_sets(
+    flat: &flat::Model,
+    values: &ShapeEnvironment,
+) -> Result<RecordEquationSets, ToDaeError> {
     Ok(RecordEquationSets {
-        continuous: analyze_record_equations(flat, &flat.equations)?,
-        initialization: analyze_record_equations(flat, &flat.initial_equations)?,
+        continuous: analyze_record_equations(flat, &flat.equations, values)?,
+        initialization: analyze_record_equations(flat, &flat.initial_equations, values)?,
     })
+}
+
+/// Rows whose residual is not lowered as written: a multi-output call
+/// equation, or a whole-record equality whose leaf owners all equate field
+/// coordinates. Their plans proved the operands' exact identities, so the
+/// written residual is not validated as an expression.
+fn plan_owned_rows(
+    multi_output: &HashMap<usize, MultiOutputEquationPlan>,
+    records: &HashMap<usize, RecordEquationPlan>,
+) -> HashSet<usize> {
+    multi_output
+        .keys()
+        .copied()
+        .chain(records.iter().filter_map(|(row, plan)| {
+            plan.fields
+                .iter()
+                .all(|field| matches!(field.value, RecordEquationFieldValue::Coordinate(_)))
+                .then_some(*row)
+        }))
+        .collect()
 }
 
 fn validate_expressions_and_structured_rows(
     input: ExpressionValidationInput<'_>,
-) -> Result<(HashSet<usize>, HashSet<usize>), ToDaeError> {
+) -> Result<StructuredFamilyRows, ToDaeError> {
+    let continuous_owned = plan_owned_rows(
+        input.multi_output_equations,
+        &input.record_equations.continuous,
+    );
+    let initialization_owned = plan_owned_rows(
+        input.initial_multi_output_equations,
+        &input.record_equations.initialization,
+    );
     validate_model_expressions(
         input.flat,
         input.expression_roles,
         input.states,
         input.record_array_fields,
         input.values,
-        input.multi_output_equations,
-        input.initial_multi_output_equations,
+        &continuous_owned,
+        &initialization_owned,
     )?;
     analyze_structured_family_rows(
         input.flat,
@@ -740,6 +879,7 @@ fn validate_expressions_and_structured_rows(
         input.states,
         input.record_array_fields,
         input.values,
+        input.record_equations,
     )
 }
 
@@ -785,6 +925,13 @@ fn validate_runtime_coordinates(
     validate_record_array_field_runtime_coordinates(flat, record_array_fields, roles)
 }
 
+struct StructuredFamilyRows {
+    continuous: HashSet<usize>,
+    initialization: HashSet<usize>,
+    continuous_record_families: HashSet<usize>,
+    initialization_record_families: HashSet<usize>,
+}
+
 fn analyze_structured_family_rows(
     flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
@@ -792,10 +939,19 @@ fn analyze_structured_family_rows(
     states: &HashSet<VarName>,
     record_array_fields: &RecordArrayFieldPlans,
     values: &ShapeEnvironment,
-) -> Result<(HashSet<usize>, HashSet<usize>), ToDaeError> {
+    records: &RecordEquationSets,
+) -> Result<StructuredFamilyRows, ToDaeError> {
+    let continuous_record_families =
+        record_equality_families(&flat.structured_equations, &records.continuous);
+    let initialization_record_families =
+        record_equality_families(&flat.initial_structured_equations, &records.initialization);
     let continuous = validate_structured_families(
-        &flat.structured_equations,
-        &flat.equations,
+        PartitionFamilies {
+            families: &flat.structured_equations,
+            equations: &flat.equations,
+            initialization: false,
+            excluded: &continuous_record_families,
+        },
         roles,
         expression_roles,
         states,
@@ -803,15 +959,24 @@ fn analyze_structured_family_rows(
         values,
     )?;
     let initialization = validate_structured_families(
-        &flat.initial_structured_equations,
-        &flat.initial_equations,
+        PartitionFamilies {
+            families: &flat.initial_structured_equations,
+            equations: &flat.initial_equations,
+            initialization: true,
+            excluded: &initialization_record_families,
+        },
         roles,
         expression_roles,
         states,
         record_array_fields,
         values,
     )?;
-    Ok((continuous, initialization))
+    Ok(StructuredFamilyRows {
+        continuous,
+        initialization,
+        continuous_record_families,
+        initialization_record_families,
+    })
 }
 
 fn analyze_expression_event_ownership(
@@ -838,7 +1003,13 @@ fn analyze_expression_event_ownership(
     Ok((events, aliases))
 }
 
-/// Prove initial-algorithm ownership and claim initial discrete equation rows
+struct InitialOwners {
+    algorithms: InitialAlgorithmAnalysis,
+    discrete_equation_rows: HashSet<usize>,
+    parameter_equations: Vec<initial_parameter_equations::InitialParameterEquation>,
+}
+
+/// Prove initial-algorithm ownership and claim initial definition rows
 /// as one construction transaction.
 ///
 /// The equation claim mutates the algorithm-owned discrete staging plan, so
@@ -848,12 +1019,27 @@ fn analyze_initial_owners(
     flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
     assertions: AssertionScope<'_>,
+    states: &HashSet<VarName>,
+    constants: &EvalContext,
+    shapes: &ShapeEnvironment,
     sample_lattices: &mut Vec<(Span, PeriodicClockSchedule)>,
-) -> Result<(InitialAlgorithmAnalysis, HashSet<usize>), ToDaeError> {
-    let mut algorithms =
-        analyze_initial_algorithm_owners(flat, roles, assertions, sample_lattices)?;
-    let rows = claim_initial_discrete_equations(flat, roles, &mut algorithms.discrete_values)?;
-    Ok((algorithms, rows))
+) -> Result<InitialOwners, ToDaeError> {
+    let mut algorithms = analyze_initial_algorithm_owners(
+        flat,
+        assertions,
+        states,
+        constants,
+        shapes,
+        sample_lattices,
+    )?;
+    let discrete_equation_rows =
+        claim_initial_discrete_equations(flat, roles, &mut algorithms.discrete_values)?;
+    let parameter_equations = initial_parameter_equations::analyze(flat, roles)?;
+    Ok(InitialOwners {
+        algorithms,
+        discrete_equation_rows,
+        parameter_equations,
+    })
 }
 
 type EventAlgorithmAnalysis = (Vec<(Span, PeriodicClockSchedule)>, Vec<ModelAlgorithmPlan>);
@@ -899,6 +1085,7 @@ fn validate_source_model(flat: &flat::Model) -> Result<(), ToDaeError> {
 fn analyze_discrete_connections(
     flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
+    record_equations: &HashMap<usize, RecordEquationPlan>,
 ) -> Result<
     (
         HashMap<VarName, usize>,
@@ -909,7 +1096,8 @@ fn analyze_discrete_connections(
 > {
     let ranks = discrete_connection_ranks(flat, roles);
     let aggregates = aggregate_discrete_connections(flat, roles, &ranks)?;
-    let topology = analyze_discrete_value_topology(flat, roles, &ranks, &aggregates)?;
+    let topology =
+        analyze_discrete_value_topology(flat, roles, &ranks, &aggregates, record_equations)?;
     Ok((ranks, aggregates, topology))
 }
 
@@ -1054,8 +1242,8 @@ fn validate_model_expressions(
     states: &HashSet<VarName>,
     record_array_fields: &RecordArrayFieldPlans,
     model_values: &ShapeEnvironment,
-    multi_output_equations: &HashMap<usize, MultiOutputEquationPlan>,
-    initial_multi_output_equations: &HashMap<usize, MultiOutputEquationPlan>,
+    owned_rows: &HashSet<usize>,
+    initial_owned_rows: &HashSet<usize>,
 ) -> Result<(), ToDaeError> {
     for variable in flat.variables.values() {
         for expression in variable_attribute_expressions(variable) {
@@ -1076,7 +1264,7 @@ fn validate_model_expressions(
         }
     }
     for (row, equation) in flat.equations.iter().enumerate() {
-        if multi_output_equations.contains_key(&row) {
+        if owned_rows.contains(&row) {
             continue;
         }
         let expression = &equation.residual;
@@ -1090,7 +1278,7 @@ fn validate_model_expressions(
         validate_known_function_calls(expression, flat)?;
     }
     for (row, equation) in flat.initial_equations.iter().enumerate() {
-        if initial_multi_output_equations.contains_key(&row) {
+        if initial_owned_rows.contains(&row) {
             continue;
         }
         let expression = &equation.residual;
@@ -1155,8 +1343,13 @@ fn analyze_source_balance(
         connection_ranks,
         aggregate_connections,
     } = input;
-    let assigned_discrete_targets =
-        defined_discrete_targets(flat, roles, connection_ranks, aggregate_connections)?;
+    let assigned_discrete_targets = defined_discrete_targets(
+        flat,
+        roles,
+        connection_ranks,
+        aggregate_connections,
+        record_equations,
+    )?;
     let mut non_runtime_rows = clock_equation_rows.clone();
     non_runtime_rows.extend(derived_parameter_rows);
     let detail = source_balance(SourceBalanceInput {
@@ -1180,69 +1373,64 @@ fn analyze_source_balance(
 /// produced — against one condition grammar.
 fn analyze_initial_algorithm_owners(
     flat: &flat::Model,
-    roles: &HashMap<VarName, PlannedRole>,
-    assertions: AssertionScope<'_>,
+    assertion_scope: AssertionScope<'_>,
+    states: &HashSet<VarName>,
+    constants: &EvalContext,
+    shapes: &ShapeEnvironment,
     sample_lattices: &mut Vec<(Span, PeriodicClockSchedule)>,
 ) -> Result<InitialAlgorithmAnalysis, ToDaeError> {
+    // The replay reads initialization values, where MLS §4.9.5 makes an
+    // enumeration literal an ordinary value, so it takes the expression roles.
     let initial_algorithms =
-        analyze_initial_algorithms(flat, roles, assertions.states, assertions.constants)?;
+        analyze_initial_algorithms(flat, assertion_scope.roles, states, constants, shapes)?;
     validate_assertions(
         flat.assert_equations
             .iter()
             .chain(&flat.initial_assert_equations)
             .chain(&initial_algorithms.assertions),
-        assertions,
+        assertion_scope,
+        states,
+        constants,
         sample_lattices,
     )?;
     Ok(initial_algorithms)
 }
 
-/// `message` and `level` are ordinary value expressions, so they resolve
-/// against `expression_roles` — the plan plus the names that may denote a value
-/// without being a coordinate, which is where MLS §4.9.5 enumeration literals
-/// live.
+/// The name scope an assertion's expressions are read in.
 ///
-/// Reading `level` against the coordinate plan is what made
-/// `assert(c, "m", AssertionLevel.warning)` fail with `ED008` on a literal the
-/// front end had already resolved and Flat carried in `enum_literal_ordinals` —
-/// the same defect `when` bodies had before they were given the expression
-/// roles.
-///
-/// The condition is an event-domain expression, but like a when activation
-/// guard it may compare against an enumeration literal
-/// (`assert(not choice == Choice.adaptive, ...)`, PowerGrids `System`), so it
-/// also reads the expression roles, with each literal checked against the
-/// model's literal catalog (`model_values`).
+/// MLS §8.3.7 makes an assertion condition an ordinary Boolean expression, and
+/// MLS §4.9.5 makes `E.lit` an ordinary value in it, so the roles here are the
+/// *expression* roles that catalog enumeration literals, paired with the
+/// literal catalog that proves each literal's enumeration identity.
+#[derive(Clone, Copy)]
+struct AssertionScope<'scope> {
+    roles: &'scope HashMap<VarName, PlannedRole>,
+    enumeration_literals: &'scope ShapeEnvironment,
+}
+
 fn validate_assertions<'flat>(
     assertions: impl IntoIterator<Item = &'flat flat::AssertEquation>,
     scope: AssertionScope<'_>,
+    states: &HashSet<VarName>,
+    constants: &EvalContext,
     sample_lattices: &mut Vec<(Span, PeriodicClockSchedule)>,
 ) -> Result<(), ToDaeError> {
     for assertion in assertions {
         require_span(assertion.span, "assert equation")?;
-        validate_assertion_condition(
+        validate_condition_expression(
             &assertion.condition,
-            scope.expression_roles,
-            scope.states,
-            scope.constants,
+            scope.roles,
+            states,
+            constants,
             sample_lattices,
-            scope.model_values,
+            scope.enumeration_literals,
         )?;
-        validate_expression(&assertion.message, scope.expression_roles, scope.states)?;
+        validate_expression(&assertion.message, scope.roles, states)?;
         if let Some(level) = &assertion.level {
-            validate_expression(level, scope.expression_roles, scope.states)?;
+            validate_expression(level, scope.roles, states)?;
         }
     }
     Ok(())
-}
-
-/// The symbol tables an assertion owner is validated against.
-#[derive(Clone, Copy)]
-struct AssertionScope<'a> {
-    expression_roles: &'a HashMap<VarName, PlannedRole>,
-    states: &'a HashSet<VarName>,
-    constants: &'a EvalContext,
-    model_values: &'a ShapeEnvironment,
 }
 
 pub(super) fn analyze_record_array_field_plans(
@@ -1287,21 +1475,7 @@ fn structured_template_expressions(
 /// `RuntimeDependentReason`. Any other failure proves the model or the
 /// evaluator wrong and is reported at the binding.
 fn constant_context(flat: &flat::Model) -> Result<EvalContext, ToDaeError> {
-    let mut context = EvalContext::with_capacity(flat.variables.len(), 0, flat.functions.len() * 2);
-    for function in flat.functions.values() {
-        context.add_function(function.clone());
-    }
-    for (name, variable) in &flat.variables {
-        context.add_array_dimensions(name.to_string(), variable.dims.clone());
-    }
-    // MLS §4.8.5.2: an enumeration literal's semantic identity is its ordinal,
-    // and both `Integer(...)` and the relational operators are defined on that
-    // ordinal. Seeding the constant table with the model's exact ordinals is
-    // what lets a parameter expression over an enumeration — such as the
-    // `resolution < Resolution.s` guard of a periodic clock — evaluate.
-    for (literal, ordinal) in &flat.enum_literal_ordinals {
-        context.add_parameter(literal.clone(), EvalValue::Integer(*ordinal));
-    }
+    let mut context = seeded_eval_context(flat);
     for _ in 0..flat.variables.len() {
         let mut progress = false;
         for (name, variable) in &flat.variables {
@@ -1310,8 +1484,10 @@ fn constant_context(flat: &flat::Model) -> Result<EvalContext, ToDaeError> {
                     variable.variability,
                     Variability::Constant(_) | Variability::Parameter(_)
                 )
+                // Parameter `fixed` is uniform here (flatten refuses non-uniform
+                // parameter arrays, EF033), so this reduction is exact.
                 || matches!(variable.variability, Variability::Parameter(_))
-                    && variable.fixed == Some(false)
+                    && variable.fixed_uniform() == Some(false)
             {
                 continue;
             }
@@ -1381,6 +1557,127 @@ fn unbound_parameter_value(
     }
 }
 
+/// An evaluation context holding the model's functions, array dimensions, and
+/// enumeration ordinals, with no variable values yet.
+fn seeded_eval_context(flat: &flat::Model) -> EvalContext {
+    let mut context = EvalContext::with_capacity(flat.variables.len(), 0, flat.functions.len() * 2);
+    for function in flat.functions.values() {
+        context.add_function(function.clone());
+    }
+    for (name, variable) in &flat.variables {
+        context.add_array_dimensions(name.to_string(), variable.dims.clone());
+    }
+    // MLS §4.8.5.2: an enumeration literal's semantic identity is its ordinal,
+    // and both `Integer(...)` and the relational operators are defined on that
+    // ordinal. Seeding the constant table with the model's exact ordinals is
+    // what lets a parameter expression over an enumeration (such as the
+    // `resolution < Resolution.s` guard of a periodic clock) evaluate.
+    for (literal, ordinal) in &flat.enum_literal_ordinals {
+        context.add_parameter(literal.clone(), EvalValue::Integer(*ordinal));
+    }
+    context
+}
+
+/// Parameters STRUCT-T10(a) may fold (MLS §4.5, §18.6).
+///
+/// A parameter qualifies when it keeps the default `fixed=true`, does not
+/// write `Evaluate=false`, and its binding evaluates from constants and other
+/// qualifying parameters alone, and either it is `final` or `Evaluate=true`,
+/// or its binding reads a qualifying parameter. The second kind is a
+/// dependent parameter determined solely by translation-time values. An
+/// ordinary independent parameter is never admitted to the context, so a
+/// binding that reads one stays unevaluated here and its parameter keeps its
+/// runtime meaning.
+fn evaluable_parameters(flat: &flat::Model) -> HashSet<VarName> {
+    let mut context = seeded_eval_context(flat);
+    let mut evaluable = HashSet::new();
+    for _ in 0..flat.variables.len() {
+        let mut progress = false;
+        for (name, variable) in &flat.variables {
+            let admitted = match variable.variability {
+                Variability::Constant(_) => true,
+                Variability::Parameter(_) => {
+                    !variable.evaluate_refused && variable.fixed_uniform() != Some(false)
+                }
+                _ => false,
+            };
+            if !admitted || context.instance_value(variable.instance_id).is_some() {
+                continue;
+            }
+            let Some(binding) = &variable.binding else {
+                continue;
+            };
+            if matches!(variable.variability, Variability::Parameter(_))
+                && !reads_only_evaluable(flat, binding, &evaluable, variable.evaluate)
+            {
+                continue;
+            }
+            let Ok(value) = eval_expr(binding, &context) else {
+                continue;
+            };
+            context.add_instance_parameter(variable.instance_id, name.to_string(), value);
+            if matches!(variable.variability, Variability::Parameter(_)) {
+                evaluable.insert(name.clone());
+            }
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    evaluable
+}
+
+/// Whether every variable `binding` reads by value is a constant or an
+/// evaluable parameter, and, unless `marked` (`final` or `Evaluate=true`), at
+/// least one is an evaluable parameter. A `size(a, k)` argument reads only the
+/// shape of `a`. This mirrors the reads DAE construction checks for the
+/// `evaluable` attribute, so a branch of a conditional binding counts even when
+/// translation would never select it.
+fn reads_only_evaluable(
+    flat: &flat::Model,
+    binding: &Expression,
+    evaluable: &HashSet<VarName>,
+    marked: bool,
+) -> bool {
+    let mut reads = ValueReads::default();
+    rumoca_core::ExpressionVisitor::visit_expression(&mut reads, binding);
+    let mut dependent = marked;
+    for read in &reads.names {
+        match flat.variables.get(read) {
+            Some(variable) if matches!(variable.variability, Variability::Constant(_)) => {}
+            Some(_) if evaluable.contains(read) => dependent = true,
+            Some(_) => return false,
+            None => {}
+        }
+    }
+    dependent
+}
+
+/// Variables an expression reads by value.
+#[derive(Default)]
+struct ValueReads {
+    names: Vec<VarName>,
+}
+
+impl rumoca_core::ExpressionVisitor for ValueReads {
+    fn visit_var_ref(
+        &mut self,
+        name: &rumoca_core::Reference,
+        subscripts: &[rumoca_core::Subscript],
+    ) {
+        self.names.push(name.var_name().clone());
+        self.walk_var_ref(name, subscripts);
+    }
+
+    fn visit_builtin_call(&mut self, function: &rumoca_core::BuiltinFunction, args: &[Expression]) {
+        let shape_only = usize::from(matches!(function, rumoca_core::BuiltinFunction::Size));
+        for arg in args.iter().skip(shape_only) {
+            self.visit_expression(arg);
+        }
+    }
+}
+
 /// Name every `fixed = false` parameter the initialization system settles, and
 /// what settles it.
 ///
@@ -1424,8 +1721,10 @@ fn unbound_parameter_value(
 /// these sample starts construct at all, rather than with this diagnostic.
 fn register_deferred_parameters(flat: &flat::Model, context: &mut EvalContext) {
     for (name, variable) in &flat.variables {
+        // Parameter `fixed` is uniform (flatten refuses non-uniform parameter
+        // arrays, EF033), so this whole-declaration reduction is exact.
         if !matches!(variable.variability, Variability::Parameter(_))
-            || variable.fixed != Some(false)
+            || variable.fixed_uniform() != Some(false)
             || variable.binding.is_some()
             || context.instance_value(variable.instance_id).is_some()
         {
@@ -1686,6 +1985,12 @@ pub(super) fn effective_variable_scalar_type(
         Some(dae::ScalarType::String)
     } else if flat.enumeration_types.contains(&variable.type_id) {
         Some(dae::ScalarType::Enumeration)
+    } else if crate::construction::native_tables::native_table_family_of_variable(flat, variable)
+        .is_some()
+    {
+        // MLS §12.9.7: a native standard-library table handle is an opaque
+        // ExternalObject, modeled as an integer table id (never a Real).
+        Some(dae::ScalarType::Integer)
     } else {
         None
     }

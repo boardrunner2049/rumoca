@@ -1,12 +1,56 @@
+mod alias_orientation;
+
 use super::*;
 use std::borrow::Cow;
 
 #[derive(Clone)]
 pub(in crate::construction) enum EquationPartition<'flat> {
     Continuous,
-    DiscreteReal { target: &'flat VarName },
+    DiscreteReal {
+        target: &'flat VarName,
+    },
     DiscreteValue(DiscreteValueAssignmentPlan<'flat>),
+    /// An array equation `{a1, ..., an} = e` whose left side lists scalar
+    /// discrete-valued variables: the element equations `ai = e[i]` (MLS 3.7
+    /// §10.6.1), each defining its own variable.
+    DiscreteElements(Vec<DiscreteValueAssignmentPlan<'flat>>),
     ConsumedDiscreteValue,
+    /// An MLS §12.4.3 multi-result equation `(a, b, ...) = f(...)` with at
+    /// least one discrete receiver. Each receiver is defined by its own result
+    /// ordinal and keeps the owner its role selects.
+    MultiOutput {
+        receivers: Vec<&'flat VarName>,
+        /// The called function every receiver reads its result from.
+        call: &'flat Expression,
+    },
+}
+
+/// The receivers of an MLS §12.4.3 multi-result equation `(a, b, ...) =
+/// f(...)`, omitted slots excluded, with the call they read, or `None` for any
+/// other residual.
+fn multi_output_receivers(residual: &Expression) -> Option<(Vec<&VarName>, &Expression)> {
+    let Expression::Binary {
+        op: OpBinary::Sub,
+        lhs,
+        rhs,
+        ..
+    } = residual
+    else {
+        return None;
+    };
+    let (Expression::Tuple { elements, .. }, call @ Expression::FunctionCall { .. }) =
+        (lhs.as_ref(), rhs.as_ref())
+    else {
+        return None;
+    };
+    let receivers = elements
+        .iter()
+        .filter_map(|element| match element {
+            Expression::VarRef { name, .. } => Some(name.var_name()),
+            _ => None,
+        })
+        .collect();
+    Some((receivers, call))
 }
 
 #[derive(Clone)]
@@ -27,26 +71,6 @@ pub(in crate::construction) struct DiscreteValueAssignmentPlan<'flat> {
 pub(in crate::construction) struct AggregateDiscreteConnections {
     owners: HashMap<usize, AggregateDiscreteConnection>,
     members: HashSet<usize>,
-    /// Rows `a = b` between two discrete-valued coordinates that own `b`
-    /// rather than `a`; see [`reversed_discrete_equalities`].
-    reversed: HashSet<usize>,
-    /// Materialized families whose rows each define whole coordinates, and
-    /// those rows; see [`whole_coordinate_element_families`].
-    row_owned_families: HashSet<usize>,
-    row_owned_rows: HashSet<usize>,
-}
-
-impl AggregateDiscreteConnections {
-    /// Structured families whose rows are lowered one by one as whole
-    /// discrete-coordinate definitions instead of as a family.
-    pub(in crate::construction) fn row_owned_families(&self) -> &HashSet<usize> {
-        &self.row_owned_families
-    }
-
-    /// The Flat rows of [`Self::row_owned_families`].
-    pub(in crate::construction) fn row_owned_rows(&self) -> &HashSet<usize> {
-        &self.row_owned_rows
-    }
 }
 
 struct AggregateDiscreteConnection {
@@ -78,27 +102,27 @@ pub(in crate::construction) fn equation_partition<'flat>(
     if aggregate_connections.members.contains(&row) {
         return Ok(EquationPartition::ConsumedDiscreteValue);
     }
+    if let Some((receivers, call)) = multi_output_receivers(&equation.residual) {
+        let discrete = receivers.iter().any(|receiver| {
+            matches!(
+                roles.get(*receiver),
+                Some(PlannedRole::DiscreteReal | PlannedRole::DiscreteValue)
+            )
+        });
+        return Ok(if discrete {
+            EquationPartition::MultiOutput { receivers, call }
+        } else {
+            EquationPartition::Continuous
+        });
+    }
     if connection_bridges_discrete_real_to_continuous(equation, roles) {
         return Ok(EquationPartition::Continuous);
     }
     if let Some(plan) = discrete_connection_assignment(flat, equation, roles, connection_ranks)? {
         return Ok(EquationPartition::DiscreteValue(plan));
     }
-    if let Some(plan) = whole_aggregate_element_assignment(flat, equation, roles)? {
-        return Ok(EquationPartition::DiscreteValue(plan));
-    }
-    if aggregate_connections.reversed.contains(&row)
-        && let Some((lhs, target)) = discrete_value_equality(&equation.residual, roles)
-    {
-        return Ok(EquationPartition::DiscreteValue(
-            DiscreteValueAssignmentPlan {
-                target,
-                value: Cow::Borrowed(lhs),
-                generated: true,
-                scalar_count: None,
-                ordered_scalar_self_dependencies: false,
-            },
-        ));
+    if let Some(plans) = discrete_element_assignments(flat, &equation.residual, roles) {
+        return Ok(EquationPartition::DiscreteElements(plans));
     }
     if let Some(plan) = discrete_value_assignment(&equation.residual, roles, equation.span)? {
         return Ok(EquationPartition::DiscreteValue(plan));
@@ -295,20 +319,27 @@ pub(super) fn aggregate_discrete_connections(
 ) -> Result<AggregateDiscreteConnections, ToDaeError> {
     let mut groups = HashMap::<VarName, AggregateConnectionGroup>::new();
     for (row, equation) in flat.equations.iter().enumerate() {
-        let (target, subscripts, value, ordered_scalar_self_dependencies) =
+        let (target, subscripts, value, ordered_scalar_self_dependencies, from_element) =
             if let Some((target, subscripts, value)) =
                 oriented_discrete_connection(flat, equation, roles, connection_ranks)
             {
-                (target, subscripts, value, false)
+                (target, subscripts, value, false, false)
             } else if let Some((target, subscripts, value)) =
                 discrete_element_assignment(equation, roles)
             {
-                (target, subscripts, value, true)
+                (target, subscripts, value, true, true)
             } else {
                 continue;
             };
-        if subscripts.is_empty()
-            || selection_denotes_whole_aggregate(&flat.variables[target], subscripts)
+        // A whole-array connection is oriented as a single coordinate by
+        // `discrete_connection_assignment`, so the aggregate builder skips it.
+        // An ordinary element equation has no such alternate owner: even when a
+        // single leading singleton index denotes the entire declared coordinate
+        // (a size-one array assigned as `x[1] = e`), the element rows are the
+        // only definition, so the aggregate builder must cover them here.
+        if !from_element
+            && (subscripts.is_empty()
+                || selection_denotes_whole_aggregate(&flat.variables[target], subscripts))
         {
             continue;
         }
@@ -325,158 +356,15 @@ pub(super) fn aggregate_discrete_connections(
             equation,
         )?;
     }
-    let mut result = AggregateDiscreteConnections {
-        reversed: reversed_discrete_equalities(flat, roles),
-        ..AggregateDiscreteConnections::default()
-    };
+    let mut result = AggregateDiscreteConnections::default();
     for target in flat.variables.keys() {
         if let Some(group) = groups.remove(target) {
             group.finish(target.clone(), &mut result)?;
         }
     }
     debug_assert!(groups.is_empty(), "every group names a Flat variable");
-    result.row_owned_families = whole_coordinate_element_families(flat, roles, &result);
-    result.row_owned_rows = result
-        .row_owned_families
-        .iter()
-        .flat_map(|family| materialized_family_rows(&flat.structured_equations[*family]))
-        .collect();
+    alias_orientation::reversed_alias_owners(flat, roles, connection_ranks, &mut result)?;
     Ok(result)
-}
-
-/// Materialized families whose every row is owned as a whole discrete-valued
-/// coordinate definition: an aggregate formed from exact element coverage, or
-/// an element assignment whose selection denotes the whole coordinate.
-///
-/// `for i in 1:n loop y[i] = u[extract[i]]; end for;` materializes one row per
-/// element and aggregate coverage packs them into the single definition of
-/// `y`. That definition is not a per-point family body, so the family view of
-/// the same rows must stand aside and let the rows be lowered as rows.
-fn whole_coordinate_element_families(
-    flat: &flat::Model,
-    roles: &HashMap<VarName, PlannedRole>,
-    aggregates: &AggregateDiscreteConnections,
-) -> HashSet<usize> {
-    flat.structured_equations
-        .iter()
-        .enumerate()
-        .filter(|(_, family)| family.interiors_materialized)
-        .filter(|(_, family)| {
-            let rows = materialized_family_rows(family);
-            !rows.is_empty()
-                && rows
-                    .into_iter()
-                    .all(|row| row_defines_whole_coordinate(flat, row, roles, aggregates))
-        })
-        .map(|(index, _)| index)
-        .collect()
-}
-
-fn row_defines_whole_coordinate(
-    flat: &flat::Model,
-    row: usize,
-    roles: &HashMap<VarName, PlannedRole>,
-    aggregates: &AggregateDiscreteConnections,
-) -> bool {
-    if aggregates.owners.contains_key(&row) || aggregates.members.contains(&row) {
-        return true;
-    }
-    let Some(equation) = flat.equations.get(row) else {
-        return false;
-    };
-    discrete_element_assignment(equation, roles).is_some_and(|(target, subscripts, _)| {
-        selection_denotes_whole_aggregate(&flat.variables[target], subscripts)
-    })
-}
-
-/// The Flat rows a materialized family represents.
-fn materialized_family_rows(family: &flat::StructuredEquationFamily) -> Vec<usize> {
-    let count = family
-        .domain
-        .scalar_count()
-        .ok()
-        .and_then(|points| points.checked_mul(family.equations_per_point))
-        .unwrap_or(0);
-    (family.first_equation_index..family.first_equation_index + count).collect()
-}
-
-/// `(lhs, rhs name)` of a residual `a - b` whose sides are both whole,
-/// unsubscripted discrete-valued coordinates.
-fn discrete_value_equality<'flat>(
-    residual: &'flat Expression,
-    roles: &HashMap<VarName, PlannedRole>,
-) -> Option<(&'flat Expression, &'flat VarName)> {
-    let Expression::Binary {
-        op: OpBinary::Sub,
-        lhs,
-        rhs,
-        ..
-    } = residual
-    else {
-        return None;
-    };
-    let (_, lhs_subscripts) = discrete_value_base_reference(lhs, roles)?;
-    let (rhs_name, rhs_subscripts) = discrete_value_base_reference(rhs, roles)?;
-    (lhs_subscripts.is_empty() && rhs_subscripts.is_empty()).then_some((lhs.as_ref(), rhs_name))
-}
-
-/// Orient equalities `a = b` between two discrete-valued coordinates whose
-/// left side is already defined by another equation.
-///
-/// Appendix B.1c owns a discrete-valued equation by its left-hand coordinate.
-/// An equality between two coordinates is symmetric, though, and MSL relies on
-/// that: `Modelica.StateGraph.Interfaces.CompositeStepState` declares
-/// `output Boolean suspend = false` *and* writes `suspend =
-/// subgraphStatePort.suspend`, so the second row is what defines
-/// `subgraphStatePort.suspend`. When `a` is the left side of some other row
-/// (or has a declaration binding) and `b` is the left side of none, the
-/// equality owns `b` with value `a`.
-/// Every other row keeps its written orientation.
-fn reversed_discrete_equalities(
-    flat: &flat::Model,
-    roles: &HashMap<VarName, PlannedRole>,
-) -> HashSet<usize> {
-    let mut left_counts = HashMap::<&VarName, usize>::new();
-    // A declaration binding (`Boolean suspend = false`) is a definition too.
-    for (name, variable) in &flat.variables {
-        if variable.binding.is_some() && matches!(roles.get(name), Some(PlannedRole::DiscreteValue))
-        {
-            *left_counts.entry(name).or_default() += 1;
-        }
-    }
-    for equation in &flat.equations {
-        if matches!(equation.origin, flat::EquationOrigin::Connection { .. }) {
-            continue;
-        }
-        if let Expression::Binary {
-            op: OpBinary::Sub,
-            lhs,
-            ..
-        } = &equation.residual
-            && let Some((name, subscripts)) = discrete_value_base_reference(lhs, roles)
-            && subscripts.is_empty()
-        {
-            *left_counts.entry(name).or_default() += 1;
-        }
-    }
-    flat.equations
-        .iter()
-        .enumerate()
-        .filter(|(_, equation)| {
-            !matches!(
-                equation.origin,
-                flat::EquationOrigin::Connection { .. } | flat::EquationOrigin::Binding { .. }
-            )
-        })
-        .filter_map(|(row, equation)| {
-            let (lhs, rhs_name) = discrete_value_equality(&equation.residual, roles)?;
-            let (lhs_name, _) = discrete_value_base_reference(lhs, roles)?;
-            let defined_elsewhere = left_counts.get(lhs_name).copied().unwrap_or(0) > 1;
-            let rhs_free = !left_counts.contains_key(rhs_name)
-                && !matches!(flat.variables[rhs_name].causality, Causality::Input(_));
-            (defined_elsewhere && rhs_free).then_some(row)
-        })
-        .collect()
 }
 
 struct SelectedPrefix {
@@ -683,7 +571,7 @@ fn pack_connection_prefix(values: &[Expression], extents: &[usize], span: Span) 
         .collect();
     Expression::Array {
         elements,
-        is_matrix: false,
+        kind: rumoca_core::ArrayConstructor::Array,
         span,
     }
 }
@@ -720,6 +608,14 @@ pub(super) fn discrete_connection_ranks(
         {
             producers.insert(plan.target.clone());
         }
+        // An element equation `x[i] = e` defines the coordinate `x` outside the
+        // connection graph, so `x` is a producer that orients any connections
+        // from it outward. Without this, a discrete array fed by a for-loop of
+        // element equations looks source-free and a fan-out to same-causality
+        // consumers cannot be oriented from the true producer.
+        if let Some((target, _, _)) = discrete_element_assignment(equation, roles) {
+            producers.insert(target.clone());
+        }
     }
     producers.extend(event_targets(flat));
     producers.extend(algorithm_targets(flat));
@@ -738,19 +634,12 @@ pub(super) fn discrete_connection_ranks(
         else {
             continue;
         };
-        let Some((lhs, _)) = discrete_connection_endpoint(lhs, roles) else {
+        let Some((lhs, _)) = discrete_value_base_reference(lhs, roles) else {
             continue;
         };
-        let Some((rhs, _)) = discrete_connection_endpoint(rhs, roles) else {
+        let Some((rhs, _)) = discrete_value_base_reference(rhs, roles) else {
             continue;
         };
-        // MLS §4.4.2.2: a top-level input is driven by the environment, so it
-        // is the producer of every discrete-valued connector it connects to.
-        for endpoint in [lhs, rhs] {
-            if matches!(roles.get(endpoint), Some(PlannedRole::Input)) {
-                producers.insert(endpoint.clone());
-            }
-        }
         neighbors.entry(lhs.clone()).or_default().push(rhs.clone());
         neighbors.entry(rhs.clone()).or_default().push(lhs.clone());
     }
@@ -759,6 +648,27 @@ pub(super) fn discrete_connection_ranks(
         .map(|producer| (producer, 0usize))
         .collect::<HashMap<_, _>>();
     let mut frontier = ranks.keys().cloned().collect::<Vec<_>>();
+    spread_connection_ranks(&mut ranks, frontier.clone(), &neighbors);
+    // A connection set no producer reaches is fed by a plain alias `a = b`
+    // whose written side already has its own definition (a binding
+    // modification, as `CompositeStepState.suspend = subgraphStatePort.suspend`
+    // of `Modelica.StateGraph`): the alias defines `b`, so `b` produces the
+    // set (see `alias_orientation`).
+    frontier = alias_orientation::alias_fed_connection_sources(flat, roles, &ranks, &neighbors);
+    for source in &frontier {
+        ranks.insert(source.clone(), 0);
+    }
+    spread_connection_ranks(&mut ranks, frontier, &neighbors);
+    ranks
+}
+
+/// Breadth-first connection distance from `frontier` to every coordinate its
+/// connection sets reach that has no rank yet.
+fn spread_connection_ranks(
+    ranks: &mut HashMap<VarName, usize>,
+    mut frontier: Vec<VarName>,
+    neighbors: &HashMap<VarName, Vec<VarName>>,
+) {
     let mut cursor = 0usize;
     while let Some(current) = frontier.get(cursor).cloned() {
         cursor += 1;
@@ -771,7 +681,6 @@ pub(super) fn discrete_connection_ranks(
             frontier.push(neighbor.clone());
         }
     }
-    ranks
 }
 
 /// Turn an element connection into a whole-coordinate definition only when
@@ -794,37 +703,11 @@ fn full_aggregate_connection_value<'flat>(
     for _ in subscripts.iter().rev() {
         aggregate = Expression::Array {
             elements: vec![aggregate],
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: owner,
         };
     }
     Ok(Cow::Owned(aggregate))
-}
-
-/// An element equation `y[1] = e` whose selection denotes all of `y` (every
-/// selected axis is a singleton, e.g. `Boolean y[1]`) defines the whole
-/// coordinate. Aggregate coverage skips it for that reason, so it is owned
-/// here as the whole-coordinate definition `y = {e}`.
-fn whole_aggregate_element_assignment<'flat>(
-    flat: &'flat flat::Model,
-    equation: &'flat flat::Equation,
-    roles: &HashMap<VarName, PlannedRole>,
-) -> Result<Option<DiscreteValueAssignmentPlan<'flat>>, ToDaeError> {
-    let Some((target, subscripts, value)) = discrete_element_assignment(equation, roles) else {
-        return Ok(None);
-    };
-    let variable = &flat.variables[target];
-    if !selection_denotes_whole_aggregate(variable, subscripts) {
-        return Ok(None);
-    }
-    let value = full_aggregate_connection_value(variable, subscripts, value, equation.span)?;
-    Ok(Some(DiscreteValueAssignmentPlan {
-        target,
-        generated: true,
-        value,
-        scalar_count: None,
-        ordered_scalar_self_dependencies: false,
-    }))
 }
 
 fn selection_denotes_whole_aggregate(target: &flat::Variable, subscripts: &[Subscript]) -> bool {
@@ -835,30 +718,6 @@ fn selection_denotes_whole_aggregate(target: &flat::Variable, subscripts: &[Subs
             .all(|(subscript, extent)| {
                 *extent == 1 && matches!(subscript, Subscript::Index { value: 1, .. })
             })
-}
-
-/// A discrete-connection endpoint: a discrete-value coordinate, or an
-/// external input (the environment's value) connected to one.
-///
-/// A connection equation between two external inputs defines nothing, so an
-/// input endpoint is only accepted when the other side is a discrete value;
-/// `oriented_discrete_connection` enforces that by refusing an input target.
-fn discrete_connection_endpoint<'flat>(
-    expression: &'flat Expression,
-    roles: &HashMap<VarName, PlannedRole>,
-) -> Option<(&'flat VarName, &'flat [Subscript])> {
-    let Expression::VarRef {
-        name, subscripts, ..
-    } = expression
-    else {
-        return None;
-    };
-    let name = name.var_name();
-    matches!(
-        roles.get(name),
-        Some(PlannedRole::DiscreteValue | PlannedRole::Input)
-    )
-    .then_some((name, subscripts.as_slice()))
 }
 
 fn discrete_value_base_reference<'flat>(
@@ -882,16 +741,6 @@ pub(in crate::construction) fn discrete_value_assignment<'flat>(
     owner: Span,
 ) -> Result<Option<DiscreteValueAssignmentPlan<'flat>>, ToDaeError> {
     match expression {
-        // A nested if-equation branch reaches Flat as `(if ... ) - 0.0`: the
-        // conditional residual minus a zero right side.
-        Expression::Binary {
-            op: OpBinary::Sub,
-            lhs,
-            rhs,
-            ..
-        } if matches!(lhs.as_ref(), Expression::If { .. }) && is_zero_literal(rhs) => {
-            discrete_value_assignment(lhs, roles, owner)
-        }
         Expression::Binary {
             op: OpBinary::Sub,
             lhs,
@@ -974,44 +823,6 @@ pub(in crate::construction) fn discrete_value_assignment<'flat>(
     }
 }
 
-/// A materialized family of discrete-value assignments to distinct targets
-/// (`legs[j].on = sel[j]` over a component array): every materialized row
-/// defines its own target, and the discrete topology plans each as its own
-/// owner, so the rows are lowered one by one and the template is not. The
-/// rows decide, not the template: `legs[j].on` names no coordinate until `j`
-/// is a number.
-///
-/// Element assignments into one array target are excluded: those rows are
-/// already validated and owned together through the aggregate pass.
-pub(in crate::construction) fn row_owned_discrete_family(
-    family: &flat::StructuredEquationFamily,
-    equations: &[flat::Equation],
-    roles: &HashMap<VarName, PlannedRole>,
-) -> bool {
-    let Some(template) = family.template.as_ref() else {
-        return false;
-    };
-    let Ok(points) = family.domain.scalar_count() else {
-        return false;
-    };
-    let Some(rows) = points
-        .checked_mul(family.equations_per_point)
-        .and_then(|count| family.first_equation_index.checked_add(count))
-        .and_then(|end| equations.get(family.first_equation_index..end))
-    else {
-        return false;
-    };
-    family.interiors_materialized
-        && !rows.is_empty()
-        && !structured_discrete_element_assignments(&template.body, roles)
-        && rows.iter().all(|row| {
-            matches!(
-                discrete_value_assignment(&row.residual, roles, row.span),
-                Ok(Some(_))
-            )
-        })
-}
-
 pub(in crate::construction) fn structured_discrete_assignments<'flat>(
     bodies: &'flat [Expression],
     roles: &HashMap<VarName, PlannedRole>,
@@ -1039,19 +850,6 @@ pub(in crate::construction) fn structured_discrete_assignments<'flat>(
     ))
 }
 
-fn is_zero_literal(expression: &Expression) -> bool {
-    matches!(
-        expression,
-        Expression::Literal {
-            value: Literal::Integer(0),
-            ..
-        }
-    ) || matches!(
-        expression,
-        Expression::Literal { value: Literal::Real(value), .. } if *value == 0.0
-    )
-}
-
 fn expression_mentions_discrete_value(
     expression: &Expression,
     roles: &HashMap<VarName, PlannedRole>,
@@ -1068,6 +866,15 @@ fn assignment_side_mentions_discrete_value(
     roles: &HashMap<VarName, PlannedRole>,
 ) -> bool {
     match expression {
+        Expression::VarRef { name, .. } => {
+            matches!(roles.get(name.var_name()), Some(PlannedRole::DiscreteValue))
+        }
+        Expression::Index { base, .. } | Expression::Unary { rhs: base, .. } => {
+            assignment_side_mentions_discrete_value(base, roles)
+        }
+        Expression::Array { elements, .. } | Expression::Tuple { elements, .. } => elements
+            .iter()
+            .any(|value| assignment_side_mentions_discrete_value(value, roles)),
         Expression::If {
             branches,
             else_branch,
@@ -1080,6 +887,95 @@ fn assignment_side_mentions_discrete_value(
         }
         _ => expression_mentions_discrete_value(expression, roles),
     }
+}
+
+/// Whether `body` is `{a1, ..., an} - e` over unsubscripted discrete-valued
+/// variables: an array equation whose element equations each define one `ai`.
+pub(in crate::construction) fn discrete_element_array_body(
+    body: &Expression,
+    roles: &HashMap<VarName, PlannedRole>,
+) -> bool {
+    let Expression::Binary {
+        op: OpBinary::Sub,
+        lhs,
+        ..
+    } = body
+    else {
+        return false;
+    };
+    let Expression::Array { elements, .. } = lhs.as_ref() else {
+        return false;
+    };
+    !elements.is_empty()
+        && elements.iter().all(|element| {
+            matches!(
+                element,
+                Expression::VarRef { name, subscripts, .. }
+                    if subscripts.is_empty()
+                        && matches!(roles.get(name.var_name()), Some(PlannedRole::DiscreteValue))
+            )
+        })
+}
+
+/// The element equations of `{a1, ..., an} = e` when every `ai` is an
+/// unsubscripted scalar discrete-valued variable (MLS 3.7 §10.6.1: an array
+/// equation is its element equations; the component-array slice
+/// `split.set = fill(inPort.set, n)` of `Modelica.StateGraph.Parallel` flattens
+/// to this form).
+fn discrete_element_assignments<'flat>(
+    flat: &'flat flat::Model,
+    residual: &'flat Expression,
+    roles: &HashMap<VarName, PlannedRole>,
+) -> Option<Vec<DiscreteValueAssignmentPlan<'flat>>> {
+    let Expression::Binary {
+        op: OpBinary::Sub,
+        lhs,
+        rhs,
+        span,
+    } = residual
+    else {
+        return None;
+    };
+    let Expression::Array { elements, .. } = lhs.as_ref() else {
+        return None;
+    };
+    let targets = elements
+        .iter()
+        .map(|element| match element {
+            Expression::VarRef {
+                name, subscripts, ..
+            } if subscripts.is_empty()
+                && matches!(roles.get(name.var_name()), Some(PlannedRole::DiscreteValue))
+                && flat
+                    .variables
+                    .get(name.var_name())
+                    .is_some_and(|variable| variable.dims.is_empty()) =>
+            {
+                Some(name.var_name())
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if targets.is_empty() {
+        return None;
+    }
+    Some(
+        targets
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, target)| DiscreteValueAssignmentPlan {
+                target,
+                value: Cow::Owned(Expression::Index {
+                    base: rhs.clone(),
+                    subscripts: vec![rumoca_core::Subscript::index(ordinal as i64 + 1, *span)],
+                    span: *span,
+                }),
+                generated: true,
+                scalar_count: None,
+                ordered_scalar_self_dependencies: false,
+            })
+            .collect(),
+    )
 }
 
 fn invalid_discrete_lhs(span: Span) -> ToDaeError {
@@ -1141,8 +1037,16 @@ pub(super) fn defined_discrete_targets(
     roles: &HashMap<VarName, PlannedRole>,
     connection_ranks: &HashMap<VarName, usize>,
     aggregate_connections: &AggregateDiscreteConnections,
+    record_equations: &HashMap<usize, RecordEquationPlan>,
 ) -> Result<HashSet<VarName>, ToDaeError> {
     let mut targets = event_targets(flat);
+    for plan in record_equations.values() {
+        targets.extend(
+            plan.field_systems(roles)
+                .filter(|(_, system)| *system != RecordFieldSystem::Continuous)
+                .map(|(field, _)| field.target.clone()),
+        );
+    }
     targets.extend(algorithm_targets(flat).into_iter().filter(|target| {
         matches!(
             roles.get(target),
@@ -1164,6 +1068,22 @@ pub(super) fn defined_discrete_targets(
             }
             EquationPartition::DiscreteValue(plan) => {
                 targets.insert(plan.target.clone());
+            }
+            EquationPartition::DiscreteElements(plans) => {
+                targets.extend(plans.into_iter().map(|plan| plan.target.clone()));
+            }
+            EquationPartition::MultiOutput { receivers, .. } => {
+                targets.extend(
+                    receivers
+                        .into_iter()
+                        .filter(|receiver| {
+                            matches!(
+                                roles.get(*receiver),
+                                Some(PlannedRole::DiscreteReal | PlannedRole::DiscreteValue)
+                            )
+                        })
+                        .cloned(),
+                );
             }
             EquationPartition::ConsumedDiscreteValue => {}
         }
@@ -1190,4 +1110,22 @@ fn discrete_references(
         )
     });
     references
+}
+
+fn discrete_connection_endpoint<'flat>(
+    expression: &'flat Expression,
+    roles: &HashMap<VarName, PlannedRole>,
+) -> Option<(&'flat VarName, &'flat [Subscript])> {
+    let Expression::VarRef {
+        name, subscripts, ..
+    } = expression
+    else {
+        return None;
+    };
+    let name = name.var_name();
+    matches!(
+        roles.get(name),
+        Some(PlannedRole::DiscreteValue | PlannedRole::Input)
+    )
+    .then_some((name, subscripts.as_slice()))
 }

@@ -18,28 +18,28 @@ This document catalogs the implicit and explicit contracts from the Modelica Lan
 |---------|-------|---------|
 | §1. Key Definitions | 46–57 | MLS terminology (component, element, flattening, etc.) |
 | §2. Compilation Pipeline | 58–73 | Source → Class Tree → Instance Tree → Flat → DAE → Simulation |
-| §3. Data Structures | 74–325 | Class tree, instance tree, modification env, connection set, DAE, type attributes, variability, class types, prefixes, arrays, state machines |
-| §4.1 LEX contracts | 326–345 | Contract catalog heading + lexical rules (13 contracts) |
-| §4.2 DECL contracts | 346–386 | Declaration rules (36 contracts) |
-| §4.3 INST contracts | 387–444 | Instantiation rules (53 contracts) |
-| §4.4 EXPR contracts | 445–489 | Expression/operator rules (40 contracts) |
-| §4.5 EQN contracts | 490–532 | Equation rules (38 contracts) |
-| §4.6 ALG contracts | 533–554 | Algorithm rules (17 contracts) |
-| §4.7 CONN contracts | 555–589 | Connection rules (30 contracts) |
-| §4.8 FUNC contracts | 590–632 | Function rules (38 contracts) |
-| §4.9 TYPE contracts | 633–672 | Type/interface rules (35 contracts) |
-| §4.10 ARR contracts | 673–719 | Array rules (42 contracts) |
-| §4.11 PKG contracts | 720–736 | Package/import rules (12 contracts) |
-| §4.12 OPREC contracts | 737–752 | Operator record rules (11 contracts) |
-| §4.13 SIM contracts | 753–767 | Simulation rules (10 contracts) |
-| §4.14 CLK contracts | 768–792 | Clock/synchronous rules (20 contracts) |
-| §4.15 STRM contracts | 793–808 | Stream connector rules (11 contracts) |
-| §4.16 SM contracts | 809–861 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
-| §4.17 ANN contracts | 862–881 | Annotation rules (15 contracts) |
-| §4.18 UNIT contracts | 882–897 | Unit expression rules (9 contracts) |
-| §5. Contract Summary | 898–923 | Category counts and totals |
-| §6. Compiler Phases | 924–973 | Phase input/output mapping |
-| §7. MLS Chapter Index | 974–1001 | MLS chapter → contract category mapping |
+| §3. Data Structures | 74–331 | Class tree, instance tree, modification env, connection set, DAE, type attributes, variability, class types, prefixes, arrays, state machines |
+| §4.1 LEX contracts | 332–351 | Contract catalog heading + lexical rules (13 contracts) |
+| §4.2 DECL contracts | 352–393 | Declaration rules (37 contracts) |
+| §4.3 INST contracts | 394–456 | Instantiation rules (58 contracts) |
+| §4.4 EXPR contracts | 457–502 | Expression/operator rules (41 contracts) |
+| §4.5 EQN contracts | 503–547 | Equation rules (40 contracts) |
+| §4.6 ALG contracts | 548–569 | Algorithm rules (18 contracts) |
+| §4.7 CONN contracts | 570–604 | Connection rules (30 contracts) |
+| §4.8 FUNC contracts | 605–649 | Function rules (40 contracts) |
+| §4.9 TYPE contracts | 650–690 | Type/interface rules (36 contracts) |
+| §4.10 ARR contracts | 691–739 | Array rules (44 contracts) |
+| §4.11 PKG contracts | 740–756 | Package/import rules (12 contracts) |
+| §4.12 OPREC contracts | 757–772 | Operator record rules (11 contracts) |
+| §4.13 SIM contracts | 773–787 | Simulation rules (10 contracts) |
+| §4.14 CLK contracts | 788–812 | Clock/synchronous rules (20 contracts) |
+| §4.15 STRM contracts | 813–830 | Stream connector rules (13 contracts) |
+| §4.16 SM contracts | 831–927 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
+| §4.17 ANN contracts | 928–949 | Annotation rules (17 contracts) |
+| §4.18 UNIT contracts | 950–965 | Unit expression rules (9 contracts) |
+| §5. Contract Summary | 966–991 | Category counts and totals |
+| §6. Compiler Phases | 992–1041 | Phase input/output mapping |
+| §7. MLS Chapter Index | 1042–1069 | MLS chapter → contract category mapping |
 
 ---
 
@@ -132,6 +132,12 @@ Equation forms:
 ### 3.12 Spanning Tree ([MLS §9.4](https://specification.modelica.org/maint/3.7/connectors-and-connections.html))
 
 Constructed from the virtual connection graph by "removing optional spanning tree edges." Contains all nodes with selected root nodes and required spanning-tree edges.
+
+MLS §9.4 lets the tool choose among the valid spanning trees. Rumoca's choice:
+
+| Rule | Owner/Where | Brief Justification |
+|---|---|---|
+| Select one spanning forest per graph. Required (`Connections.branch`) edges are admitted first; optional edges are then admitted in ascending order of (smaller, larger) endpoint distance from the nearest root of their connected component, ties broken by the lexicographically ordered endpoint names; an edge is broken when it would close a cycle or join two definite-root trees. Distances are graph distances over all required and optional edges from the component's definite roots, or from the root that `isRoot` selects when the component has none. `Connections.rooted`/`isRoot` evaluation and connection-equation emission consume this one forest: every selected optional edge keeps its ordinary equalities, every broken one is replaced by `equalityConstraint` (omitted when zero-width). | `rumoca-phase-flatten` `vcg::build_vcg`, `vcg::spanning_forest` | The tree depends only on the graph and node names, never on `connect` statement order; a graph without overconstrained loops breaks no edge and emits the same equations as before, and the branch orientation `rooted` reports is exactly the tree whose loops the emitted equations cut; two independently chosen forests leave `if Connections.rooted(...)` branches inconsistent with the cut |
 
 ### 3.13 Root Nodes ([MLS §9.4](https://specification.modelica.org/maint/3.7/connectors-and-connections.html))
 
@@ -383,12 +389,13 @@ Defines state-to-state transitions with priority and timing control.
 | DECL-034 | Array class extends | §4.6.2 | "Not legal to combine equations/algorithms/components with extends from array class or simple type" |
 | DECL-035 | Local class flattenable | §4.6.3 | "Local class should be statically flattenable with partially flattened enclosing class" |
 | DECL-036 | Type class contents | §4.7 | "type – May only be predefined types, enumerations, array of type, or classes extending from type"
+| DECL-037 | Structural parameters | §10.1, §8.3.3 | "The number of dimensions and the dimension sizes are fixed at translation"; a for-equation range is evaluated at translation. Rumoca: an ordinary parameter read by a declared array dimension or a for-equation range, directly or through a `final` or `Evaluate = true` parameter whose binding reads it (a `size`/`ndims` operand contributes only its fixed shape, so `size` of an input array is constant), is structural: flatten records the use (`flat::ParameterBranchSelection` with `ArrayDimension`/`ForRange`), DAE construction marks it evaluable with every parameter its binding reads (SPEC_0040 DAE-C22), WD001 names it at the use, and it exports as `calculatedParameter`; an ordinary parameter no structure reads stays settable. Tested in `suite_core/structural_parameters.rs` |
 
 ### 4.3 Instantiation Contracts (INST)
 
 | ID | Contract | MLS | Requirement |
 |----|----------|-----|-------------|
-| INST-001 | Modification context | §7.2 | "Modifier value found in the context in which the modifier occurs" |
+| INST-001 | Modification context | §7.2 | "Modifier value found in the context in which the modifier occurs". Rumoca: flatten qualifies a modification binding from the modifier's scope, and translation-time evaluation (branch selection, ranges, sizes) reads those names from the root before the modified component's scope, so `c(p = p)` reads the enclosing `p`, never `c.p` or its declaration default. Tested in `suite_core/modifier_value_context.rs` |
 | INST-002 | Modification merging | §7.2.3 | "Outer modifiers override inner modifiers" |
 | INST-003 | Single modification | §7.2.4 | "Two arguments of a modification shall not modify the same element, attribute, or description-string" |
 | INST-004 | Unnamed extends nodes | §5.6 | Preserve declaration order in inheritance |
@@ -441,6 +448,11 @@ Defines state-to-state transitions with priority and timing control.
 | INST-051 | Constraining annotation conflict | §7.3.2.1 | "Error if annotations appear on both definition and constraining clause" |
 | INST-052 | Redeclaration dimension match | §7.3.2 | "Redeclaration must have same number of dimensions as original element" |
 | INST-053 | Conditional component removal | §5.6.2 | "Conditional components with false condition are removed and not part of simulation model"
+| INST-054 | Automatic inner creation | §5.4 | "If a unique non-partial class is used for all outer declarations of the same name lacking a matching inner declaration, an inner declaration of that class is automatically added at the top of the model and a diagnostic is given" (rumoca: WI013; conflicting classes EI015, partial class EI012) |
+| INST-055 | Extends redeclaration replaces element | §7.3 | "A redeclaration in the modification of an extends-clause replaces the inherited element; the derived class and its descendants see the replacing class under the element name" |
+| INST-056 | Extends-modified package constant in sibling bindings | §7.2 | Modifications of an extends clause apply to the inherited elements, so a constant an extends modification binds (`extends TableBased(tableDensity = [...])`) has that value wherever the package is read, including inside the binding of a sibling constant (`poly_rho = fitting(tableDensity[:, 1], ...)`) and through an element selection. Rumoca: constant substitution reads a constant's binding in the package it is exposed through and resolves modified constants, whole or indexed, from that scope. Tested in `suite_core/fluid_function_data.rs` |
+| INST-057 | Occurrence-selected member class | §7.3 | A redeclaration modifies one occurrence, so a component declared through a replaceable alias (`Medium.BaseProperties medium`) therefore has its class selected per occurrence, and a reference `tank.medium.T` written outside `tank` (in an equation or a modifier binding) names the member of the class that occurrence of `tank.medium` selected; occurrences of one declaration that select different classes have no single member tail and are rejected |
+| INST-058 | Redeclare value through the enclosing occurrence | §7.3 | A redeclare value that names a replaceable element of the enclosing class (`Inner a(redeclare package Medium = MA)`) denotes the class that occurrence of the enclosing class selected for `MA`, which an outer redeclaration may have replaced, never the default of the lexical declaration |
 
 ### 4.4 Expression/Operator Contracts (EXPR)
 
@@ -457,7 +469,7 @@ Defines state-to-state transitions with priority and timing control.
 | EXPR-009 | cardinality restrictions | §3.7 | "Shall not be applied to expandable connectors or arrays of connectors" |
 | EXPR-010 | spatialDistribution range | §3.7 | "initialPoints array shall span entire range from 0 to 1" |
 | EXPR-011 | spatialDistribution sorted | §3.7 | "initialPoints must be sorted in non-descending order" |
-| EXPR-012 | Variability assignment | §3.8 | "Expression must not have higher variability than assigned component" |
+| EXPR-012 | Variability assignment | §3.8 | "Expression must not have higher variability than assigned component". Rumoca: a Boolean, Integer, String, or enumeration variable defined outside a when-clause by an expression that reads `time` or a continuous variable outside an event-generating relation (§3.8.5: relations and `ceil`/`floor`/`div`/`integer` outside `noEvent`/`smooth`; `mod` and `rem` generate events but are not discrete-time; `pre`, `edge`, `change`, `sample`, `initial`, `terminal`, and calls whose arguments are all discrete-time) is refused (ED023). Rumoca (documented deviation, accepted extension that MSL 4.1 relies on: `Media.Water` binds the Integer `ThermodynamicState.phase` field from `setState_phX(p, h)` of continuous port values, e.g. `flowModel.states` in `Fluid.Pipes.StaticPipe`): such a definition is accepted when nothing reads the variable, proven at DAE construction. A read is any occurrence of the variable, of a component that contains it, or of an element of it in an equation, binding, attribute, assertion, algorithm, when-clause, or `pre`, except a plain reference passed to a function input the callee never reads (MSL `density(state)` reads only `state.d`; an input of an external, impure, or derivative-annotated function is always read). The variable cannot influence the simulation, so it is an observation: the DAE marks its owner observed and the solver evaluates it at every output point instead of holding it between events, as OpenModelica reports it. A definition whose variable is read stays refused (ED023). Tested in `suite_core/discrete_time_definitions.rs` and `expr_contracts.rs` |
 | EXPR-013 | end only in subscripts | §10.5 | "Expression 'end' may only appear inside array subscripts" |
 | EXPR-014 | Non-associative chaining | §3.2 | "Non-associative operators (^, :, relational, ?:) cannot be chained: 1 < 2 < 3 is invalid" |
 | EXPR-015 | Unary additive position | §3.2 | "Additive unary expressions only allowed in first term of sum: 2*-2 is illegal" |
@@ -475,17 +487,18 @@ Defines state-to-state transitions with priority and timing control.
 | EXPR-027 | delay expr type | §3.7.2 | "Expression shall be subtype of Real, Integer, Boolean, or enumeration" |
 | EXPR-028 | delay time type | §3.7.2 | "Time arguments shall be subtypes of Real" |
 | EXPR-029 | delay delayTime param | §3.7.2 | "When delayMax not provided, delayTime > 0 shall be parameter expression" |
-| EXPR-030 | spatialDistribution params | §3.7.4.1 | "initialPoints and initialValues shall be parameter expressions of equal size" |
-| EXPR-031 | spatialDistribution no vectorize | §3.7.4.1 | "Operator cannot be vectorized according to §12.4.6" |
-| EXPR-032 | cardinality scope | §3.7.4.2 | "Should only be used in condition of assert and if-statements without connect" |
-| EXPR-033 | cardinality not in function | §3.7.4.2 | "cardinality operator not allowed inside function classes" |
-| EXPR-034 | homotopy types | §3.7.4.3 | "Scalar expressions actual and simplified are subtypes of Real" |
+| EXPR-030 | spatialDistribution params | §3.7.2.2 | "initialPoints and initialValues shall be parameter expressions of equal size" |
+| EXPR-031 | spatialDistribution no vectorize | §3.7.2.2 | "Operator cannot be vectorized according to §12.4.6" |
+| EXPR-032 | cardinality scope | §3.7.4.1 | "Should only be used in condition of assert and if-statements without connect" |
+| EXPR-033 | cardinality not in function | §3.7.4.1 | "cardinality operator not allowed inside function classes" |
+| EXPR-034 | homotopy types | §3.7.4.2 | "Scalar expressions actual and simplified are subtypes of Real". An Integer operand is a Real expression by the implicit Integer-to-Real conversion (§10.6.13), so `homotopy(if s > 0 then s/rho else 0, 0)` is a Real homotopy; both operands share one shape and the result is Real. |
 | EXPR-035 | inStream not in function | §3.7.4 | "inStream operator not allowed inside function classes" |
 | EXPR-036 | actualStream not in function | §3.7.4 | "actualStream operator not allowed inside function classes" |
 | EXPR-037 | pre not in function | §3.7.5 | "pre operator is not allowed inside function classes" |
 | EXPR-038 | smooth differentiability | §3.7.5 | "smooth(p, expr) treats expression as p times continuously differentiable" |
 | EXPR-039 | noEvent event suppression | §3.3 | "noEvent suppresses event generation for relational operators within its scope" |
-| EXPR-040 | Event triggering operators | §3.7.2 | "div, ceil, floor, integer can only change values at events and will trigger events as needed" |
+| EXPR-040 | Event triggering operators | §3.7.2 | "div, ceil, floor, integer can only change values at events and will trigger events as needed". Rumoca: a model-level `floor`, `ceil`, or `integer` of a varying argument `x` outside `noEvent`/`smooth` owns one state-event root on `sin(pi*x) >= 0`, so a discrete target defined from it changes at each integer crossing; function bodies generate no events. Tested in `suite_core/integer_step_events.rs` |
+| EXPR-041 | smooth event freedom | §3.7.5 | "A tool is free to not generate events for expressions inside smooth. However, smooth does not guarantee that no events will be generated." Rumoca takes the freedom except for a relation inside `smooth(0, ..)` whose operands are unknowns of its own algebraic block, which owns an MLS §8.5 event (SPEC_0044 ME-EVENT-008) |
 
 ### 4.5 Equation Contracts (EQN)
 
@@ -526,9 +539,11 @@ Defines state-to-state transitions with priority and timing control.
 | EQN-033 | Perfect matching | §8.4 | "There must exist a perfect matching of variables to equations after flattening" |
 | EQN-034 | Discrete persistence | §8.4 | "Discrete-time variables keep their values until explicitly changed" |
 | EQN-035 | Init pre equality | §8.6 | "Before start of integration, for all variables v, v = pre(v) must be guaranteed" |
-| EQN-036 | Assert evaluable level | §8.3.7 | "assertionLevel is an optional evaluable expression" |
+| EQN-036 | Assert evaluable level | §8.3.7 | "assertionLevel is an optional evaluable expression". "If the level is AssertionLevel.warning, the current evaluation is not aborted" and "the assert(..) statement shall have no influence on the behavior of the model". For example, "by evaluating the condition to report the message an event is not triggered". Implemented: flattening settles a level that names a predefined literal by its declaration identity; `AssertionLevel.error` is the default level and any other level expression is a typed construction rejection (`UnsupportedAssertionLevel`). A warning-level condition is evaluated as `noEvent(condition)`: it owns no relation, condition memory, root, or step-control influence, never aborts a call, event iteration, step, or transaction commit, and leaves the trace bit-identical. The run observes it at every settled event and every accepted output point and reports each site once, at its first observed violation, as SPEC_0008 `WX001` on the simulation result; generated FMI 2 and FMI 3 components log it once through the importer's logger at the warning status, at initialization, events, completed integrator steps, and co-simulation step ends. GALEC and eFMI export omit warnings, which have no behavior to represent; that target has no reporting channel. |
 | EQN-037 | When not in initial eq | §8.6 | "It is not allowed to use when-clauses in initial equation/algorithm sections" |
 | EQN-038 | Connections.branch scope | §8.3.3 | "Connections.branch/root/potentialRoot same restrictions as connect in for/if-equations"
+| EQN-039 | If-equation evaluable conditions | §8.3.4 | "The if-equations which do not have exclusively evaluable expressions as switching conditions shall satisfy the following: [...] Have the same number of equations in each branch, where the number of equations is defined as in definition 4.4." An ordinary parameter (MLS 3.7 §4.5: evaluable, and neither `final` nor `Evaluate = true`) is determined by the initialization problem, which §4.5 leaves to the tool, so a guard reading one over branches with the same scalar equation count and the same unknown incidence is kept as a run-time branch; otherwise the tool determines those parameters during translation instead (structural selection), publishes them non-settable, and warns at the equation (WD001). A guard reading a non-evaluable parameter (§4.5: `fixed = false`, `Evaluate = false`, or a binding that is not an evaluable expression) is never selected at translation, so an if-equation whose branches differ in equation count under such a guard is rejected |
+| EQN-040 | Initial discrete definitions | §8.6 | "During this phase, also the derivatives `der(...)` and the pre-variables `pre(...)` are interpreted as unknown algebraic variables. The initialization uses all equations and algorithms that are utilized in the intended operation." An initial equation `pre(m) = e` or `m = e` therefore determines the initialization value of a discrete `m` from the initialization solution, not only from parameters. Rumoca: for a discrete-valued `m` (Boolean, Integer, enumeration), `e` may read parameters, constants, `time`, inputs, states, and algebraics (directly or through a binding or connection); Solve applies the definition as an initialization update after the projection, and construction proves that its reads, expanded through matched algebraic definitions, derivative rows, and substituted bindings, reach no discrete or `pre` value, so the projection settles them independently of `m` (SPEC_0043 §4). A read that leads back to a discrete value is rejected rather than iterated; a definition reading `pre`, a derivative, or another discrete coordinate stays an initialization residual, and so does a discrete Real `m` defined from a continuous coordinate, which the projection solves simultaneously with it. A whole-array definition (`pre(reset) = fill(false, nReset)` in `Modelica.Blocks.Sources.RadioButtonSource`) owns the one row its row-major structured family materializes. An initial equation relating two whole discrete coordinates (`pre(newActive) = pre(localActive)` in `Modelica.StateGraph` steps) is settled through the equation section (SPEC_0040 DAE-C28): the coordinates that initial relations and plain aliases (`a = b`, `a = pre(b)`) join take the one value determined among them (`InitialStep`: `active = true`); none or two determined values are refused (ED013), never settled by a start value. Tested in `suite_core/initial_discrete_relations.rs`. Tested in `suite_core/initial_discrete_row_major_family.rs` |
 
 ### 4.6 Algorithm Contracts (ALG)
 
@@ -546,12 +561,12 @@ Defines state-to-state transitions with priority and timing control.
 | ALG-010 | When not in control | §11.2 | "When-statements shall not occur inside while/for/if in algorithms" |
 | ALG-011 | When discrete Boolean | §11.2 | "Expression of when-statement shall be discrete-time Boolean" |
 | ALG-012 | break scope | §11.2 | "break can only be used in while or for loop" |
-| ALG-013 | return scope | §11.2 | "return can only be used inside functions" |
+| ALG-013 | return scope | §11.2 | "return can only be used inside functions". A `return` ends the function's algorithm (§11.2.6): statements after a top-level `return` never run, a conditional all of whose branches return guards the statements after it, and a conditional only some of whose branches return (the else part of `Modelica.Fluid.Utilities.regRoot2_utility`) continues each non-returning branch with the statements after it. A further `return` after such a conditional, or one inside a loop, is a typed refusal. |
 | ALG-014 | terminate not in function | §11.2 | "terminate-statement shall not be used in functions" |
-| ALG-015 | Assert execution halt | §11.2.8.1 | "A failed assert stops the execution of the current algorithm" |
-| ALG-016 | For range fixed | §11.2.2 | "For-statement range expressions are evaluated once before entering loop" |
-| ALG-017 | LHS initialization | §11.1 | "Variables on the left-hand side of := must be initialized when algorithm is invoked"
-
+| ALG-015 | Assert execution halt | §11.2.8.1 | "A failed assert stops the execution of the current algorithm". An `assert` or `terminate` message is a String expression (§8.3.7, §8.3.8): literals, concatenation, `String(...)` conversions, and String parameters, which read as their declared value because the runtime owns no String storage (`Modelica.Blocks.Logical.TerminateSimulation.terminationText`); any other String-valued message is refused at its own span. |
+| ALG-016 | For range fixed | §11.2.2 | "For-statement range expressions are evaluated once before entering loop". Rumoca: an `initial algorithm` `for` whose range bounds read only literals, constants, and evaluable parameters unrolls into its iterations, each replayed with the index bound, so `y[i]` names the element coordinate `y[k]`; a range that reads a settable parameter is refused (ED013). Tested in `suite_core/initial_algorithm_test.rs` |
+| ALG-017 | LHS initialization | §11.1.2 | "Variables on the left-hand side of := must be initialized when algorithm is invoked". Rumoca: an event algorithm seeds every discrete target with its `pre` value (§11.1.2), so a read before the target's own definition is a history read and no current-value self-dependency in the Appendix B solved-form proof |
+| ALG-018 | While loop execution | §11.2.3 | "The body of a while-statement is executed as long as the condition is true". Rumoca: a function `while` loop with a proven iteration bound (a counter conjunct `k < N`, `k <= N` with `N` settled at translation, one top-level `k := k + d` with `d > 0` and otherwise only `k := N` before it, no `break`/`return`, and `k >= 1` proven by a subscript it indexes or a dominating literal assignment or declaration default) lowers to `for w in 1:N loop if c then S end if; end for`, exact because a false condition changes no value; a loop inside a conditional branch runs as statements guarded by the branch's immutable guard, and the loop-free remainder stays one conditional. Any other `while` keeps its typed rejection. Tested in `suite_core/function_while_loops.rs` |
 ### 4.7 Connection Contracts (CONN)
 
 | ID | Contract | MLS | Requirement |
@@ -559,7 +574,7 @@ Defines state-to-state transitions with priority and timing control.
 | CONN-001 | Homogeneity | §9.2 | "Connection set shall contain either only flow or only non-flow variables" |
 | CONN-002 | Type matching | §9.2 | "Matched primitive components must have the same primitive types" |
 | CONN-003 | Flow-to-flow | §9.2 | "Flow variables may only connect to other flow variables" |
-| CONN-004 | Single source | §9.2 | "At most one inside output connector or one public outside input connector" |
+| CONN-004 | Single source | §9.2 | "At most one inside output connector or one public outside input connector". Rumoca: the equalities of a discrete-valued connection set are oriented away from its one producer (a defined coordinate), each defining the member farther from it; a set whose output member is the right side of a plain alias `a = b` whose `a` already has a definition (`Modelica.StateGraph.Interfaces.CompositeStepState.suspend = subgraphStatePort.suspend` under the composite step's binding) is produced by that member through the reversed alias (MLS Appendix B). Tested in `suite_core/discrete_alias_fed_connections.rs` |
 | CONN-005 | Quantity matching | §9.2 | "Variables with non-empty quantity attribute must match" |
 | CONN-006 | No outer-to-outer | §9.2 | "Cannot connect two connectors of outer elements" |
 | CONN-007 | Connector not parameter | §9.1 | "Connector component shall not be declared with parameter or constant" |
@@ -604,7 +619,7 @@ Defines state-to-state transitions with priority and timing control.
 | FUNC-011 | No Clock components | §12.2 | "Function may not contain components of type Clock" |
 | FUNC-012 | No inner/outer | §12.2 | "Function elements shall not have prefixes inner or outer" |
 | FUNC-013 | Non-partial for simulation | §12 | "For simulation, function shall not be partial" |
-| FUNC-014 | Single algorithm/external | §12.2 | "Function can have at most one algorithm section or one external function interface" |
+| FUNC-014 | Single algorithm/external | §12.2 | "Function can have at most one algorithm section or one external function interface". MLS 3.7 wording: "A function can have at most one algorithm section or one external function interface (not both), which, if present, is the body of the function." Rumoca: the algorithm sections a function declares and inherits are counted together, so a `function extends` (including `redeclare function extends`) that adds a section to a base with one is refused (EF035); a function that only modifies an inherited body is accepted. Tested in `suite_core/function_single_body.rs` |
 | FUNC-015 | Component types | §12.2 | "Function must not contain model, block, operator, or connector components" |
 | FUNC-016 | Not in connections | §12.2 | "Functions shall not be used in connections" |
 | FUNC-017 | Return in algorithm only | §12.1.2 | "Return statement can only be used in an algorithm section of a function" |
@@ -614,21 +629,23 @@ Defines state-to-state transitions with priority and timing control.
 | FUNC-021 | Impure inheritance | §12.3 | "If function declared impure, any extending function shall be declared impure" |
 | FUNC-022 | Impure call scope | §12.3 | Stated of the written prefix: "With the prefix keyword impure it is stated that a Modelica function is impure and it is only allowed to call such a function from within: Another function marked with the prefix impure. A when-equation. A when-statement. pure(impureFunction(…)). Initial equations and initial algorithms. Binding equations for components declared as parameter. Binding equations for external objects." Rumoca enforces the first three plus initial sections and parameter bindings. `pure(…)` is recognized and erased during lowering, but it does not yet suppress the callee purity check (that needs a Flat-visible call-site marker; task #57), so `pure(impureFunction(…))` is still rejected by Resolve. External-object bindings are not yet constructible (ED019). Neither is advertised in the diagnostics as an accepting context while that holds. |
 | FUNC-023 | Binding no cycles | §12.4.4 | "Binding execution order must not have cycles" |
-| FUNC-024 | Uninitialized error | §12.4.4 | "Error to use or return an uninitialized variable" |
+| FUNC-024 | Uninitialized error | §12.4.4 | "It is an error to use or return an un-initialized variable in a function." The error belongs to the executed path. Rumoca: a value that a top-level `if` of the function body defines totally on some paths and leaves unwritten on others is joined with a dead operand on the unwritten paths; each top-level use of it, and its return as an output, is preceded by a call-scoped assertion that the executed path assigned it (the call fails there, never returns the dead operand). A use inside a nested statement, or a use after a loop that may write the value, stays a typed construction rejection. Rumoca also (partial): a record result or protected record field is initialized by its type's field default when the algorithm never writes it; a field with neither is rejected as ED022. Tested in `suite_core/function_record_defaults.rs` |
 | FUNC-025 | LHS list output | §12.4.3 | "Left-hand side references must agree with type of corresponding output component" |
-| FUNC-026 | Vectorization non-replaceable | §12.4.6 | "Only transitively non-replaceable functions support automatic vectorization" |
-| FUNC-027 | Vectorization size match | §12.4.6 | "Array arguments have to be the same size" |
+| FUNC-026 | Vectorization non-replaceable | §12.4.6 | "Only function classes that are transitively non-replaceable (see section 6.3.1 and section 7.1.4) may be called vectorized." §6.3.1: "A class reference is transitively non-replaceable if and only if all parts of the name satisfy the following: If the class definition is long it is transitively non-replaceable if not declared replaceable. If the class definition is short (i.e., class A = P.B) it is transitively non-replaceable if it is non-replaceable and equal to class reference (P.B) that is transitively non-replaceable." Rumoca (documented deviation, accepted extension that MSL 4.1 relies on, e.g. `Medium.prandtlNumber(states)` in `Fluid.Pipes.BaseClasses.HeatTransfer.LocalPipeFlowHeatTransfer`): a vectorized call is also accepted when, after replaceable-package selection (MLS §7.3), the call's exposure path names the function through enclosing classes that are all transitively non-replaceable, so the selected package fixes the function at translation even though the function itself is declared `replaceable` there (the restriction exists so the callee is known at translation, and it then is). A call spelled through a replaceable package alias (`replaceable package Medium = A` in the model) is accepted on the same ground when the classes enclosing the alias and its right-hand side are transitively non-replaceable: the declared selection, or the redeclaration flattening resolves to one exact function instance, fixes the package. A call whose callee is still unresolved after selection (an alias to a replaceable package, or a partial function) is refused. Tested in `suite_core/selected_package_vectorization.rs` and `func_contracts.rs` |
+| FUNC-027 | Vectorization size match | §12.4.6 | "Array arguments have to be the same size". Rumoca: the translation-time evaluator applies a scalar function to an array argument element-wise over the extra leading dimension and rejects arguments of different sizes; element-wise operators broadcast a scalar operand (§10.6). Tested in `suite_core/vectorized_constant_calls.rs` |
 | FUNC-028 | Record constructor scope | §12.6 | "Record constructor can only reference records found in global scope" |
 | FUNC-029 | Record cast conditional error | §12.6.1 | "A record cast is erroneous if a corresponding source model/block/connector component is conditional" |
 | FUNC-030 | Derivative outputs non-empty | §12.7.1 | "Derivative output list shall not be empty" |
 | FUNC-031 | zeroDerivative condition | §12.7.1 | "zeroDerivative applies only if inputVar is independent of differentiation variables" |
-| FUNC-032 | External purity deprecated | §12.3 | "External functions not explicitly declared with pure or impure is deprecated." Such a function is normative-impure for transformations: "a function shall be treated as impure in the following cases (applied recursively): It is declared impure. It is an external function without explicit purity. It calls another function treated as impure, except when wrapped in pure(…)." The deprecation is a report, not a call restriction — MLS 3.6 §12.3 stated the report as a requirement ("a diagnostic must be given if called in a simulation model") and made callability explicit ("without any restriction on calling them"), which is the historical basis for accepting the call. Rumoca: WR001 on every such declaration; body recorded impure; recursive third case is task #76. |
+| FUNC-032 | External purity deprecated | §12.3 | "External functions not explicitly declared with pure or impure is deprecated." Such a function is normative-impure for transformations: "a function shall be treated as impure in the following cases (applied recursively): It is declared impure. It is an external function without explicit purity. It calls another function treated as impure, except when wrapped in pure(…)." The deprecation is a report, not a call restriction — MLS 3.6 §12.3 stated the report as a requirement ("a diagnostic must be given if called in a simulation model") and made callability explicit ("without any restriction on calling them"), which is the historical basis for accepting the call. Rumoca: WR001 on every such declaration; body recorded impure. The recursive third case is closed over the DAE call graph in `rumoca-phase-structural/src/time_invariant.rs` (greatest fixpoint starting from all-pure; a bare external is impure; the `pure(...)` exception is not honored, conservatively) and feeds the structural time-invariance proof (SPEC_0040 STRUCT-T03). |
 | FUNC-033 | Functional param type | §12.4.2 | "Function type parameter cannot be type-specifier of record or enumeration" |
 | FUNC-034 | Input default independence | §12.4.1 | "Default values for inputs shall not depend on non-input variables in the function" |
 | FUNC-035 | Derivative ordering | §12.7.1 | "Most restrictive derivative annotations should be written first"
 | FUNC-036 | ExternalObject lifecycle shape | §12.9.7 | "ExternalObject owner uses the specialized class `class`, directly extends ExternalObject, owns exactly non-replaceable constructor and destructor functions, and owns no other elements" |
 | FUNC-037 | ExternalObject lifecycle signatures | §12.9.7 | "Constructor has exactly one output of the owning ExternalObject type; destructor has exactly one input of that type and no outputs" |
 | FUNC-038 | ExternalObject lifecycle calls | §12.9.7 | "Constructor and destructor cannot be called explicitly; each constructed object is constructed and destroyed exactly once" |
+| FUNC-039 | Component bindings read inputs | §12.4.4 | Output and protected component declaration bindings are evaluated in the function, with its inputs available, including fields of a record input (`Real k1 = f(if data.zeta1_at_a then data.diameter_a else data.diameter_b)`). Rumoca: record inputs are decomposed into field inputs, and the declaration expressions of outputs and locals are rewritten to those fields like the algorithm section. Tested in `suite_core/fluid_function_data.rs` |
+| FUNC-040 | Function arguments | §12.4.2.1 | "A function partial application is specified by the function keyword followed by a function call to func_name giving named formal parameter associations for the formal parameters to be bound". Rumoca: flattening specializes the callee once per distinct function argument; calls of the formal function become direct calls with the bound formals as extra inputs, so no function value reaches DAE or Solve. A bare function name is collected and specialized like a partial application with no bindings. An argument that is neither (a Real value at a function input, for example) is refused (EF016). Tested in `suite_core/function_valued_arguments.rs` |
 
 ### 4.9 Type/Interface Contracts (TYPE)
 
@@ -669,6 +686,7 @@ Defines state-to-state transitions with priority and timing control.
 | TYPE-033 | Real/Integer coercion | §6.7 | "If A is Real expression, B must be Real or Integer; result is Real" |
 | TYPE-034 | Integer division result | §6.7 | "For Integer exponentiation and division, result type is Real even if both operands Integer" |
 | TYPE-035 | Operator record consistency | §6.7 | "For array/if-expressions: if A has operator record base, B must have same one"
+| TYPE-036 | Predefined-type attribute inheritance | §4.6.2, §4.9, §7.2.3 | A component of a type derived from a predefined type (short class definition or `extends` of a type, through any chain) carries the attribute modifications of that chain; the component's own modifiers and outer modifications win, then the innermost type, then its bases in order. Rumoca: every §3.16 attribute except `unbounded`, which the IR does not represent; values are evaluated in the scope of the type that wrote them; a non-`each` value of an array type repeats over the component's own dimensions; a modification of an attribute the chain made `final` is EI028 (INST-010). |
 
 ### 4.10 Array Contracts (ARR)
 
@@ -716,6 +734,8 @@ Defines state-to-state transitions with priority and timing control.
 | ARR-040 | min/max type restriction | §10.3.4 | "min/max require scalar enumeration, Boolean, Integer, or Real types" |
 | ARR-041 | diagonal vector shape | §10.3.5 | "diagonal(v) requires a vector and returns a square matrix with both extents equal to size(v, 1)" |
 | ARR-042 | outer product shape | §10.3.5 | "outerProduct(v1, v2) requires two vectors and returns a matrix with extents size(v1, 1) and size(v2, 1)" |
+| ARR-043 | Record array equality element-wise | §10.6.1 | "Equality a=b ... of scalars, vectors, matrices, and arrays is defined element-wise". Each element pair of an equation between arrays of records is one whole-record equality, so a slice `s[1:n] = m[1:n].r`, a whole array `s = m.r` (Flat spells the member of a component array as the array of its element records), and a for-equation over elements state the same field equations. Rumoca: DAE record-equation analysis resolves each operand to its element record occurrences, proving the indexed declaration, the element subscript, and every projected field declaration, and owns the leaf equalities of every pair; a structured family whose rows are all such equalities is not a separate owner. A discrete-valued equation `{a1, ..., an} = e` over unsubscripted scalar discrete-valued variables (the component-array slice `split.set = fill(inPort.set, nBranches)` of `Modelica.StateGraph.Parallel`) is its element equations `ai = e[i]`, each defining its own variable. Likewise a for-equation over the fields of a component array (`inPort[i].occupied = ...` in `Modelica.StateGraph.Step`) is its materialized element-field assignments, each defining its own field. Tested in `suite_core/record_array_equation.rs` and `suite_core/discrete_array_element_equations.rs` |
+| ARR-044 | der and pre element-wise shape | §3.7.4, §3.7.5 | "der(expr) ... If expr is an array, the operator is applied to all elements of the array" (§3.7.4; likewise `pre(y)`, §3.7.5), so the result has the operand shape and an equation between zero-sized operands has no scalar equations. Tested in `suite_core/record_array_equation.rs` |
 
 ### 4.11 Package/Import Contracts (PKG)
 
@@ -754,7 +774,7 @@ Defines state-to-state transitions with priority and timing control.
 
 | ID | Contract | MLS | Requirement |
 |----|----------|-----|-------------|
-| SIM-001 | Event iteration | §8.6/App B | "Iterate solving equations until z == pre(z) and m == pre(m)" |
+| SIM-001 | Event iteration | §8.6/App B | "Iterate solving equations until z == pre(z) and m == pre(m)". Known difference from OpenModelica, not yet resolved: coupled `Modelica.Blocks.Sources.RadioButtonSource` instances whose `reset` inputs read each other settle to different outputs when two of them fire at the same instant; the equivalent equation form shows the same difference, so it belongs to event iteration rather than to algorithm `when` lowering (DAE-C25). |
 | SIM-002 | Initialization fixed | §8.6 | "Continuous Real with fixed=true adds equation vc = startExpression" |
 | SIM-003 | Parameter fixed default | §8.6 | "For parameters: fixed defaults to true" |
 | SIM-004 | Variable fixed default | §8.6 | "For other variables: fixed defaults to false" |
@@ -805,6 +825,8 @@ Defines state-to-state transitions with priority and timing control.
 | STRM-009 | No division by zero | §15.2 | "Division by zero can no longer occur; result is always well-defined" |
 | STRM-010 | actualStream argument | §15.3 | "Only argument of actualStream needs to be a reference to a stream variable" |
 | STRM-011 | Flow/stream same level | §15.1 | "Flow variable must exist at same level as stream variable in connector hierarchy" |
+| STRM-012 | actualStream flow product | §15.3 | "The product of a flow variable and actualStream of a stream variable of the same connector is continuous, so a tool may treat it as smooth(0, ...)" (rumoca: the product owns no event; a standalone actualStream keeps its flow-reversal event) |
+| STRM-013 | One-direction flow | §15.2 | A connector whose flow can only enter its own component (`m_flow.min >= 0` on an inside connector, `max <= 0` on an outside connector) never supplies its connection set, so its term vanishes from every peer's `inStream` mix; with no supplying peer left, `inStream(c.h_outflow)` is `c.h_outflow`, as for an unconnected connector. Rumoca reads literal `min`/`max` attributes of the flow variable. Tested in `suite_core/stream_one_direction_flow.rs` |
 
 ### 4.16 State Machine Contracts (SM)
 
@@ -836,6 +858,50 @@ areas.
   and `shiftSample`/`backSample` compositions over statically scheduled base
   clocks. `Clock(condition)` is preserved as a dynamic event clock; unresolved
   or unsupported constructor forms must report `ED009` before simulation.
+  A Clock defined by a parameter-selected `if` (equation or expression form)
+  takes the branch the parameter values select (§16.7).
+- Clock inference (§16.5.1, §16.5.2): `subSample(u)`/`superSample(u)` without
+  `factor` take the exact integer ratio of the source and target partitions'
+  clocks, proven per component instance; a `sample(u)` partition is owned
+  through the conversions it takes part in before any fallback to a unique
+  model clock; declaration bindings and clocked `when` bodies contribute
+  conversions like equations, and a `when`-body `if` whose arms state a
+  conversion is decided by its parameter values.
+- Clocked values: `sample(u)` of a discrete `u` reads its left limit (the pre
+  value); a vector `sample` defines clocked discrete Real elements; an MLS
+  §12.4.3 multi-result call equation may define discrete receivers (one pure
+  call per discrete owner); the condition of an `if` inside a clocked `when`
+  body is a clocked value of the partition; `firstTick()` (§16.10) reads the
+  `previous` of a generated clocked indicator of its partition clock; the
+  scalar elements of a discrete Real array may each be defined by their own
+  row (`y[1] = u[1]`, a connection `d.u = y[1]`), oriented like whole
+  coordinates and issued as one producer per array coordinate.
+- Functions (§3.7.2, §12): `div`/`mod`/`rem` of Integer operands in a
+  function body are exact Integer quotients (truncating `div`, flooring `mod`)
+  in the typed Solve program, and a function-body quotient needs no event owner
+  whatever its operands' variability.
+- Event clocks (§16.3 Operator 16.4): `Clock(condition, startInterval)` whose
+  condition names a scalar Boolean coordinate ticks when `edge(pre(condition))`
+  becomes true, once per rise: a condition that stays true through later event
+  iterations or events does not tick it again. Its partition's rows are guarded
+  updates on the tick, ordered over the whole partition so a row observes the
+  tick's values of the rows it reads while `sample(u)` reads `u` at its left
+  limit (§16.5.1), before the tick's own `hold` updates;
+  `previous` reads the value of the previous tick, and `interval()` (§16.10)
+  is `startInterval` at the first tick and the time since the previous tick
+  afterwards. `shiftSample(u, k)` of an event clock (§16.5.2, resolution 1) is
+  the clock that skips its first `k` ticks and then ticks with it, for a
+  `Clock` and for a clocked value alike. Any other clock conversion of an
+  event clock, and a condition that is not a Boolean coordinate, are refused
+  at construction.
+- Clock arrays (a `ClockVectorInput`): each element of a clock array is a
+  connection hub that carries the scalar clock connected to it; an element
+  with no connected clock, or a clock array used other than through element
+  connections, has no resolved schedule and is refused.
+- Not yet supported: `Clock(c, solverMethod)` discretized
+  partitions (§16.8.1), refused at construction when a clock-owned equation
+  contains `der()` so a partition is never integrated continuously; external C noise generators with Integer state
+  arrays (`Xorshift64star`).
 - State-machine support currently covers library-style `Modelica.StateGraph`
   models that lower as ordinary discrete/event equations, with
   `Modelica.StateGraph.Examples.ExecutionPaths` as the OMC-backed
@@ -877,7 +943,9 @@ areas.
 | ANN-012 | mayOnlyConnectOnce error | §18.8 | "Error if connection set has more than two elements" |
 | ANN-013 | Annotation placement | §18.1 | "Standard annotations shall only be used where their semantics is defined" |
 | ANN-014 | TestCase restriction | §18.7 | "Class with TestCase annotation shall not be used in other models unless those also have TestCase" |
-| ANN-015 | Extent coordinate order | §18.9.1.1 | "Coordinates of first point shall be less than coordinates of second point"
+| ANN-015 | Extent coordinate order | §18.9.1.1 | "Coordinates of first point shall be less than coordinates of second point" |
+| ANN-016 | Inline expansion | §18.3 | `Inline = true` and `LateInline = true` propose including the function body at each call; `InlineAfterIndexReduction = true` proposes it after the function is differentiated for index reduction and before other symbolic transformations. Rumoca (SPEC_0040 STRUCT-T10(b)): a pure, non-recursive Modelica body that is one straight-line result assignment is inlined with substituted arguments (a body with an assertion, relation, or event-generating operator is refused), `Inline`/`LateInline` before index reduction and `InlineAfterIndexReduction` after formal-derivative construction; a callee with a derivative annotation is never inlined before index reduction, and external, impure, recursive, or loop-bearing callees are refused |
+| ANN-017 | Evaluate folding | §18.6 | `Evaluate = true` on an evaluable parameter proposes using its value during symbolic processing, after which the value cannot change. Rumoca (SPEC_0040 STRUCT-T10(a)): evaluable parameters declared `final` or `Evaluate = true`, and dependent parameters whose bindings read only such parameters, literals, and constants, are replaced by their values in one checked reconstruction and exported as constants; `Evaluate = false` outranks `final`, and ordinary independent parameters and unevaluable bindings are never folded (ANN-009). An assert condition that evaluates to `true` from its `final` and `Evaluate = true` parameters alone, whatever its time-varying operands and ordinary parameters are, is the literal `true` and owns no relation, so it raises no event (`m_flow > -m_flow_small or allowFlowReversal` under `allowFlowReversal = true`); a condition whose value depends on an ordinary parameter keeps its relation. Tested in `suite_core/evaluate_assert_fold.rs` |
 
 ### 4.18 Unit Expression Contracts (UNIT)
 
@@ -900,24 +968,24 @@ areas.
 | Category | Prefix | Count |
 |----------|--------|-------|
 | Lexical | LEX | 13 |
-| Declarations | DECL | 36 |
-| Instantiation | INST | 53 |
-| Expressions | EXPR | 40 |
-| Equations | EQN | 38 |
-| Algorithms | ALG | 17 |
+| Declarations | DECL | 37 |
+| Instantiation | INST | 58 |
+| Expressions | EXPR | 41 |
+| Equations | EQN | 40 |
+| Algorithms | ALG | 18 |
 | Connections | CONN | 30 |
-| Functions | FUNC | 38 |
-| Types/Interfaces | TYPE | 35 |
-| Arrays | ARR | 42 |
+| Functions | FUNC | 40 |
+| Types/Interfaces | TYPE | 36 |
+| Arrays | ARR | 44 |
 | Packages | PKG | 12 |
 | Operator Records | OPREC | 11 |
 | Simulation | SIM | 10 |
 | Clocks/Synchronous | CLK | 20 |
-| Stream Connectors | STRM | 11 |
+| Stream Connectors | STRM | 13 |
 | State Machines | SM | 8 |
-| Annotations | ANN | 15 |
+| Annotations | ANN | 17 |
 | Unit Expressions | UNIT | 9 |
-| **Total** | | **438** |
+| **Total** | | **457** |
 
 ---
 
@@ -1006,5 +1074,5 @@ The following design decisions extend MLS requirements for implementation:
 | Data Structures | 26 |
 | Algorithmic Processes | 4 |
 | Contract Categories | 18 |
-| Total Contracts | 438 |
+| Total Contracts | 457 |
 | MLS Chapters Referenced | 21 |

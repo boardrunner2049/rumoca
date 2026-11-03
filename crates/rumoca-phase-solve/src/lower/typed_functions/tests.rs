@@ -4,7 +4,11 @@ use rumoca_core::{SourceMap, Span, StructuredIndexBinder, StructuredIndexDomain,
 
 use super::*;
 
+mod comprehensions;
+mod equal_value_types;
 mod fixtures;
+mod linear_solve;
+mod shared_nested_calls;
 
 use fixtures::{integer_to_real_sibling_folds, lower_root_call, structured_range};
 
@@ -1016,7 +1020,7 @@ fn function_fold_stays_one_compact_typed_owner() {
             .iter()
             .filter(|operation| matches!(operation.operation(), solve::SolveOperation::Map { .. }))
             .count(),
-        1
+        0
     );
     let output = rumoca_eval_solve::eval_pure_call(&table, owner.id(), &[]).unwrap();
     assert_eq!(output[0].elements(), [solve::SolveValueKind::Integer(6)]);

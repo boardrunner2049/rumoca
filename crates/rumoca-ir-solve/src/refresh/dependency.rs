@@ -19,14 +19,12 @@ pub(super) fn assignment_y_dependencies_for_shapes(
                         ScalarProgramYDependency::new(prefix),
                     )
                 });
-            let registers = shape_value_registers(*shape);
             indices
                 .iter()
                 .copied()
                 .filter(|index| {
-                    registers
-                        .into_iter()
-                        .flatten()
+                    shape
+                        .value_registers()
                         .any(|register| dependency.depends_on(register, *index))
                 })
                 .collect::<Vec<_>>()
@@ -34,22 +32,6 @@ pub(super) fn assignment_y_dependencies_for_shapes(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
-}
-
-pub(super) fn shape_value_registers(shape: TargetAssignmentShape) -> [Option<u32>; 3] {
-    match shape {
-        TargetAssignmentShape::Direct { expr_reg, .. } => [Some(expr_reg), None, None],
-        TargetAssignmentShape::Affine {
-            offset_reg,
-            coefficient_reg,
-            ..
-        } => [Some(offset_reg), coefficient_reg, None],
-        TargetAssignmentShape::AffineResidual {
-            target_reg,
-            residual_reg,
-            ..
-        } => [Some(target_reg), Some(residual_reg), None],
-    }
 }
 
 pub(super) fn y_load_indices(program: &[LinearOp]) -> BTreeSet<usize> {
@@ -104,6 +86,17 @@ impl<'a> ScalarProgramYDependency<'a> {
         }
     }
 
+    /// The exact solver-Y dependencies of `register`, or `None` when the
+    /// analysis cannot bound them and [`Self::depends_on`] answers `true` for
+    /// every target.
+    pub fn register_dependencies(&self, register: u32) -> Option<BTreeSet<usize>> {
+        self.dependencies
+            .as_ref()
+            .and_then(|dependencies| dependencies.get(register as usize))
+            .and_then(Option::as_ref)
+            .cloned()
+    }
+
     pub fn depends_on(&self, register: u32, target: usize) -> bool {
         self.dependencies
             .as_ref()
@@ -111,13 +104,4 @@ impl<'a> ScalarProgramYDependency<'a> {
             .and_then(Option::as_ref)
             .is_none_or(|dependencies| dependencies.contains(&target))
     }
-}
-
-pub(super) fn register_is_written_by(operation: &LinearOp, register: u32) -> bool {
-    operation.dst_register().is_some_and(|start| {
-        u32::try_from(operation.dst_register_count())
-            .ok()
-            .and_then(|count| start.checked_add(count))
-            .is_some_and(|end| register >= start && register < end)
-    })
 }

@@ -2,11 +2,13 @@
 //!
 //! DAE construction lowers the whole conditional; the default pass group's
 //! `select-family-branches` replaces it by the branch taken, which is what
-//! construction itself used to do (docs/design/minimal-frontend.md).
+//! construction itself used to do (docs/design/minimal-frontend.md). Only a
+//! guard that cannot change on the artifact is decided: one reading a tunable
+//! parameter stays a run-time selection (SPEC_0040 DAE-C22).
 
 const FAMILY_IF: &str = "\
 model FamilyIf
-  parameter Real k = 2;
+  parameter Real k = 2 annotation(Evaluate = true);
   Real x[4];
 equation
   for i in 1:4 loop
@@ -17,11 +19,15 @@ end FamilyIf;
 
 /// Whether any equation family body reaches a conditional.
 fn family_has_conditional(passes: &[&str]) -> bool {
+    source_family_has_conditional(FAMILY_IF, passes)
+}
+
+fn source_family_has_conditional(source: &str, passes: &[&str]) -> bool {
     let passes: Vec<String> = passes.iter().map(ToString::to_string).collect();
     let compiled = rumoca::Compiler::new()
         .model("FamilyIf")
         .passes(&passes)
-        .compile_str(FAMILY_IF, "FamilyIf.mo")
+        .compile_str(source, "FamilyIf.mo")
         .expect("model compiles");
     let file = rumoca_bitcode::export(
         &compiled.dae,
@@ -59,10 +65,19 @@ fn family_has_conditional(passes: &[&str]) -> bool {
 
 #[test]
 fn construction_keeps_the_conditional() {
-    assert!(family_has_conditional(&["none"]));
+    // An evaluated guard is decided by construction itself; a tunable one is
+    // the conditional that reaches the artifact.
+    let tunable = FAMILY_IF.replace(" annotation(Evaluate = true)", "");
+    assert!(source_family_has_conditional(&tunable, &["none"]));
 }
 
 #[test]
 fn the_default_group_selects_the_branch() {
     assert!(!family_has_conditional(&[]));
+}
+
+#[test]
+fn a_tunable_guard_stays_a_run_time_selection() {
+    let tunable = FAMILY_IF.replace(" annotation(Evaluate = true)", "");
+    assert!(source_family_has_conditional(&tunable, &[]));
 }

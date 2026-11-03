@@ -169,6 +169,10 @@ impl Shift for RbcAction {
                 state.shift(m)?;
                 value.shift(m)?;
             }
+            Self::Warning { message, condition } => {
+                message.shift(m)?;
+                condition.shift(m)?;
+            }
             Self::Assert { message, level } => {
                 message.shift(m)?;
                 level.shift(m)?;

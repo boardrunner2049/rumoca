@@ -12,7 +12,10 @@
 //! What lowering must *not* do is leave a binding unresolved that decides the
 //! model's shape. MLS §18.3 structural parameters decide array extents and
 //! branch selection, and Integer/Boolean/String parameters seed those
-//! decisions for nested components, so the frontend resolves those.
+//! decisions for nested components, so the frontend resolves those. The
+//! resolved value decides the shape; Flat still renders the binding as
+//! written (instantiation keeps it as the binding source), so a legal parent
+//! override recomputes the dependent value.
 
 use rumoca_compile::compile::{Session, SessionConfig};
 
@@ -155,15 +158,10 @@ fn the_frontend_still_resolves_structural_and_discrete_parameters() {
         .compile_model("Structural")
         .unwrap_or_else(|error| panic!("should compile: {error:?}"));
 
-    for name in ["n", "useExtra"] {
-        let binding = binding_of(&compiled.flat, name);
-        assert!(
-            !binding.contains("base"),
-            "`{name}` decides model shape and must be resolved, got {binding}"
-        );
-    }
     // Shape is the real claim: the array extent and the conditional component
-    // are decided from the resolved values.
+    // are decided from the resolved values. The Flat bindings of `n` and
+    // `useExtra` stay as written (`base + 1`, `base > 1`): instantiation keeps
+    // the declaration as the binding source once it resolves a different value.
     let has = |name: &str| {
         compiled
             .flat
@@ -171,8 +169,13 @@ fn the_frontend_still_resolves_structural_and_discrete_parameters() {
             .contains_key(&rumoca_core::VarName::intern(name))
     };
     assert!(has("extra"), "the conditional component should exist");
+    let extent = compiled
+        .flat
+        .variables
+        .get(&rumoca_core::VarName::intern("y"))
+        .map(|variable| variable.dims.clone());
     assert!(
-        has("y[3]") || has("y"),
+        extent == Some(vec![3]) || (has("y[3]") && !has("y[4]")),
         "the array should have extent 3: {:?}",
         compiled.flat.variables.keys().collect::<Vec<_>>()
     );

@@ -25,6 +25,7 @@ fn discrete_valued_input_is_external_and_excluded_from_event_iteration() {
                 declaration,
                 dae::VariableAttributes {
                     causality: dae::VariableCausality::Input,
+                    declared_causality: dae::DeclaredCausality::Input,
                     ..Default::default()
                 },
             )
@@ -181,18 +182,21 @@ fn coupled_discrete_real_row_is_oriented_by_the_coordinate_left_undefined() {
 
 /// Two identical connection rows leave both coordinates undefined, so neither
 /// row is ever forced. The partition admits more than one causality and is
-/// reported instead of guessed.
+/// reported instead of guessed, at the owning row: the same-tick definitions
+/// and the discrete row assembly both require the derived plan, so neither can
+/// leave such a row silently undefined.
 #[test]
 fn ambiguous_coupled_discrete_real_rows_are_reported_before_runtime() {
     let source = TestSource::new("Real a; Real b; a=b; a=b;");
+    let owner = source.at(8, 20);
     let model = discrete_real_pair_model(source, 2, false);
 
     let error = lower_solve_problem(&model).unwrap_err();
     assert!(
         matches!(
             &error,
-            LowerError::NonComputable { reason, .. }
-                if reason.contains("coupled discrete Real residual")
+            LowerError::NonComputable { reason, span }
+                if reason.contains("coupled discrete Real residual") && *span == owner.span()
         ),
         "unforced discrete Real rows must be reported: {error}"
     );

@@ -6,15 +6,18 @@ pub(super) fn register_call<'dae>(
     table: &mut solve::SolvePureCallTableBuilder,
     view: dae::DaeView<'dae>,
     call: dae::ExprId<'dae>,
-    identity: solve::SolvePureCallIdentity,
+    identity: Option<solve::SolvePureCallIdentity>,
     arithmetic: solve::SolveArithmeticProfile,
-    identities: &mut NestedIdentityIssuer,
+    identities: &mut CallRegistration<'dae>,
     active: &mut Vec<dae::FunctionId<'dae>>,
 ) -> Result<RegisteredCall<'dae>, solve::SolveProgramConstructionError> {
     let node = view
         .expression(call)
         .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-    let dae::ExpressionOperation::Call { function, .. } = node.operation() else {
+    let dae::ExpressionOperation::Call {
+        function, owner, ..
+    } = node.operation()
+    else {
         return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
             provenance: node.provenance().span(),
         });
@@ -25,9 +28,19 @@ pub(super) fn register_call<'dae>(
             provenance: node.provenance().span(),
         });
     }
+    if let Some(registered) = identities.calls.get(&owner) {
+        return Ok(registered.clone());
+    }
+    let identity = match identity {
+        Some(identity) => identity,
+        None => identities.issue(node.provenance().span())?,
+    };
     active.push(function);
-    let result = register_call_body(table, view, call, identity, arithmetic, identities, active);
+    let result = register_call_body(table, view, owner, identity, arithmetic, identities, active);
     active.pop();
+    if let Ok(registered) = &result {
+        identities.calls.insert(owner, registered.clone());
+    }
     result
 }
 
@@ -39,7 +52,7 @@ fn register_call_body<'dae>(
     call: dae::ExprId<'dae>,
     identity: solve::SolvePureCallIdentity,
     arithmetic: solve::SolveArithmeticProfile,
-    identities: &mut NestedIdentityIssuer,
+    identities: &mut CallRegistration<'dae>,
     active: &mut Vec<dae::FunctionId<'dae>>,
 ) -> Result<RegisteredCall<'dae>, solve::SolveProgramConstructionError> {
     let call_node = view
@@ -63,36 +76,16 @@ fn register_call_body<'dae>(
     let nested_call_ids = nested_calls(view, function, &assertions);
     let mut callees = HashMap::new();
     for nested_call in nested_call_ids.iter().copied() {
-        let nested_node = view
-            .expression(nested_call)
-            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-        let nested_identity = identities.issue(nested_node.provenance().span())?;
         let registered = register_call(
             table,
             view,
             nested_call,
-            nested_identity,
+            None,
             arithmetic,
             identities,
             active,
         )?;
         callees.insert(nested_call, registered);
-    }
-    let mut predicate_ranges = HashMap::new();
-    let mut next_predicate = assertions.len();
-    for nested_call in &nested_call_ids {
-        let call = callees.get(nested_call).ok_or(
-            solve::SolveProgramConstructionError::UnknownCallOwner {
-                provenance: call_node.provenance().span(),
-            },
-        )?;
-        let end = next_predicate.checked_add(call.assertion_count).ok_or(
-            solve::SolveProgramConstructionError::IdentityOverflow {
-                provenance: call_node.provenance().span(),
-            },
-        )?;
-        predicate_ranges.insert(*nested_call, next_predicate..end);
-        next_predicate = end;
     }
     let parameter_types = function.parameter_types().iter().collect::<Vec<_>>();
     let mut inputs = Vec::new();
@@ -111,45 +104,26 @@ fn register_call_body<'dae>(
         result_ranges.push(start..result_leaf_types.len());
     }
     let result_leaf_count = result_leaf_types.len();
-    let assertion_count = callees
-        .values()
-        .try_fold(assertions.len(), |count, call| {
-            count.checked_add(call.assertion_count)
-        })
-        .ok_or(solve::SolveProgramConstructionError::IdentityOverflow {
-            provenance: call_node.provenance().span(),
-        })?;
-    let mut registered_assertions = assertions
-        .iter()
-        .enumerate()
-        .map(|(index, assertion)| RegisteredAssertion {
-            predicate_output: result_leaf_count + index,
-            message: assertion.message,
-            provenance: assertion.provenance,
-        })
-        .collect::<Vec<_>>();
-    let mut parent_predicate = assertions.len();
-    for nested_call in &nested_call_ids {
-        let nested = callees.get(nested_call).ok_or(
-            solve::SolveProgramConstructionError::UnknownCallOwner {
-                provenance: call_node.provenance().span(),
-            },
-        )?;
-        for assertion in nested.assertions.iter() {
-            registered_assertions.push(RegisteredAssertion {
-                predicate_output: result_leaf_count + parent_predicate,
-                message: assertion.message,
-                provenance: assertion.provenance,
-            });
-            parent_predicate += 1;
-        }
-    }
+    let AssertionLayout {
+        slots,
+        predicate_ranges,
+        direct_message_values,
+        registered: registered_assertions,
+    } = assertion_layout(
+        view,
+        &assertions,
+        &nested_call_ids,
+        &callees,
+        result_leaf_count,
+        arithmetic,
+    )?;
+    let assertion_slots = std::sync::Arc::<[AssertionSlot]>::from(slots);
     let mut outputs = result_leaf_types
         .iter()
         .cloned()
         .map(solve::SolvePureCallOutput::result)
         .collect::<Vec<_>>();
-    outputs.extend((0..assertion_count).map(|_| solve::SolvePureCallOutput::assertion_predicate()));
+    outputs.extend(assertion_slots.iter().map(AssertionSlot::output));
     let provenance = call_node.provenance().span();
     let owner = table.add_owner(
         identity,
@@ -176,6 +150,7 @@ fn register_call_body<'dae>(
                 parameters,
                 function_values: HashMap::new(),
                 conditional_groups,
+                fold_bodies: super::assertions::fold_bodies(function.statements()),
                 fold_parameters: HashMap::new(),
                 fold_values: HashMap::new(),
                 binders: HashMap::new(),
@@ -183,7 +158,8 @@ fn register_call_body<'dae>(
                 predicate_ranges,
                 cache: HashMap::new(),
                 call_values: HashMap::new(),
-                predicate_values: vec![None; assertion_count],
+                predicate_values: vec![None; assertion_slots.len()],
+                assertion_slots: assertion_slots.clone(),
                 next_direct_assertion: 0,
                 direct_assertion_count: assertions.len(),
             };
@@ -212,6 +188,19 @@ fn register_call_body<'dae>(
                         .store(*output, source, definition.provenance().span())?;
                 }
             }
+            for &(value, slot) in &direct_message_values {
+                let at = view
+                    .expression(value)
+                    .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
+                    .provenance()
+                    .span();
+                let register = lowerer.expression(value)?.only_register(at)?;
+                if lowerer.predicate_values[slot].replace(register).is_some() {
+                    return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
+                        provenance: at,
+                    });
+                }
+            }
             if lowerer.predicate_values.iter().any(Option::is_none) {
                 return Err(solve::SolveProgramConstructionError::InvalidCallOutput { provenance });
             }
@@ -234,7 +223,108 @@ fn register_call_body<'dae>(
         site,
         result_ranges: result_ranges.into_boxed_slice(),
         result_leaf_count,
-        assertion_count,
+        assertion_slots,
         assertions: registered_assertions.into_boxed_slice(),
+    })
+}
+
+/// Assertion outputs of one owner after its result leaves.
+struct AssertionLayout<'dae> {
+    slots: Vec<AssertionSlot>,
+    predicate_ranges: HashMap<dae::ExprId<'dae>, Range<usize>>,
+    /// Each message value of an assertion this function declares, with the
+    /// slot its frame publishes it in.
+    direct_message_values: Vec<(dae::ExprId<'dae>, usize)>,
+    registered: Vec<RegisteredAssertion<'dae>>,
+}
+
+/// Lay out the owner's own predicates, then its own message values, then each
+/// nested call's complete slot tuple, so every nested assertion keeps the
+/// predicate and message values its callee's frame produced.
+fn assertion_layout<'dae>(
+    view: dae::DaeView<'dae>,
+    assertions: &[assertions::FunctionAssertion<'dae>],
+    nested_call_ids: &[dae::ExprId<'dae>],
+    callees: &HashMap<dae::ExprId<'dae>, RegisteredCall<'dae>>,
+    result_leaf_count: usize,
+    arithmetic: solve::SolveArithmeticProfile,
+) -> Result<AssertionLayout<'dae>, solve::SolveProgramConstructionError> {
+    let mut slots = vec![AssertionSlot::Predicate; assertions.len()];
+    let mut direct_message_values = Vec::new();
+    let mut registered = Vec::with_capacity(assertions.len());
+    for (index, assertion) in assertions.iter().enumerate() {
+        let mut message_values = Vec::new();
+        for value in assertions::message_values(view, assertion) {
+            let Some(value_type) = message_value_type(view, value, arithmetic)? else {
+                continue;
+            };
+            direct_message_values.push((value, slots.len()));
+            message_values.push((value, result_leaf_count + slots.len()));
+            let predicate = slots.len() - index;
+            slots.push(AssertionSlot::MessageValue {
+                value_type,
+                predicate,
+            });
+        }
+        registered.push(RegisteredAssertion {
+            predicate_output: result_leaf_count + index,
+            message: assertion.message,
+            message_values: message_values.into_boxed_slice(),
+            level: assertion.level,
+            provenance: assertion.provenance,
+        });
+    }
+    let mut predicate_ranges = HashMap::new();
+    for nested_call in nested_call_ids {
+        let nested = callees
+            .get(nested_call)
+            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
+        let start = slots.len();
+        slots.extend(nested.assertion_slots.iter().cloned());
+        predicate_ranges.insert(*nested_call, start..slots.len());
+        let shift = |output: usize| result_leaf_count + start + output - nested.result_leaf_count;
+        registered.extend(nested.assertions.iter().map(|assertion| {
+            RegisteredAssertion {
+                predicate_output: shift(assertion.predicate_output),
+                message: assertion.message,
+                message_values: assertion
+                    .message_values
+                    .iter()
+                    .map(|&(value, output)| (value, shift(output)))
+                    .collect(),
+                level: assertion.level,
+                provenance: assertion.provenance,
+            }
+        }));
+    }
+    Ok(AssertionLayout {
+        slots,
+        predicate_ranges,
+        direct_message_values,
+        registered,
+    })
+}
+
+/// The scalar output type of one converted message value, or `None` for a
+/// value no String conversion renders (MLS §3.7.2 converts Real, Integer and
+/// Boolean scalars here).
+fn message_value_type<'dae>(
+    view: dae::DaeView<'dae>,
+    value: dae::ExprId<'dae>,
+    arithmetic: solve::SolveArithmeticProfile,
+) -> Result<Option<solve::SolveValueType>, solve::SolveProgramConstructionError> {
+    let node = view
+        .expression(value)
+        .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
+    if !matches!(
+        node.value_type().scalar_type(),
+        dae::ScalarType::Real | dae::ScalarType::Integer | dae::ScalarType::Boolean
+    ) {
+        return Ok(None);
+    }
+    let leaves = lower_value_type_leaves(view, node.value_type_id(), arithmetic)?;
+    Ok(match leaves.as_slice() {
+        [leaf] if leaf.dimensions().is_empty() => Some(leaf.clone()),
+        _ => None,
     })
 }

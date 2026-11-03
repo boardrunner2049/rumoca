@@ -105,11 +105,34 @@ pub(crate) struct StructuredFamilyEntry {
     pub(crate) provenance: DaeProvenance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EquationOwnerEntry {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EquationOwnerKind {
     Residual(u32),
     Structured(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EquationOwnerEntry {
+    pub(crate) kind: EquationOwnerKind,
+    pub(crate) scalar_row_end: usize,
+}
+
+impl EquationOwnerEntry {
+    fn next_scalar_row_end(
+        owners: &[Self],
+        rows: u32,
+        owner: DaeProvenance,
+    ) -> Result<usize, DaeConstructionError> {
+        owners
+            .last()
+            .map_or(0, |previous| previous.scalar_row_end)
+            .checked_add(rows as usize)
+            .ok_or(DaeConstructionError::CapacityExceeded {
+                arena: "equation scalar rows",
+                attempted_index: usize::MAX,
+                span: owner.span(),
+            })
+    }
 }
 
 trait ResidualPartition {
@@ -147,8 +170,13 @@ macro_rules! equation_partitions {
                     entry: ResidualEquationEntry,
                     owner: DaeProvenance,
                 ) -> Result<u32, DaeConstructionError> {
+                    let scalar_row_end =
+                        EquationOwnerEntry::next_scalar_row_end(&storage.$owners, 1, owner)?;
                     let raw = push_dense(&mut storage.$equations, entry, "equation arena", owner)?;
-                    storage.$owners.push(EquationOwnerEntry::Residual(raw));
+                    storage.$owners.push(EquationOwnerEntry {
+                        kind: EquationOwnerKind::Residual(raw),
+                        scalar_row_end,
+                    });
                     Ok(raw)
                 }
             }
@@ -159,13 +187,21 @@ macro_rules! equation_partitions {
                     entry: StructuredFamilyEntry,
                     owner: DaeProvenance,
                 ) -> Result<u32, DaeConstructionError> {
+                    let scalar_row_end = EquationOwnerEntry::next_scalar_row_end(
+                        &storage.$owners,
+                        entry.scalar_rows,
+                        owner,
+                    )?;
                     let raw = push_dense(
                         &mut storage.$families,
                         entry,
                         "structured equation family arena",
                         owner,
                     )?;
-                    storage.$owners.push(EquationOwnerEntry::Structured(raw));
+                    storage.$owners.push(EquationOwnerEntry {
+                        kind: EquationOwnerKind::Structured(raw),
+                        scalar_row_end,
+                    });
                     Ok(raw)
                 }
             }
@@ -313,14 +349,16 @@ impl<'dae> InitializationEquations<'_, 'dae> {
 
 /// Insert one checked discrete initial-value definition.
 ///
-/// The local integrity this checks is what makes an unsettled read
-/// unrepresentable rather than merely unlikely: the initialization update rows
-/// are applied at the known initialization instant, before any trajectory
-/// exists, so the defining value may read only coordinates that are already
-/// settled there — parameters, constants, and `time`. A read of a state,
-/// algebraic, output, input, `pre`, delay, or any other discrete coordinate has
-/// no proven evaluation order at that instant, so it fails here instead of
-/// producing a numerically plausible but unproven initial value.
+/// The local integrity this checks is what makes an unordered read
+/// unrepresentable rather than merely unlikely. MLS 3.7 §8.6 solves the
+/// initial equations together with the model equations, so the defining value
+/// may read what that system settles: parameters, constants, and `time`, which
+/// are known before it, and the continuous coordinates (states, algebraics,
+/// inputs), which its projection determines. Solve applies the definition after
+/// that projection and proves that the read cone excludes the target's own
+/// storage. A read of a derivative, `pre`, delay, or any discrete coordinate
+/// has no such ordering owner, so it fails here instead of producing a
+/// numerically plausible but unproven initial value.
 fn insert_initial_discrete_value<'dae>(
     source_map: &rumoca_core::SourceMap,
     storage: &mut Storage,
@@ -351,8 +389,13 @@ fn insert_initial_discrete_value<'dae>(
             span: owner.span(),
         });
     }
-    if !declared.is_scalar() || !found.is_scalar() {
+    // MLS 3.7 §8.6 determines a discrete array coordinate element by element;
+    // the definition is the whole aggregate, so its shape is the declared one.
+    if declared.is_record() || found.is_record() {
         return Err(DaeConstructionError::ExpectedScalar { span: owner.span() });
+    }
+    if found.dimensions() != declared.dimensions() {
+        return Err(DaeConstructionError::ShapeMismatch { span: owner.span() });
     }
     expect_initialization_settled_reads(storage, value, owner)?;
     if storage
@@ -399,7 +442,12 @@ fn expect_initialization_settled_reads(
         let settled = match node {
             ExprNode::Coordinate(coordinate) => matches!(
                 coordinate,
-                Coordinate::Parameter(_) | Coordinate::Time | Coordinate::ClockInterval(_)
+                Coordinate::Parameter(_)
+                    | Coordinate::Time
+                    | Coordinate::ClockInterval(_)
+                    | Coordinate::Input(_)
+                    | Coordinate::State(_)
+                    | Coordinate::Algebraic(_)
             ),
             ExprNode::Call { function, .. } => storage.function_is_pure(*function, owner)?,
             _ => true,
@@ -769,6 +817,18 @@ fn expect_clock_owned_discrete_reals(
             continue;
         }
         let node = &storage.expressions.nodes[expression as usize];
+        // MLS §16.5.2: a clock conversion's operand is read on its source
+        // clock, and the conversion itself yields a value of its target clock;
+        // its construction already proved the operand's source ownership.
+        if let ExprNode::ClockTransfer { target_clock, .. } = node {
+            if *target_clock != clock {
+                return Err(DaeConstructionError::InvalidClockedOperand {
+                    operator: "clocked value conversion",
+                    span: owner.span(),
+                });
+            }
+            continue;
+        }
         if let ExprNode::Coordinate(Coordinate::DiscreteReal(variable)) = node
             && storage
                 .clock_ownership_by_variable

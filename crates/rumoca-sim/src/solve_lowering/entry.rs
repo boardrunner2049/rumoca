@@ -182,6 +182,7 @@ pub(crate) fn lower_correlated_for_simulation_with_stage_timing_and_param_overri
         }
     })
     .map_err(model_lowering_error)?;
+    report_unlocalizable_guards(&lowered.model().problem.continuous.unlocalizable_guards);
     let timings = crate::BuildSimulationTimings {
         ir_solve_seconds: lowered.program_seconds() + lowered.runtime_value_seconds(),
         ir_solve_structural_dae_seconds: lowered.runtime_value_seconds(),
@@ -189,6 +190,15 @@ pub(crate) fn lower_correlated_for_simulation_with_stage_timing_and_param_overri
         ..crate::BuildSimulationTimings::default()
     };
     Ok((lowered, timings))
+}
+
+/// Warn, before any integration, about every ES016 fact of the Solve model
+/// (SPEC_0044 ME-EVENT-008): a block whose own unknowns a relation under
+/// `noEvent` switches fails with a typed fold error where its branch ends.
+pub(super) fn report_unlocalizable_guards(guards: &[solve::UnlocalizableGuard]) {
+    for guard in guards {
+        eprintln!("warning[ES016]: {}", guard.warning());
+    }
 }
 
 fn fmi_metadata_error(

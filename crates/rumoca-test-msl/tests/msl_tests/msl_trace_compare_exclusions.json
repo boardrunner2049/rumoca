@@ -1,77 +1,514 @@
 {
-  "schema": "msl_trace_compare_exclusions",
-  "exclusions": [
+  "schema": "msl_trace_exceptions_v2",
+  "exceptions": [
     {
       "model_name": "Modelica.Blocks.Examples.DemoSignalCharacteristic",
-      "reason": "The analytic first-harmonic cosine coefficient is zero. Rumoca and OMC both leave integration residue, and Rumoca's residual is closer to zero; OMC's near-zero reference spread makes normalized pointwise comparison non-identifying."
+      "kind": "comparator_limitation",
+      "reason": "The analytic first-harmonic cosine coefficient is zero. Rumoca and OMC both leave integration residue, and Rumoca's residual is closer to zero; OMC's near-zero reference spread makes normalized pointwise comparison non-identifying.",
+      "evidence": {
+        "facts": [
+          "analytic first-harmonic cosine coefficient is 0",
+          "OMC reference spread of that channel is at integration-residue scale; Rumoca residual is closer to 0"
+        ]
+      },
+      "retired_by": "near_zero_channel_scaling"
+    },
+    {
+      "model_name": "Modelica.Clocked.Examples.Elementary.BooleanSignals.Sample2",
+      "kind": "reference_failure",
+      "reason": "OMC a96aa1a-cmake reports an internal backend error for this model (BackendDAETransform.analyseStrongComponentBlock: purely discrete algebraic loop through xor, xor1, sample2 and hold1), so the parity harness records the reference as an error. OMC still writes a result file after the error; the Rumoca trace agrees with it exactly on every shared channel. This is a reference-generation failure, not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "OMC log: Internal error BackendDAETransform.analyseStrongComponentBlock failed (Purely discrete algebraic loops cannot be solved by iterative processes)",
+          "harness omc_simulation_reference status: error",
+          "Rumoca vs the OMC-written result: 14 of 14 shared channels, max abs difference 0 over t in [0, 0.2]"
+        ],
+        "artifact": "msl:Modelica.Clocked.Examples.Elementary.BooleanSignals.Sample2"
+      }
+    },
+    {
+      "model_name": "Modelica.Clocked.Examples.Elementary.BooleanSignals.TickBasedPulse",
+      "kind": "reference_failure",
+      "reason": "OMC a96aa1a-cmake reports an internal error transforming the clocked equation pulse.startOutput = previous(pulse.counter) >= pulse.startTick - 1 to residual form, so the parity harness records the reference as an error. OMC still simulates and writes a result; the Rumoca trace agrees with it exactly and with the tick sequence computed by hand from MLS section 16 (widthTicks=2, periodTicks=4, startTick=2). This is a reference-generation failure, not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "OMC log: Internal error - BackendDAEOptimize.makeEquationToResidualExp failed to transform equation: pulse.startOutput = previous(pulse.counter) >= pulse.startTick - 1 to residual form",
+          "harness omc_simulation_reference status: error",
+          "Rumoca vs the OMC-written result: 3 of 3 shared channels, max abs difference 0 over t in [0, 1]",
+          "pulse.y at ticks 0, 0.1, ..., 0.7: false, true, true, false, false, true, true, false in both traces and by hand"
+        ],
+        "artifact": "msl:Modelica.Clocked.Examples.Elementary.BooleanSignals.TickBasedPulse"
+      }
+    },
+    {
+      "model_name": "Modelica.Clocked.Examples.Elementary.IntegerSignals.Sample2",
+      "kind": "reference_failure",
+      "reason": "OMC a96aa1a-cmake reports an internal backend error for this model (BackendDAETransform.analyseStrongComponentBlock: purely discrete algebraic loop), so the parity harness records the reference as an error. OMC still writes a result file after the error; the Rumoca trace agrees with it exactly on every shared channel. This is a reference-generation failure, not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "OMC log: Internal error BackendDAETransform.analyseStrongComponentBlock failed (Purely discrete algebraic loops cannot be solved by iterative processes)",
+          "harness omc_simulation_reference status: error",
+          "Rumoca vs the OMC-written result: 14 of 14 shared channels, max abs difference 0 over t in [0, 0.2]"
+        ],
+        "artifact": "msl:Modelica.Clocked.Examples.Elementary.IntegerSignals.Sample2"
+      }
+    },
+    {
+      "model_name": "Modelica.Clocked.Examples.Elementary.RealSignals.TickBasedSine",
+      "kind": "reference_failure",
+      "reason": "OMC a96aa1a-cmake reports an internal error transforming the clocked equation sine.startOutput = previous(sine.counter) >= sine.startTick - 1 to residual form, so the parity harness records the reference as an error. OMC still simulates and writes a result; the clocked channels of the Rumoca trace agree with it to 2.5e-32, and the continuous sineRef.y agrees at every sampled instant apart from its startTime=0.3 event, where OMC records both the pre- and post-event values. This is a reference-generation failure, not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "OMC log: Internal error - BackendDAEOptimize.makeEquationToResidualExp failed to transform equation: sine.startOutput = previous(sine.counter) >= sine.startTick - 1 to residual form",
+          "harness omc_simulation_reference status: error",
+          "Rumoca vs the OMC-written result: sine.y and assignClock1.u/y max abs difference 2.5e-32 over t in [0, 1]",
+          "sineRef.y identical at t = 0.28, 0.29, 0.3+, 0.31, 0.32, 0.4, 0.5; the only difference is the duplicated OMC row at the t=0.3 startTime event"
+        ],
+        "artifact": "msl:Modelica.Clocked.Examples.Elementary.RealSignals.TickBasedSine"
+      }
+    },
+    {
+      "model_name": "Modelica.Electrical.Analog.Examples.AmplifierWithOpAmpDetailed",
+      "kind": "reference_failure",
+      "reason": "The default OMC reference (tolerance 2e-7) shows a one-cycle excursion of the op-amp internal states between 0.9 and 1.4 ms that the periodic Rumoca trace does not have, giving 11 deviating channels. OMC cannot refine its own reference: the same model at tolerance 1e-10 terminates at t = 1.369e-4 s with 'DASKR-- NONLINEAR SOLVER FAILED TO CONVERGE' and 'Integrator failed'. No converged OMC reference exists, so the pointwise comparison is not identifying; this is not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "11 deviating channels against the default OMC reference; the OMC excursion lies in 0.9-1.4 ms",
+          "OMC at tolerance 1e-10 terminates at t=1.369e-4 s: DASKR nonlinear solver failed to converge, integrator failed",
+          "OMC at default tolerance 2e-7 finishes successfully"
+        ],
+        "commit": "305c8ce49",
+        "artifact": "docs/dev-guide/src/tooling/electrical-coverage.md"
+      }
     },
     {
       "model_name": "Modelica.Electrical.Analog.Examples.ChuaCircuit",
-      "reason": "The MSL model is explicitly chaotic and runs for 50000 seconds. Exponential trajectory separation makes one solver's pointwise trajectory non-identifying; this model requires invariant or statistical comparison."
+      "kind": "model_issue",
+      "reason": "The MSL model is explicitly chaotic and runs for 50000 seconds. Exponential trajectory separation makes one solver's pointwise trajectory non-identifying; this model requires invariant or statistical comparison.",
+      "evidence": {
+        "facts": [
+          "MSL documents the circuit as chaotic",
+          "experiment StopTime=50000 s"
+        ],
+        "artifact": "msl:Modelica.Electrical.Analog.Examples.ChuaCircuit"
+      }
     },
     {
       "model_name": "Modelica.Electrical.Analog.Examples.ControlledSwitchWithArc",
-      "reason": "Only switch1.LossPower is non-high (67/68 channels and all initial conditions are high). The ideal switch defines LossPower=v*i and produces the same 2.3247705375e8 W opening spike in both traces, but the independently located sine zero crossing is recorded at t=0.416666833851481 by Rumoca and t=0.416666666694237 by OMC. Pointwise interpolation converts that sub-microsecond coordinate difference on a discontinuous algebraic spike into a severe integral error even though its value and the state trajectories agree, so OMC pointwise comparison is non-identifying for this event-local observable."
+      "kind": "comparator_limitation",
+      "reason": "Only switch1.LossPower is non-high (67/68 channels and all initial conditions are high). The ideal switch defines LossPower=v*i and produces the same 2.3247705375e8 W opening spike in both traces, but the independently located sine zero crossing is recorded at t=0.416666833851481 by Rumoca and t=0.416666666694237 by OMC. Pointwise interpolation converts that sub-microsecond coordinate difference on a discontinuous algebraic spike into a severe integral error even though its value and the state trajectories agree, so OMC pointwise comparison is non-identifying for this event-local observable.",
+      "evidence": {
+        "facts": [
+          "67/68 channels and all initial conditions high",
+          "only non-high channel: switch1.LossPower",
+          "opening spike 2.3247705375e8 W in both traces",
+          "sine zero crossing recorded at t=0.416666833851481 (Rumoca) and t=0.416666666694237 (OMC)"
+        ]
+      },
+      "retired_by": "event_instant_alignment"
+    },
+    {
+      "model_name": "Modelica.Electrical.Analog.Examples.DemoPowerSupplyWithBuffer",
+      "kind": "model_issue",
+      "reason": "The only non-high channel is the ideal-diode Boolean diode.off (41 of 42 channels high, including diode.v at bounded-L1 0.0054). For about a third of the run the diode sits at its complementarity knee (diode.v near 1.3e-18 V, diode.i near 1.3e-13 A), where the discrete off flag is underdetermined: both labels give identical voltage and current, OMC records off=false (conducting at zero current) and rumoca off=true (blocking at zero voltage), while every continuous electrical quantity agrees. Pointwise comparison of the discrete flag is non-identifying at the knee.",
+      "evidence": {
+        "facts": [
+          "41 of 42 channels high; only non-high channel: diode.off",
+          "diode.v near 1.3e-18 V and diode.i near 1.3e-13 A at the knee",
+          "diode.v bounded-L1 0.0054"
+        ]
+      }
     },
     {
       "model_name": "Modelica.Electrical.Analog.Examples.OpAmps.ControlCircuit",
-      "reason": "At the 0.1 s input step, OMC records the pre-event PIA resistor loss powers at t=0.1 and the post-event values at t=0.1000000001100004, while Rumoca records the post-event values at t=0.1. The post-event peak agrees to floating-point precision and 281/283 channels are strict-high; the two minor channels are aliases of this event-side output convention, so raw pointwise interpolation is non-identifying."
+      "kind": "comparator_limitation",
+      "reason": "At the 0.1 s input step, OMC records the pre-event PIA resistor loss powers at t=0.1 and the post-event values at t=0.1000000001100004, while Rumoca records the post-event values at t=0.1. The post-event peak agrees to floating-point precision and 281/283 channels are strict-high; the two minor channels are aliases of this event-side output convention, so raw pointwise interpolation is non-identifying.",
+      "evidence": {
+        "facts": [
+          "281/283 channels strict-high",
+          "OMC records pre-event values at t=0.1 and post-event values at t=0.1000000001100004; Rumoca records post-event values at t=0.1",
+          "post-event peak agrees to floating-point precision"
+        ]
+      },
+      "retired_by": "event_instant_alignment"
     },
     {
       "model_name": "Modelica.Electrical.Analog.Examples.OpAmps.Multivibrator",
-      "reason": "This autonomous relaxation oscillator deliberately wraps the op-amp saturation branch in noEvent, so the MLS does not require event localization at its discontinuous right-hand side. Both traces start from the same state and preserve the analytic 30 V amplitude, but solver-dependent crossing phase accumulates over ten periods (Rumoca's default half-period is about 0.0472 s and OMC's about 0.0495 s); tightening Rumoca converges toward 0.05 s, while OMC at 1e-8 and 1e-10 fails at the hidden discontinuity instead of providing a converged reference. Same-time pointwise comparison is therefore non-identifying; this model requires limit-cycle amplitude/period and phase-aligned waveform obligations."
+      "kind": "model_issue",
+      "reason": "This autonomous relaxation oscillator deliberately wraps the op-amp saturation branch in noEvent, so the MLS does not require event localization at its discontinuous right-hand side. Both traces start from the same state and preserve the analytic 30 V amplitude, but solver-dependent crossing phase accumulates over ten periods (Rumoca's default half-period is about 0.0472 s and OMC's about 0.0495 s); tightening Rumoca converges toward 0.05 s, while OMC at 1e-8 and 1e-10 fails at the hidden discontinuity instead of providing a converged reference. Same-time pointwise comparison is therefore non-identifying; this model requires limit-cycle amplitude/period and phase-aligned waveform obligations.",
+      "evidence": {
+        "facts": [
+          "op-amp saturation branch is wrapped in noEvent in the MSL source",
+          "analytic 30 V amplitude preserved in both traces",
+          "default half-period about 0.0472 s (Rumoca) and 0.0495 s (OMC); tightened Rumoca converges toward 0.05 s",
+          "OMC at 1e-8 and 1e-10 fails at the hidden discontinuity"
+        ],
+        "artifact": "msl:Modelica.Electrical.Analog.Examples.OpAmps.Multivibrator"
+      }
+    },
+    {
+      "model_name": "Modelica.Electrical.Analog.Examples.OpAmps.SignalGenerator",
+      "kind": "reference_failure",
+      "reason": "The Schmitt-trigger op-amp uses strict=false, so its saturation branches are event relations and the rectangle output may only switch when V0*v_in crosses a supply limit. For R1=1000, R2=1500, Vps=15 and V0=15000 that crossing is at |vOutTriangle| = (Vps*R1 - (R1+R2)*Vps/V0)/R2 = 9.998333 V, so the ideal circuit is strictly periodic. Rumoca switches at exactly that amplitude every half period at both 1e-6 and 1e-10. The default OMC reference switches early and irregularly (amplitudes from 1.886 V to 9.994 V, half periods from 0.0237 s to 0.0498 s), so its phase drifts and 47 of 66 channels deviate. OMC at 1e-10 moves toward the analytic amplitude but still switches irregularly, and OMC at 1e-12 does not finish within 600 s, so there is no converged reference. This is a reference-generation failure, not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "analytic switching amplitude (Vps*R1 - (R1+R2)*Vps/V0)/R2 = 9.998333 V; ideal circuit is periodic",
+          "Rumoca switches at |vOutTriangle| = 9.998333 V at 1e-6 and 1e-10; first switch at t=0.02499805516 (1e-6) and t=0.02499805515 (1e-10), half period 0.0499950 s",
+          "default OMC (1e-6) switch amplitudes 1.886 V to 9.994 V, half periods 0.0237 s to 0.0498 s; 19 high and 47 deviating channels",
+          "OMC at 1e-10 switch amplitudes 9.805 V to 9.998 V, still irregular; OMC at 1e-12 does not finish within 600 s"
+        ],
+        "artifact": "msl:Modelica.Electrical.Analog.Examples.OpAmps.SignalGenerator"
+      }
     },
     {
       "model_name": "Modelica.Electrical.Analog.Examples.SwitchWithArc",
-      "reason": "Only switch1.LossPower is non-high (57/58 channels and all initial conditions are high). The ideal switch defines LossPower=v*i and both traces produce the same approximately 2.466374e8 W opening spike, but Rumoca records the scheduled opening at the exact t=0.5 coordinate while OMC records it at t=0.500000000200003. Pointwise interpolation turns this 2.0e-10 s event-coordinate convention into a deviation on the discontinuous algebraic spike although the state trajectories agree, so OMC pointwise comparison is non-identifying for this event-local observable."
+      "kind": "comparator_limitation",
+      "reason": "Only switch1.LossPower is non-high (57/58 channels and all initial conditions are high). The ideal switch defines LossPower=v*i and both traces produce the same approximately 2.466374e8 W opening spike, but Rumoca records the scheduled opening at the exact t=0.5 coordinate while OMC records it at t=0.500000000200003. Pointwise interpolation turns this 2.0e-10 s event-coordinate convention into a deviation on the discontinuous algebraic spike although the state trajectories agree, so OMC pointwise comparison is non-identifying for this event-local observable.",
+      "evidence": {
+        "facts": [
+          "57/58 channels and all initial conditions high",
+          "only non-high channel: switch1.LossPower",
+          "opening spike about 2.466374e8 W in both traces",
+          "scheduled opening recorded at t=0.5 (Rumoca) and t=0.500000000200003 (OMC)"
+        ]
+      },
+      "retired_by": "event_instant_alignment"
     },
     {
       "model_name": "Modelica.Electrical.Machines.Examples.DCMachines.DCPM_CurrentControlled",
-      "reason": "At the 0.1 s current-command step, OMC records the pre-event PID error at t=0.1 and the post-event value at t=0.1000000001100014, while Rumoca records the post-event value at t=0.1. The seven minor channels are PID error aliases of this event-side phase shift; all 200 other channels are strict-high and the post-event response agrees, so raw pointwise interpolation at the discontinuity is non-identifying."
+      "kind": "comparator_limitation",
+      "reason": "At the 0.1 s current-command step, OMC records the pre-event PID error at t=0.1 and the post-event value at t=0.1000000001100014, while Rumoca records the post-event value at t=0.1. The seven minor channels are PID error aliases of this event-side phase shift; all 200 other channels are strict-high and the post-event response agrees, so raw pointwise interpolation at the discontinuity is non-identifying.",
+      "evidence": {
+        "facts": [
+          "200 channels strict-high; 7 minor channels are PID error aliases",
+          "OMC records the pre-event PID error at t=0.1 and the post-event value at t=0.1000000001100014; Rumoca records the post-event value at t=0.1"
+        ]
+      },
+      "retired_by": "event_instant_alignment"
     },
     {
       "model_name": "Modelica.Electrical.Machines.Examples.DCMachines.DCPM_Drive",
-      "reason": "Only four aliases of the two IdealDcDc power-balance residuals are non-high; 586/590 channels and every initial condition are high. These near-zero residuals drive integral controllers with Ti=1e-6 and are dominated by integration error: tightening OMC from 1e-6 to 1e-8 reduces their ranges from 8.18e-3/6.84e-3 W to 7.16e-4/1.92e-4 W, while tightened Rumoca gives comparable 7.83e-4/2.62e-4 W ranges. The default-tolerance OMC residual is not converged enough to identify pointwise parity, while the physical trajectory agrees."
+      "kind": "comparator_limitation",
+      "reason": "Only four aliases of the two IdealDcDc power-balance residuals are non-high; 586/590 channels and every initial condition are high. These near-zero residuals drive integral controllers with Ti=1e-6 and are dominated by integration error: tightening OMC from 1e-6 to 1e-8 reduces their ranges from 8.18e-3/6.84e-3 W to 7.16e-4/1.92e-4 W, while tightened Rumoca gives comparable 7.83e-4/2.62e-4 W ranges. The default-tolerance OMC residual is not converged enough to identify pointwise parity, while the physical trajectory agrees.",
+      "evidence": {
+        "facts": [
+          "586/590 channels and every initial condition high",
+          "non-high channels: four aliases of the two IdealDcDc power-balance residuals",
+          "OMC residual ranges 8.18e-3/6.84e-3 W at 1e-6 and 7.16e-4/1.92e-4 W at 1e-8; tightened Rumoca 7.83e-4/2.62e-4 W"
+        ]
+      },
+      "retired_by": "near_zero_channel_scaling"
     },
     {
-      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.DiodeBridge2mPulse",
-      "reason": "The differing channels are period Mean/RMS aggregates at integration-residue scale within the model's 1e-6 experiment tolerance; waveform channels agree and Rumoca's mean is closer to the analytic 3*sqrt(6)/pi*Vrms value."
+      "model_name": "Modelica.Electrical.Machines.Examples.InductionMachines.IMS_Start",
+      "kind": "reference_failure",
+      "reason": "Default OMC reference accuracy is insufficient for this model's near-zero summed currents and pre-closing leakage voltages. With lossless trace decoding, the unchanged Rumoca trace has 690 high, 18 near, and two deviating channels against OMC at the model's 1e-6 tolerance. The same xtask-generated OMC executable at 1e-10 and 1e-12 agrees with that unchanged Rumoca trace on all 710 shared channels; the two refined OMC traces agree on all 735 shared channels. Default OMC's summed star current reaches 9.24e-6 A while Rumoca remains near 1e-13 A, consistent with the SpacePhasor zero-sequence equations. This is a pointwise-reference limitation, not strict-high or certification credit. Source equations, immutable executable/input hashes, and convergence comparisons are recorded in docs/dev-guide/src/tooling/multibody-coverage.md at evidence commit 3d76411c; official tolerances and reference traces are unchanged.",
+      "evidence": {
+        "facts": [
+          "690 high, 18 near, 2 deviating channels against OMC at the model tolerance 1e-6",
+          "OMC at 1e-10 and 1e-12 agrees with the unchanged Rumoca trace on all 710 shared channels",
+          "default OMC summed star current reaches 9.24e-6 A; Rumoca stays near 1e-13 A"
+        ],
+        "commit": "3d76411c1",
+        "artifact": "docs/dev-guide/src/tooling/multibody-coverage.md"
+      }
     },
     {
-      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.HalfControlledBridge2mPulse",
-      "reason": "The 17 differing channels are all aliases of one degenerate node: the supply star point (sineVoltage.plug_n joined through MultiStarResistance, R=1e6, to ground), which carries zero net current in exact arithmetic so its exact voltage is 0 V; OMC's reference spread is below 1e-9 V. Rumoca's within-tolerance algebraic-loop residual current of order 1e-10 A is amplified by the 1e6 ohm grounding resistance into a broadband 1e-4 V signal that saturates the metric against the 1e-6 normalization floor. All 374 other channels are strict-high (currentSensor.i and voltagesensor.v agree within 1.4e-3 on 13.5 A and 269 V scales) and the rectifier conduction sequence is identical with every switching edge matching within 6e-7 s, so the near-zero reference makes pointwise comparison non-identifying for this node."
+      "model_name": "Modelica.Electrical.Machines.Examples.SynchronousMachines.SMEE_Generator",
+      "kind": "reference_failure",
+      "reason": "Only seven aliases of the damper-cage loss power are non-high (571 of 578 channels high). After the start-up transient the loss power is a 0.29260696 W constant, and the default OMC reference carries integration residue of up to 9.7e-6 W on it, so the channel's p95-p05 reference range (4.05e-6 W) is that residue and Rumoca's own 1e-6 residue (mean difference 3.7e-6 W) scores as a deviation against it. With the same OMC model at 1e-10 as the converged reference, the default OMC trace differs by a mean 3.15e-6 W and the unchanged Rumoca trace by a mean 9.4e-7 W, and Rumoca at 1e-10 agrees with OMC at 1e-10 within 1.3e-8 W. The default reference is not accurate enough to identify this near-constant observable pointwise; this is not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "571 high and 7 deviating channels; all 7 are aliases of smee.damperCage.lossPower",
+          "damper-cage loss power after start-up: 0.29260696 W; default OMC p95-p05 range 4.05e-6 W",
+          "against OMC at 1e-10 on t in [1, 30]: default OMC mean difference 3.15e-6 W, Rumoca 1e-6 mean difference 9.4e-7 W",
+          "Rumoca at 1e-10 vs OMC at 1e-10: maximum difference 1.3e-8 W"
+        ],
+        "artifact": "msl:Modelica.Electrical.Machines.Examples.SynchronousMachines.SMEE_Generator"
+      }
     },
     {
-      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.ThyristorBridge2mPulse_R",
-      "reason": "The 17 differing channels are all aliases of one degenerate node: the supply star point (sineVoltage.plug_n joined through MultiStarResistance, R=1e6, to ground), which carries zero net current in exact arithmetic so its exact voltage is 0 V; OMC's reference spread is below 8.5e-10 V. Rumoca's within-tolerance algebraic-loop residual current of order 1e-10 A is amplified by the 1e6 ohm grounding resistance into a broadband 1.2e-4 V mean signal that saturates the metric against the 1e-6 normalization floor. All 401 other channels are strict-high (currentSensor.i and voltagesensor.v agree within 1.7e-3 on 13.5 A and 269 V scales) and the thyristor firing sequence is identical with every interior switching edge matching within 5.9e-7 s, ruling out a torn-solve root divergence; the near-zero reference makes pointwise comparison non-identifying for this node."
-    },
-    {
-      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.ThyristorBridge2mPulse_RL",
-      "reason": "The 17 differing channels are all aliases of one degenerate node: the supply star point (sineVoltage.plug_n joined through MultiStarResistance, R=1e6, to ground), which carries zero net current in exact arithmetic so its exact voltage is 0 V; OMC's reference spread is below 8.9e-10 V. Rumoca's within-tolerance algebraic-loop residual current of order 1e-10 A is amplified by the 1e6 ohm grounding resistance into a broadband 8.4e-5 V mean signal that saturates the metric against the 1e-6 normalization floor. All 407 other channels are strict-high (inductor.i agrees within 2.3e-4 on a 9.56 A scale and voltagesensor.v within 1.7e-3 on 269 V) and the thyristor firing sequence is identical with every interior switching edge matching within 6.4e-7 s, ruling out a torn-solve root divergence; the near-zero reference makes pointwise comparison non-identifying for this node."
+      "model_name": "Modelica.Electrical.Machines.Examples.SynchronousMachines.SMPM_Braking",
+      "kind": "reference_failure",
+      "reason": "The default OMC reference does not resolve the four zero-sequence voltage observables: SMPM_Braking has 584 high and four deviating channels, with all 588 initial values high. The source and generated OMC equations give vzero=mean(vAC)+3*Rg*i0-mean(rs.v), Rg=1e6; current error is amplified by approximately 3e6 into voltage error. Both original traces satisfy this identity within 7e-8 V. Running the same OMC executable at 1e-9 and 1e-10 reduces the unchanged Rumoca comparison to four near channels, but those two OMC traces themselves have five deviating channels; the 1e-12 diagnostic times out after chattering. There is no converged reference or strict-high claim. An independent analytic stiff RL reproduction at unchanged 1e-6 tolerances has maximum voltage errors of 0.5054 V in OMC and 1.1509 V in Rumoca despite small current errors. This is a conditioned-observable reference limitation; bounding amplified output error remains an explicit numerical accuracy obligation, not certification credit. Source equations, failed diagnostics, and the analytic regression are recorded in docs/dev-guide/src/tooling/multibody-coverage.md at evidence commit 0de3f29c. Official reference traces and tolerances are unchanged.",
+      "evidence": {
+        "facts": [
+          "584 high and 4 deviating channels; all 588 initial values high",
+          "vzero=mean(vAC)+3*Rg*i0-mean(rs.v) with Rg=1e6 amplifies current error by about 3e6",
+          "OMC at 1e-9 and 1e-10 leaves 4 near channels, and those two OMC traces disagree on 5 channels"
+        ],
+        "commit": "0de3f29c0",
+        "artifact": "docs/dev-guide/src/tooling/multibody-coverage.md"
+      }
     },
     {
       "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2Pulse.ThyristorBridge2Pulse_RLV_Characteristic",
-      "reason": "Only aliases of the period-integrated RootMeanSquare/Mean aggregate differ. At the annotation tolerance of 1e-6, OMC's endpoint RMS is 109.999434852 V; rerunning the same generated OMC model at 1e-10 moves it to 110.000018546 V, a 5.84e-4 V shift that accounts for Rumoca's 5.74e-4 V difference. The physical waveform and state channels agree, so the default-tolerance OMC trace is not converged enough to identify pointwise aggregate parity."
+      "kind": "comparator_limitation",
+      "reason": "Only aliases of the period-integrated RootMeanSquare/Mean aggregate differ. At the annotation tolerance of 1e-6, OMC's endpoint RMS is 109.999434852 V; rerunning the same generated OMC model at 1e-10 moves it to 110.000018546 V, a 5.84e-4 V shift that accounts for Rumoca's 5.74e-4 V difference. The physical waveform and state channels agree, so the default-tolerance OMC trace is not converged enough to identify pointwise aggregate parity.",
+      "evidence": {
+        "facts": [
+          "only period RootMeanSquare/Mean aggregate aliases differ",
+          "OMC endpoint RMS 109.999434852 V at 1e-6 and 110.000018546 V at 1e-10 (shift 5.84e-4 V)",
+          "Rumoca difference 5.74e-4 V"
+        ]
+      },
+      "retired_by": "aggregate_tolerance_at_annotation_scale"
     },
     {
-      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierCenterTap2mPulse.ThyristorCenterTap2mPulse_RLV",
-      "reason": "The differing channels are aliases of one period RMS aggregate at integration-residue scale within the model's 1e-6 experiment tolerance. OMC gives 17103.337997 at 1e-6 and 17103.266886 at 1e-10, while Rumoca gives 17103.258674 at 1e-6; the default-tolerance OMC trace is not converged enough to identify pointwise aggregate parity."
+      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.DiodeBridge2mPulse",
+      "kind": "comparator_limitation",
+      "reason": "The differing channels are period Mean/RMS aggregates at integration-residue scale within the model's 1e-6 experiment tolerance; waveform channels agree and Rumoca's mean is closer to the analytic 3*sqrt(6)/pi*Vrms value.",
+      "evidence": {
+        "facts": [
+          "differing channels are period Mean/RMS aggregates within the 1e-6 experiment tolerance",
+          "Rumoca mean is closer to the analytic 3*sqrt(6)/pi*Vrms"
+        ]
+      },
+      "retired_by": "aggregate_tolerance_at_annotation_scale"
+    },
+    {
+      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.HalfControlledBridge2mPulse",
+      "kind": "comparator_limitation",
+      "reason": "The 17 differing channels are all aliases of one degenerate node: the supply star point (sineVoltage.plug_n joined through MultiStarResistance, R=1e6, to ground), which carries zero net current in exact arithmetic so its exact voltage is 0 V; OMC's reference spread is below 1e-9 V. Rumoca's within-tolerance algebraic-loop residual current of order 1e-10 A is amplified by the 1e6 ohm grounding resistance into a broadband 1e-4 V signal that saturates the metric against the 1e-6 normalization floor. All 374 other channels are strict-high (currentSensor.i and voltagesensor.v agree within 1.4e-3 on 13.5 A and 269 V scales) and the rectifier conduction sequence is identical with every switching edge matching within 6e-7 s, so the near-zero reference makes pointwise comparison non-identifying for this node.",
+      "evidence": {
+        "facts": [
+          "17 differing channels are aliases of the supply star point, 0 V in exact arithmetic",
+          "OMC reference spread below 1e-9 V",
+          "all 374 other channels strict-high",
+          "every switching edge matches within 6e-7 s"
+        ]
+      },
+      "retired_by": "near_zero_channel_scaling"
+    },
+    {
+      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.ThyristorBridge2mPulse_R",
+      "kind": "comparator_limitation",
+      "reason": "The 17 differing channels are all aliases of one degenerate node: the supply star point (sineVoltage.plug_n joined through MultiStarResistance, R=1e6, to ground), which carries zero net current in exact arithmetic so its exact voltage is 0 V; OMC's reference spread is below 8.5e-10 V. Rumoca's within-tolerance algebraic-loop residual current of order 1e-10 A is amplified by the 1e6 ohm grounding resistance into a broadband 1.2e-4 V mean signal that saturates the metric against the 1e-6 normalization floor. All 401 other channels are strict-high (currentSensor.i and voltagesensor.v agree within 1.7e-3 on 13.5 A and 269 V scales) and the thyristor firing sequence is identical with every interior switching edge matching within 5.9e-7 s, ruling out a torn-solve root divergence; the near-zero reference makes pointwise comparison non-identifying for this node.",
+      "evidence": {
+        "facts": [
+          "17 differing channels are aliases of the supply star point, 0 V in exact arithmetic",
+          "OMC reference spread below 8.5e-10 V",
+          "all 401 other channels strict-high",
+          "every interior switching edge matches within 5.9e-7 s"
+        ]
+      },
+      "retired_by": "near_zero_channel_scaling"
+    },
+    {
+      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.ThyristorBridge2mPulse_RL",
+      "kind": "comparator_limitation",
+      "reason": "The 17 differing channels are all aliases of one degenerate node: the supply star point (sineVoltage.plug_n joined through MultiStarResistance, R=1e6, to ground), which carries zero net current in exact arithmetic so its exact voltage is 0 V; OMC's reference spread is below 8.9e-10 V. Rumoca's within-tolerance algebraic-loop residual current of order 1e-10 A is amplified by the 1e6 ohm grounding resistance into a broadband 8.4e-5 V mean signal that saturates the metric against the 1e-6 normalization floor. All 407 other channels are strict-high (inductor.i agrees within 2.3e-4 on a 9.56 A scale and voltagesensor.v within 1.7e-3 on 269 V) and the thyristor firing sequence is identical with every interior switching edge matching within 6.4e-7 s, ruling out a torn-solve root divergence; the near-zero reference makes pointwise comparison non-identifying for this node.",
+      "evidence": {
+        "facts": [
+          "17 differing channels are aliases of the supply star point, 0 V in exact arithmetic",
+          "OMC reference spread below 8.9e-10 V",
+          "all 407 other channels strict-high",
+          "every interior switching edge matches within 6.4e-7 s"
+        ]
+      },
+      "retired_by": "near_zero_channel_scaling"
     },
     {
       "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierCenterTap2Pulse.ThyristorCenterTap2Pulse_RLV_Characteristic",
-      "reason": "Only aliases of the period-integrated RootMeanSquare/Mean aggregate differ. At the annotation tolerance of 1e-6, OMC's endpoint RMS is 109.999434852 V; rerunning the same generated OMC model at 1e-10 moves it to 110.000018546 V, a 5.84e-4 V shift that accounts for Rumoca's 5.74e-4 V difference. The physical waveform and state channels agree, so the default-tolerance OMC trace is not converged enough to identify pointwise aggregate parity."
+      "kind": "comparator_limitation",
+      "reason": "Only aliases of the period-integrated RootMeanSquare/Mean aggregate differ. At the annotation tolerance of 1e-6, OMC's endpoint RMS is 109.999434852 V; rerunning the same generated OMC model at 1e-10 moves it to 110.000018546 V, a 5.84e-4 V shift that accounts for Rumoca's 5.74e-4 V difference. The physical waveform and state channels agree, so the default-tolerance OMC trace is not converged enough to identify pointwise aggregate parity.",
+      "evidence": {
+        "facts": [
+          "only period RootMeanSquare/Mean aggregate aliases differ",
+          "OMC endpoint RMS 109.999434852 V at 1e-6 and 110.000018546 V at 1e-10 (shift 5.84e-4 V)",
+          "Rumoca difference 5.74e-4 V"
+        ]
+      },
+      "retired_by": "aggregate_tolerance_at_annotation_scale"
+    },
+    {
+      "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierCenterTap2mPulse.ThyristorCenterTap2mPulse_RLV",
+      "kind": "comparator_limitation",
+      "reason": "The differing channels are aliases of one period RMS aggregate at integration-residue scale within the model's 1e-6 experiment tolerance. OMC gives 17103.337997 at 1e-6 and 17103.266886 at 1e-10, while Rumoca gives 17103.258674 at 1e-6; the default-tolerance OMC trace is not converged enough to identify pointwise aggregate parity.",
+      "evidence": {
+        "facts": [
+          "differing channels are aliases of one period RMS aggregate",
+          "OMC 17103.337997 at 1e-6 and 17103.266886 at 1e-10; Rumoca 17103.258674 at 1e-6"
+        ]
+      },
+      "retired_by": "aggregate_tolerance_at_annotation_scale"
     },
     {
       "model_name": "Modelica.Electrical.PowerConverters.Examples.DCDC.HBridge.HBridge_TrianglePWM_RL",
-      "reason": "The differing meanVoltage.y channel is the event-latched output of Blocks.Math.Mean. Tiny PWM event-time shifts make raw pointwise comparison of the held aggregate non-identifying; the switching waveform and physical states agree, and both solvers converge to the same 19.999995992 V endpoint within 2.7e-10 V."
+      "kind": "comparator_limitation",
+      "reason": "The differing meanVoltage.y channel is the event-latched output of Blocks.Math.Mean. Tiny PWM event-time shifts make raw pointwise comparison of the held aggregate non-identifying; the switching waveform and physical states agree, and both solvers converge to the same 19.999995992 V endpoint within 2.7e-10 V.",
+      "evidence": {
+        "facts": [
+          "only differing channel: meanVoltage.y, the event-latched Blocks.Math.Mean output",
+          "both solvers reach the 19.999995992 V endpoint within 2.7e-10 V"
+        ]
+      },
+      "retired_by": "event_instant_alignment"
+    },
+    {
+      "model_name": "Modelica.Fluid.Examples.AST_BatchPlant.Test.TwoTanks",
+      "kind": "comparator_limitation",
+      "reason": "The 11 non-high channels are all aliases of tank1's temperature and enthalpy (74 of 85 channels high, tank2 and every flow and level channel high). Tank1 only drains through its bottom port into the pipe, so its exact temperature is the constant 323.15 K; OMC's whole reference spread on these channels (6.37e-6 K) is its own integration residue, since the same OMC model at tolerance 1e-10 differs from its 1e-6 trace by exactly that 6.37e-6 K. Normalizing against that spread makes pointwise comparison non-identifying: Rumoca's 1e-6 drift of 2.4e-4 K is 7.4e-7 of the level, inside the experiment's relative tolerance, and at rtol = atol = 1e-10 Rumoca agrees with the 1e-10 OMC trace to 4.7e-9 K on these channels while both remain near-flat (drifts 6.9e-9 and 2.2e-9 K), so the channel stays degenerate at every tolerance.",
+      "evidence": {
+        "facts": [
+          "74/85 channels high; the 11 non-high channels are tank1.medium.T, tank1.medium.T_degC, tank1.medium.state.T, tank1.medium.h, tank1.medium.u, tank1.heatTransfer.Ts[1], tank1.heatTransfer.states[1].T, tank1.heatTransfer.heatPorts[1].T, pipe.flowModel.states[1].T, pipe.port_b.h_outflow and tank1.ports[1].h_outflow",
+          "exact tank1 temperature is constant 323.15 K; OMC 1e-6 vs OMC 1e-10 on tank1.medium.T: max abs 6.371e-6 K, equal to the reference spread",
+          "Rumoca vs OMC at rtol = atol = 1e-10 on tank1.medium.T: max abs 4.7e-9 K; tank2 mixing temperature within 1.2e-6 K of the exact 75 degC energy balance",
+          "a tolerance-times-nominal floor (1e-6 x 300 K) would still score the 1.69e-4 K mean error at 0.56, so no unit-free floor identifies the channel"
+        ],
+        "artifact": "msl:Modelica.Fluid.Examples.AST_BatchPlant.Test.TwoTanks"
+      },
+      "retired_by": "near_zero_channel_scaling"
+    },
+    {
+      "model_name": "Modelica.Magnetic.FluxTubes.Examples.SolenoidActuator.ComparisonPullInStroke",
+      "kind": "model_issue",
+      "reason": "Only the two stopper_xMin.lossPower channels are non-high (477 of 479 channels high). Both traces reach the stopper at the same instants and dissipate the same impact energy; the channels differ in the damped bounce tail of the stiff elastic stopper, whose loss power is not converged at the annotation tolerance: Rumoca at rtol=atol=1e-9 differs from its own 1e-6 trace by more than either differs from OMC. Pointwise comparison of this unconverged event-local observable is non-identifying, while every position, velocity, flux, current and force channel is high.",
+      "evidence": {
+        "facts": [
+          "477/0/2 high/minor/deviation channels; non-high: advancedSolenoid.armature.stopper_xMin.lossPower, simpleSolenoid.armature.stopper_xMin.lossPower",
+          "stopper contact begins at t=0.0136 (advancedSolenoid) and peaks at t=0.0124 (simpleSolenoid) in both traces",
+          "peak loss power 76.85 W (OMC) vs 76.67 W (Rumoca) and 94.48 W vs 94.72 W; dissipated energy 1.4956e-2 J vs 1.4896e-2 J and 2.2124e-2 J vs 2.2190e-2 J",
+          "summed |difference| on the OMC grid: Rumoca 1e-6 vs Rumoca 1e-9 is 7.0 and 6.3, OMC vs Rumoca 1e-6 is 3.3 and 3.6, OMC vs Rumoca 1e-9 is 3.8 and 2.7"
+        ]
+      }
+    },
+    {
+      "model_name": "Modelica.Magnetic.FluxTubes.Examples.SolenoidActuator.ComparisonQuasiStatic",
+      "kind": "model_issue",
+      "reason": "All observed non-high channels are internal advancedSolenoid node voltages and half-coil across-voltages (r_par1.v, r_par2.v, r_2.p.v, coil1.n.v, coil2.v and sibling node potentials); no current, flux, force, inductance, position, or terminal channel deviates. They share an identical common-mode offset near 0.4544 V across nodes at very different levels, the signature of a floating internal sub-network whose half-coil voltage split the model regularizes only with 1 nF parasitic capacitors (their documented purpose is to keep the half-coil voltages well-defined). At the quasi-static 12 V operating point that regularization is weakest; the total coil EMF (coil1.v + coil2.v) and all terminal and resistive drops agree, only the weakly-determined split between the half-coils differs. Pointwise comparison of these internal voltages against OMC is non-identifying.",
+      "evidence": {
+        "facts": [
+          "non-high channels are internal advancedSolenoid node and half-coil voltages only",
+          "common-mode offset near 0.4544 V across those nodes",
+          "the split is regularized only by 1 nF parasitic capacitors",
+          "no current, flux, force, inductance, position, or terminal channel deviates"
+        ]
+      }
+    },
+    {
+      "model_name": "Modelica.Magnetic.FundamentalWave.Examples.Components.EddyCurrentLosses",
+      "kind": "reference_failure",
+      "reason": "OMC folds atan2(0, x) to 0 whatever the sign of x, so its ComplexMath.arg channel of the phase-1 converter (orientation 0, V_m.im structurally zero, V_m.re alternating with the current) is the constant 0, while atan2 is pi for a negative real part. The only non-high channels are these two angles; 678 of 680 are high.",
+      "evidence": {
+        "facts": [
+          "678/0/2 channels (high/minor/deviating)",
+          "deviating: converter_m and converter_e singlePhaseElectroMagneticConverter[1].arg_V_m",
+          "OMC repro: atan2(0, -0.757) = 0 and ComplexMath.arg(Complex(-0.757, 0)) = 0"
+        ],
+        "commit": "6313cdbe3",
+        "artifact": "docs/dev-guide/src/tooling/electrical-coverage.md"
+      }
+    },
+    {
+      "model_name": "Modelica.Magnetic.FundamentalWave.Examples.Components.SinglePhaseInductance",
+      "kind": "reference_failure",
+      "reason": "OMC folds atan2(0, x) to 0 whatever the sign of x, so its ComplexMath.arg channels of the orientation-0 single-phase phasors are the constant 0, while atan2 is pi for a negative real part. The only non-high channels are these four angles; 78 of 82 are high.",
+      "evidence": {
+        "facts": [
+          "78/0/4 channels",
+          "deviating: reluctance_m.arg_Phi, reluctance_m.arg_V_m, converter_m.arg_V_m, converter_m.arg_Phi",
+          "OMC repro: atan2(0, -0.757) = 0"
+        ],
+        "commit": "6313cdbe3",
+        "artifact": "docs/dev-guide/src/tooling/electrical-coverage.md"
+      }
+    },
+    {
+      "model_name": "Modelica.Magnetic.QuasiStatic.FluxTubes.Examples.FixedShapes.CuboidSections",
+      "kind": "comparator_limitation",
+      "reason": "Every non-high channel is an arg_* angle, and every difference is the sign of a zero. At t = 0 the phasors are exactly zero, and atan2 of a zero phasor returns 0, pi or -pi according to the signs of its zeros (Rumoca (-0, -0) gives -pi, OMC records 0). cuboidTop and idle lie on the branch cut, pi in one trace and -pi in the other. Pointwise angle comparison is not identifying there.",
+      "evidence": {
+        "facts": [
+          "171/0/11 channels",
+          "11 angles differ at t = 0; 5 of them are pi against -pi throughout",
+          "no non-angle channel differs"
+        ],
+        "commit": "6313cdbe3",
+        "artifact": "docs/dev-guide/src/tooling/electrical-coverage.md"
+      },
+      "retired_by": "angle_branch_aware_comparison"
+    },
+    {
+      "model_name": "Modelica.Magnetic.QuasiStatic.FluxTubes.Examples.FixedShapes.CylinderSections",
+      "kind": "comparator_limitation",
+      "reason": "The only differences are 8 arg_* angles at t = 0, where the flux-tube phasors are exactly zero and atan2 returns 0, pi or -pi according to the signs of the zeros; every later sample agrees. The angle of a zero phasor is undefined.",
+      "evidence": {
+        "facts": [
+          "156/0/8 channels",
+          "8 angles differ at t = 0 only"
+        ],
+        "commit": "6313cdbe3",
+        "artifact": "docs/dev-guide/src/tooling/electrical-coverage.md"
+      },
+      "retired_by": "angle_branch_aware_comparison"
+    },
+    {
+      "model_name": "Modelica.Magnetic.QuasiStatic.FluxTubes.Examples.Leakage.CylinderLeakage",
+      "kind": "comparator_limitation",
+      "reason": "The only non-high channels are two angles of phasors with a negative real part and a zero imaginary part, on the atan2 branch cut: pi in one trace and -pi in the other, the same angle.",
+      "evidence": {
+        "facts": [
+          "232/0/2 channels",
+          "hollowCylinderAxialFlux1.arg_H and magneticFluxSensor.arg_Phi: pi against -pi throughout"
+        ],
+        "commit": "6313cdbe3",
+        "artifact": "docs/dev-guide/src/tooling/electrical-coverage.md"
+      },
+      "retired_by": "angle_branch_aware_comparison"
+    },
+    {
+      "model_name": "Modelica.Mechanics.MultiBody.Examples.Rotational3DEffects.BevelGear1D",
+      "kind": "reference_failure",
+      "reason": "The default OMC trajectory is not converged under integration refinement: at t=1 s, revolute1.phi is 72.3016881 rad at 1e-6, 48.8580302 at 1e-9, and 48.1459607 at 1e-12. At 1e-12, changing only its fixed initial angle by 1e-8 rad changes the endpoint by 7.1132384 rad. Rumoca and OMC agree on all 5020 state derivatives evaluated at 502 identical OMC points (maximum abs(error)/max(1,abs(reference)) is 1.45e-11), separating equation evaluation from trajectory sensitivity. One default-tolerance OMC trajectory cannot identify pointwise refinement for this sensitive drive train; invariant and sensitivity analysis remain outstanding, and this exclusion is not strict-high certification. Reproduction, source/trace digests, and limitations are recorded in the MultiBody coverage ledger.",
+      "evidence": {
+        "facts": [
+          "OMC revolute1.phi at t=1 s: 72.3016881 rad at 1e-6, 48.8580302 at 1e-9, 48.1459607 at 1e-12",
+          "at 1e-12 a 1e-8 rad initial-angle change moves the endpoint by 7.1132384 rad",
+          "all 5020 state derivatives at 502 identical OMC points agree to 1.45e-11 relative"
+        ],
+        "commit": "6e3b5c2d3",
+        "artifact": "docs/dev-guide/src/tooling/multibody-coverage.md"
+      }
     },
     {
       "model_name": "Modelica.Mechanics.Translational.Examples.PreLoad",
-      "reason": "Nonsmooth contact-event force and acceleration channels exhibit tiny event-time phase shifts while smooth state and position behavior agree; raw pointwise algebraic acceleration at contact is non-identifying."
+      "kind": "comparator_limitation",
+      "reason": "Nonsmooth contact-event force and acceleration channels exhibit tiny event-time phase shifts while smooth state and position behavior agree; raw pointwise algebraic acceleration at contact is non-identifying.",
+      "evidence": {
+        "facts": [
+          "differing channels are nonsmooth contact-event force and acceleration channels",
+          "smooth state and position channels agree"
+        ]
+      },
+      "retired_by": "event_instant_alignment"
+    },
+    {
+      "model_name": "Modelica.StateGraph.Examples.ControlledTanks",
+      "kind": "reference_failure",
+      "reason": "OMC a96aa1a-cmake stops at t = 13 s with too many event iterations, so the parity harness records the reference as an error and writes no reference trace. At that instant the start button is released while the stop button is pressed, and the two RadioButtonSource blocks reset each other (start.reset = {stop.on, shut.on}, stop.reset = {start.on, shut.on}); OMC still fails with the event-iteration limit raised to 1000. Up to that instant the Rumoca trace agrees with the result OMC writes before it stops, and after it Rumoca pauses the process as the model documentation specifies for the stop button. This is a reference-generation failure, not strict-high credit.",
+      "evidence": {
+        "facts": [
+          "OMC log: Simulation terminated due to too many, i.e. 20, event iterations (also with -mei=1000); the last result row OMC writes is t = 13",
+          "harness omc_simulation_reference status: error, result_file null",
+          "Rumoca vs the OMC-written result over t in [0, 13): 104 of 104 shared channels, max abs difference 8.7e-6 (tank1.level, range 0.98) away from event instants",
+          "Rumoca at t = 13: start.on false, stop.on true, valve1, valve2 and valve3 closed until the start press at t = 15; at t = 21 shut.on true opens valve2 and valve3"
+        ],
+        "artifact": "msl:Modelica.StateGraph.Examples.ControlledTanks"
+      }
     },
     {
       "model_name": "Modelica.Thermal.FluidHeatFlow.Examples.ParallelPumpDropOut",
-      "reason": "The DoubleRamp pump drop-out holds V_flow at exactly zero during t in [0.4, 0.6] s. At exactly zero flow the semiLinear outflow enthalpy observables (pipe T_b, dT, and flowPort h aliases; 9 deviation plus 6 minor of 121 channels, zero severe) are underdetermined by MLS 3.7.4.5 at the model's three-way FlowPort junction, so OMC holds the previous value while rumoca reports a different admissible value. 100.0 percent of every deviating channel's integral error mass lies inside that zero-flow window and the maximum deviation outside it is 2.3e-3 K, while every state (pipe and heat capacitor temperatures) agrees within 1.5e-3 K over the whole 2 s horizon; pointwise comparison of the zero-flow observable is non-identifying."
+      "kind": "model_issue",
+      "reason": "The DoubleRamp pump drop-out holds V_flow at exactly zero during t in [0.4, 0.6] s. At exactly zero flow the semiLinear outflow enthalpy observables (pipe T_b, dT, and flowPort h aliases; 9 deviation plus 6 minor of 121 channels, zero severe) are underdetermined by MLS 3.7.4.5 at the model's three-way FlowPort junction, so OMC holds the previous value while rumoca reports a different admissible value. 100.0 percent of every deviating channel's integral error mass lies inside that zero-flow window and the maximum deviation outside it is 2.3e-3 K, while every state (pipe and heat capacitor temperatures) agrees within 1.5e-3 K over the whole 2 s horizon; pointwise comparison of the zero-flow observable is non-identifying.",
+      "evidence": {
+        "facts": [
+          "V_flow is exactly 0 during t in [0.4, 0.6] s",
+          "9 deviation and 6 minor of 121 channels, zero severe",
+          "100.0 percent of each deviating channel error mass lies inside the zero-flow window; maximum deviation outside it 2.3e-3 K",
+          "every state agrees within 1.5e-3 K over 2 s"
+        ]
+      }
     }
   ]
 }

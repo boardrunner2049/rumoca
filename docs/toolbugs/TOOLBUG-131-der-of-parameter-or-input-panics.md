@@ -31,7 +31,7 @@ and the constructor's `expect` fired.
 
 Affected (cluster G): OpenIPSL `SimpleLead`, Modelica_DeviceDrivers
 `EmbeddedTargets.AVR.Examples.SBHS.Controller` (`der(degC)` of an input) —
-2 models; both now end in the ED022 diagnostic instead of a panic.
+2 models; both now end in the ED024 diagnostic instead of a panic.
 
 ## Fix
 
@@ -40,10 +40,10 @@ Affected (cluster G): OpenIPSL `SimpleLead`, Modelica_DeviceDrivers
   variable (whole or scalar-subscripted) or a numeric literal to a zero of the
   same shape.
 - `rumoca-phase-dae/src/construction/analysis/model_roles.rs`: a top-level input
-  used under `der` is rejected with the new `ED022` (`ToDaeError::DerivativeOfInput`),
+  used under `der` is rejected with the new `ED024` (`ToDaeError::DerivativeOfInput`),
   labelled at the input declaration.
 
 ## Test
 
 `crates/rumoca-contracts/tests/expr_contracts.rs::der_of_parameter_is_zero`
-(simulates) and `::der_of_top_level_input_is_diagnosed` (ED022 in ToDae).
+(simulates) and `::der_of_top_level_input_is_diagnosed` (ED024 in ToDae).

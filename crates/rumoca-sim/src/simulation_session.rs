@@ -252,7 +252,7 @@ fn new_auto_session(
         match crate::diffsol::select_auto_integrator(&artifact, &opts, execution_backend.clone())
             .map_err(|error| SimulationDiagnosticError::Solver(error.to_string()))?
         {
-            crate::diffsol::SelectedAutoIntegrator::Bdf => {
+            crate::diffsol::SelectedAutoIntegrator::Bdf(_) => {
                 crate::diffsol::SimulationSession::from_artifact(artifact, opts, execution_backend)
                     .map(|session| SimulationSession {
                         inner: SimulationSessionInner::Diffsol(Box::new(session)),

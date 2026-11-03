@@ -1,3 +1,4 @@
+{%- from "fmi-typed-arithmetic.jinja" import integer %}
 {%- macro scalar_const(op) -%}
 {%- if op.value_class == "finite" -%}{{ op.value }}
 {%- elif op.value_class == "positive_infinity" -%}INFINITY
@@ -44,79 +45,317 @@
 {%- else -%}{{ fail("unsupported-feature:scalar.compare." ~ operator) }}
 {%- endif -%}
 {%- endmacro %}
+{#- The emitted symbol of a pure-call owner: its content-addressed family
+    representative. Every render path that emits pure calls must supply
+    `pure_call_symbols`; a merged owner referenced by its own name would
+    otherwise fail only at link time. -#}
+{%- macro pure_symbol(owner) -%}
+{%- if pure_call_symbols is not defined %}{{ fail("internal: pure_call_symbols is not in the render context") }}{% endif -%}
+{{ pure_call_symbols[owner] }}
+{%- endmacro %}
+{#- The storage one output is written to: its target slot when a target list
+    is given (a state start target in the solver vector, any other in
+    `output`), else `output` at the output ordinal. -#}
+{%- macro store_target(output, targets, index) -%}
+{%- if targets is none %}{{ output }}[{{ index }}]
+{%- elif targets[index].Y is defined %}m->y[{{ targets[index].Y.index }}]
+{%- else %}{{ output }}[{{ targets[index].P.index }}]{% endif -%}
+{%- endmacro %}
+
 {%- macro scalar_op(op, output="m->derivative", error_status="fmi3Error", targets=none) %}
 {%- if op.kind == "Const" %}    r[{{ op.dst }}] = {{ scalar_const(op) }};
+{%- elif op.kind == "LoadFoldCarried" %}    r[{{ op.dst }}] = ff_carried[{{ op.index }}];
+{%- elif op.kind == "LoadFoldCapture" %}    r[{{ op.dst }}] = ff_captures[{{ op.index }}];
+{%- elif op.kind == "LoadFoldIndex" %}    r[{{ op.dst }}] = ff_indices[{{ op.dimension }}];
+{%- elif op.kind in ["LoadIndexedFoldCarried", "LoadIndexedFoldCapture", "LoadIndexedRegister"] %}{{ indexed_fold_load(op) }}
+{%- elif op.kind in ["FunctionFold", "GuardedFunctionFold", "StoreOutputFunctionFold"] %}{{ function_fold(op, output, error_status) }}
+{%- elif op.kind == "StoreOutputFoldTensorUpdate" %}{{ fold_tensor_update(op, output) }}
 {%- elif op.kind == "LoadTime" %}    r[{{ op.dst }}] = m->time;
 {%- elif op.kind == "LoadY" %}    r[{{ op.dst }}] = m->y[{{ op.index }}];
 {%- elif op.kind == "LoadP" %}    r[{{ op.dst }}] = m->p[{{ op.index }}];
+{%- elif op.kind == "LoadSeed" %}    r[{{ op.dst }}] = seed[{{ op.index }}];
 {%- elif op.kind == "LoadIndexedP" %}    r[{{ op.dst }}] = m->p[{{ op.base }} + (size_t)fmin(fmax(round(r[{{ op.index_ref }}]), 0.0), {{ op.count - 1 if op.count > 0 else 0 }}.0)];
 {%- elif op.kind == "Move" %}    r[{{ op.dst }}] = r[{{ op.src }}];
+{%- elif op.kind == "LinearSolveComponent" %}    { double w[{{ op.n * (op.n + 1) }}]; if (!rmc_linear_solve_component(&r[{{ op.matrix_start }}], &r[{{ op.rhs_start }}], {{ op.n }}, {{ op.component }}, w, &r[{{ op.dst }}])) return {{ error_status }}; }
 {%- elif op.kind == "Unary" %}    r[{{ op.dst }}] = {{ unary(op.operator, op.arg) }};
 {%- elif op.kind == "Binary" %}    r[{{ op.dst }}] = {{ binary(op.operator, op.lhs, op.rhs) }};
 {%- elif op.kind == "Compare" %}    r[{{ op.dst }}] = {{ compare(op.operator, op.lhs, op.rhs) }};
 {%- elif op.kind == "Select" %}    r[{{ op.dst }}] = r[{{ op.cond }}] != 0.0 ? r[{{ op.if_true }}] : r[{{ op.if_false }}];
-{%- elif op.kind == "PureCall" %}    if (rumoca_scalar_pure_{{ op.owner }}((const double*[]){ {% for start in op.input_starts %}&r[{{ start }}],{% else %}NULL{% endfor %} }, &r[{{ op.dst }}])) return {{ error_status }};
+{%- elif op.kind == "PureCall" %}    if (rumoca_scalar_pure_{{ pure_symbol(op.owner) }}((const double*[]){ {% for start in op.input_starts %}&r[{{ start }}],{% else %}NULL{% endfor %} }, &r[{{ op.dst }}])) return {{ error_status }};
+{%- elif op.kind == "PureCallDirectional" %}    if (rumoca_scalar_pure_directional_{{ pure_symbol(op.owner) }}((const double*[]){ {% for start in op.input_starts %}&r[{{ start }}],{% else %}NULL{% endfor %} }, &r[{{ op.dst }}])) return {{ error_status }};
 {%- elif op.kind == "TensorLoad" and op.lanes == 1 %}    for (size_t k=0; k<{{ op.count }}; ++k) r[{{ op.dst }}+k] = m->{{ op.input | lower }}[{{ op.input_start }}+k];
 {%- elif op.kind == "TensorBinary" and op.lanes == 1 %}    for (size_t k=0; k<{{ op.count }}; ++k) r[{{ op.dst }}+k] = {{ binary(op.operator, op.lhs_start ~ "+k*" ~ op.lhs_stride, op.rhs_start ~ "+k*" ~ op.rhs_stride) }};
-{%- elif op.kind == "MatrixMultiply" and op.lanes == 1 %}
-    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
+{%- elif op.kind == "MatrixMultiply" and op.lanes == 1 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
         double sum=0.0;
         for (size_t k=0; k<{{ op.inner }}; ++k) sum+=r[{{ op.lhs_start }}+i*{{ op.inner }}+k]*r[{{ op.rhs_start }}+k*{{ op.columns }}+j];
         r[{{ op.dst }}+i*{{ op.columns }}+j]=sum;
     }
-{%- elif op.kind == "TensorTranspose" and op.lanes == 1 %}
-    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) for (size_t k=0; k<{{ op.element_width }}; ++k)
+{%- elif op.kind == "TensorTranspose" and op.lanes == 1 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) for (size_t k=0; k<{{ op.element_width }}; ++k)
         r[{{ op.dst }}+(i*{{ op.columns }}+j)*{{ op.element_width }}+k]=r[{{ op.src_start }}+(j*{{ op.rows }}+i)*{{ op.element_width }}+k];
+{%- elif op.kind == "TensorFill" %}    for (size_t k=0; k<{{ op.count }}; ++k) for (size_t l=0; l<{{ op.lanes }}; ++l) r[{{ op.dst }}+k*{{ op.lanes }}+l] = r[{{ op.value_start }}+l];
+{%- elif op.kind == "TensorIdentity" %}    for (size_t k=0; k<{{ op.size * op.size * op.lanes }}; ++k) r[{{ op.dst }}+k] = 0.0;
+    for (size_t k=0; k<{{ op.size }}; ++k) r[{{ op.dst }}+(k*{{ op.size }}+k)*{{ op.lanes }}] = 1.0;
 {%- elif op.kind == "TensorCross" and op.lanes == 1 %}{%- for i in range(3) %}    r[{{ op.dst + i }}] = r[{{ op.lhs_start + (i+1)%3 }}]*r[{{ op.rhs_start + (i+2)%3 }}] - r[{{ op.lhs_start + (i+2)%3 }}]*r[{{ op.rhs_start + (i+1)%3 }}];
 {%- endfor %}
-{%- elif op.kind == "StoreOutput" %}    {{ output }}[{{ targets[op.output_index].P.index if targets is not none else op.output_index }}] = r[{{ op.src }}];
-{%- elif op.kind == "StoreOutputRange" %}{%- for output_index in op.output_indices %}    {{ output }}[{{ targets[output_index].P.index if targets is not none else output_index }}] = r[{{ op.start + loop.index0 * op.stride }}];
+{%- elif op.kind == "TensorLoad" and op.lanes == 2 %}    for (size_t k=0; k<{{ op.count }}; ++k) { r[{{ op.dst }}+2*k] = m->{{ op.input | lower }}[{{ op.input_start }}+k]; r[{{ op.dst }}+2*k+1] = {% if op.seed_start is defined and op.seed_start is not none %}seed[{{ op.seed_start }}+k]{% else %}0.0{% endif %}; }
+{%- elif op.kind == "TensorBinary" and op.lanes == 2 and op.operator in ["Add", "Sub", "Mul", "Div"] %}    for (size_t k=0; k<{{ op.count }}; ++k) {
+        double a = r[{{ op.lhs_start }}+k*{{ op.lhs_stride * 2 }}], da = r[{{ op.lhs_start }}+k*{{ op.lhs_stride * 2 }}+1];
+        double b = r[{{ op.rhs_start }}+k*{{ op.rhs_stride * 2 }}], db = r[{{ op.rhs_start }}+k*{{ op.rhs_stride * 2 }}+1];
+{%- if op.operator == "Add" %}
+        r[{{ op.dst }}+2*k] = a + b; r[{{ op.dst }}+2*k+1] = da + db;
+{%- elif op.operator == "Sub" %}
+        r[{{ op.dst }}+2*k] = a - b; r[{{ op.dst }}+2*k+1] = da - db;
+{%- elif op.operator == "Mul" %}
+        r[{{ op.dst }}+2*k] = a * b; r[{{ op.dst }}+2*k+1] = da * b + a * db;
+{%- else %}
+        /* reverse.rs division_tangent: each local partial when finite, else zero */
+        double pa = 1.0 / b, pb = -a / (b * b); pa = isfinite(pa) ? pa : 0.0; pb = isfinite(pb) ? pb : 0.0;
+        r[{{ op.dst }}+2*k] = (b == 0.0 && a == 0.0) ? 0.0 : a / b; r[{{ op.dst }}+2*k+1] = da * pa + db * pb;
+{%- endif %}
+    }
+{%- elif op.kind == "MatrixMultiply" and op.lanes == 2 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
+        double re=0.0, du=0.0;
+        for (size_t k=0; k<{{ op.inner }}; ++k) {
+            size_t l={{ op.lhs_start }}+(i*{{ op.inner }}+k)*2, q={{ op.rhs_start }}+(k*{{ op.columns }}+j)*2;
+            re += r[l]*r[q]; du += r[l+1]*r[q] + r[l]*r[q+1];
+        }
+        r[{{ op.dst }}+(i*{{ op.columns }}+j)*2]=re; r[{{ op.dst }}+(i*{{ op.columns }}+j)*2+1]=du;
+    }
+{%- elif op.kind == "TensorTranspose" and op.lanes >= 2 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) for (size_t k=0; k<{{ op.element_width * op.lanes }}; ++k)
+        r[{{ op.dst }}+(i*{{ op.columns }}+j)*{{ op.element_width * op.lanes }}+k]=r[{{ op.src_start }}+(j*{{ op.rows }}+i)*{{ op.element_width * op.lanes }}+k];
+{%- elif op.kind == "TensorCross" and op.lanes == 2 %}    {
+        double a[6], b[6], c[6];
+        for (size_t k=0; k<6; ++k) { a[k]=r[{{ op.lhs_start }}+k]; b[k]=r[{{ op.rhs_start }}+k]; }
+        static const size_t first[3]={1,2,0}, second[3]={2,0,1};
+        for (size_t k=0; k<3; ++k) {
+            size_t f=2*first[k], s=2*second[k];
+            c[2*k]=a[f]*b[s]-a[s]*b[f];
+            c[2*k+1]=a[f+1]*b[s]+a[f]*b[s+1]-a[s+1]*b[f]-a[s]*b[f+1];
+        }
+        for (size_t k=0; k<6; ++k) r[{{ op.dst }}+k]=c[k];
+    }
+{#- Tangent-lane programs (rumoca_ir_solve::TangentLaneProgram) widen dual
+    aggregates to one primal and lanes-1 tangents per element; the lane count
+    is a render-time constant, so every local array has a fixed size. -#}
+{%- elif op.kind == "TensorLoad" and op.lanes > 2 %}{% set w = op.lanes %}    for (size_t k=0; k<{{ op.count }}; ++k) {
+        r[{{ op.dst }}+{{ w }}*k] = m->{{ op.input | lower }}[{{ op.input_start }}+k];
+        for (size_t l=1; l<{{ w }}; ++l) r[{{ op.dst }}+{{ w }}*k+l] = {% if op.seed_start is defined and op.seed_start is not none %}seed[({{ op.seed_start }}+k)*{{ w - 1 }}+(l-1)]{% else %}0.0{% endif %};
+    }
+{%- elif op.kind == "TensorBinary" and op.lanes > 2 and op.operator in ["Add", "Sub", "Mul", "Div"] %}{% set w = op.lanes %}    for (size_t k=0; k<{{ op.count }}; ++k) {
+        size_t x = {{ op.lhs_start }}+k*{{ op.lhs_stride * w }}, y = {{ op.rhs_start }}+k*{{ op.rhs_stride * w }}, z = {{ op.dst }}+k*{{ w }};
+        double a = r[x], b = r[y], c[{{ w }}];
+{%- if op.operator == "Add" %}
+        c[0] = a + b; for (size_t l=1; l<{{ w }}; ++l) c[l] = r[x+l] + r[y+l];
+{%- elif op.operator == "Sub" %}
+        c[0] = a - b; for (size_t l=1; l<{{ w }}; ++l) c[l] = r[x+l] - r[y+l];
+{%- elif op.operator == "Mul" %}
+        c[0] = a * b; for (size_t l=1; l<{{ w }}; ++l) c[l] = r[x+l] * b + a * r[y+l];
+{%- else %}
+        /* reverse.rs division_tangent: each local partial when finite, else zero */
+        double pa = 1.0 / b, pb = -a / (b * b); pa = isfinite(pa) ? pa : 0.0; pb = isfinite(pb) ? pb : 0.0;
+        c[0] = (b == 0.0 && a == 0.0) ? 0.0 : a / b; for (size_t l=1; l<{{ w }}; ++l) c[l] = r[x+l] * pa + r[y+l] * pb;
+{%- endif %}
+        for (size_t l=0; l<{{ w }}; ++l) r[z+l] = c[l];
+    }
+{%- elif op.kind == "MatrixMultiply" and op.lanes > 2 %}{% set w = op.lanes %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
+        double c[{{ w }}] = {0.0};
+        for (size_t k=0; k<{{ op.inner }}; ++k) {
+            size_t x={{ op.lhs_start }}+(i*{{ op.inner }}+k)*{{ w }}, y={{ op.rhs_start }}+(k*{{ op.columns }}+j)*{{ w }};
+            c[0] += r[x]*r[y];
+            for (size_t l=1; l<{{ w }}; ++l) c[l] += r[x+l]*r[y] + r[x]*r[y+l];
+        }
+        for (size_t l=0; l<{{ w }}; ++l) r[{{ op.dst }}+(i*{{ op.columns }}+j)*{{ w }}+l]=c[l];
+    }
+{%- elif op.kind == "TensorCross" and op.lanes > 2 %}{% set w = op.lanes %}    {
+        double a[{{ 3 * w }}], b[{{ 3 * w }}], c[{{ 3 * w }}];
+        for (size_t k=0; k<{{ 3 * w }}; ++k) { a[k]=r[{{ op.lhs_start }}+k]; b[k]=r[{{ op.rhs_start }}+k]; }
+        static const size_t first[3]={1,2,0}, second[3]={2,0,1};
+        for (size_t k=0; k<3; ++k) {
+            size_t f={{ w }}*first[k], s={{ w }}*second[k];
+            c[{{ w }}*k]=a[f]*b[s]-a[s]*b[f];
+            for (size_t l=1; l<{{ w }}; ++l) c[{{ w }}*k+l]=a[f+l]*b[s]+a[f]*b[s+l]-a[s+l]*b[f]-a[s]*b[f+l];
+        }
+        for (size_t k=0; k<{{ 3 * w }}; ++k) r[{{ op.dst }}+k]=c[k];
+    }
+
+{%- elif op.kind == "TensorConcatenate" %}
+{%- set inner = op.dimensions[op.axis + 1:]|product %}{%- set result_axis = op.dimensions[op.axis] %}{%- set offset = namespace(value=0) %}
+{%- for source in op.sources %}
+{%- set source_axis = source.dimensions[op.axis] %}{%- set block = source_axis * inner %}
+{%- if not loop.first %}
+{% endif %}    for (size_t e=0; e<{{ source.dimensions|product }}; ++e) for (size_t l=0; l<{{ op.lanes }}; ++l)
+        r[{{ op.dst }}+((e/{{ block }})*{{ result_axis * inner }}+{{ offset.value * inner }}+e%{{ block }})*{{ op.lanes }}+l] = r[{{ source.start }}+e*{{ op.lanes }}+l];
+{%- set offset.value = offset.value + source_axis %}
 {%- endfor %}
+{%- elif op.kind == "StoreOutput" %}    {{ store_target(output, targets, op.output_index) }} = r[{{ op.src }}];
+{%- elif op.kind == "StoreOutputRange" %}{%- for output_index in op.output_indices %}    {{ store_target(output, targets, output_index) }} = r[{{ op.start + loop.index0 * op.stride }}];
+{%- endfor %}
+{%- elif op.kind == "LoadFunctionConditionalCapture" %}    r[{{ op.dst }}] = fc_captures[{{ op.index }}];
+{%- elif op.kind == "LoadFunctionConditionalCaptureRange" %}    for (size_t k=0; k<{{ op.count }}; ++k) r[{{ op.dst }}+k] = fc_captures[{{ op.index_start }}+k];
+{#- A checked function conditional runs each condition region in order and
+    only the selected result region, each in its own register file; the
+    captures are the enclosing registers the regions read. #}
+{%- elif op.kind == "FunctionConditional" %}    {
+        double *const fc_outer = r;
+        const double *const fc_captures = r + {{ op.capture_start }};
+        double fc_out[{{ op.result_count if op.result_count > 0 else 1 }}];
+        int fc_taken = 0;
+        (void)fc_captures;
+{%- for arm in op.arms %}
+        if (!fc_taken) {
+            double fc_cond[1];
+            {
+                double r[{{ arm.condition.register_count if arm.condition.register_count > 0 else 1 }}];
+{%- for region_op in arm.condition.ops %}
+{{ scalar_op(region_op, "fc_cond", error_status) }}
+{%- endfor %}
+            }
+            if (fc_cond[0] != 0.0) {
+                double r[{{ arm.result.register_count if arm.result.register_count > 0 else 1 }}];
+                fc_taken = 1;
+{%- for region_op in arm.result.ops %}
+{{ scalar_op(region_op, "fc_out", error_status) }}
+{%- endfor %}
+            }
+        }
+{%- endfor %}
+        if (!fc_taken) {
+            double r[{{ op.fallback.register_count if op.fallback.register_count > 0 else 1 }}];
+{%- for region_op in op.fallback.ops %}
+{{ scalar_op(region_op, "fc_out", error_status) }}
+{%- endfor %}
+        }
+        for (size_t k=0; k<{{ op.result_count }}; ++k) fc_outer[{{ op.dst }}+k] = fc_out[k];
+    }
 {%- else %}{{ fail("unsupported-feature:scalar.op." ~ op.kind) }}
 {%- endif %}
 {%- endmacro %}
 
-{%- macro refresh_algebraics(solve, prefix) %}
-static {{ prefix }}Status refresh_parameters(ModelInstance* m) {
-    if (!m->parameters_dirty) return {{ prefix }}OK;
-{%- for program in solve.initialization.update_plan.programs %}
-    {
-    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
-{%- for op in program.ops %}
-{{ scalar_op(op, "m->p", prefix ~ "Error", solve.initialization.update_targets) }}
-{%- endfor %}
-    }
-{%- endfor %}
-    m->parameters_dirty = false;
-    return {{ prefix }}OK;
-}
-static {{ prefix }}Status refresh_algebraics(ModelInstance* m) {
-    if (refresh_parameters(m) != {{ prefix }}OK) return {{ prefix }}Error;
-{%- if solve.continuous.algebraic_assignment_plan.programs|length == 0 %}
-    (void)m;
-{%- endif %}
-{%- for program in solve.continuous.algebraic_assignment_plan.programs %}
-    {
-    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
-{%- for op in program.ops %}
-{{ scalar_op(op, "m->y", prefix ~ "Error") }}
-{%- if op.kind == "StoreOutput" %}    if (!isfinite(m->y[{{ op.output_index }}])) return {{ prefix }}Error;
-{%- elif op.kind == "StoreOutputRange" %}{%- for output_index in op.output_indices %}    if (!isfinite(m->y[{{ output_index }}])) return {{ prefix }}Error;
-{%- endfor %}
-{%- endif %}
-{%- endfor %}
-    }
-{%- endfor %}
-    return {{ prefix }}OK;
-}
-{%- endmacro %}
-
 {%- macro c_string(bytes) -%}"{% for byte in bytes %}\{{ byte // 64 }}{{ (byte // 8) % 8 }}{{ byte % 8 }}{% endfor %}"{%- endmacro %}
 
-{%- macro assertions(solve, fmi, messages, prefix) %}
+{#- The discrete rows in the admitted dependency order, each storing straight
+    into its parameter-backed target (the event iteration's fixed point). #}
+{%- macro discrete_rows(solve, order, prefix) %}
+{%- for index in order %}{% set program = solve.discrete.rhs_plan.programs[index] %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "m->p", prefix ~ "Error", solve.discrete.update_targets) }}
+{%- endfor %}
+    }
+{%- endfor %}
+{%- endmacro %}
+
+{#- Assertion message assembly (rumoca-eval-solve eval_event_action_message):
+    literal segments verbatim, each String(...) conversion formatted as the
+    linked runtime formats it. -#}
+{%- macro message_support(rows, prefix) %}
+typedef struct { char* data; size_t len; size_t cap; bool failed; } RmcMessage;
+static void rmc_message_push(RmcMessage* msg, const char* text, size_t len) {
+    if (msg->failed) return;
+    if (msg->len + len + 1 > msg->cap) {
+        size_t cap = msg->cap ? msg->cap : 64;
+        while (cap < msg->len + len + 1) cap *= 2;
+        char* data = realloc(msg->data, cap);
+        if (!data) { msg->failed = true; return; }
+        msg->data = data; msg->cap = cap;
+    }
+    memcpy(msg->data + msg->len, text, len);
+    msg->len += len;
+    msg->data[msg->len] = '\0';
+}
+{%- if rows.programs|length > 0 %}
+/* Rust's `f64` Display for non-finite and zero values. */
+static int rmc_format_special(char* out, size_t cap, double value) {
+    if (isnan(value)) return snprintf(out, cap, "NaN");
+    if (isinf(value)) return snprintf(out, cap, value < 0.0 ? "-inf" : "inf");
+    return snprintf(out, cap, signbit(value) ? "-0" : "0");
+}
+/* trim_fraction_zeros: drop trailing fraction zeros and a bare point before
+   the exponent marker (or the end). */
+static void rmc_trim_fraction(char* text, char marker) {
+    char* exponent = marker ? strchr(text, marker) : NULL;
+    char* end = exponent ? exponent : text + strlen(text);
+    if (!strchr(text, '.')) return;
+    char* cut = end;
+    while (cut > text && cut[-1] == '0') --cut;
+    if (cut > text && cut[-1] == '.') --cut;
+    memmove(cut, end, strlen(end) + 1);
+}
+/* format_significant_digits: `{:.*e}` or `{:.N}`, then trimmed. Rust writes
+   the exponent without a sign for positive powers and without padding. */
+static void rmc_format_real(char* out, size_t cap, double value, long digits) {
+    if (!isfinite(value) || value == 0.0) { rmc_format_special(out, cap, value); return; }
+    int exponent = (int)floor(log10(fabs(value)));
+    if (exponent < -4 || exponent >= digits) {
+        char raw[1200];
+        snprintf(raw, sizeof raw, "%.*e", (int)(digits - 1), value);
+        char* e = strchr(raw, 'e');
+        int power = atoi(e + 1);
+        *e = '\0';
+        rmc_trim_fraction(raw, '\0');
+        snprintf(out, cap, "%se%d", raw, power);
+        return;
+    }
+    long fractional = digits - exponent - 1;
+    snprintf(out, cap, "%.*f", (int)(fractional > 0 ? fractional : 0), value);
+    rmc_trim_fraction(out, '\0');
+}
+/* eval_event_message_conversion; `false` for an option the runtime refuses. */
+static bool rmc_message_convert(RmcMessage* msg, int source, double value, double minimum_length, double left_justified, double significant_digits) {
+    char text[1400];
+    if (!isfinite(minimum_length) || minimum_length != floor(minimum_length) || minimum_length < 0.0 || minimum_length > 1048576.0) return false;
+    if (!isfinite(significant_digits) || significant_digits != floor(significant_digits) || significant_digits < 1.0 || significant_digits > 1024.0) return false;
+    if (left_justified != 0.0 && left_justified != 1.0) return false;
+    if (source == 0) rmc_format_real(text, sizeof text, value, (long)significant_digits);
+    else if (source == 1) { if (!isfinite(value) || value != floor(value)) return false; snprintf(text, sizeof text, "%.0f", value); }
+    else { if (value != 0.0 && value != 1.0) return false; snprintf(text, sizeof text, "%s", value == 1.0 ? "true" : "false"); }
+    size_t len = strlen(text), width = (size_t)minimum_length;
+    if (len < width && left_justified == 0.0) for (size_t k = len; k < width; ++k) rmc_message_push(msg, " ", 1);
+    rmc_message_push(msg, text, len);
+    if (len < width && left_justified != 0.0) for (size_t k = len; k < width; ++k) rmc_message_push(msg, " ", 1);
+    return true;
+}
+static {{ prefix }}Status rmc_message_rows(ModelInstance* m, double* rows) {
+{%- for program in rows.programs %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "rows", prefix ~ "Error") }}
+{%- endfor %}
+    }
+{%- endfor %}
+    return {{ prefix }}OK;
+}
+{%- endif %}
+{%- endmacro %}
+
+{%- macro log_message(parts, rows, prefix, sink="log_assertion") %}
+        {
+        RmcMessage msg = {0};
+{%- if rows.programs|length > 0 %}
+        double rows[{{ rows.programs|length }}];
+        bool rows_ok = rmc_message_rows(m, rows) == {{ prefix }}OK; (void)rows_ok;
+{%- endif %}
+{%- for part in parts %}
+{%- if part.text is defined %}
+        rmc_message_push(&msg, {{ c_string(part.text) }}, {{ part.text|length }});
+{%- else %}{% set c = part.conversion %}
+        if (!rows_ok || !rmc_message_convert(&msg, {{ 0 if c.source == "real" else (1 if c.source == "integer" else 2) }}, rows[{{ c.value }}], {% if c.minimum_length is not none %}rows[{{ c.minimum_length }}]{% else %}0.0{% endif %}, {% if c.left_justified is not none %}rows[{{ c.left_justified }}]{% else %}1.0{% endif %}, {% if c.significant_digits is not none %}rows[{{ c.significant_digits }}]{% else %}6.0{% endif %})) msg.failed = true;
+{%- endif %}
+{%- endfor %}
+        {{ sink }}(m, msg.failed || !msg.data ? "assertion failed (its message could not be formatted)" : msg.data);
+        free(msg.data);
+        }
+{%- endmacro %}
+
+{%- macro assertions(solve, fmi, messages, rows, prefix) %}
+{%- if fmi.assertions and solve.events.actions|length > 0 %}
+{{ message_support(rows, prefix) }}
+{%- endif %}
 static {{ prefix }}Status check_assertions(ModelInstance* m) {
     (void)m;
-{%- if fmi.assertions %}
+{%- if fmi.assertions and (solve.events.actions | rejectattr("kind", "equalto", "Warning") | list | length > 0) %}
     if (m->assertion_failed) return {{ prefix }}Error;
     double actions[{{ solve.events.actions|length }}];
 {%- for program in solve.events.action_plan.programs %}
@@ -127,48 +366,368 @@ static {{ prefix }}Status check_assertions(ModelInstance* m) {
 {%- endfor %}
     }
 {%- endfor %}
-{%- for action in solve.events.actions %}
+{%- for action in solve.events.actions %}{% if action.kind != "Warning" %}
     if (actions[{{ loop.index0 }}] != 0.0) {
-        log_assertion(m, {{ c_string(messages[loop.index0]) }});
+{{- log_message(messages[loop.index0], rows, prefix) }}
         m->assertion_failed = true;
         return {{ prefix }}Error;
     }
-{%- endfor %}
+{%- endif %}{%- endfor %}
 {%- endif %}
     return {{ prefix }}OK;
 }
-static {{ prefix }}Status update_assertion_memory(ModelInstance* m) {
+/* MLS §8.3.7 warning-level assertions (SPEC_0008 WX001): evaluated only at
+   an accepted point, never aborting, each site logged once at the importer's
+   warning status. */
+static {{ prefix }}Status report_warnings(ModelInstance* m) {
     (void)m;
-{%- if fmi.assertions and solve.discrete.update_targets|length > 0 %}
-    double current[{{ solve.discrete.update_targets|length }}];
-{%- for program in solve.discrete.rhs_plan.programs %}
+{%- if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %}
+    double actions[{{ solve.events.actions|length }}];
+{%- for program in solve.events.action_plan.programs %}
     {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
 {%- for op in program.ops %}
-{{ scalar_op(op, "current", prefix ~ "Error") }}
+{{ scalar_op(op, "actions", prefix ~ "Error") }}
 {%- endfor %}
     }
 {%- endfor %}
-{%- for target in solve.discrete.update_targets %}
-    m->p[{{ target.P.index }}] = current[{{ loop.index0 }}];
-{%- endfor %}
+{%- for action in solve.events.actions %}{% if action.kind == "Warning" %}
+    if (actions[{{ loop.index0 }}] != 0.0 && !m->rmc_warned[{{ loop.index0 }}]) {
+        m->rmc_warned[{{ loop.index0 }}] = true;
+{{- log_message(messages[loop.index0], rows, prefix, "log_warning") }}
+    }
+{%- endif %}{%- endfor %}
 {%- endif %}
+    return {{ prefix }}OK;
+}
+/* The parameter-determined discrete equations, settled with the bindings. */
+static {{ prefix }}Status update_discrete_equations(ModelInstance* m) {
+    (void)m;
+{{- discrete_rows(solve, fmi.discrete_equations, prefix) }}
+    return {{ prefix }}OK;
+}
+/* The condition memories after the algebraic refresh, then the event commit:
+   every pre() history takes the value its source settled to. */
+static {{ prefix }}Status update_assertion_memory(ModelInstance* m) {
+    (void)m;
+{{- discrete_rows(solve, fmi.discrete_memories, prefix) }}
+{%- for binding in solve.solve_layout.pre_param_bindings %}
+    m->p[{{ binding.dest_p_index }}] = {% if binding.source.Y is defined %}m->y[{{ binding.source.Y.index }}]{% else %}m->p[{{ binding.source.P.index }}]{% endif %};
+{%- endfor %}
     return {{ prefix }}OK;
 }
 {%- endmacro %}
 
-{%- macro assertion_lifecycle(prefix) %}
+{%- macro assertion_lifecycle(prefix, scalar_events=none) %}
 static {{ prefix }}Status settle_values(ModelInstance* m) {
     if (refresh_algebraics(m) != {{ prefix }}OK) return {{ prefix }}Error;
     return m->assertions_initialized ? check_assertions(m) : {{ prefix }}OK;
 }
+static {{ prefix }}Status settle_derivative_values(ModelInstance* m) {
+    if (refresh_derivative_values(m) != {{ prefix }}OK) return {{ prefix }}Error;
+    return m->assertions_initialized ? check_assertions(m) : {{ prefix }}OK;
+}
+{%- if not scalar_events %}
 static {{ prefix }}Status initialize_assertions(ModelInstance* m) {
     if (refresh_algebraics(m) != {{ prefix }}OK || update_assertion_memory(m) != {{ prefix }}OK) return {{ prefix }}Error;
     m->assertions_initialized = true;
-    return check_assertions(m);
+    if (check_assertions(m) != {{ prefix }}OK) return {{ prefix }}Error;
+    return report_warnings(m);
 }
+{%- endif %}
 static {{ prefix }}Status settle_assertion_event(ModelInstance* m) {
     if (settle_values(m) != {{ prefix }}OK) return {{ prefix }}Error;
+    if (m->assertions_initialized && report_warnings(m) != {{ prefix }}OK) return {{ prefix }}Error;
     return update_assertion_memory(m);
 }
+{%- endmacro %}
+
+{#- A function-scope constant double array, eight values per line; an empty
+    list zero-fills. -#}
+{%- macro value_array(name, length, values) %}
+    static const double {{ name }}[{{ length }}] = {
+{%- for value in values %}{% if loop.index0 % 8 == 0 %}
+       {% endif %} {{ value }},{% else %} 0.0{% endfor %}
+    };
+{%- endmacro %}
+
+{#- The FMI value type of one inventory entry: Real is Float64, Integer and
+    enumeration ordinals are Int32, Boolean is Boolean, String is String. -#}
+{%- macro rmc_kind(variable) -%}
+{%- if variable.value_kind == "Real" %}RMC_KIND_FLOAT64{% elif variable.value_kind in ["Integer", "Enumeration"] %}RMC_KIND_INT32{% elif variable.value_kind == "Boolean" %}RMC_KIND_BOOLEAN{% elif variable.value_kind == "String" %}RMC_KIND_STRING{% else %}{{ fail("unsupported-feature:fmi.c.value-kind " ~ variable.value_kind) }}{% endif -%}
+{%- endmacro %}
+
+{#- Instance storage of the String texts: the current text of every String
+    scalar and the owned copy an importer's set installed, if any. -#}
+{%- macro text_fields(texts) -%}
+{%- if texts|length > 0 %} const char* text[{{ texts|length }}]; char* text_owned[{{ texts|length }}];{% endif -%}
+{%- endmacro %}
+
+{#- The literal start texts and the text accessors. A set copies the text so
+    the importer's buffer may be released; reset and free release the copies. -#}
+{%- macro text_table(texts) %}
+{%- if texts|length > 0 %}
+static const char* const rmc_text_start[{{ texts|length }}] = {
+{%- for bytes in texts %}
+    {{ c_string(bytes) }},
+{%- endfor %}
+};
+static const char* rmc_text(const ModelInstance* m, size_t index) { return m->text[index]; }
+static bool rmc_set_text(ModelInstance* m, size_t index, const char* value) {
+    size_t length = strlen(value); char* copy = malloc(length + 1);
+    if (!copy) return false;
+    memcpy(copy, value, length + 1);
+    free(m->text_owned[index]); m->text_owned[index] = copy; m->text[index] = copy;
+    return true;
+}
+static void rmc_release_text(ModelInstance* m) {
+    for (size_t k = 0; k < {{ texts|length }}; ++k) { free(m->text_owned[k]); m->text_owned[k] = NULL; m->text[k] = rmc_text_start[k]; }
+}
+/* After a bytewise copy of `src` into `dst`, give `dst` its own copies of the
+   texts `src` owns; on a failed copy `dst` keeps only start texts. */
+static inline bool rmc_own_text(ModelInstance* dst, const ModelInstance* src) {
+    for (size_t k = 0; k < {{ texts|length }}; ++k) { dst->text_owned[k] = NULL; dst->text[k] = rmc_text_start[k]; }
+    for (size_t k = 0; k < {{ texts|length }}; ++k) if (src->text_owned[k] && !rmc_set_text(dst, k, src->text_owned[k])) { rmc_release_text(dst); return false; }
+    return true;
+}
+{%- else %}
+static const char* rmc_text(const ModelInstance* m, size_t index) { (void)m; (void)index; return NULL; }
+static bool rmc_set_text(ModelInstance* m, size_t index, const char* value) { (void)m; (void)index; (void)value; return false; }
+static void rmc_release_text(ModelInstance* m) { (void)m; }
+static inline bool rmc_own_text(ModelInstance* dst, const ModelInstance* src) { (void)dst; (void)src; return true; }
+{%- endif %}
+{%- endmacro %}
+
+{#- One component of `A x = b` for a `LinearSolveComponent` op: the linked
+    kernel's Gauss-Jordan elimination with partial pivoting (eval-solve
+    linear_solve.rs, Golub and Van Loan algorithm 3.4.1), operation for
+    operation, so both evaluate bitwise-equal values. The pivot is the last row
+    of largest magnitude; a zero or non-finite pivot, or a non-finite
+    solution, refuses the evaluation. `work` holds the n x (n + 1) augmented
+    matrix. -#}
+{%- macro linear_solve_kernel() %}
+static inline bool rmc_linear_solve_component(const double* matrix, const double* rhs, size_t n, size_t component, double* work, double* value) {
+    size_t stride = n + 1;
+    for (size_t row = 0; row < n; ++row) {
+        for (size_t col = 0; col < n; ++col) work[row * stride + col] = matrix[row * n + col];
+        work[row * stride + n] = rhs[row];
+    }
+    for (size_t col = 0; col < n; ++col) {
+        size_t pivot = col; double best = fabs(work[col * stride + col]);
+        for (size_t row = col + 1; row < n; ++row) {
+            double candidate = fabs(work[row * stride + col]);
+            if (isnan(candidate) || (!isnan(best) && candidate >= best)) { best = candidate; pivot = row; }
+        }
+        double pivot_value = work[pivot * stride + col];
+        if (pivot_value == 0.0 || !isfinite(pivot_value)) return false;
+        for (size_t k = 0; k < stride; ++k) { double swap = work[col * stride + k]; work[col * stride + k] = work[pivot * stride + k]; work[pivot * stride + k] = swap; }
+        for (size_t k = col; k < stride; ++k) work[col * stride + k] /= pivot_value;
+        for (size_t row = 0; row < n; ++row) {
+            if (row == col) continue;
+            double factor = work[row * stride + col];
+            for (size_t k = col; k < stride; ++k) work[row * stride + k] -= factor * work[col * stride + k];
+        }
+    }
+    for (size_t row = 0; row < n; ++row) if (!isfinite(work[row * stride + n])) return false;
+    *value = work[component * stride + n];
+    return true;
+}
+{%- endmacro %}
+
+{#- The component's Co-Simulation step rule (ir-solve fmi::CoSimulationStepPlan,
+    SPEC_0044 ME-LSW-001): the name of the substep integrator it selects. -#}
+{%- macro cs_integrator(fmi) -%}
+{%- if fmi.co_simulation.method == "DormandPrince54" and fmi.co_simulation.substep == "ErrorControlled" -%}integrate_dopri5
+{%- else -%}{{ fail("unsupported-feature:fmi.c.co-simulation-step " ~ fmi.co_simulation.method ~ "/" ~ fmi.co_simulation.substep) }}
+{%- endif -%}
+{%- endmacro %}
+
+{#- The substep integrator the plan selects, shared by the FMI 2 and FMI 3
+    components: the tableau and controller of rumoca-solver-rk45, with the
+    controller constants read from the plan. -#}
+{%- macro cs_integrator_function(fmi, solve, prefix) %}
+{%- set plan = fmi.co_simulation.controller %}
+/* Co-Simulation step rule (Solve IR CoSimulationStepPlan): error-controlled
+   Dormand-Prince 5(4) over one communication step [start, start + step].
+   - Substeps start from the step size the previous communication step
+     proposed and the last one ends exactly at start + step.
+   - A substep is accepted when the max-norm of the difference between the
+     fifth- and embedded fourth-order solutions stays within
+     tol * (1 + max(|y|, |y_new|)); tol is the fmi*SetupExperiment /
+     fmi3EnterInitializationMode tolerance, or {{ plan.default_tolerance }} when
+     the importer defines none.
+   - The next substep is h * min(max({{ plan.safety }} * err^({{ plan.exponent }}), {{ plan.min_factor }}), {{ plan.max_factor }})
+     (Hairer, Norsett and Wanner, Solving ODEs I, section II.4).
+   - A communication step whose substep underflows or which attempts more
+     than {{ plan.max_substeps }} substeps returns Discard; a failed derivative
+     evaluation returns Error. The caller rolls the state back either way.
+   Accuracy therefore follows the tolerance, not the importer's communication
+   step size: a stiff mode takes as many substeps as its stability needs. */
+static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double start, double step) {
+    static const double a[6][6] = {
+        {1.0 / 5.0},
+        {3.0 / 40.0, 9.0 / 40.0},
+        {44.0 / 45.0, -56.0 / 15.0, 32.0 / 9.0},
+        {19372.0 / 6561.0, -25360.0 / 2187.0, 64448.0 / 6561.0, -212.0 / 729.0},
+        {9017.0 / 3168.0, -355.0 / 33.0, 46732.0 / 5247.0, 49.0 / 176.0, -5103.0 / 18656.0},
+        {35.0 / 384.0, 0.0, 500.0 / 1113.0, 125.0 / 192.0, -2187.0 / 6784.0, 11.0 / 84.0}};
+    static const double c[6] = {1.0 / 5.0, 3.0 / 10.0, 4.0 / 5.0, 8.0 / 9.0, 1.0, 1.0};
+    static const double low[7] = {5179.0 / 57600.0, 0.0, 7571.0 / 16695.0, 393.0 / 640.0, -92097.0 / 339200.0, 187.0 / 2100.0, 1.0 / 40.0};
+    double y0[STATE_LEN];
+    double k[7][STATE_LEN];
+    const size_t n = {{ solve.solve_layout.state_scalar_count }};
+    const double tol = m->tolerance > 0.0 ? m->tolerance : {{ plan.default_tolerance }};
+    const double end = start + step;
+    double t = start;
+    double h = m->rmc_cs_substep > 0.0 ? fmin(m->rmc_cs_substep, step) : step;
+    bool start_derivative = false;
+    for (unsigned long attempt = 0; t < end; ++attempt) {
+        if (attempt >= {{ plan.max_substeps }}UL) { RMC_LOG(m, "Co-Simulation step exceeded its substep budget"); return {{ prefix }}Discard; }
+        const bool last = h >= end - t;
+        if (last) h = end - t;
+        if (!(h > 0.0) || t + h == t) { RMC_LOG(m, "Co-Simulation substep underflowed"); return {{ prefix }}Discard; }
+        for (size_t i = 0; i < n; ++i) y0[i] = m->y[i];
+        if (!start_derivative) {
+            m->time = t;
+            if (evaluate_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+            for (size_t i = 0; i < n; ++i) k[0][i] = m->derivative[i];
+            start_derivative = true;
+        }
+        for (size_t s = 0; s < 6; ++s) {
+            for (size_t i = 0; i < n; ++i) {
+                double sum = 0.0;
+                for (size_t j = 0; j <= s; ++j) sum += a[s][j] * k[j][i];
+                m->y[i] = y0[i] + h * sum;
+            }
+            m->time = s >= 4 && last ? end : t + c[s] * h;
+            if (evaluate_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+            for (size_t i = 0; i < n; ++i) k[s + 1][i] = m->derivative[i];
+        }
+        double error = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            double estimate = 0.0;
+            for (size_t j = 0; j < 7; ++j) estimate += low[j] * k[j][i];
+            estimate = y0[i] + h * estimate;
+            double scale = tol + tol * fmax(fabs(y0[i]), fabs(m->y[i]));
+            double ratio = fabs(m->y[i] - estimate) / fmax(scale, DBL_MIN);
+            error = isfinite(ratio) ? fmax(error, ratio) : INFINITY;
+        }
+        double factor = error > 0.0 ? fmin(fmax({{ plan.safety }} * pow(error, {{ plan.exponent }}), {{ plan.min_factor }}), {{ plan.max_factor }}) : {{ plan.max_factor }};
+        if (error <= 1.0) {
+            /* First same as last: the seventh stage is the derivative at the
+               accepted state. */
+            for (size_t i = 0; i < n; ++i) k[0][i] = k[6][i];
+            if (!last) m->rmc_cs_substep = h * factor;
+            t = last ? end : t + h;
+        } else {
+            for (size_t i = 0; i < n; ++i) m->y[i] = y0[i];
+            m->time = t;
+        }
+        h *= factor;
+    }
+    m->time = end;
+    return settle_assertion_event(m);
+}
+{%- endmacro %}
+
+{#- Instance storage of the warning sites already reported. -#}
+{%- macro warning_fields(solve, fmi) -%}
+{%- if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %} bool rmc_warned[{{ solve.events.actions|length }}];{% endif -%}
+{%- endmacro %}
+
+{%- macro tensor_index(index) -%}
+{%- if index.Constant is defined -%}{{ index.Constant }}
+{%- else -%}(r[{{ index.Runtime }}] - 1.0){%- endif -%}
+{%- endmacro %}
+
+{%- macro indexed_fold_load(op) %}
+    { size_t offset = 0; int valid = 1;
+{%- for index in op.indices %}
+{%- set extent = op.dimensions[loop.index0] %}
+        { double coordinate = {{ tensor_index(index) }};
+          if (!isfinite(coordinate) || coordinate != floor(coordinate) || coordinate < 0 || coordinate >= {{ extent }}) valid = 0;
+          else offset = offset * {{ extent }} + (size_t)coordinate; }
+{%- endfor %}
+        r[{{ op.dst }}] = valid ? {% if op.kind == "LoadIndexedFoldCapture" %}ff_captures{% elif op.kind == "LoadIndexedFoldCarried" %}ff_carried{% else %}r{% endif %}[{{ op.base }} + offset * {{ op.stride }}] : NAN;
+    }
+{%- endmacro %}
+
+{%- macro function_fold(op, output, error_status) %}
+    {
+        double *const ff_outer = r;
+{%- if op.kind == "StoreOutputFunctionFold" %}
+        double *const ff_result = {{ output }};
+{%- endif %}
+        double ff_state[{{ op.carried_count if op.carried_count else 1 }}], ff_next[{{ op.carried_count if op.carried_count else 1 }}];
+{%- if op.kind == "StoreOutputFunctionFold" %}{% set cursor = namespace(value=0) %}
+{%- for source in op.initial %}
+{%- if source.Registers is defined %}{% set src = source.Registers %}
+        for (size_t k=0; k<{{ src.count }}; ++k) ff_state[{{ cursor.value }}+k] = r[{{ src.start }}+k];
+{%- else %}{% set src = source.ParentCarried %}
+        for (size_t k=0; k<{{ src.count }}; ++k) ff_state[{{ cursor.value }}+k] = ff_carried[{{ src.base }}+k];
+{%- endif %}{% set cursor.value = cursor.value + src.count %}
+{%- endfor %}
+{%- else %}
+        for (size_t k=0; k<{{ op.carried_count }}; ++k) ff_state[k] = r[{{ op.initial_start }}+k];
+{%- endif %}
+        const double *const ff_captures = r + {{ op.capture_start }};
+        (void)ff_captures; (void)ff_outer; (void)ff_next;
+{%- if op.kind == "GuardedFunctionFold" %}
+        if (r[{{ op.activation }}] != 0.0) {
+{%- elif op.kind == "StoreOutputFunctionFold" and op.condition is defined %}
+        if ((r[{{ op.condition }}] != 0.0) == {{ 1 if op.nested_when_true else 0 }}) {
+{%- endif %}
+{%- for binder in op.domain.binders %}
+{% set count = 0 if (binder.step > 0 and binder.lower > binder.upper) or (binder.step < 0 and binder.lower < binder.upper) else (binder.upper - binder.lower)//binder.step + 1 %}
+        int64_t ff_i{{ loop.index0 }}={{ integer(binder.lower) }};
+        for (size_t ff_n{{ loop.index0 }}=0; ff_n{{ loop.index0 }}<{{ count }}; ++ff_n{{ loop.index0 }}) {
+            if (ff_n{{ loop.index0 }}) ff_i{{ loop.index0 }} += {{ integer(binder.step) }};
+{%- endfor %}
+            const double ff_indices[] = { {% for binder in op.domain.binders %}(double)ff_i{{ loop.index0 }},{% else %}0.0{% endfor %} };
+            const double *const ff_carried = ff_state;
+            (void)ff_indices; (void)ff_carried;
+            {
+                double r[{{ op.register_count if op.register_count else 1 }}]; (void)r;
+{%- for update in op.update %}
+{{ scalar_op(update, "ff_next", error_status) }}
+{%- endfor %}
+            }
+            for (size_t k=0; k<{{ op.carried_count }}; ++k) ff_state[k] = ff_next[k];
+{%- for binder in op.domain.binders %}
+        }
+{%- endfor %}
+{%- if op.kind == "GuardedFunctionFold" or (op.kind == "StoreOutputFunctionFold" and op.condition is defined) %}
+        }
+{%- endif %}
+{%- if op.kind == "StoreOutputFunctionFold" %}
+        for (size_t k=0; k<{{ op.count }}; ++k) ff_result[{{ op.output_index }}+k] = ff_state[{{ op.result_base }}+k];
+{%- else %}
+        for (size_t k=0; k<{{ op.carried_count }}; ++k) ff_outer[{{ op.dst }}+k] = ff_state[k];
+{%- endif %}
+    }
+{%- endmacro %}
+
+{%- macro fold_tensor_update(op, output) %}
+    for (size_t e=0; e<{{ op.dimensions|product }}; ++e) for (size_t lane=0; lane<{{ op.lanes }}; ++lane) {
+        double nodes[{{ op.nodes|length + 1 }}];
+        nodes[0] = ff_carried[{{ op.source_base }}+e*{{ op.source_stride }}+lane];
+{%- for node in op.nodes %}{% set node_index=loop.index %}
+{%- if node.Update is defined %}{% set patch=op.updates[node.Update.update] %}
+        {
+            size_t value_offset = 0; int selected = {% if patch.condition is not none %}r[{{ patch.condition }}] != 0.0{% else %}1{% endif %};
+{%- for subscript in patch.subscripts %}{% set axis=loop.index0 %}{% set extent=op.dimensions[axis] %}{% set stride=op.dimensions[axis+1:]|product %}
+{%- if subscript == "Whole" %}
+            value_offset = value_offset * {{ extent }} + (e / {{ stride }}) % {{ extent }};
+{%- else %}
+            selected = selected && (double)((e / {{ stride }}) % {{ extent }}) == {{ tensor_index(subscript.Index) }};
+{%- endif %}
+{%- endfor %}
+            nodes[{{ node_index }}] = selected ? r[{{ patch.value_start }}+value_offset*{{ patch.value_stride }}+lane] : nodes[{{ node.Update.base }}];
+        }
+{%- else %}
+        nodes[{{ node_index }}] = r[{{ node.Select.condition }}] != 0.0 ? nodes[{{ node.Select.if_true }}] : nodes[{{ node.Select.if_false }}];
+{%- endif %}
+{%- endfor %}
+        {{ output }}[{{ op.output_index }}+e*{{ op.lanes }}+lane] = nodes[{{ op.result }}];
+    }
 {%- endmacro %}

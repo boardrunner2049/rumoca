@@ -120,6 +120,33 @@ pub(super) fn check_function_bodies(
             counts,
             referrer: format!("function {}", function.id.0),
         };
+        for derivative in &function.derivatives {
+            reference(
+                errors,
+                checker.referrer.clone(),
+                "function",
+                derivative.target.0,
+                counts.functions,
+            );
+            if derivative.inputs.len() != function.parameters.len() {
+                checker.fail(
+                    errors,
+                    format_args!("derivative input classification does not match its function"),
+                );
+            }
+            if let Some((previous, ordinal)) = derivative.previous
+                && model
+                    .functions
+                    .get(previous.0 as usize)
+                    .and_then(|owner| owner.derivatives.get(ordinal as usize))
+                    .is_none()
+            {
+                checker.fail(
+                    errors,
+                    format_args!("derivative predecessor is not defined"),
+                );
+            }
+        }
         for value in &function.values {
             checker.type_ref(errors, value.value_type);
         }
@@ -347,6 +374,12 @@ pub(crate) fn function_spans(model: &RbcModel) -> Vec<RbcSpan> {
     let mut found = Vec::new();
     for function in &model.functions {
         found.push(function.declaration.span);
+        found.extend(
+            function
+                .derivatives
+                .iter()
+                .map(|derivative| derivative.provenance.span),
+        );
         found.extend(
             function
                 .parameters

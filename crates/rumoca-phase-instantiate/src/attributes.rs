@@ -1,7 +1,7 @@
 use super::*;
 use rumoca_eval_ast::eval_instantiate::{
-    InstantiateEvalCtx, eval_state_select_expr_with_source_scope, expr_to_bool, expr_to_string,
-    parse_state_select,
+    InstantiateEvalCtx, eval_boolean_attribute_values, eval_state_select_expr_with_source_scope,
+    expr_to_string, parse_state_select,
 };
 
 pub(super) struct ComponentAttrsAndBinding {
@@ -128,139 +128,28 @@ fn insert_attribute_source_scope(
     }
 }
 
-fn extract_string_attr_value_from_modification_expr(
-    expr: &ast::Expression,
-    attr_name: &str,
-) -> Option<String> {
-    match expr {
-        ast::Expression::Modification { target, value, .. } => {
-            let target_name = target.parts.last()?.ident.text.as_ref();
-            if target_name == attr_name {
-                expr_to_string(value)
-            } else {
-                None
-            }
-        }
-        ast::Expression::NamedArgument { name, value, .. } => {
-            if name.text.as_ref() == attr_name {
-                expr_to_string(value)
-            } else {
-                None
-            }
-        }
-        ast::Expression::ClassModification { modifications, .. } => modifications
-            .iter()
-            .find_map(|m| extract_string_attr_value_from_modification_expr(m, attr_name)),
-        _ => None,
-    }
-}
-
-fn has_all_type_string_attrs(attrs: &ExtractedAttributes) -> bool {
-    attrs.quantity.is_some() && attrs.unit.is_some() && attrs.display_unit.is_some()
-}
-
-fn merge_missing_type_string_attrs_from_expr(
-    attrs: &mut ExtractedAttributes,
-    expr: &ast::Expression,
-) {
-    if attrs.quantity.is_none() {
-        attrs.quantity = extract_string_attr_value_from_modification_expr(expr, "quantity");
-    }
-    if attrs.unit.is_none() {
-        attrs.unit = extract_string_attr_value_from_modification_expr(expr, "unit");
-    }
-    if attrs.display_unit.is_none() {
-        attrs.display_unit = extract_string_attr_value_from_modification_expr(expr, "displayUnit");
-    }
-}
-
-/// The value expression a modification gives `attr_name`, if it gives one.
+/// The classes of a declared type chain, innermost first (MLS §4.8.1).
 ///
-/// The string counterpart renders to a `String`, which is right for `unit` and
-/// wrong for `min`: a bound may be `Modelica.Constants.eps` or `-1e40`, and it
-/// has to reach Flat as the expression it is so later phases can evaluate it.
-fn extract_attr_expr_from_modification_expr(
-    expr: &ast::Expression,
-    attr_name: &str,
-) -> Option<ast::Expression> {
-    match expr {
-        ast::Expression::Modification { target, value, .. } => {
-            (target.parts.last()?.ident.text.as_ref() == attr_name).then(|| value.as_ref().clone())
-        }
-        ast::Expression::NamedArgument { name, value, .. } => {
-            (name.text.as_ref() == attr_name).then(|| value.as_ref().clone())
-        }
-        ast::Expression::ClassModification { modifications, .. } => modifications
-            .iter()
-            .find_map(|m| extract_attr_expr_from_modification_expr(m, attr_name)),
-        _ => None,
-    }
-}
-
-fn merge_missing_type_numeric_attrs_from_expr(
-    attrs: &mut ExtractedAttributes,
-    expr: &ast::Expression,
-) {
-    for (name, slot) in [
-        ("min", &mut attrs.min),
-        ("max", &mut attrs.max),
-        ("nominal", &mut attrs.nominal),
-    ] {
-        if slot.is_none() {
-            *slot = extract_attr_expr_from_modification_expr(expr, name);
-        }
-    }
-}
-
-/// Fill missing `min`/`max`/`nominal` from the declared type hierarchy.
-///
-/// MLS §4.8: a type's attribute modifications are part of the variable's type,
-/// so `type Mass = Real(min=0)` bounds every `SI.Mass` whether or not the
-/// declaration repeats it. Only the string attributes were inherited here, so
-/// the numeric ones were silently dropped:
-///
-/// ```text
-/// parameter SI.Mass m1 = 1;           DAE min: None   <- the type says 0
-/// parameter SI.Mass m2(min=0) = 1;    DAE min: 0
-/// ```
-///
-/// Anything reading the DAE therefore saw no bound on 29 of MSL's SI types.
-/// For this project's own sanitizers that was **6424 of 10942 findings** — 59%
-/// — reporting "nothing bounds this declaration" about declarations the library
-/// does bound.
-///
-/// A declaration's own modifier still wins: it is more specific, and MLS §7.2.5
-/// lets it narrow the inherited one.
-pub(super) fn merge_type_hierarchy_numeric_attributes(
-    tree: &ast::ClassTree,
-    class_def: Option<&ast::ClassDef>,
-    attrs: &mut ExtractedAttributes,
-) {
-    if attrs.min.is_some() && attrs.max.is_some() && attrs.nominal.is_some() {
-        return;
-    }
-
+/// A short class definition `type A = B(...)` and a long `type A extends B(...)`
+/// both appear as an `extends` of the base, so the chain is the depth-first
+/// order of those base classes. That order is also the precedence of their
+/// modifications: a modification in a derived class overrides the one in its
+/// base (MLS §7.2.3).
+fn type_chain<'a>(
+    tree: &'a ast::ClassTree,
+    class_def: Option<&'a ast::ClassDef>,
+) -> Vec<&'a ast::ClassDef> {
+    let mut chain = Vec::new();
     let mut stack: Vec<&ast::ClassDef> = class_def.into_iter().collect();
     let mut visited = std::collections::HashSet::<DefId>::new();
-
     while let Some(class) = stack.pop() {
         if let Some(def_id) = class.def_id
             && !visited.insert(def_id)
         {
             continue;
         }
-
-        for ext in &class.extends {
-            for modification in &ext.modifications {
-                merge_missing_type_numeric_attrs_from_expr(attrs, &modification.expr);
-            }
-        }
-
-        if attrs.min.is_some() && attrs.max.is_some() && attrs.nominal.is_some() {
-            break;
-        }
-
-        for ext in &class.extends {
+        chain.push(class);
+        for ext in class.extends.iter().rev() {
             let base_name = ext.base_name.to_string();
             if let Some(base_class) = ext
                 .base_def_id
@@ -271,53 +160,214 @@ pub(super) fn merge_type_hierarchy_numeric_attributes(
             }
         }
     }
+    chain
 }
 
-/// Fill missing quantity/unit/displayUnit attributes from the declared type hierarchy.
-///
-/// This is needed for Modelica type aliases (for example
-/// `type Resistance = Real(final unit="Ohm", ...)`) where the attribute is defined
-/// on the type's `extends` chain rather than on the component declaration itself.
-pub(super) fn merge_type_hierarchy_string_attributes(
-    tree: &ast::ClassTree,
-    class_def: Option<&ast::ClassDef>,
-    attrs: &mut ExtractedAttributes,
-) {
-    if has_all_type_string_attrs(attrs) {
-        return;
+/// A single attribute modification `name = value` of a type chain element.
+fn type_attribute_modification(expr: &ast::Expression) -> Option<(&str, &ast::Expression)> {
+    match expr {
+        ast::Expression::Modification { target, value, .. } if target.parts.len() == 1 => {
+            Some((target.parts[0].ident.text.as_ref(), value))
+        }
+        ast::Expression::NamedArgument { name, value, .. } => Some((name.text.as_ref(), value)),
+        _ => None,
     }
+}
 
-    let mut stack: Vec<&ast::ClassDef> = class_def.into_iter().collect();
-    let mut visited = std::collections::HashSet::<DefId>::new();
+/// The component whose attributes the declared type chain completes.
+pub(super) struct TypeAttributeMerge<'a, 'e> {
+    pub(super) ctx: &'a InstantiateContext,
+    pub(super) comp: &'a ast::Component,
+    pub(super) class_def: Option<&'a ast::ClassDef>,
+    pub(super) eval_ctx: &'a InstantiateEvalCtx<'e>,
+}
 
-    while let Some(class) = stack.pop() {
-        if let Some(def_id) = class.def_id
-            && !visited.insert(def_id)
-        {
+/// Array ranks of attribute values taken from an array type.
+///
+/// A value written in `type V = Real[3](start = {1, 2, 3})` has the shape of
+/// `V`, so a component `V w[2]` repeats it over its own leading dimensions.
+/// Values written with `each`, or in a scalar type, broadcast unchanged.
+#[derive(Debug, Default)]
+pub(super) struct TypeAttributeShapes {
+    ranks: IndexMap<String, usize>,
+}
+
+/// Fill the attributes that neither an outer modification nor the component
+/// declaration sets from the declared type chain (MLS §4.8.1, §4.9).
+///
+/// The component modifier wins, then the innermost type definition, then its
+/// base types in order (MLS §7.2.3). Only components of a predefined type
+/// carry these attributes, so the caller applies this to primitive components.
+/// Each value is evaluated in the scope it was written in: the type
+/// definition, not the component declaration.
+pub(super) fn merge_type_hierarchy_attributes(
+    merge: &TypeAttributeMerge<'_, '_>,
+    attrs: &mut ExtractedAttributes,
+) -> InstantiateResult<TypeAttributeShapes> {
+    let state_select_path = ast::QualifiedName::from_ident(&merge.comp.name).child("stateSelect");
+    let mut state_select_set = merge.comp.modifications.contains_key("stateSelect")
+        || merge.eval_ctx.mod_env.get(&state_select_path).is_some();
+    let declaration_scope = component_declaration_source_scope(merge.ctx, merge.comp);
+    let chain = type_chain(merge.eval_ctx.tree, merge.class_def);
+    let mut shapes = TypeAttributeShapes::default();
+    // A value's rank is the dimension count of the class that wrote it: its
+    // own subscripts plus those of its bases.
+    let modifications = chain.iter().enumerate().flat_map(|(index, class)| {
+        let value_rank = chain[index..]
+            .iter()
+            .map(|class| class.array_subscripts.len())
+            .sum::<usize>();
+        class
+            .extends
+            .iter()
+            .flat_map(|ext| &ext.modifications)
+            .filter(|modification| !modification.redeclare)
+            .map(move |modification| (value_rank, modification))
+    });
+    for (value_rank, modification) in modifications {
+        let Some((name, value)) = type_attribute_modification(&modification.expr) else {
+            continue;
+        };
+        let written_scope = expression_source_scope(merge.ctx, value);
+        if name == "stateSelect" {
+            if !state_select_set {
+                attrs.state_select = parse_required_state_select(
+                    value,
+                    merge.eval_ctx,
+                    &[],
+                    written_scope.as_ref(),
+                    &enclosing_instance_path(merge.ctx),
+                )?;
+                state_select_set = true;
+            }
             continue;
         }
-
-        for ext in &class.extends {
-            for modification in &ext.modifications {
-                merge_missing_type_string_attrs_from_expr(attrs, &modification.expr);
-            }
-        }
-
-        if has_all_type_string_attrs(attrs) {
-            break;
-        }
-
-        for ext in &class.extends {
-            let base_name = ext.base_name.to_string();
-            if let Some(base_class) = ext
-                .base_def_id
-                .and_then(|def_id| tree.get_class_by_def_id(def_id))
-                .or_else(|| find_class_in_tree(tree, &base_name))
-            {
-                stack.push(base_class);
-            }
+        let value = TypeAttributeValue {
+            name,
+            value,
+            written_scope: written_scope.as_ref(),
+            declaration_scope: declaration_scope.as_ref(),
+        };
+        if merge_type_attribute(merge.eval_ctx, attrs, &value)?
+            && !modification.each
+            && value_rank > 0
+        {
+            shapes.ranks.insert(name.to_string(), value_rank);
         }
     }
+    Ok(shapes)
+}
+
+struct TypeAttributeValue<'a> {
+    name: &'a str,
+    value: &'a ast::Expression,
+    written_scope: Option<&'a ast::QualifiedName>,
+    declaration_scope: Option<&'a ast::QualifiedName>,
+}
+
+/// Set one attribute from the type chain unless it is already set; returns
+/// whether it was set.
+fn merge_type_attribute(
+    eval_ctx: &InstantiateEvalCtx<'_>,
+    attrs: &mut ExtractedAttributes,
+    attr: &TypeAttributeValue<'_>,
+) -> InstantiateResult<bool> {
+    let slot = match attr.name {
+        "start" => &mut attrs.start,
+        "min" => &mut attrs.min,
+        "max" => &mut attrs.max,
+        "nominal" => &mut attrs.nominal,
+        "quantity" if attrs.quantity.is_none() => {
+            attrs.quantity = expr_to_string(attr.value);
+            return Ok(false);
+        }
+        "unit" if attrs.unit.is_none() => {
+            attrs.unit = expr_to_string(attr.value);
+            return Ok(false);
+        }
+        "displayUnit" if attrs.display_unit.is_none() => {
+            attrs.display_unit = expr_to_string(attr.value);
+            return Ok(false);
+        }
+        "fixed" if attrs.fixed.is_none() => {
+            attrs.fixed = Some(parse_required_fixed(
+                attr.value,
+                eval_ctx,
+                &[],
+                attr.written_scope,
+            )?);
+            return Ok(true);
+        }
+        _ => return Ok(false),
+    };
+    if slot.is_some() {
+        return Ok(false);
+    }
+    *slot = Some(attr.value.clone());
+    if attr.name == "start" {
+        attrs.start_is_explicit = true;
+    }
+    if let Some(scope) = attr.written_scope
+        && Some(scope) != attr.declaration_scope
+        && !attrs.source_scopes.contains_key(attr.name)
+    {
+        attrs
+            .source_scopes
+            .insert(attr.name.to_string(), scope.clone());
+    }
+    Ok(true)
+}
+
+/// Repeat array-type attribute values over the component's own leading
+/// dimensions (see [`TypeAttributeShapes`]).
+pub(super) fn broadcast_type_attribute_values(
+    shapes: &TypeAttributeShapes,
+    dims: &[i64],
+    attrs: &mut ExtractedAttributes,
+) {
+    for (name, &rank) in &shapes.ranks {
+        let Some(leading) = dims.len().checked_sub(rank).map(|count| &dims[..count]) else {
+            continue;
+        };
+        let Some(leading) = leading
+            .iter()
+            .map(|&dim| usize::try_from(dim).ok())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if leading.is_empty() {
+            continue;
+        }
+        if name == "fixed" {
+            if let Some(fixed) = attrs.fixed.as_mut() {
+                *fixed = fixed.repeat(leading.iter().product());
+            }
+            continue;
+        }
+        let slot = match name.as_str() {
+            "start" => &mut attrs.start,
+            "min" => &mut attrs.min,
+            "max" => &mut attrs.max,
+            "nominal" => &mut attrs.nominal,
+            _ => continue,
+        };
+        if let Some(value) = slot.take() {
+            *slot = Some(repeat_over_dims(value, &leading));
+        }
+    }
+}
+
+fn repeat_over_dims(value: ast::Expression, leading: &[usize]) -> ast::Expression {
+    let span = value.span();
+    leading
+        .iter()
+        .rev()
+        .fold(value, |element, &count| ast::Expression::Array {
+            elements: vec![element; count],
+            kind: rumoca_core::ArrayConstructor::Array,
+            span,
+        })
 }
 
 pub(super) fn validate_final_type_attribute_overrides(
@@ -326,7 +376,7 @@ pub(super) fn validate_final_type_attribute_overrides(
     comp: &ast::Component,
     mod_env: &ast::ModificationEnvironment,
 ) -> InstantiateResult<()> {
-    let final_attrs = final_type_attribute_names(tree, class_def);
+    let final_attrs = final_type_attribute_names(tree, class_def)?;
     for attr_name in comp.final_attributes.iter().chain(final_attrs.iter()) {
         let attr_path = ast::QualifiedName::from_ident(&comp.name).child(attr_name);
         if let Some(mod_value) = mod_env.get(&attr_path) {
@@ -337,7 +387,27 @@ pub(super) fn validate_final_type_attribute_overrides(
             )));
         }
     }
+    // MLS §7.2.6: the declaration's own modifier is a modification too, so it
+    // cannot override an attribute the declared type made final.
+    for attr_name in &final_attrs {
+        if let Some(value) = comp.modifications.get(attr_name) {
+            return Err(final_override_error(
+                format!("{}.{}", comp.name, attr_name),
+                value,
+            ));
+        }
+    }
     Ok(())
+}
+
+fn final_override_error(name: String, value: &ast::Expression) -> Box<InstantiateError> {
+    let span = value.span();
+    if span.is_dummy() {
+        return Box::new(InstantiateError::missing_source_context(
+            "final type attribute override is missing source provenance",
+        ));
+    }
+    Box::new(InstantiateError::redeclare_final(name, span))
 }
 
 fn required_modifier_value_span(
@@ -354,49 +424,42 @@ fn required_modifier_value_span(
     Ok(span)
 }
 
+/// Names the declared type chain makes final, rejecting a derived type that
+/// modifies an element a base type made final (MLS §7.2.6).
 fn final_type_attribute_names(
     tree: &ast::ClassTree,
     class_def: Option<&ast::ClassDef>,
-) -> indexmap::IndexSet<String> {
+) -> InstantiateResult<indexmap::IndexSet<String>> {
     let mut final_attrs = indexmap::IndexSet::new();
-    let mut stack: Vec<&ast::ClassDef> = class_def.into_iter().collect();
-    let mut visited = std::collections::HashSet::<DefId>::new();
-
-    while let Some(class) = stack.pop() {
-        if let Some(def_id) = class.def_id
-            && !visited.insert(def_id)
-        {
-            continue;
-        }
-        for ext in &class.extends {
-            for modification in &ext.modifications {
-                insert_final_type_attribute_name(&mut final_attrs, modification);
+    // Modifications written by the classes already walked. While every class
+    // walked has a single base, they all derive from the classes still to come;
+    // past a class with several bases the walk order no longer implies that.
+    let mut derived_modifications = IndexMap::<String, &ast::Expression>::default();
+    let mut single_base_chain = true;
+    for class in type_chain(tree, class_def) {
+        let modifications = class.extends.iter().flat_map(|ext| &ext.modifications);
+        for modification in modifications.clone() {
+            let Some(attr_name) = type_attribute_modification_name(&modification.expr) else {
+                continue;
+            };
+            if !modification.final_ {
+                continue;
             }
-
-            let base_name = ext.base_name.to_string();
-            if let Some(base_class) = ext
-                .base_def_id
-                .and_then(|def_id| tree.get_class_by_def_id(def_id))
-                .or_else(|| find_class_in_tree(tree, &base_name))
-            {
-                stack.push(base_class);
+            if single_base_chain && let Some(expr) = derived_modifications.get(&attr_name) {
+                return Err(final_override_error(attr_name, expr));
+            }
+            final_attrs.insert(attr_name);
+        }
+        single_base_chain &= class.extends.len() <= 1;
+        for modification in modifications {
+            if let Some(attr_name) = type_attribute_modification_name(&modification.expr) {
+                derived_modifications
+                    .entry(attr_name)
+                    .or_insert(&modification.expr);
             }
         }
     }
-
-    final_attrs
-}
-
-fn insert_final_type_attribute_name(
-    final_attrs: &mut indexmap::IndexSet<String>,
-    modification: &ast::ExtendModification,
-) {
-    if !modification.final_ {
-        return;
-    }
-    if let Some(attr_name) = type_attribute_modification_name(&modification.expr) {
-        final_attrs.insert(attr_name);
-    }
+    Ok(final_attrs)
 }
 
 fn type_attribute_modification_name(expr: &ast::Expression) -> Option<String> {
@@ -472,7 +535,7 @@ pub(super) fn extract_attributes(
     let mut attrs = ExtractedAttributes {
         start_is_explicit: start_from_mod_env.is_some(),
         start: start_from_mod_env,
-        fixed: mod_env.get_attr(comp_name, "fixed").and_then(expr_to_bool),
+        fixed: extract_fixed_attribute(comp, comp_name, eval_ctx, imports)?,
         min: attr_from_mod_env("min"),
         max: attr_from_mod_env("max"),
         nominal: attr_from_mod_env("nominal"),
@@ -493,7 +556,6 @@ pub(super) fn extract_attributes(
                 attrs.start = Some(value.clone());
                 attrs.start_is_explicit = true;
             }
-            "fixed" if attrs.fixed.is_none() => attrs.fixed = expr_to_bool(value),
             "min" if attrs.min.is_none() => attrs.min = Some(value.clone()),
             "max" if attrs.max.is_none() => attrs.max = Some(value.clone()),
             "nominal" if attrs.nominal.is_none() => attrs.nominal = Some(value.clone()),
@@ -516,6 +578,45 @@ pub(super) fn extract_attributes(
     }
 
     Ok(attrs)
+}
+
+fn extract_fixed_attribute(
+    comp: &ast::Component,
+    comp_name: &str,
+    eval_ctx: &InstantiateEvalCtx<'_>,
+    imports: &[(String, String)],
+) -> InstantiateResult<Option<Vec<bool>>> {
+    let path = ast::QualifiedName::from_ident(comp_name).child("fixed");
+    match eval_ctx.mod_env.get(&path) {
+        Some(value) => {
+            parse_required_fixed(&value.value, eval_ctx, imports, value.source_scope.as_ref())
+                .map(Some)
+        }
+        None => comp
+            .modifications
+            .get("fixed")
+            .map(|value| parse_required_fixed(value, eval_ctx, imports, None))
+            .transpose(),
+    }
+}
+
+fn parse_required_fixed(
+    value: &ast::Expression,
+    eval_ctx: &InstantiateEvalCtx<'_>,
+    imports: &[(String, String)],
+    source_scope: Option<&ast::QualifiedName>,
+) -> InstantiateResult<Vec<bool>> {
+    eval_boolean_attribute_values(eval_ctx, value, source_scope)
+        .or_else(|| {
+            let qualified = crate::dims::qualify_shape_expr_imports(eval_ctx.tree, value, imports);
+            eval_boolean_attribute_values(eval_ctx, &qualified, source_scope)
+        })
+        .ok_or_else(|| {
+            Box::new(InstantiateError::UnsupportedFixedAttribute {
+                value: value.to_string(),
+                span: value.span(),
+            })
+        })
 }
 
 fn parse_required_state_select(

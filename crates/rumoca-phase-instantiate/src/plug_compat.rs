@@ -56,7 +56,7 @@ pub(crate) fn class_flags_compatible(
 }
 
 /// TYPE-022 (MLS §6.4): a transitively non-replaceable constraint requires a
-/// transitively non-replaceable replacement.
+/// replacement without replaceable elements.
 ///
 /// Only applied when the replacement was accepted structurally (sibling
 /// classes). A class that nominally extends the constraint is its subtype by
@@ -71,7 +71,14 @@ pub(crate) fn replaceability_compatible(
     let Some(supertype) = supertype else {
         return true;
     };
-    !is_transitively_non_replaceable(supertype) || is_transitively_non_replaceable(subtype)
+    // The `replaceable` prefix on the subtype's own declaration describes its
+    // slot, not its interface, so only its elements are compared (MLS §7.3).
+    !is_transitively_non_replaceable(supertype) || !has_replaceable_elements(subtype)
+}
+
+fn has_replaceable_elements(class: &ast::ClassDef) -> bool {
+    class.components.values().any(|comp| comp.is_replaceable)
+        || class.classes.values().any(|nested| nested.is_replaceable)
 }
 
 /// MLS §6.4: a class is transitively non-replaceable when neither it nor any
@@ -104,7 +111,16 @@ pub(crate) fn members_plug_compatible(
 ) -> bool {
     let sub_members = collect_public_members(tree, subtype);
     let super_members = collect_public_members(tree, supertype);
-    for (name, b_comp) in &super_members {
+    public_members_plug_compatible(tree, &sub_members, &super_members, &supertype.class_type)
+}
+
+pub(crate) fn public_members_plug_compatible<S: std::hash::BuildHasher>(
+    tree: &ast::ClassTree,
+    sub_members: &indexmap::IndexMap<String, ast::Component, S>,
+    super_members: &indexmap::IndexMap<String, ast::Component, S>,
+    class_type: &rumoca_core::ClassType,
+) -> bool {
+    for (name, b_comp) in super_members {
         let Some(a_comp) = sub_members.get(name) else {
             return false;
         };
@@ -125,8 +141,8 @@ pub(crate) fn members_plug_compatible(
             return false;
         }
     }
-    if supertype.class_type == rumoca_core::ClassType::Function {
-        return function_signatures_plug_compatible(&sub_members, &super_members);
+    if *class_type == rumoca_core::ClassType::Function {
+        return function_signatures_plug_compatible(sub_members, super_members);
     }
     // MLS §6.4's transitively-non-replaceable "no other elements" rule
     // (TYPE-023) is deliberately not enforced: idiomatic MSL redeclarations
@@ -138,7 +154,7 @@ pub(crate) fn members_plug_compatible(
     // replacement's own equations; the genuinely dangling case is an extra
     // *input* without a default, which nothing in the constrained usage will
     // ever bind.
-    for (name, member) in &sub_members {
+    for (name, member) in sub_members {
         if super_members.contains_key(name) {
             continue;
         }
@@ -373,18 +389,18 @@ fn external_object_ancestry_inner(
 
 /// MLS §6.6 / TYPE-018..020: constrained inputs and outputs must be leading
 /// prefixes in the replacement; additional inputs need defaults.
-fn function_signatures_plug_compatible(
-    sub_members: &indexmap::IndexMap<String, ast::Component>,
-    super_members: &indexmap::IndexMap<String, ast::Component>,
+fn function_signatures_plug_compatible<S: std::hash::BuildHasher>(
+    sub_members: &indexmap::IndexMap<String, ast::Component, S>,
+    super_members: &indexmap::IndexMap<String, ast::Component, S>,
 ) -> bool {
-    let inputs = |members: &indexmap::IndexMap<String, ast::Component>| -> Vec<String> {
+    let inputs = |members: &indexmap::IndexMap<String, ast::Component, S>| -> Vec<String> {
         members
             .iter()
             .filter(|(_, c)| matches!(c.causality, rumoca_core::Causality::Input(_)))
             .map(|(name, _)| name.clone())
             .collect()
     };
-    let outputs = |members: &indexmap::IndexMap<String, ast::Component>| -> Vec<String> {
+    let outputs = |members: &indexmap::IndexMap<String, ast::Component, S>| -> Vec<String> {
         members
             .iter()
             .filter(|(_, c)| matches!(c.causality, rumoca_core::Causality::Output(_)))

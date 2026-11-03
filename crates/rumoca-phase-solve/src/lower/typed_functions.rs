@@ -3,14 +3,18 @@
 mod assertions;
 mod captures;
 mod folds;
+pub(crate) mod formal_stages;
 mod indexed_slices;
+mod indexed_values;
+mod model_calls;
+mod model_coordinates;
 pub(in crate::lower) mod model_events;
 mod regions;
 mod registration;
 mod tensor;
 
 use assertions::{assertion_conditions, assertion_is_map_independent, nested_calls};
-use model_events::ModelCoordinateKey;
+use model_coordinates::ModelCoordinateKey;
 pub(super) use model_events::lower_model_event_transactions;
 use regions::{
     EnvironmentLayout, RegionAssignmentChain, RegionConditional, RegionContext, RegionValues,
@@ -37,8 +41,7 @@ use rumoca_ir_solve as solve;
 /// the resulting table is finite and topological by construction.
 pub(crate) struct PureCallRegistry<'dae> {
     table: solve::SolvePureCallTableBuilder,
-    identities: NestedIdentityIssuer,
-    roots: HashMap<dae::ExprId<'dae>, RegisteredCall<'dae>>,
+    identities: CallRegistration<'dae>,
 }
 
 impl<'dae> PureCallRegistry<'dae> {
@@ -46,8 +49,7 @@ impl<'dae> PureCallRegistry<'dae> {
         let arithmetic = arithmetic_profile();
         Self {
             table: solve::SolvePureCallTable::builder(arithmetic),
-            identities: NestedIdentityIssuer::new(None),
-            roots: HashMap::new(),
+            identities: CallRegistration::new(None),
         }
     }
 
@@ -56,38 +58,20 @@ impl<'dae> PureCallRegistry<'dae> {
         view: dae::DaeView<'dae>,
         call: dae::ExprId<'dae>,
     ) -> Result<RegisteredCall<'dae>, solve::SolveProgramConstructionError> {
-        let call_node = view
-            .expression(call)
-            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-        let dae::ExpressionOperation::Call { owner, .. } = call_node.operation() else {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: call_node.provenance().span(),
-            });
-        };
-        if let Some(registered) = self.roots.get(&owner) {
-            return Ok(registered.clone());
-        }
-        let provenance = view
-            .expression(owner)
-            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
-            .provenance()
-            .span();
-        let identity = self.identities.issue(provenance)?;
-        let registered = register_call(
+        register_call(
             &mut self.table,
             view,
-            owner,
-            identity,
+            call,
+            None,
             arithmetic_profile(),
             &mut self.identities,
             &mut Vec::new(),
-        )?;
-        self.roots.insert(owner, registered.clone());
-        Ok(registered)
+        )
     }
 
     pub(crate) fn finish(&mut self) -> solve::SolvePureCallTable {
         let replacement = solve::SolvePureCallTable::builder(arithmetic_profile());
+        self.identities = CallRegistration::new(None);
         std::mem::replace(&mut self.table, replacement).finish()
     }
 }
@@ -106,12 +90,12 @@ pub(super) fn lower_exact_call<'dae>(
 ) -> Result<solve::SolvePureCallTable, solve::SolveProgramConstructionError> {
     let arithmetic = arithmetic_profile();
     let mut table = solve::SolvePureCallTable::builder(arithmetic);
-    let mut identities = NestedIdentityIssuer::new(Some(identity));
+    let mut identities = CallRegistration::new(Some(identity));
     register_call(
         &mut table,
         view,
         call,
-        identity,
+        Some(identity),
         arithmetic,
         &mut identities,
         &mut Vec::new(),
@@ -125,8 +109,73 @@ pub(crate) struct RegisteredCall<'dae> {
     pub(crate) site: solve::SolvePureCallSite,
     pub(crate) result_ranges: Box<[Range<usize>]>,
     pub(crate) result_leaf_count: usize,
-    pub(crate) assertion_count: usize,
+    /// Every call-scoped assertion output after the result leaves, in owner
+    /// output order: the owner's own predicates, its own message values, then
+    /// each nested call's complete slot tuple.
+    pub(crate) assertion_slots: std::sync::Arc<[AssertionSlot]>,
     pub(crate) assertions: Box<[RegisteredAssertion<'dae>]>,
+}
+
+/// One call-scoped assertion output of a pure-call owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AssertionSlot {
+    /// The Boolean condition of one assertion reached by the invocation.
+    Predicate,
+    /// One scalar an assertion message converts to text, evaluated in the
+    /// frame of the function that declares that assertion. `predicate` is
+    /// the backward distance to that assertion's predicate slot, which slot
+    /// tuples keep when they are concatenated.
+    MessageValue {
+        value_type: solve::SolveValueType,
+        predicate: usize,
+    },
+}
+
+impl AssertionSlot {
+    fn value_type(&self) -> solve::SolveValueType {
+        match self {
+            Self::Predicate => solve::SolveValueType::scalar(solve::SolveScalarType::Boolean),
+            Self::MessageValue { value_type, .. } => value_type.clone(),
+        }
+    }
+
+    fn output(&self) -> solve::SolvePureCallOutput {
+        match self {
+            Self::Predicate => solve::SolvePureCallOutput::assertion_predicate(),
+            Self::MessageValue { value_type, .. } => {
+                solve::SolvePureCallOutput::assertion_message_value(value_type.clone())
+            }
+        }
+    }
+
+    const fn is_predicate(&self) -> bool {
+        matches!(self, Self::Predicate)
+    }
+
+    /// The value a slot holds when its assertion lies in a branch the
+    /// invocation does not select: a satisfied predicate, and a message value
+    /// that is never rendered because that predicate cannot fail.
+    fn unselected<'program>(
+        &self,
+        builder: &mut solve::TypedProgramBuilder<'program>,
+        provenance: rumoca_core::Span,
+    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
+        let value = match self {
+            Self::Predicate => solve::SolveValue::boolean(true),
+            Self::MessageValue { value_type, .. } => match value_type.element_type() {
+                solve::SolveScalarType::Real { .. } => {
+                    solve::SolveValue::real(arithmetic_profile(), 0.0)
+                }
+                solve::SolveScalarType::Integer(_) => {
+                    solve::SolveValue::integer(arithmetic_profile(), 0).map_err(|_| {
+                        solve::SolveProgramConstructionError::InvalidCallOutput { provenance }
+                    })?
+                }
+                solve::SolveScalarType::Boolean => solve::SolveValue::boolean(false),
+            },
+        };
+        builder.constant(value, provenance)
+    }
 }
 
 /// Construction-issued correlation shared by every definition one function
@@ -201,6 +250,10 @@ fn insert_conditional_definition_group<'dae>(
 pub(crate) struct RegisteredAssertion<'dae> {
     pub(crate) predicate_output: usize,
     pub(crate) message: dae::ExprId<'dae>,
+    /// Owner output carrying each converted message value, keyed by the value
+    /// expression the message converts.
+    pub(crate) message_values: Box<[(dae::ExprId<'dae>, usize)]>,
+    pub(crate) level: dae::AssertionLevel,
     pub(crate) provenance: dae::DaeProvenance,
 }
 
@@ -211,6 +264,15 @@ struct LoweredValue<'program, 'dae> {
 }
 
 impl<'program, 'dae> LoweredValue<'program, 'dae> {
+    /// A value with a zero extent: it holds no scalar, so it holds no leaf
+    /// (the rule [`lower_value_type_leaves`] applies to interfaces).
+    fn empty(value_type: dae::ValueTypeId<'dae>) -> Self {
+        Self {
+            value_type,
+            leaves: Vec::new(),
+        }
+    }
+
     fn scalar(
         value_type: dae::ValueTypeId<'dae>,
         register: solve::ProgramRegister<'program>,
@@ -232,14 +294,19 @@ impl<'program, 'dae> LoweredValue<'program, 'dae> {
     }
 }
 
-struct NestedIdentityIssuer {
+struct CallRegistration<'dae> {
     reserved: Option<solve::SolvePureCallIdentity>,
     next: u64,
+    calls: HashMap<dae::ExprId<'dae>, RegisteredCall<'dae>>,
 }
 
-impl NestedIdentityIssuer {
-    const fn new(reserved: Option<solve::SolvePureCallIdentity>) -> Self {
-        Self { reserved, next: 1 }
+impl CallRegistration<'_> {
+    fn new(reserved: Option<solve::SolvePureCallIdentity>) -> Self {
+        Self {
+            reserved,
+            next: 1,
+            calls: HashMap::new(),
+        }
     }
 
     fn issue(
@@ -453,6 +520,7 @@ struct ExpressionLowerer<'builder, 'program, 'dae> {
     function_values: HashMap<dae::FunctionDefinitionId<'dae>, LoweredValue<'program, 'dae>>,
     /// Exact DAE assignment-group membership for demand-ordered definitions.
     conditional_groups: HashMap<dae::FunctionDefinitionId<'dae>, ConditionalDefinitionGroup<'dae>>,
+    fold_bodies: HashMap<dae::FunctionFoldId<'dae>, assertions::FoldBody<'dae>>,
     fold_parameters: HashMap<(dae::FunctionFoldId<'dae>, u32), LoweredValue<'program, 'dae>>,
     fold_values: HashMap<dae::FunctionFoldId<'dae>, Vec<LoweredValue<'program, 'dae>>>,
     binders: HashMap<(u32, u32), solve::ProgramRegister<'program>>,
@@ -461,6 +529,8 @@ struct ExpressionLowerer<'builder, 'program, 'dae> {
     cache: HashMap<dae::ExprId<'dae>, LoweredValue<'program, 'dae>>,
     call_values: HashMap<dae::ExprId<'dae>, Vec<solve::ProgramRegister<'program>>>,
     predicate_values: Vec<Option<solve::ProgramRegister<'program>>>,
+    /// Kind of each entry of `predicate_values`, in owner output order.
+    assertion_slots: std::sync::Arc<[AssertionSlot]>,
     next_direct_assertion: usize,
     direct_assertion_count: usize,
 }
@@ -536,10 +606,14 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                     self.conditional_assignment(definitions, conditional)?;
                 }
                 dae::FunctionStatementView::For {
-                    fold,
-                    statements,
-                    provenance,
+                    fold, provenance, ..
                 } => {
+                    let assertion_end = self
+                        .fold_bodies
+                        .get(&fold)
+                        .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
+                        .assertions
+                        .end;
                     let values = self.function_fold(fold, provenance.span())?;
                     let fold = self
                         .view
@@ -550,7 +624,6 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                             provenance: provenance.span(),
                         });
                     }
-                    let domain = fold.domain();
                     // The loop's exit value of each carried target belongs to
                     // the output definition the fold issued, not to the
                     // in-body definitions that produced it.
@@ -560,7 +633,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                             .map(|definition| definition.id())
                             .zip(values),
                     );
-                    self.loop_assertions(statements, &mut vec![domain], provenance.span())?;
+                    self.next_direct_assertion = assertion_end;
                 }
             }
         }
@@ -602,13 +675,22 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                             provenance: provenance.span(),
                         });
                     }
-                    let predicate =
-                        self.map_assertion_predicate(condition, domains, provenance.span())?;
-                    let predicate = self.builder.reduce(
-                        solve::SolveReductionOperator::All,
-                        predicate,
+                    let predicate = if assertions::assertion_domain_is_empty(
+                        self.view,
+                        domains,
                         provenance.span(),
-                    )?;
+                    )? {
+                        self.builder
+                            .constant(solve::SolveValue::boolean(true), provenance.span())?
+                    } else {
+                        let mapped =
+                            self.map_assertion_predicate(condition, domains, provenance.span())?;
+                        self.builder.reduce(
+                            solve::SolveReductionOperator::All,
+                            mapped,
+                            provenance.span(),
+                        )?
+                    };
                     self.record_assertion_predicate(predicate, provenance.span())?;
                 }
                 dae::FunctionStatementView::For {
@@ -659,7 +741,8 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             callees: self.callees.clone(),
             predicate_ranges: self.predicate_ranges.clone(),
             conditional_groups: self.conditional_groups.clone(),
-            predicate_count: self.predicate_values.len(),
+            fold_bodies: self.fold_bodies.clone(),
+            assertion_slots: self.assertion_slots.clone(),
             direct_assertion_count: self.direct_assertion_count,
         };
         let remaining = remaining.to_vec();
@@ -671,15 +754,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             move |builder, captures, binders, output| {
                 let mut lowerer =
                     load_region_lowerer(builder, captures, &environment, &context, provenance)?;
-                for (ordinal, binder) in binders.iter().enumerate() {
-                    let register = lowerer.builder.load(*binder, provenance)?;
-                    let ordinal = u32::try_from(ordinal).map_err(|_| {
-                        solve::SolveProgramConstructionError::IdentityOverflow { provenance }
-                    })?;
-                    lowerer
-                        .binders
-                        .insert((domain_id.index(), ordinal), register);
-                }
+                lowerer.load_domain_binders(domain_id, binders, provenance)?;
                 let predicate =
                     lowerer.map_assertion_predicate(condition, &remaining, provenance)?;
                 lowerer.builder.store(output, predicate, provenance)
@@ -701,10 +776,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         let mut output_types =
             lower_value_type_leaves(self.view, value_type, arithmetic_profile())?;
         let value_leaf_count = output_types.len();
-        output_types.extend(std::iter::repeat_n(
-            solve::SolveValueType::scalar(solve::SolveScalarType::Boolean),
-            pending.len(),
-        ));
+        output_types.extend(self.pending_slot_types(&pending));
         let (captures, environment) =
             self.capture_environment_for(operands[1..].iter().copied())?;
         let context = RegionContext {
@@ -712,7 +784,8 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             callees: self.callees.clone(),
             predicate_ranges: self.predicate_ranges.clone(),
             conditional_groups: self.conditional_groups.clone(),
-            predicate_count: self.predicate_values.len(),
+            fold_bodies: self.fold_bodies.clone(),
+            assertion_slots: self.assertion_slots.clone(),
             direct_assertion_count: self.direct_assertion_count,
         };
         let true_environment = environment.clone();
@@ -792,6 +865,10 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             .view
             .value_type(target)
             .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
+        if source_type == target_type {
+            value.value_type = target;
+            return Ok(value);
+        }
         if !source_type.is_record()
             && !target_type.is_record()
             && source_type.dimensions() == target_type.dimensions()
@@ -801,6 +878,10 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 dae::ScalarType::Integer | dae::ScalarType::Enumeration
             )
         {
+            // A zero-size array holds no scalar to convert (MLS 3.7 §10.4).
+            if source_type.dimensions().contains(&0) {
+                return Ok(LoweredValue::empty(target));
+            }
             let register = value.only_register(provenance)?;
             value.leaves = vec![self.builder.convert(
                 solve::SolveConversionOperator::IntegerToReal,
@@ -811,6 +892,33 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             return Ok(value);
         }
         Err(solve::SolveProgramConstructionError::TypeMismatch { provenance })
+    }
+
+    /// Output types of the pending assertion slots a region publishes.
+    fn pending_slot_types(&self, pending: &[usize]) -> Vec<solve::SolveValueType> {
+        pending
+            .iter()
+            .map(|&slot| self.assertion_slots[slot].value_type())
+            .collect()
+    }
+
+    /// The value a region publishes for one pending assertion slot: the value
+    /// its branch produced, or the unselected value when the branch reaches
+    /// no call that owns the slot.
+    fn published_slot(
+        &mut self,
+        slot: usize,
+        provenance: rumoca_core::Span,
+    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
+        if let Some(value) = self.predicate_values.get(slot).copied().flatten() {
+            return Ok(value);
+        }
+        let kind = self
+            .assertion_slots
+            .get(slot)
+            .cloned()
+            .ok_or(solve::SolveProgramConstructionError::InvalidCallOutput { provenance })?;
+        kind.unselected(self.builder, provenance)
     }
 
     fn pending_predicates(
@@ -867,15 +975,14 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         {
             return Err(solve::SolveProgramConstructionError::InvalidCallOutput { provenance });
         }
-        if !self
-            .pending_predicates(std::iter::once(*condition_expression))
-            .is_empty()
-        {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface { provenance });
-        }
         let condition = self
             .expression(*condition_expression)?
             .only_register(provenance)?;
+        // The calls the condition reaches run in this scope before either arm,
+        // so the assertion slots they settle are published from here; the arms
+        // publish only the slots still pending.
+        let all_pending = pending;
+        let pending = &self.still_pending(all_pending);
         let mut output_types = Vec::new();
         for value_type in value_types {
             output_types.extend(lower_value_type_leaves(
@@ -884,10 +991,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 arithmetic_profile(),
             )?);
         }
-        output_types.extend(std::iter::repeat_n(
-            solve::SolveValueType::scalar(solve::SolveScalarType::Boolean),
-            pending.len(),
-        ));
+        output_types.extend(self.pending_slot_types(pending));
         let capture_roots = conditions[1..]
             .iter()
             .copied()
@@ -899,7 +1003,8 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             callees: self.callees.clone(),
             predicate_ranges: self.predicate_ranges.clone(),
             conditional_groups: self.conditional_groups.clone(),
-            predicate_count: self.predicate_values.len(),
+            fold_bodies: self.fold_bodies.clone(),
+            assertion_slots: self.assertion_slots.clone(),
             direct_assertion_count: self.direct_assertion_count,
         };
         let true_environment = environment.clone();
@@ -915,7 +1020,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         let false_conditions = conditions[1..].to_vec();
         let false_branches = branches[1..].to_vec();
         let false_fallback = fallback.to_vec();
-        self.builder.conditional(
+        let destinations = self.builder.conditional(
             condition,
             &captures,
             output_types,
@@ -951,7 +1056,49 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                     },
                 )
             },
-        )
+        )?;
+        self.publish_chain_slots(&destinations, all_pending, pending, provenance)
+    }
+
+    /// The slots of `pending` no call of this scope has settled yet.
+    fn still_pending(&self, pending: &[usize]) -> Vec<usize> {
+        pending
+            .iter()
+            .copied()
+            .filter(|slot| {
+                self.predicate_values
+                    .get(*slot)
+                    .is_some_and(Option::is_none)
+            })
+            .collect()
+    }
+
+    /// A chain's values followed by every slot of `all_pending`: the arms'
+    /// value for a slot they published, and this scope's value for a slot its
+    /// condition settled.
+    fn publish_chain_slots(
+        &self,
+        destinations: &[solve::ProgramRegister<'program>],
+        all_pending: &[usize],
+        regional_slots: &[usize],
+        provenance: rumoca_core::Span,
+    ) -> Result<Vec<solve::ProgramRegister<'program>>, solve::SolveProgramConstructionError> {
+        let value_count = destinations.len() - regional_slots.len();
+        let mut published = destinations[..value_count].to_vec();
+        let mut regional = destinations[value_count..].iter().copied();
+        for slot in all_pending {
+            let value = if regional_slots.contains(slot) {
+                regional.next()
+            } else {
+                self.predicate_values.get(*slot).copied().flatten()
+            };
+            published.push(
+                value.ok_or(solve::SolveProgramConstructionError::InvalidCallOutput {
+                    provenance,
+                })?,
+            );
+        }
+        Ok(published)
     }
 
     fn conditional_assignment(
@@ -1013,10 +1160,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             value_ranges.push((value_type, start..output_types.len()));
         }
         let value_leaf_count = output_types.len();
-        output_types.extend(std::iter::repeat_n(
-            solve::SolveValueType::scalar(solve::SolveScalarType::Boolean),
-            pending.len(),
-        ));
+        output_types.extend(self.pending_slot_types(&pending));
         let destinations = self.assignment_conditional_chain(
             &value_types,
             &conditions,
@@ -1041,10 +1185,16 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             let value = self.predicate_values.get_mut(slot).ok_or(
                 solve::SolveProgramConstructionError::InvalidCallOutput { provenance: at },
             )?;
-            if value.replace(predicate).is_some() {
-                return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
-                    provenance: at,
-                });
+            // A slot the chain's first condition settled in this scope comes
+            // back as the value this scope already holds.
+            match value {
+                Some(existing) if *existing == predicate => {}
+                Some(_) => {
+                    return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
+                        provenance: at,
+                    });
+                }
+                None => *value = Some(predicate),
             }
         }
         Ok(())
@@ -1093,6 +1243,9 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             }
             dae::ExpressionOperation::Unary { operator, operand } => {
                 let operand = self.expression(operand)?;
+                if operand.leaves.is_empty() && self.is_zero_size(node.value_type_id())? {
+                    return Ok(LoweredValue::empty(node.value_type_id()));
+                }
                 let register = operand.only_register(at)?;
                 let result = match operator {
                     dae::UnaryOperator::Plus => register,
@@ -1133,8 +1286,8 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             dae::ExpressionOperation::Field { base, field } => {
                 self.field(node.value_type_id(), base, field, at)?
             }
-            dae::ExpressionOperation::Comprehension { body, .. } => {
-                self.comprehension(node.value_type_id(), body, at)?
+            dae::ExpressionOperation::Comprehension { domain, body } => {
+                self.comprehension(node.value_type_id(), domain, body, at)?
             }
             dae::ExpressionOperation::ArrayUpdate {
                 base,
@@ -1142,7 +1295,14 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 subscripts,
             } => self.array_update(node.value_type_id(), base, value, subscripts, at)?,
             dae::ExpressionOperation::Index { base, subscripts } => {
-                self.index(node.value_type_id(), base, subscripts, at)?
+                if self.is_zero_size(node.value_type_id())? {
+                    // A zero-size slice holds no leaf; its base is still
+                    // lowered so a call inside it keeps its evaluation.
+                    self.expression(base)?;
+                    LoweredValue::empty(node.value_type_id())
+                } else {
+                    self.index(node.value_type_id(), base, subscripts, at)?
+                }
             }
             dae::ExpressionOperation::FunctionValue { definition, .. } => {
                 self.function_definition_value(definition)?
@@ -1167,6 +1327,20 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         };
         self.cache.insert(expression, value.clone());
         Ok(value)
+    }
+
+    /// Whether `value_type` has a zero extent (MLS 3.7 §10.1), so a value of it
+    /// holds no scalar and lowers to no leaf.
+    fn is_zero_size(
+        &self,
+        value_type: dae::ValueTypeId<'dae>,
+    ) -> Result<bool, solve::SolveProgramConstructionError> {
+        Ok(self
+            .view
+            .value_type(value_type)
+            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
+            .dimensions()
+            .contains(&0))
     }
 
     fn record(
@@ -1302,73 +1476,47 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         Ok(LoweredValue { value_type, leaves })
     }
 
-    // SPEC_0021: Exception - exhaustive checked tensor-comprehension lowering.
-    #[allow(clippy::excessive_nesting)]
     fn comprehension(
         &mut self,
         value_type: dae::ValueTypeId<'dae>,
+        domain_id: dae::DomainId<'dae>,
         body: dae::ExprId<'dae>,
         at: rumoca_core::Span,
     ) -> Result<LoweredValue<'program, 'dae>, solve::SolveProgramConstructionError> {
+        // A zero-size comprehension holds no scalar, so it holds no leaf.
+        if self.is_zero_size(value_type)? {
+            return Ok(LoweredValue::empty(value_type));
+        }
         let body_node = self
             .view
             .expression(body)
             .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-        if let Some(domain_id) = body_node.binder_domain() {
-            if !self.pending_predicates([body]).is_empty() {
-                return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                    provenance: at,
-                });
-            }
-            let domain = self
-                .view
-                .domain(domain_id)
-                .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
-                .structured()
-                .clone();
-            let body_types = lower_value_type_leaves(
-                self.view,
-                body_node.value_type_id(),
-                arithmetic_profile(),
-            )?;
-            let [body_type] = body_types.as_slice() else {
-                return Err(solve::SolveProgramConstructionError::InvalidMap { provenance: at });
-            };
-            let (captures, environment) = self.capture_environment_for([body])?;
-            let context = RegionContext {
-                view: self.view,
-                callees: self.callees.clone(),
-                predicate_ranges: self.predicate_ranges.clone(),
-                conditional_groups: self.conditional_groups.clone(),
-                predicate_count: self.predicate_values.len(),
-                direct_assertion_count: self.direct_assertion_count,
-            };
+        let domain = self
+            .view
+            .domain(domain_id)
+            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
+            .structured()
+            .clone();
+        if body_node.binder_domain().is_some() {
+            let result = self.mapped_expression(body, domain_id, domain, at)?;
+            return Ok(LoweredValue::scalar(value_type, result));
+        }
+        let value = self.expression(body)?.only_register(at)?;
+        if !body_node.value_type().dimensions().is_empty() {
+            let body_type =
+                lower_primitive_type(self.view, body_node.value_type_id(), arithmetic_profile())?;
             let result = self.builder.map(
                 domain,
-                &captures,
-                body_type.clone(),
+                &[value],
+                body_type,
                 at,
-                move |builder, captures, binders, output| {
-                    let mut lowerer =
-                        load_region_lowerer(builder, captures, &environment, &context, at)?;
-                    for (ordinal, binder) in binders.iter().enumerate() {
-                        let register = lowerer.builder.load(*binder, at)?;
-                        let ordinal = u32::try_from(ordinal).map_err(|_| {
-                            solve::SolveProgramConstructionError::IdentityOverflow {
-                                provenance: at,
-                            }
-                        })?;
-                        lowerer
-                            .binders
-                            .insert((domain_id.index(), ordinal), register);
-                    }
-                    let value = lowerer.expression(body)?.only_register(at)?;
-                    lowerer.builder.store(output, value, at)
+                |builder, captures, _, output| {
+                    let value = builder.load(captures[0], at)?;
+                    builder.store(output, value, at)
                 },
             )?;
             return Ok(LoweredValue::scalar(value_type, result));
         }
-        let value = self.expression(body)?.only_register(at)?;
         let dimensions = self
             .view
             .value_type(value_type)
@@ -1377,6 +1525,71 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             .to_vec();
         let result = self.builder.fill(value, dimensions, at)?;
         Ok(LoweredValue::scalar(value_type, result))
+    }
+
+    fn load_domain_binders(
+        &mut self,
+        domain: dae::DomainId<'dae>,
+        binders: &[solve::ProgramSlot<'program>],
+        at: rumoca_core::Span,
+    ) -> Result<(), solve::SolveProgramConstructionError> {
+        for (ordinal, &binder) in binders.iter().enumerate() {
+            let register = self.builder.load(binder, at)?;
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                solve::SolveProgramConstructionError::IdentityOverflow { provenance: at }
+            })?;
+            self.binders.insert((domain.index(), ordinal), register);
+        }
+        Ok(())
+    }
+
+    fn mapped_expression(
+        &mut self,
+        body: dae::ExprId<'dae>,
+        domain_id: dae::DomainId<'dae>,
+        domain: rumoca_core::StructuredIndexDomain,
+        at: rumoca_core::Span,
+    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
+        if !self.pending_predicates([body]).is_empty() {
+            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
+                provenance: at,
+            });
+        }
+        let body_types = lower_value_type_leaves(
+            self.view,
+            self.view
+                .expression(body)
+                .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
+                .value_type_id(),
+            arithmetic_profile(),
+        )?;
+        let [body_type] = body_types.as_slice() else {
+            return Err(solve::SolveProgramConstructionError::InvalidMap { provenance: at });
+        };
+        let (captures, environment) = self.capture_environment_for([body])?;
+        let context = RegionContext {
+            view: self.view,
+            callees: self.callees.clone(),
+            predicate_ranges: self.predicate_ranges.clone(),
+            conditional_groups: self.conditional_groups.clone(),
+            fold_bodies: self.fold_bodies.clone(),
+            assertion_slots: self.assertion_slots.clone(),
+            direct_assertion_count: self.direct_assertion_count,
+        };
+        let result = self.builder.map(
+            domain,
+            &captures,
+            body_type.clone(),
+            at,
+            move |builder, captures, binders, output| {
+                let mut lowerer =
+                    load_region_lowerer(builder, captures, &environment, &context, at)?;
+                lowerer.load_domain_binders(domain_id, binders, at)?;
+                let value = lowerer.expression(body)?.only_register(at)?;
+                lowerer.builder.store(output, value, at)
+            },
+        )?;
+        Ok(result)
     }
 
     fn array_update(
@@ -1464,251 +1677,6 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         Ok(LoweredValue::scalar(value_type, result))
     }
 
-    fn index(
-        &mut self,
-        value_type: dae::ValueTypeId<'dae>,
-        base: dae::ExprId<'dae>,
-        subscripts: dae::SubscriptsView<'dae>,
-        at: rumoca_core::Span,
-    ) -> Result<LoweredValue<'program, 'dae>, solve::SolveProgramConstructionError> {
-        if self.needs_indexed_slice(subscripts) {
-            return self.indexed_slice(value_type, base, subscripts, at);
-        }
-        let base = self.expression(base)?;
-        let base_types = lower_value_type_leaves(self.view, base.value_type, arithmetic_profile())?;
-        let result_types = lower_value_type_leaves(self.view, value_type, arithmetic_profile())?;
-        if base.leaves.len() != base_types.len() || base.leaves.len() != result_types.len() {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: at,
-            });
-        }
-        if subscripts.iter().all(|subscript| {
-            matches!(
-                subscript,
-                dae::SubscriptView::Whole { .. } | dae::SubscriptView::Slice { .. }
-            )
-        }) {
-            let outer_origin = self.contiguous_slice_origin(subscripts, at)?;
-            let leaves = base
-                .leaves
-                .iter()
-                .zip(&base_types)
-                .zip(&result_types)
-                .map(|((&register, base_type), result_type)| {
-                    let mut origin = outer_origin.clone();
-                    origin.resize(base_type.dimensions().len(), 0);
-                    self.builder.project_slice(
-                        register,
-                        origin,
-                        result_type.dimensions().to_vec(),
-                        at,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(LoweredValue { value_type, leaves });
-        }
-        if subscripts.iter().any(|subscript| {
-            matches!(
-                subscript,
-                dae::SubscriptView::Whole { .. } | dae::SubscriptView::Slice { .. }
-            )
-        }) {
-            if base.leaves.len() != 1 {
-                return Err(solve::SolveProgramConstructionError::InvalidProjection {
-                    provenance: at,
-                });
-            }
-            let axes = self.tensor_view_axes(subscripts, result_types[0].dimensions(), at)?;
-            let result = self.builder.project_view(base.leaves[0], &axes, at)?;
-            return Ok(LoweredValue::scalar(value_type, result));
-        }
-        let index_expressions = subscripts
-            .iter()
-            .map(|subscript| {
-                let dae::SubscriptView::Index { expression, .. } = subscript else {
-                    return Err(solve::SolveProgramConstructionError::InvalidProjection {
-                        provenance: at,
-                    });
-                };
-                Ok(expression)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let static_indices = index_expressions
-            .iter()
-            .map(|expression| {
-                let node = self.view.expression(*expression)?;
-                let dae::ExpressionOperation::Literal(dae::DaeLiteral::Integer(index)) =
-                    node.operation()
-                else {
-                    return None;
-                };
-                index
-                    .checked_sub(1)
-                    .and_then(|index| u32::try_from(index).ok())
-            })
-            .collect::<Option<Vec<_>>>();
-        let dynamic_indices = static_indices.is_none().then(|| {
-            index_expressions
-                .iter()
-                .map(|expression| self.expression(*expression)?.only_register(at))
-                .collect::<Result<Vec<_>, _>>()
-        });
-        let dynamic_indices = dynamic_indices.transpose()?;
-        let mut leaves = Vec::with_capacity(base.leaves.len());
-        for ((&register, base_type), result_type) in
-            base.leaves.iter().zip(&base_types).zip(&result_types)
-        {
-            let result = self.project_indexed_leaf(
-                register,
-                base_type.dimensions().len(),
-                result_type.dimensions(),
-                static_indices.as_deref(),
-                dynamic_indices.as_deref(),
-                at,
-            )?;
-            leaves.push(result);
-        }
-        Ok(LoweredValue { value_type, leaves })
-    }
-
-    fn project_indexed_leaf(
-        &mut self,
-        register: solve::ProgramRegister<'program>,
-        base_rank: usize,
-        result_dimensions: &[u32],
-        static_indices: Option<&[u32]>,
-        dynamic_indices: Option<&[solve::ProgramRegister<'program>]>,
-        at: rumoca_core::Span,
-    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
-        let index_count = static_indices.map_or_else(
-            || dynamic_indices.map_or(0, |indices| indices.len()),
-            |indices| indices.len(),
-        );
-        if base_rank == index_count {
-            if let Some(indices) = static_indices {
-                return self.builder.project_element(register, indices.to_vec(), at);
-            }
-            let indices =
-                dynamic_indices.ok_or(solve::SolveProgramConstructionError::InvalidProjection {
-                    provenance: at,
-                })?;
-            return self.builder.project_element_dynamic(register, indices, at);
-        }
-        let indices = dynamic_indices
-            .ok_or(solve::SolveProgramConstructionError::InvalidProjection { provenance: at })?;
-        let mut axes = indices
-            .iter()
-            .copied()
-            .map(solve::ProgramTensorViewAxis::Index)
-            .collect::<Vec<_>>();
-        axes.extend(
-            result_dimensions
-                .iter()
-                .copied()
-                .map(|extent| solve::ProgramTensorViewAxis::Span { origin: 0, extent }),
-        );
-        self.builder.project_view(register, &axes, at)
-    }
-
-    fn contiguous_slice_origin(
-        &self,
-        subscripts: dae::SubscriptsView<'dae>,
-        at: rumoca_core::Span,
-    ) -> Result<Vec<u32>, solve::SolveProgramConstructionError> {
-        subscripts
-            .iter()
-            .map(|subscript| match subscript {
-                dae::SubscriptView::Whole { .. } => Ok(0),
-                dae::SubscriptView::Slice { expression, .. } => {
-                    let range = self
-                        .view
-                        .expression(expression)
-                        .and_then(|node| match node.operation() {
-                            dae::ExpressionOperation::Range(range) => Some(range),
-                            _ => None,
-                        })
-                        .ok_or(solve::SolveProgramConstructionError::InvalidProjection {
-                            provenance: at,
-                        })?;
-                    if range.effective_step() != 1 {
-                        return Err(solve::SolveProgramConstructionError::InvalidProjection {
-                            provenance: at,
-                        });
-                    }
-                    range
-                        .start()
-                        .value()
-                        .checked_sub(1)
-                        .and_then(|index| u32::try_from(index).ok())
-                        .ok_or(solve::SolveProgramConstructionError::InvalidProjection {
-                            provenance: at,
-                        })
-                }
-                dae::SubscriptView::Index { .. } => {
-                    Err(solve::SolveProgramConstructionError::InvalidProjection { provenance: at })
-                }
-            })
-            .collect()
-    }
-
-    fn tensor_view_axes(
-        &mut self,
-        subscripts: dae::SubscriptsView<'dae>,
-        result_dimensions: &[u32],
-        at: rumoca_core::Span,
-    ) -> Result<Vec<solve::ProgramTensorViewAxis<'program>>, solve::SolveProgramConstructionError>
-    {
-        let mut retained = result_dimensions.iter().copied();
-        let axes = subscripts
-            .iter()
-            .map(|subscript| match subscript {
-                dae::SubscriptView::Index { expression, .. } => self
-                    .expression(expression)?
-                    .only_register(at)
-                    .map(solve::ProgramTensorViewAxis::Index),
-                dae::SubscriptView::Whole { .. } => retained
-                    .next()
-                    .map(|extent| solve::ProgramTensorViewAxis::Span { origin: 0, extent })
-                    .ok_or(solve::SolveProgramConstructionError::InvalidProjection {
-                        provenance: at,
-                    }),
-                dae::SubscriptView::Slice { expression, .. } => {
-                    let range = self
-                        .view
-                        .expression(expression)
-                        .and_then(|node| match node.operation() {
-                            dae::ExpressionOperation::Range(range) => Some(range),
-                            _ => None,
-                        })
-                        .ok_or(solve::SolveProgramConstructionError::InvalidProjection {
-                            provenance: at,
-                        })?;
-                    if range.effective_step() != 1 {
-                        return Err(solve::SolveProgramConstructionError::InvalidProjection {
-                            provenance: at,
-                        });
-                    }
-                    let origin = range
-                        .start()
-                        .value()
-                        .checked_sub(1)
-                        .and_then(|index| u32::try_from(index).ok())
-                        .ok_or(solve::SolveProgramConstructionError::InvalidProjection {
-                            provenance: at,
-                        })?;
-                    let extent = retained.next().ok_or(
-                        solve::SolveProgramConstructionError::InvalidProjection { provenance: at },
-                    )?;
-                    Ok(solve::ProgramTensorViewAxis::Span { origin, extent })
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if retained.next().is_some() {
-            return Err(solve::SolveProgramConstructionError::InvalidProjection { provenance: at });
-        }
-        Ok(axes)
-    }
-
     // SPEC_0021: Exception - exhaustive checked typed-call interface lowering.
     #[allow(clippy::excessive_nesting)]
     fn call(
@@ -1732,7 +1700,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             None => {
                 let lowered_arguments = self.call_arguments(expression, arguments, at)?;
                 let values = self.builder.call(call.owner, &lowered_arguments, at)?;
-                if values.len() != call.result_leaf_count + call.assertion_count {
+                if values.len() != call.result_leaf_count + call.assertion_slots.len() {
                     return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
                         provenance: at,
                     });
@@ -1740,7 +1708,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 let predicate_range = self.predicate_ranges.get(&owner).cloned().ok_or(
                     solve::SolveProgramConstructionError::InvalidCallOutput { provenance: at },
                 )?;
-                if predicate_range.len() != call.assertion_count {
+                if predicate_range.len() != call.assertion_slots.len() {
                     return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
                         provenance: at,
                     });
@@ -1751,11 +1719,14 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                     let destination = self.predicate_values.get_mut(slot).ok_or(
                         solve::SolveProgramConstructionError::InvalidCallOutput { provenance: at },
                     )?;
-                    if destination.replace(predicate).is_some() {
-                        return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
-                            provenance: at,
-                        });
-                    }
+                    // A slot already holds a value only when a conditional
+                    // region of this lowerer evaluated the same call owner
+                    // and published its predicate (a region's call values
+                    // stay inside the region). This evaluation is the same
+                    // pure call in the same environment, unconditional here,
+                    // so its predicate is exact on every path and the
+                    // region's selected-or-vacuous value is subsumed by it.
+                    *destination = Some(predicate);
                 }
                 self.call_values.insert(owner, values.clone());
                 values

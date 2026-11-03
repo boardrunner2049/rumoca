@@ -43,6 +43,18 @@ pub(super) fn rebuild<'dae>(
                     .scheduled(schedule, at)
                     .map(|id| (id.into(), Some(id)))
             }
+            RbcClockNode::Shifted {
+                base,
+                counter,
+                condition,
+            } => owner
+                .shifted(
+                    resolve(&ids, base.0, "clock", ctx)?,
+                    *counter,
+                    resolve(conditions, condition.0, "condition", ctx)?,
+                    at,
+                )
+                .map(|id| (id, None)),
             RbcClockNode::Triggered { condition } => owner
                 .triggered(resolve(conditions, condition.0, "condition", ctx)?, at)
                 .map(|id| (id, None)),

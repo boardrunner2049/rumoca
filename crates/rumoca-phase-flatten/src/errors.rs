@@ -261,7 +261,7 @@ pub enum FlattenError {
         "expandable connector member `{member}` has {sources} sources; exactly one is required"
     )]
     #[diagnostic(
-        code(rumoca::flatten::EF033),
+        code(rumoca::flatten::EF037),
         help(
             "MLS §9.1.3 with §9.3: an augmented member is an ordinary signal, so exactly one connection may drive it"
         )
@@ -455,11 +455,80 @@ pub enum FlattenError {
         #[label("call would silently use the declared default")]
         span: Span,
     },
+
+    #[error("invalid derivative annotation: {reason}")]
+    #[diagnostic(code(rumoca::flatten::EF032))]
+    InvalidDerivativeAnnotation {
+        reason: String,
+        #[label("derivative annotation does not satisfy MLS §12.7.1")]
+        span: Span,
+    },
+
+    /// A parameter or constant declares a `fixed` array whose elements disagree.
+    ///
+    /// MLS §8.6 makes each `fixed = false` parameter scalar an initialization
+    /// unknown and each `fixed = true` scalar a value the declaration supplies.
+    /// A parameter whose elements mix the two would need per-element parameter
+    /// initialization; the initialization system owns one determination per
+    /// whole parameter, so a non-uniform `fixed` cannot be represented and must
+    /// be reported rather than reduced to a single Boolean.
+    #[error(
+        "per-element `fixed` on parameter arrays is not supported: `{name}` declares a non-uniform `fixed` modifier {values}"
+    )]
+    #[diagnostic(
+        code(rumoca::flatten::EF033),
+        help(
+            "MLS §8.6: a parameter's `fixed` elements must all agree; declare the array with a single `fixed` value, or split the differing elements into separate declarations"
+        )
+    )]
+    NonUniformParameterFixed {
+        name: String,
+        values: String,
+        #[label("non-uniform `fixed` on a parameter or constant")]
+        span: Span,
+    },
+
+    /// A function reached through several packages reads a constant those
+    /// packages give different values (MLS §7.3).
+    ///
+    /// One function instance is shared by every exposure, so a constant its
+    /// declarations or body read has one value; packages that disagree leave
+    /// the read without one, and no package is preferred over another.
+    #[error(
+        "constant `{name}` read by a function exposed through {packages} has a different value in each package"
+    )]
+    #[diagnostic(
+        code(rumoca::flatten::EF034),
+        help(
+            "MLS §7.3: a function shared by several packages reads one value of each constant; give the packages the same value, or call the function through one package"
+        )
+    )]
+    ConflictingExposedConstant {
+        name: String,
+        packages: String,
+        #[label("read through packages that disagree on its value")]
+        span: Span,
+    },
+
+    /// A function class with more than one algorithm section (MLS §12.2).
+    #[error("function `{name}` has {sections} algorithm sections")]
+    #[diagnostic(
+        code(rumoca::flatten::EF035),
+        help(
+            "MLS 3.7 §12.2: \"A function can have at most one algorithm section or one external function interface (not both), which, if present, is the body of the function.\" A function that extends another with an algorithm section must not add its own"
+        )
+    )]
+    MultipleFunctionBodies {
+        name: String,
+        sections: usize,
+        #[label("function with more than one algorithm section")]
+        span: Span,
+    },
     /// A pure, fully evaluated binding attempts a source array coordinate that
     /// is outside the actual array. This code never reports an unsupported fold.
     #[error("constant evaluation proves array index out of bounds: index {index}, size {size}")]
     #[diagnostic(
-        code(rumoca::flatten::EF032),
+        code(rumoca::flatten::EF036),
         help("the declared binding accesses outside the supplied array")
     )]
     ConstantIndexOutOfBounds {
@@ -471,6 +540,10 @@ pub enum FlattenError {
 }
 
 impl FlattenError {
+    error_constructor!(
+        invalid_derivative_annotation,
+        InvalidDerivativeAnnotation { reason: String }
+    );
     /// Create a StructuralAssertionFailed error.
     pub fn structural_assertion_failed(message: impl Into<String>, span: Span) -> Self {
         Self::StructuralAssertionFailed {
@@ -510,6 +583,19 @@ impl FlattenError {
         Self::ExpandableMemberSourceCount {
             member: member.into(),
             sources,
+            span,
+        }
+    }
+
+    /// Create a ConflictingExposedConstant error.
+    pub fn conflicting_exposed_constant(
+        name: impl Into<String>,
+        packages: impl Into<String>,
+        span: rumoca_core::Span,
+    ) -> Self {
+        Self::ConflictingExposedConstant {
+            name: name.into(),
+            packages: packages.into(),
             span,
         }
     }
@@ -793,6 +879,10 @@ impl PhaseError for FlattenError {
             | Self::InconsistentFunctionReference { span, .. }
             | Self::MissingFunctionSelectionIdentity { span, .. }
             | Self::UnhonoredFunctionRedeclare { span, .. }
+            | Self::InvalidDerivativeAnnotation { span, .. }
+            | Self::NonUniformParameterFixed { span, .. }
+            | Self::ConflictingExposedConstant { span, .. }
+            | Self::MultipleFunctionBodies { span, .. }
             | Self::UnsupportedExpandableConnectorAugmentation { span, .. }
             | Self::ExpandableMemberSourceCount { span, .. }
             | Self::CyclicConstantBinding { span, .. }

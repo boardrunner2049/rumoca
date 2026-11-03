@@ -5,20 +5,12 @@
 //! selection, so it can prove the final member declarations of equations,
 //! statements, and expressions without rewriting source aliases.
 
+pub(crate) use super::occurrence_selections::SelectedComponentTypes;
 use super::override_map::TypeOverrideMap;
 use super::selected_class_members::resolve_member_reference_in_class;
 use crate::{InstantiateError, InstantiateResult};
-use rumoca_core::DefId;
 use rumoca_ir_ast as ast;
 use rumoca_ir_ast::visitor::ExpressionTransformer;
-use rustc_hash::FxHashMap;
-
-/// Selected class of each component declaration in one instantiation scope.
-///
-/// Keys are the component declaration identities Resolve records on a reference
-/// root; values are the classes instantiation actually selected for those
-/// occurrences.
-pub(crate) type SelectedComponentTypes = FxHashMap<DefId, DefId>;
 
 /// Resolve a reference deferred by Resolve across a replaceable class edge.
 ///
@@ -28,7 +20,7 @@ pub(crate) type SelectedComponentTypes = FxHashMap<DefId, DefId>;
 pub(crate) fn resolve_dynamic_expression_targets(
     tree: &ast::ClassTree,
     overrides: &TypeOverrideMap,
-    selected_component_types: &SelectedComponentTypes,
+    selected_component_types: &SelectedComponentTypes<'_>,
     expression: ast::Expression,
 ) -> InstantiateResult<ast::Expression> {
     let mut batch = DynamicExpressionTargetBatch::new(tree, overrides, selected_component_types);
@@ -39,7 +31,7 @@ pub(crate) fn resolve_dynamic_expression_targets(
 pub(crate) fn resolve_dynamic_equation_targets(
     tree: &ast::ClassTree,
     overrides: &TypeOverrideMap,
-    selected_component_types: &SelectedComponentTypes,
+    selected_component_types: &SelectedComponentTypes<'_>,
     equation: ast::Equation,
 ) -> InstantiateResult<ast::Equation> {
     let mut batch = DynamicExpressionTargetBatch::new(tree, overrides, selected_component_types);
@@ -50,7 +42,7 @@ pub(crate) fn resolve_dynamic_equation_targets(
 pub(crate) fn resolve_dynamic_statement_targets(
     tree: &ast::ClassTree,
     overrides: &TypeOverrideMap,
-    selected_component_types: &SelectedComponentTypes,
+    selected_component_types: &SelectedComponentTypes<'_>,
     statement: ast::Statement,
 ) -> InstantiateResult<ast::Statement> {
     let mut batch = DynamicExpressionTargetBatch::new(tree, overrides, selected_component_types);
@@ -73,7 +65,7 @@ impl<'a> DynamicExpressionTargetBatch<'a> {
     pub(crate) fn new(
         tree: &'a ast::ClassTree,
         overrides: &'a TypeOverrideMap,
-        selected_component_types: &'a SelectedComponentTypes,
+        selected_component_types: &'a SelectedComponentTypes<'a>,
     ) -> Self {
         Self {
             resolver: DynamicExpressionTargetResolver::new(
@@ -120,7 +112,7 @@ impl<'a> DynamicExpressionTargetBatch<'a> {
 struct DynamicExpressionTargetResolver<'a> {
     tree: &'a ast::ClassTree,
     overrides: &'a TypeOverrideMap,
-    selected_component_types: &'a SelectedComponentTypes,
+    selected_component_types: &'a SelectedComponentTypes<'a>,
     error: Option<Box<InstantiateError>>,
 }
 
@@ -133,29 +125,59 @@ impl ExpressionTransformer for DynamicExpressionTargetResolver<'_> {
         if self.error.is_some() || reference.target_def_id().is_some() {
             return reference;
         }
-        let Some((deferred_index, selected, target_class_def_id)) = self.deferred_edge(&reference)
-        else {
+        let mut edge = None;
+        let first_missing = reference
+            .parts
+            .iter()
+            .position(|part| part.def_id.is_none());
+        for index in std::iter::once(0).chain(
+            first_missing
+                .and_then(|i| i.checked_sub(1))
+                .filter(|i| *i > 0),
+        ) {
+            let Some(root_def_id) = reference.parts.get(index).and_then(|p| p.def_id) else {
+                continue;
+            };
+            let alias_target = self.overrides.target_for_alias_def_id(root_def_id);
+            let selected = alias_target.or_else(|| self.selected_component_types.get(&root_def_id));
+            let target = selected.or_else(|| {
+                self.tree
+                    .get_class_by_def_id(root_def_id)
+                    .is_some_and(|class| class.is_replaceable)
+                    .then_some(root_def_id)
+            });
+            if let Some(target) = target {
+                edge = Some((index, root_def_id, alias_target, selected, target));
+                break;
+            }
+        }
+        let Some((index, root_def_id, alias_target, selected, target_class_def_id)) = edge else {
             return reference;
         };
-        let first_member = deferred_index + 1;
+        // A component root's member tail follows the classes its materialized
+        // occurrences selected; a class-alias root has no occurrence.
+        let selected_component_types = self.selected_component_types;
+        let mut occurrence_selection = |path: &[rumoca_core::DefId]| {
+            if alias_target.is_some() || selected.is_none() || index > 0 {
+                return Ok(None);
+            }
+            let mut rooted = Vec::with_capacity(path.len() + 1);
+            rooted.push(root_def_id);
+            rooted.extend_from_slice(path);
+            selected_component_types.selected_at_path(&rooted, reference.span)
+        };
         match resolve_member_reference_in_class(
             self.tree,
             target_class_def_id,
             &reference,
-            first_member,
+            index + 1,
+            &mut occurrence_selection,
         ) {
             Ok(identities) => {
-                for (part, def_id) in reference
-                    .parts
-                    .iter_mut()
-                    .skip(first_member)
-                    .zip(identities)
-                {
+                for (part, def_id) in reference.parts.iter_mut().skip(index + 1).zip(identities) {
                     part.def_id = Some(def_id);
                 }
             }
-            // The declared default is only a proof when it names the member;
-            // otherwise the reference keeps its deferred identity unchanged.
             Err(_) if selected.is_none() => {}
             Err(error) => self.error = Some(error),
         }
@@ -167,7 +189,7 @@ impl DynamicExpressionTargetResolver<'_> {
     fn new<'a>(
         tree: &'a ast::ClassTree,
         overrides: &'a TypeOverrideMap,
-        selected_component_types: &'a SelectedComponentTypes,
+        selected_component_types: &'a SelectedComponentTypes<'a>,
     ) -> DynamicExpressionTargetResolver<'a> {
         DynamicExpressionTargetResolver {
             tree,
@@ -175,47 +197,6 @@ impl DynamicExpressionTargetResolver<'_> {
             selected_component_types,
             error: None,
         }
-    }
-
-    /// The segment a deferred reference is resolved from, the class it
-    /// selects and whether a modification selected it. The root comes first
-    /// (`Medium.f`, a replaceable component `comb.u`); the last resolved
-    /// segment is tried after it, for a replaceable class inside a qualified
-    /// name (`Pkg.Medium.f`).
-    fn deferred_edge(
-        &self,
-        reference: &ast::ComponentReference,
-    ) -> Option<(usize, Option<DefId>, DefId)> {
-        let inner = reference
-            .parts
-            .iter()
-            .position(|part| part.def_id.is_none())
-            .and_then(|first_missing| first_missing.checked_sub(1))
-            .filter(|index| *index > 0)
-            .and_then(|index| reference.parts[index].def_id.map(|def_id| (index, def_id)));
-        let root = reference.root_def_id().map(|def_id| (0, def_id));
-        root.into_iter().chain(inner).find_map(|(index, def_id)| {
-            // A replaceable class alias selects a class directly; a
-            // replaceable component selects one through the type of its
-            // instantiated occurrence.
-            let selected = self
-                .overrides
-                .target_for_alias_def_id(def_id)
-                .or_else(|| self.selected_component_types.get(&def_id).copied());
-            let target = selected.or_else(|| self.default_selection(def_id))?;
-            Some((index, selected, target))
-        })
-    }
-
-    /// MLS §7.3: a replaceable class that no enclosing modification
-    /// redeclares denotes its declared default, so a reference through it is
-    /// a member of that declaration (e.g. `Medium.nX` in a component whose
-    /// `replaceable package Medium = PartialMedium` is not redeclared).
-    fn default_selection(&self, root_def_id: DefId) -> Option<DefId> {
-        self.tree
-            .get_class_by_def_id(root_def_id)
-            .is_some_and(|class| class.is_replaceable)
-            .then_some(root_def_id)
     }
 
     fn finish<T>(self, value: T) -> InstantiateResult<T> {

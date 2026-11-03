@@ -111,13 +111,14 @@ pub trait StatementRewriter: ExpressionRewriter {
     }
 
     fn rewrite_for_indices(&mut self, indices: &[ForIndex]) -> Vec<ForIndex> {
-        indices
-            .iter()
-            .map(|index| ForIndex {
+        let mut rewritten = Vec::with_capacity(indices.len());
+        for index in indices {
+            rewritten.push(ForIndex {
                 ident: index.ident.clone(),
                 range: self.rewrite_expression(&index.range),
-            })
-            .collect()
+            });
+        }
+        rewritten
     }
 
     fn rewrite_component_reference(
@@ -276,15 +277,14 @@ pub trait FallibleStatementRewriter: FallibleExpressionRewriter {
     }
 
     fn rewrite_for_indices(&mut self, indices: &[ForIndex]) -> Result<Vec<ForIndex>, Self::Error> {
-        indices
-            .iter()
-            .map(|index| {
-                Ok(ForIndex {
-                    ident: index.ident.clone(),
-                    range: self.rewrite_expression(&index.range)?,
-                })
-            })
-            .collect()
+        let mut rewritten = Vec::with_capacity(indices.len());
+        for index in indices {
+            rewritten.push(ForIndex {
+                ident: index.ident.clone(),
+                range: self.rewrite_expression(&index.range)?,
+            });
+        }
+        Ok(rewritten)
     }
 
     fn rewrite_component_reference(
@@ -323,5 +323,35 @@ pub trait FallibleStatementRewriter: FallibleExpressionRewriter {
             subs: self.rewrite_subscripts(&part.subs)?,
             def_id: part.def_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Expression, Span};
+
+    struct Identity;
+    impl ExpressionRewriter for Identity {}
+    impl StatementRewriter for Identity {}
+
+    struct Fallible;
+    impl FallibleExpressionRewriter for Fallible {
+        type Error = ();
+    }
+    impl FallibleStatementRewriter for Fallible {}
+
+    fn indices() -> Vec<ForIndex> {
+        vec![ForIndex {
+            ident: "i".to_string(),
+            range: Expression::Empty { span: Span::DUMMY },
+        }]
+    }
+
+    #[test]
+    fn for_indices_keep_their_names_and_rewrite_their_ranges() {
+        let source = indices();
+        assert_eq!(Identity.rewrite_for_indices(&source), source);
+        assert_eq!(Fallible.rewrite_for_indices(&source), Ok(source));
     }
 }

@@ -113,7 +113,8 @@ fn alias_definition(
                 }
                 ExpressionEventPlan::StateRelation
                 | ExpressionEventPlan::TimeEvent(_)
-                | ExpressionEventPlan::DynamicTimeEvent(_) => None,
+                | ExpressionEventPlan::DynamicTimeEvent(_)
+                | ExpressionEventPlan::IntegerStep => None,
             }
         }
         Expression::VarRef {

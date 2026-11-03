@@ -136,13 +136,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                     arguments.get(0).expect("checked unary builtin argument"),
                     scalar,
                 )?;
-                let dst = self.register(span)?;
-                self.ops.push(solve::LinearOp::Unary {
-                    dst,
-                    op: unary_builtin(builtin),
-                    arg: argument,
-                });
-                Ok(dst)
+                self.solve_unary(unary_builtin(builtin), argument, span)
             }
             dae::PureBuiltin::Atan2 => self.atan2(arguments, scalar, span),
             dae::PureBuiltin::Div | dae::PureBuiltin::Mod | dae::PureBuiltin::Rem => {
@@ -152,10 +146,10 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                 arguments.get(1).expect("checked smooth value argument"),
                 scalar,
             ),
-            dae::PureBuiltin::NoEvent => self.expression(
-                arguments.get(0).expect("checked noEvent value argument"),
-                scalar,
-            ),
+            dae::PureBuiltin::NoEvent => {
+                let argument = arguments.get(0).expect("checked noEvent value argument");
+                self.with_no_event(|compiler| compiler.expression(argument, scalar))
+            }
             dae::PureBuiltin::Vector => {
                 self.expression(arguments.get(0).expect("checked vector operand"), scalar)
             }
@@ -203,6 +197,10 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             dae::PureBuiltin::Linspace => self.linspace(arguments, scalar, span),
             dae::PureBuiltin::Cross => self.cross(arguments, scalar, span),
             dae::PureBuiltin::Skew => self.skew(arguments, scalar, span),
+            dae::PureBuiltin::LinearSolve => Err(LowerError::non_computable(
+                "linear solve requires an aggregate function owner",
+                span,
+            )),
             dae::PureBuiltin::Identity => self.identity(dims, scalar, span),
             dae::PureBuiltin::PromotedCat1 | dae::PureBuiltin::PromotedCat2 => {
                 let axis = usize::from(builtin == dae::PureBuiltin::PromotedCat2);

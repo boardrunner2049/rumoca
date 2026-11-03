@@ -1,4 +1,11 @@
 //! Per-iteration bound on a Newton step taken by the algebraic projection.
+//!
+//! A trust region on the Newton step, expressed here as a per-unknown relative
+//! bound rather than a norm ball, is the globalization strategy of J. E. Dennis
+//! Jr. and R. B. Schnabel, "Numerical Methods for Unconstrained Optimization
+//! and Nonlinear Equations", SIAM 1996, chapter 6; section 6.3 is the
+//! line-search counterpart the projection also uses, and section 7.2 is why the
+//! bound is relative to each unknown's own magnitude.
 
 /// Per-iteration bound on how far one unknown may move, as a fraction of its own
 /// magnitude, in the branch-preserving algebraic projection.
@@ -34,17 +41,20 @@
 /// The fraction is a globalization constant, and the root the projection converges to does
 /// not depend on it: sweeping 0.01 to 0.9 reaches the same solution and changes only
 /// the evaluation count.
-pub(super) const ALGEBRAIC_PROJECTION_TRUST_FRACTION: f64 = 0.25;
+pub(super) const ALGEBRAIC_PROJECTION_TRUST_FRACTION: f64 =
+    rumoca_eval_solve::projection_policy::ALGEBRAIC_PROJECTION_TRUST_FRACTION;
 
 /// Iteration-budget multiplier for the step-limited projection: a pass that advances
 /// each unknown by at most [`ALGEBRAIC_PROJECTION_TRUST_FRACTION`] of its own
 /// magnitude needs proportionally more steps to cover the same distance.
-pub(super) const ALGEBRAIC_PROJECTION_ITER_FACTOR: usize = 4;
+pub(super) const ALGEBRAIC_PROJECTION_ITER_FACTOR: usize =
+    rumoca_eval_solve::projection_policy::ALGEBRAIC_PROJECTION_ITER_FACTOR;
 
 /// Per-iteration bound on a block's Newton step.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum StepLimit {
-    /// Complete Newton step for a construction-certified affine block.
+    /// Unbounded control for nonlinear projection regression tests.
+    #[cfg(test)]
     None,
     /// No unknown may move more than this fraction of its own magnitude (or of
     /// its declared scale, whichever is larger) in one accepted step.
@@ -62,6 +72,7 @@ impl StepLimit {
     ) -> f64 {
         let fraction = match self {
             Self::Fraction(fraction) => fraction,
+            #[cfg(test)]
             Self::None => return 1.0,
         };
         let mut alpha = 1.0_f64;

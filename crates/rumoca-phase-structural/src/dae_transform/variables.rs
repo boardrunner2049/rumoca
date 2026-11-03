@@ -1,8 +1,8 @@
 //! Reserve and define the rebuilt variables, carrying the demotion decision.
 //!
 //! Reservation is where a proved role change actually happens: a selected
-//! state can become algebraic, or a frontier algebraic can become a state for
-//! one Pantelides lift. Every other variable keeps its source role.
+//! state can become algebraic, while requested coordinates and Pantelides
+//! frontier algebraics can become states. Other variables keep their source role.
 //! [`TargetVariable`] records the resulting role so later stages can translate
 //! coordinates without re-deriving the decision, and definition replays the
 //! full attribute set once the rebuilt expressions backing them exist.
@@ -26,8 +26,35 @@ impl Clone for TargetVariable<'_> {
     }
 }
 
+impl<'dae> TargetVariable<'dae> {
+    pub(super) fn variable(self) -> dae::VariableId<'dae> {
+        match self {
+            Self::Parameter(id) => id.into(),
+            Self::Input(id) => id.into(),
+            Self::State(id) => id.into(),
+            Self::Algebraic(id) => id.into(),
+            Self::DiscreteReal(id) => id.into(),
+            Self::DiscreteValue(id) => id.into(),
+        }
+    }
+}
+
+/// The representative coordinate an eliminated alias member reads through.
+#[derive(Clone, Copy)]
+pub(super) struct ValueAlias<'dae> {
+    pub(super) representative: TargetVariable<'dae>,
+    pub(super) negated: bool,
+}
+
 pub(super) struct ReservedVariable<'dae> {
     pub(super) identity: TargetVariable<'dae>,
+    pub(super) derivative_alias: Option<dae::AlgebraicId<'dae>>,
+    /// STRUCT-T02: every read of this coordinate is replaced by its class
+    /// representative, negated when the alias is a negation.
+    pub(super) value_alias: Option<ValueAlias<'dae>>,
+    /// STRUCT-T10(a): every read of this parameter is replaced by its value.
+    pub(super) folded: Option<std::sync::Arc<super::evaluable_parameters::FoldedValue>>,
+    pub(super) formal_derivatives: Vec<dae::AlgebraicId<'dae>>,
     reservation: Option<dae::VariableReservation<'dae>>,
 }
 
@@ -35,8 +62,8 @@ pub(super) fn reserve_variables<'target>(
     source: dae::DaeView<'_>,
     target: &mut dae::DaeConstruction<'target>,
     types: &[dae::ValueTypeId<'target>],
-    demoted: Option<u32>,
-    promoted: Option<u32>,
+    demoted: &[u32],
+    promoted: &[u32],
 ) -> Result<Vec<ReservedVariable<'target>>, dae::DaeConstructionError> {
     target.variables(|variables| {
         source
@@ -58,8 +85,8 @@ fn reserve_variable<'target>(
     variables: &mut dae::Variables<'_, 'target>,
     variable: dae::VariableView<'_>,
     value_type: dae::ValueTypeId<'target>,
-    demoted: Option<u32>,
-    promoted: Option<u32>,
+    demoted: &[u32],
+    promoted: &[u32],
 ) -> Result<ReservedVariable<'target>, dae::DaeConstructionError> {
     let name = variable.name().clone();
     let declaration = variable.declaration();
@@ -78,7 +105,7 @@ fn reserve_variable<'target>(
                 variables.reserve_input(name, value_type, variability, declaration)?;
             (TargetVariable::Input(id), reservation)
         }
-        dae::VariableRole::State if Some(variable.id().index()) == demoted => {
+        dae::VariableRole::State if demoted.contains(&variable.id().index()) => {
             let (id, reservation) = variables.reserve_algebraic(name, value_type, declaration)?;
             (TargetVariable::Algebraic(id), reservation)
         }
@@ -86,7 +113,9 @@ fn reserve_variable<'target>(
             let (id, reservation) = variables.reserve_state(name, value_type, declaration)?;
             (TargetVariable::State(id), reservation)
         }
-        dae::VariableRole::Algebraic if Some(variable.id().index()) == promoted => {
+        dae::VariableRole::Algebraic | dae::VariableRole::Output
+            if promoted.contains(&variable.id().index()) =>
+        {
             let (id, reservation) = variables.reserve_state(name, value_type, declaration)?;
             (TargetVariable::State(id), reservation)
         }
@@ -111,6 +140,10 @@ fn reserve_variable<'target>(
     };
     Ok(ReservedVariable {
         identity,
+        derivative_alias: None,
+        value_alias: None,
+        folded: None,
+        formal_derivatives: Vec::new(),
         reservation: Some(reservation),
     })
 }
@@ -189,7 +222,7 @@ fn define_variable<'target>(
         component_ref: source.component_reference().cloned(),
         binding: source.binding().map(&expression),
         start: source.start().map(&expression),
-        fixed: source.fixed(),
+        fixed: source.fixed().map(<[bool]>::to_vec),
         min: source.minimum().map(&expression),
         max: source.maximum().map(&expression),
         nominal: source.nominal().map(expression),
@@ -197,9 +230,20 @@ fn define_variable<'target>(
         state_select: source.state_select(),
         description: source.description().map(str::to_owned),
         causality: source.causality(),
+        declared_causality: source.declared_causality(),
         is_tunable: source.is_tunable(),
         is_held: source.is_held(),
+        evaluable: source.is_evaluable(),
         origin: source.origin(),
     };
     target.define(reservation, attributes, source.declaration())
+}
+
+/// The coordinate input that reads an alias representative.
+pub(super) fn value_alias_coordinate(alias: ValueAlias<'_>) -> dae::CoordinateInput<'_> {
+    match alias.representative {
+        TargetVariable::State(id) => dae::CoordinateInput::State(id),
+        TargetVariable::Algebraic(id) => dae::CoordinateInput::Algebraic(id),
+        _ => unreachable!("an alias representative is a continuous state or algebraic"),
+    }
 }

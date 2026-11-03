@@ -1,12 +1,10 @@
-use rumoca_eval_solve as solve_eval;
 use rumoca_ir_solve as solve;
 use rustc_hash::{FxHashMap, FxHasher};
-use std::collections::BTreeSet;
 use std::hash::Hasher;
 use std::io::{self, Write};
 
 use crate::RuntimeSolveError;
-use rumoca_eval_solve::{EvalSolveError, PreparedComputeBlock, RowEvalContext};
+use rumoca_eval_solve::EvalSolveError;
 
 #[derive(Clone, Copy)]
 pub(super) enum DirectVisibleSource {
@@ -41,21 +39,14 @@ pub(super) struct VisibleValuePlan {
 }
 
 #[derive(Clone, Copy)]
-enum DirectTimeRootKind {
-    ParamMinusTime,
-    TimeMinusParam,
-}
-
-#[derive(Clone, Copy)]
 pub(super) struct DirectTimeRoot {
     param_index: usize,
-    kind: DirectTimeRootKind,
+    sign: solve::TimeRootSign,
     span: Option<rumoca_core::Span>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum RootConditionPlanEntry {
-    ConstantNonZero(f64),
     DirectTime(DirectTimeRoot),
     ContinuousStatic,
     Dynamic,
@@ -121,59 +112,43 @@ pub(super) fn visible_value_plan(model: &solve::SolveModel) -> Option<VisibleVal
     })
 }
 
-pub(super) fn root_condition_plan(
-    model: &solve::SolveModel,
-    root_refresh: &solve::RefreshPlan,
-) -> Option<RootConditionPlan> {
+pub(super) fn root_condition_plan(model: &solve::SolveModel) -> Option<RootConditionPlan> {
     let roots = &model.problem.events.root_conditions;
     if !roots.uses_local_contiguous_output_indices() {
         return None;
     }
-    let mut entries = Vec::with_capacity(roots.output_count());
+    let search = solve::RootSearchPlan::derive(&model.problem);
+    let mut entries = Vec::with_capacity(search.len());
     let mut evaluated_rows = Vec::new();
     let mut search_rows = Vec::new();
-    let static_y = root_refresh
-        .static_causal_rows()
-        .iter()
-        .map(|row| row.target_index())
-        .collect::<BTreeSet<_>>();
     let mut output = 0;
     for (program, row) in roots.programs().iter().enumerate() {
-        let output_count = solve::ScalarProgramBlock::program_output_count(row);
-        if output_count == 0 {
-            return None;
-        }
         let span = roots.program_span(program);
-        if output_count == 1
-            && let Some(root) = direct_time_root(row, span)
-        {
-            entries.push(RootConditionPlanEntry::DirectTime(root));
-            output += 1;
-            continue;
+        let first = output;
+        output += solve::ScalarProgramBlock::program_output_count(row);
+        for index in first..output {
+            let role = *search.roles().get(index)?;
+            entries.push(match role {
+                solve::RootSearchRole::AnnouncedTime { param_index, sign } => {
+                    RootConditionPlanEntry::DirectTime(DirectTimeRoot {
+                        param_index,
+                        sign,
+                        span,
+                    })
+                }
+                solve::RootSearchRole::Static => {
+                    evaluated_rows.push(index);
+                    RootConditionPlanEntry::ContinuousStatic
+                }
+                solve::RootSearchRole::Search => {
+                    evaluated_rows.push(index);
+                    search_rows.push(index);
+                    RootConditionPlanEntry::Dynamic
+                }
+            });
         }
-        if output_count == 1
-            && let Some(value) = constant_nonzero_root_value(row)
-        {
-            entries.push(RootConditionPlanEntry::ConstantNonZero(value));
-            output += 1;
-            continue;
-        }
-        if continuous_static_root(row, &static_y) {
-            for index in output..output + output_count {
-                entries.push(RootConditionPlanEntry::ContinuousStatic);
-                evaluated_rows.push(index);
-            }
-            output += output_count;
-            continue;
-        }
-        for index in output..output + output_count {
-            entries.push(RootConditionPlanEntry::Dynamic);
-            evaluated_rows.push(index);
-            search_rows.push(index);
-        }
-        output += output_count;
     }
-    if output != roots.output_count() {
+    if output != search.len() {
         return None;
     }
     tracing::debug!(
@@ -189,124 +164,6 @@ pub(super) fn root_condition_plan(
         evaluated_rows,
         search_rows,
     })
-}
-
-fn direct_time_root(
-    row: &[solve::LinearOp],
-    span: Option<rumoca_core::Span>,
-) -> Option<DirectTimeRoot> {
-    let [
-        first_load,
-        second_load,
-        solve::LinearOp::Binary {
-            dst,
-            op: solve::BinaryOp::Sub,
-            lhs,
-            rhs,
-        },
-        solve::LinearOp::StoreOutput { src },
-    ] = row
-    else {
-        return None;
-    };
-    if dst != src {
-        return None;
-    }
-    let (time_reg, param_reg, param_index) = time_and_param_loads(first_load, second_load)?;
-    if *lhs == param_reg && *rhs == time_reg {
-        return Some(DirectTimeRoot {
-            param_index,
-            kind: DirectTimeRootKind::ParamMinusTime,
-            span,
-        });
-    }
-    if *lhs == time_reg && *rhs == param_reg {
-        return Some(DirectTimeRoot {
-            param_index,
-            kind: DirectTimeRootKind::TimeMinusParam,
-            span,
-        });
-    }
-    None
-}
-
-fn time_and_param_loads(
-    first: &solve::LinearOp,
-    second: &solve::LinearOp,
-) -> Option<(solve::Reg, solve::Reg, usize)> {
-    match (first, second) {
-        (
-            solve::LinearOp::LoadTime { dst: time_reg },
-            solve::LinearOp::LoadP {
-                dst: param_reg,
-                index,
-            },
-        )
-        | (
-            solve::LinearOp::LoadP {
-                dst: param_reg,
-                index,
-            },
-            solve::LinearOp::LoadTime { dst: time_reg },
-        ) => Some((*time_reg, *param_reg, *index)),
-        _ => None,
-    }
-}
-
-fn constant_nonzero_root_value(row: &[solve::LinearOp]) -> Option<f64> {
-    if !row.iter().all(constant_root_op_allowed) {
-        return None;
-    }
-    let value =
-        solve_eval::eval_row_with_context(row, &[], &[], 0.0, RowEvalContext::default()).ok()?;
-    (value.is_finite() && value != 0.0).then_some(value)
-}
-
-fn constant_root_op_allowed(op: &solve::LinearOp) -> bool {
-    matches!(
-        op,
-        solve::LinearOp::Const { .. }
-            | solve::LinearOp::Move { .. }
-            | solve::LinearOp::Unary { .. }
-            | solve::LinearOp::Binary { .. }
-            | solve::LinearOp::Compare { .. }
-            | solve::LinearOp::Select { .. }
-            | solve::LinearOp::StoreOutput { .. }
-    )
-}
-
-fn continuous_static_root(row: &[solve::LinearOp], static_y: &BTreeSet<usize>) -> bool {
-    let Ok(y_dependencies) = solve::StructuralPattern::derive_output_y_dependencies(row, None)
-    else {
-        return false;
-    };
-    if y_dependencies
-        .iter()
-        .any(|dependencies| !dependencies.is_subset(static_y))
-    {
-        return false;
-    }
-    // Every P slot is fixed during one accepted FMI Model Exchange interval.
-    // Inputs and discrete values may mutate only between accepted intervals,
-    // where the host refreshes retained indicators before continuous search
-    // resumes. Keep the full Event Mode value, but do not expose a P-only
-    // surface to the continuous root finder.
-    solve::StructuralPattern::derive_output_p_dependencies(row, None).is_ok()
-        && output_dependencies_are_empty(solve::StructuralPattern::derive_output_time_dependencies(
-            row, None,
-        ))
-        && output_dependencies_are_empty(solve::StructuralPattern::derive_output_seed_dependencies(
-            row, None,
-        ))
-        && output_dependencies_are_empty(
-            solve::StructuralPattern::derive_output_effect_dependencies(row, None),
-        )
-}
-
-fn output_dependencies_are_empty(
-    dependencies: Result<Vec<bool>, solve::StructuralPatternError>,
-) -> bool {
-    dependencies.is_ok_and(|dependencies| dependencies.iter().all(|depends| !depends))
 }
 
 fn visible_expression_group_index(
@@ -405,9 +262,9 @@ pub(super) fn direct_time_root_value(
     t: f64,
 ) -> Result<f64, RuntimeSolveError> {
     let event_time = direct_time_root_time(root, params)?;
-    Ok(match root.kind {
-        DirectTimeRootKind::ParamMinusTime => event_time - t,
-        DirectTimeRootKind::TimeMinusParam => t - event_time,
+    Ok(match root.sign {
+        solve::TimeRootSign::ParamMinusTime => event_time - t,
+        solve::TimeRootSign::TimeMinusParam => t - event_time,
     })
 }
 
@@ -456,22 +313,6 @@ pub(super) fn visible_plan_output_index_error(index: usize, len: usize) -> Runti
     ))
 }
 
-/// Prepare the manifold residual and its Jacobian-vector product.
-pub(super) fn prepare_manifold_projection_programs(
-    model: &solve::SolveModel,
-) -> Result<(PreparedComputeBlock, PreparedComputeBlock), EvalSolveError> {
-    Ok((
-        PreparedComputeBlock::new_with_label(
-            &model.problem.continuous.manifold_residual,
-            "runtime_manifold_residual",
-        )?,
-        PreparedComputeBlock::new_with_label(
-            &model.artifacts.continuous.manifold_jacobian_v,
-            "runtime_manifold_jacobian_v",
-        )?,
-    ))
-}
-
 /// Total root-condition count: the model's own conditions plus the roots the
 /// delay runtime schedules.
 pub(super) fn total_root_condition_count(
@@ -488,86 +329,4 @@ pub(super) fn total_root_condition_count(
             message: "combined model and delay root count exceeds host index range".to_string(),
             span: None,
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn continuous_static_root_uses_certified_tensor_dependency_flow() {
-        let parameter_tensor_root = vec![
-            solve::LinearOp::TensorLoad {
-                dst_start: 0,
-                input: solve::TensorInputKind::P,
-                input_start: 0,
-                count: 2,
-                seed_start: None,
-                lanes: 1,
-            },
-            solve::LinearOp::MatrixMultiply {
-                dst_start: 2,
-                lhs_start: 0,
-                rhs_start: 0,
-                rows: 1,
-                inner: 2,
-                columns: 1,
-                lanes: 1,
-            },
-            solve::LinearOp::StoreOutput { src: 2 },
-        ];
-        assert!(continuous_static_root(
-            &parameter_tensor_root,
-            &BTreeSet::new(),
-        ));
-
-        let state_tensor_root = vec![
-            solve::LinearOp::TensorLoad {
-                dst_start: 0,
-                input: solve::TensorInputKind::Y,
-                input_start: 3,
-                count: 2,
-                seed_start: None,
-                lanes: 1,
-            },
-            solve::LinearOp::StoreOutputRange {
-                start: 0,
-                count: 2,
-                stride: 1,
-            },
-        ];
-        assert!(!continuous_static_root(
-            &state_tensor_root,
-            &BTreeSet::from([3]),
-        ));
-        assert!(continuous_static_root(
-            &state_tensor_root,
-            &BTreeSet::from([3, 4]),
-        ));
-    }
-
-    #[test]
-    fn continuous_static_root_rejects_time_dependency_through_register_flow() {
-        let time_root = vec![
-            solve::LinearOp::LoadTime { dst: 0 },
-            solve::LinearOp::Const { dst: 1, value: 2.0 },
-            solve::LinearOp::Binary {
-                dst: 2,
-                op: solve::BinaryOp::Mul,
-                lhs: 0,
-                rhs: 1,
-            },
-            solve::LinearOp::StoreOutput { src: 2 },
-        ];
-        assert!(!continuous_static_root(&time_root, &BTreeSet::new()));
-    }
-
-    #[test]
-    fn continuous_static_root_rejects_seed_dependency() {
-        let seed_root = vec![
-            solve::LinearOp::LoadSeed { dst: 0, index: 3 },
-            solve::LinearOp::StoreOutput { src: 0 },
-        ];
-        assert!(!continuous_static_root(&seed_root, &BTreeSet::new()));
-    }
 }

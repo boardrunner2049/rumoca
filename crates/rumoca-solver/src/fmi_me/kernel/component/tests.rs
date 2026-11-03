@@ -104,6 +104,7 @@ fn steep_algebraic_time_event_model() -> solve::SolveModel {
                         rows: vec![1],
                         y_indices: vec![1],
                         tearing: None,
+                        alternate_charts: Vec::new(),
                     }],
                 },
                 ..Default::default()
@@ -124,6 +125,7 @@ fn steep_algebraic_time_event_model() -> solve::SolveModel {
             ..Default::default()
         },
         artifacts: solve::SolveArtifacts {
+            discrete: Default::default(),
             continuous: solve::ContinuousSolveArtifacts {
                 implicit_jacobian_v: solve::ComputeBlock::from_scalar_program_block(
                     implicit_jvp.clone(),
@@ -152,6 +154,46 @@ fn instantiate(model: &solve::SolveModel) -> SolveMeKernel {
             .expect("event-entry instance configuration constructs"),
     )
     .expect("event-entry fixture instantiates")
+}
+
+#[test]
+fn scheduled_boundary_preserves_the_continuous_derivative_coordinate() {
+    use solve::LinearOp::{Binary, Const, LoadTime, StoreOutput};
+    let mut model = steep_algebraic_time_event_model();
+    model.problem.continuous.derivative_rhs =
+        solve::ComputeBlock::from_scalar_program_block(block(
+            vec![vec![
+                LoadTime { dst: 0 },
+                Const {
+                    dst: 1,
+                    value: ALGEBRAIC_SLOPE,
+                },
+                Binary {
+                    dst: 2,
+                    op: solve::BinaryOp::Mul,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                StoreOutput { src: 2 },
+            ]],
+            "scheduled_derivative_coordinate.mo",
+        ));
+    let mut kernel = instantiate(&model);
+    for time in [0.9, 1.0] {
+        kernel.set_time(MeTime::new(time, Some(1.0))).unwrap();
+        let mut derivative = [f64::NAN];
+        kernel
+            .continuous_state_derivatives_into(&mut derivative)
+            .unwrap();
+        // The left limit of a smooth function agrees with its value at the
+        // boundary. Solver state tolerances cannot change physical time.
+        assert!(
+            (derivative[0] - ALGEBRAIC_SLOPE * time).abs() < 1e-6,
+            "at {time}: derivative={}, expected {}",
+            derivative[0],
+            ALGEBRAIC_SLOPE * time
+        );
+    }
 }
 
 #[test]

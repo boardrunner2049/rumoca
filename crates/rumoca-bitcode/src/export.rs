@@ -258,6 +258,14 @@ fn build(
         functions,
         discrete_real_equations,
         initial_discrete_values,
+        initial_parameter_values: view
+            .initial_parameter_values()
+            .map(|entry| RbcInitialDiscreteValue {
+                target: VariableId(entry.target().index()),
+                value: ExprId(entry.value().index()),
+                provenance: ctx.provenance(entry.provenance()),
+            })
+            .collect(),
         equation_families,
         initial_equation_families,
         relations,
@@ -410,6 +418,11 @@ fn export_variables(
                 id: VariableId(index as u32),
                 role: role_of(variable.role()),
                 causality: causality_of(variable.causality()),
+                declared_causality: Some(match variable.declared_causality() {
+                    dae::DeclaredCausality::None => RbcDeclaredCausality::None,
+                    dae::DeclaredCausality::Input => RbcDeclaredCausality::Input,
+                    dae::DeclaredCausality::Output => RbcDeclaredCausality::Output,
+                }),
                 value_type: TypeId(variable.value_type_id().index()),
                 scalar_count: variable.scalar_count() as u32,
                 discrete_input: variable.role() == dae::VariableRole::Input
@@ -426,7 +439,20 @@ fn export_variables(
                 min: variable.minimum().map(|e| ExprId(e.index())),
                 max: variable.maximum().map(|e| ExprId(e.index())),
                 nominal: variable.nominal().map(|e| ExprId(e.index())),
-                fixed: variable.fixed(),
+                fixed: variable.fixed_uniform(),
+                fixed_elements: variable
+                    .fixed()
+                    .filter(|_| variable.fixed_uniform().is_none())
+                    .map(<[bool]>::to_vec),
+                evaluable: variable.is_evaluable(),
+                held: variable.is_held(),
+                state_select: match variable.state_select() {
+                    rumoca_core::StateSelect::Never => RbcStateSelect::Never,
+                    rumoca_core::StateSelect::Avoid => RbcStateSelect::Avoid,
+                    rumoca_core::StateSelect::Default => RbcStateSelect::Default,
+                    rumoca_core::StateSelect::Prefer => RbcStateSelect::Prefer,
+                    rumoca_core::StateSelect::Always => RbcStateSelect::Always,
+                },
                 tunable: variable.is_tunable(),
                 from_source: matches!(variable.origin(), dae::VariableOrigin::Source),
                 connector,
@@ -582,11 +608,19 @@ fn export_expressions(
     Ok(out)
 }
 
+// SPEC_0021: Exception - exhaustive expression encoding dispatch.
+#[allow(clippy::too_many_lines)]
 fn expression_node(
     expression: dae::ExpressionView<'_>,
     index: u32,
     options: &ExportOptions,
 ) -> Result<RbcExprNode, ExportError> {
+    if expression.call_derivative().is_some() {
+        return unsupported(
+            "differentiated call provenance has no bitcode v2 encoding",
+            options,
+        );
+    }
     let check = |operand: dae::ExprId<'_>| -> Result<ExprId, ExportError> {
         if operand.index() >= index {
             return Err(ExportError::ForwardOperand(index, operand.index()));
@@ -924,6 +958,7 @@ fn coordinate_of(coordinate: dae::CoordinateView<'_>) -> Option<RbcCoordinate> {
 fn builtin_name(builtin: dae::PureBuiltin) -> &'static str {
     use dae::PureBuiltin as B;
     match builtin {
+        B::LinearSolve => "LinearSolve",
         B::Abs => "abs",
         B::Sign => "sign",
         B::Sqrt => "sqrt",
@@ -1153,7 +1188,22 @@ fn export_functions(view: dae::DaeView<'_>, ctx: &mut Ctx<'_>) -> Vec<RbcFunctio
                     rumoca_core::InlineAnnotation::Unstated => RbcInline::Unstated,
                     rumoca_core::InlineAnnotation::Requested => RbcInline::Requested,
                     rumoca_core::InlineAnnotation::Never => RbcInline::Never,
+                    rumoca_core::InlineAnnotation::AfterIndexReduction => {
+                        RbcInline::AfterIndexReduction
+                    }
                 },
+                derivatives: function
+                    .derivatives()
+                    .map(|link| RbcFunctionDerivative {
+                        target: FunctionId(link.target().index()),
+                        inputs: link.inputs().to_vec(),
+                        priority: link.priority(),
+                        previous: link
+                            .previous()
+                            .map(|id| (FunctionId(id.function().index()), id.ordinal())),
+                        provenance: ctx.provenance(link.provenance()),
+                    })
+                    .collect(),
                 values: function_body::value_table(function, ctx),
                 body,
                 folds,
@@ -1453,9 +1503,13 @@ fn export_events(view: dae::DaeView<'_>, ctx: &mut Ctx<'_>) -> Vec<RbcEventActio
                     state: VariableId(state.index()),
                     value: ExprId(value.index()),
                 },
-                Op::Assert { message, level } => RbcAction::Assert {
+                Op::Assert { message } => RbcAction::Assert {
                     message: ExprId(message.index()),
-                    level: level.map(|level| ExprId(level.index())),
+                    level: None,
+                },
+                Op::Warning { message, condition } => RbcAction::Warning {
+                    message: ExprId(message.index()),
+                    condition: ExprId(condition.index()),
                 },
                 Op::Terminate { message } => RbcAction::Terminate {
                     message: ExprId(message.index()),
@@ -1512,6 +1566,7 @@ fn export_discrete_definitions(
                 })
                 .collect();
             Some(RbcDiscreteDefinition {
+                observed: owner.observed(),
                 targets,
                 branches,
                 provenance: ctx.provenance(owner.provenance()),

@@ -59,6 +59,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "ALG-014",
     "ALG-016",
     "ALG-017",
+    "ALG-018",
     "ANN-001",
     "ANN-003",
     "ANN-008",
@@ -66,6 +67,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "ANN-010",
     "ANN-013",
     "ANN-014",
+    "ANN-017",
     "ARR-001",
     "ARR-002",
     "ARR-003",
@@ -105,6 +107,8 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "ARR-040",
     "ARR-041",
     "ARR-042",
+    "ARR-043",
+    "ARR-044",
     "CLK-001",
     "CLK-002",
     "CLK-003",
@@ -187,6 +191,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "DECL-033",
     "DECL-034",
     "DECL-036",
+    "DECL-037",
     "EQN-001",
     "EQN-002",
     "EQN-003",
@@ -225,6 +230,8 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "EQN-036",
     "EQN-037",
     "EQN-038",
+    "EQN-039",
+    "EQN-040",
     "EXPR-001",
     "EXPR-002",
     "EXPR-003",
@@ -263,6 +270,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "EXPR-037",
     "EXPR-038",
     "EXPR-039",
+    "EXPR-041",
     "FUNC-001",
     "FUNC-002",
     "FUNC-003",
@@ -284,6 +292,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "FUNC-021",
     "FUNC-022",
     "FUNC-023",
+    "FUNC-026",
     "FUNC-027",
     "FUNC-030",
     "FUNC-031",
@@ -292,6 +301,8 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "FUNC-034",
     "FUNC-036",
     "FUNC-037",
+    "FUNC-039",
+    "FUNC-040",
     "INST-001",
     "INST-002",
     "INST-003",
@@ -338,6 +349,11 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "INST-049",
     "INST-050",
     "INST-053",
+    "INST-054",
+    "INST-055",
+    "INST-056",
+    "INST-057",
+    "INST-058",
     "LEX-001",
     "LEX-002",
     "LEX-003",
@@ -394,6 +410,8 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "STRM-009",
     "STRM-010",
     "STRM-011",
+    "STRM-012",
+    "STRM-013",
     "TYPE-001",
     "TYPE-004",
     "TYPE-005",
@@ -424,6 +442,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "TYPE-033",
     "TYPE-034",
     "TYPE-035",
+    "TYPE-036",
     "UNIT-001",
     "UNIT-002",
     "UNIT-003",
@@ -472,11 +491,11 @@ mod tests {
     #[test]
     fn test_registry_has_all_contracts() {
         let registry = create_registry();
-        // SPEC_0022 defines 438 contracts
+        // SPEC_0022 defines 457 contracts
         assert_eq!(
             registry.len(),
-            438,
-            "Expected 438 contracts, got {}",
+            457,
+            "Expected 457 contracts, got {}",
             registry.len()
         );
     }
@@ -489,30 +508,30 @@ mod tests {
         assert_eq!(registry.by_category(ContractCategory::Lexical).count(), 13);
         assert_eq!(
             registry.by_category(ContractCategory::Declaration).count(),
-            36
+            37
         );
         assert_eq!(
             registry
                 .by_category(ContractCategory::Instantiation)
                 .count(),
-            53
+            58
         );
         assert_eq!(
             registry.by_category(ContractCategory::Expression).count(),
-            40
+            41
         );
-        assert_eq!(registry.by_category(ContractCategory::Equation).count(), 38);
+        assert_eq!(registry.by_category(ContractCategory::Equation).count(), 40);
         assert_eq!(
             registry.by_category(ContractCategory::Algorithm).count(),
-            17
+            18
         );
         assert_eq!(
             registry.by_category(ContractCategory::Connection).count(),
             30
         );
-        assert_eq!(registry.by_category(ContractCategory::Function).count(), 38);
-        assert_eq!(registry.by_category(ContractCategory::Type).count(), 35);
-        assert_eq!(registry.by_category(ContractCategory::Array).count(), 42);
+        assert_eq!(registry.by_category(ContractCategory::Function).count(), 40);
+        assert_eq!(registry.by_category(ContractCategory::Type).count(), 36);
+        assert_eq!(registry.by_category(ContractCategory::Array).count(), 44);
         assert_eq!(registry.by_category(ContractCategory::Package).count(), 12);
         assert_eq!(
             registry
@@ -525,14 +544,14 @@ mod tests {
             10
         );
         assert_eq!(registry.by_category(ContractCategory::Clock).count(), 20);
-        assert_eq!(registry.by_category(ContractCategory::Stream).count(), 11);
+        assert_eq!(registry.by_category(ContractCategory::Stream).count(), 13);
         assert_eq!(
             registry.by_category(ContractCategory::StateMachine).count(),
             8
         );
         assert_eq!(
             registry.by_category(ContractCategory::Annotation).count(),
-            15
+            17
         );
         assert_eq!(registry.by_category(ContractCategory::Unit).count(), 9);
     }

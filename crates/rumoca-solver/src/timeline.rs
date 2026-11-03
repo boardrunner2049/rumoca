@@ -370,7 +370,7 @@ pub fn event_left_probe_time(t_event: f64, tolerance: f64) -> f64 {
 /// step. Solver state-value tolerances therefore cannot widen it. Typed
 /// relation memory carries the mathematical post-event side when one
 /// floating-point step cannot move a state value.
-pub fn event_right_limit_time(t_event: f64, _tolerance: f64) -> f64 {
+pub fn event_right_limit_time(t_event: f64) -> f64 {
     if !t_event.is_finite() {
         return t_event;
     }
@@ -381,8 +381,8 @@ pub fn event_right_limit_time(t_event: f64, _tolerance: f64) -> f64 {
 ///
 /// Event initialization and the linked FMI component share this one formula,
 /// so they cannot assign different superdense coordinates to the same event.
-pub fn bounded_event_right_limit_time(t_event: f64, horizon: f64, tolerance: f64) -> f64 {
-    event_right_limit_time(t_event, tolerance).min(horizon)
+pub fn bounded_event_right_limit_time(t_event: f64, horizon: f64) -> f64 {
+    event_right_limit_time(t_event).min(horizon)
 }
 
 /// Relative resolution of the semantic left-limit probe at an event boundary.
@@ -477,25 +477,16 @@ mod tests {
     #[test]
     fn event_right_limit_time_uses_one_representable_step() {
         let t_event = 0.001_f64;
-        let t_right = event_right_limit_time(t_event, 0.0);
+        let t_right = event_right_limit_time(t_event);
         assert_eq!(t_right, t_event.next_up());
         assert!(t_right - t_event < 1.0e-12);
-    }
-
-    #[test]
-    fn event_right_limit_time_is_independent_of_state_value_tolerance() {
-        let t_event = 0.0005_f64;
-        let exact = event_right_limit_time(t_event, 0.0);
-        let loose = event_right_limit_time(t_event, 1.0e-6);
-        assert_eq!(exact.to_bits(), t_event.next_up().to_bits());
-        assert_eq!(loose.to_bits(), exact.to_bits());
     }
 
     #[test]
     fn bounded_event_right_limit_uses_the_adjacent_coordinate_inside_the_horizon() {
         let event = 0.5_f64;
         assert_eq!(
-            bounded_event_right_limit_time(event, 1.0, 1.0e-6).to_bits(),
+            bounded_event_right_limit_time(event, 1.0).to_bits(),
             event.next_up().to_bits()
         );
     }
@@ -504,7 +495,7 @@ mod tests {
     fn bounded_event_right_limit_never_crosses_the_host_horizon() {
         let event = 0.5_f64;
         assert_eq!(
-            bounded_event_right_limit_time(event, event, 1.0e-6).to_bits(),
+            bounded_event_right_limit_time(event, event).to_bits(),
             event.to_bits()
         );
     }
@@ -514,11 +505,7 @@ mod tests {
         let t_event = 0.5_f64;
         let t_left = event_left_limit_time(t_event);
         assert!(t_left < t_event);
-        assert!(
-            event_right_limit_time(t_left, 0.0)
-                .total_cmp(&t_event)
-                .is_ge()
-        );
+        assert!(event_right_limit_time(t_left).total_cmp(&t_event).is_ge());
     }
 
     #[test]

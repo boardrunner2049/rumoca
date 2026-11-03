@@ -213,13 +213,17 @@ type Writers<'dae> = BTreeMap<u32, WriterAccumulator<'dae>>;
 impl<'dae> SameTickDefinitions<'dae> {
     /// Derive the exact-definition map for one branded DAE view.
     ///
-    /// [`CausalDefinitions`] is authoritative wherever it applies: it already
-    /// proves orientation and acyclicity for whole algebraic aliases. This
+    /// The plan's [`CausalDefinitions`] are authoritative wherever they apply:
+    /// they already prove orientation and acyclicity for whole algebraic
+    /// aliases, and the plan orients every two-sided discrete Real row. Holding
+    /// a derived plan is the precondition, so a row the plan cannot orient is
+    /// reported by its derivation instead of silently left undefined here. This
     /// derivation adds the exact single-writer definitions that proof declines
     /// (a widening `Real x = integerDiscrete`, a `B.1c` value owner, an exact
     /// generated connection row) and records every other writer as opaque.
     #[must_use]
-    pub fn derive(view: dae::DaeView<'dae>, causal: &CausalDefinitions<'dae>) -> Self {
+    pub fn derive(view: dae::DaeView<'dae>, plan: &crate::CausalDiscretePlan<'dae>) -> Self {
+        let causal: &CausalDefinitions<'dae> = plan.causal_definitions();
         let mut ids = vec![None; view.variable_count()];
         for (id, _) in view.variables() {
             if let Some(slot) = ids.get_mut(id.index() as usize) {
@@ -229,7 +233,7 @@ impl<'dae> SameTickDefinitions<'dae> {
         let mut writers = Writers::new();
         let mut refresh_on_tick = BTreeSet::new();
         collect_continuous_writers(view, &mut writers);
-        collect_discrete_real_writers(view, &mut writers, &mut refresh_on_tick);
+        collect_discrete_real_writers(view, plan, &mut writers, &mut refresh_on_tick);
         collect_discrete_value_writers(view, &mut writers, &mut refresh_on_tick);
 
         let mut exact = BTreeMap::new();
@@ -297,7 +301,6 @@ impl<'dae> SameTickDefinitions<'dae> {
         value_reads: &[dae::ExprId<'dae>],
         condition_reads: &[dae::ConditionId<'dae>],
     ) -> BTreeSet<u32> {
-        let mut pending = Vec::new();
         let mut direct = BTreeSet::new();
         for &value in value_reads {
             collect_same_instant_reads(view, value, &mut direct);
@@ -305,7 +308,18 @@ impl<'dae> SameTickDefinitions<'dae> {
         for &condition in condition_reads {
             collect_condition_same_instant_reads(view, condition, &mut direct);
         }
-        pending.extend(direct.iter().copied());
+        self.variable_read_closure(view, direct)
+    }
+
+    /// The coordinates `seeds` name, alias-followed through the exact
+    /// definitions: everything a reader of `seeds` observes at the tick.
+    #[must_use]
+    pub fn variable_read_closure(
+        &self,
+        view: dae::DaeView<'dae>,
+        seeds: BTreeSet<u32>,
+    ) -> BTreeSet<u32> {
+        let mut pending = seeds.into_iter().collect::<Vec<_>>();
         let mut closure = BTreeSet::new();
         while let Some(variable) = pending.pop() {
             if !closure.insert(variable) {
@@ -362,6 +376,7 @@ fn collect_continuous_writers<'dae>(view: dae::DaeView<'dae>, writers: &mut Writ
 /// define a whole algebraic or discrete-Real coordinate.
 fn collect_discrete_real_writers<'dae>(
     view: dae::DaeView<'dae>,
+    plan: &crate::CausalDiscretePlan<'dae>,
     writers: &mut Writers<'dae>,
     refresh_on_tick: &mut BTreeSet<u32>,
 ) {
@@ -372,11 +387,27 @@ fn collect_discrete_real_writers<'dae>(
         if equation.activation() != dae::DiscreteRealActivation::Always {
             continue;
         }
-        if let Some((target, value)) = single_coordinate_definition(
+        // A row between two discrete Real coordinates (a connection) names no
+        // side by shape; its proven orientation is the causal discrete plan's.
+        let definition = single_coordinate_definition(
             view,
             equation.residual(),
             CoordinateKinds::AlgebraicOrDiscreteReal,
-        ) {
+        )
+        .or_else(|| {
+            let oriented = plan.discrete_real_definition(index)?;
+            let target = dae::VariableId::from(oriented.target()).index();
+            // One element of an array coordinate is not an exact definition of
+            // the whole coordinate: it is one of several writers.
+            if oriented.element().is_some() {
+                let mut reads = BTreeSet::new();
+                collect_same_instant_reads(view, oriented.value(), &mut reads);
+                record_opaque_writer(writers, target, &reads);
+                return None;
+            }
+            Some((target, oriented.value()))
+        });
+        if let Some((target, value)) = definition {
             record_definition(view, writers, target, value);
             refresh_on_tick.insert(target);
         }
@@ -1257,10 +1288,17 @@ mod tests {
 
     fn probe<R>(wiring: Wiring, body: impl for<'dae> FnOnce(&Probe<'dae>) -> R) -> R {
         fixture(wiring).inspect(|view| {
-            let causal = CausalDefinitions::derive(view);
-            let definitions = SameTickDefinitions::derive(view, &causal);
+            let definitions = SameTickDefinitions::derive(view, &oriented_plan(view));
             body(&Probe { view, definitions })
         })
+    }
+
+    /// The fixture's causal discrete plan; every fixture row orients.
+    fn oriented_plan(view: dae::DaeView<'_>) -> crate::CausalDiscretePlan<'_> {
+        match crate::CausalDiscretePlan::derive(view) {
+            Ok(plan) => plan,
+            Err(error) => panic!("fixture discrete rows orient: {error}"),
+        }
     }
 
     impl<'dae> Probe<'dae> {

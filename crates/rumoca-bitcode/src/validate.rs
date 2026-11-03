@@ -348,7 +348,12 @@ fn check_discrete_real(errors: &mut Vec<ValidationError>, model: &RbcModel, coun
             );
         }
     }
-    for (index, entry) in model.initial_discrete_values.iter().enumerate() {
+    for (index, entry) in model
+        .initial_discrete_values
+        .iter()
+        .chain(&model.initial_parameter_values)
+        .enumerate()
+    {
         let owner = format!("initial discrete value {index}");
         reference(
             errors,
@@ -770,7 +775,29 @@ fn check_conditions(errors: &mut Vec<ValidationError>, model: &RbcModel, counts:
 
 fn check_clocks(errors: &mut Vec<ValidationError>, model: &RbcModel, counts: &Counts) {
     for clock in &model.clocks {
-        if let RbcClockNode::Triggered { condition } = clock.node {
+        if let RbcClockNode::Shifted { base, counter, .. } = clock.node {
+            reference(
+                errors,
+                format!("clock {} base", clock.id),
+                "clock",
+                base.0,
+                counts.clocks,
+            );
+            if base.0 >= clock.id.0
+                || counter == 0
+                || !model
+                    .clocks
+                    .get(base.0 as usize)
+                    .is_some_and(|clock| matches!(clock.node, RbcClockNode::Triggered { .. }))
+            {
+                errors.push(ValidationError::Clock(
+                    "shifted clock requires an earlier triggered base and positive counter".into(),
+                ));
+            }
+        }
+        if let RbcClockNode::Triggered { condition } | RbcClockNode::Shifted { condition, .. } =
+            clock.node
+        {
             reference(
                 errors,
                 format!("clock {}", clock.id),
@@ -856,6 +883,17 @@ fn check_event_actions(errors: &mut Vec<ValidationError>, model: &RbcModel, coun
                     value.0,
                     counts.expressions,
                 );
+            }
+            RbcAction::Warning { message, condition } => {
+                for expression in [message, condition] {
+                    reference(
+                        errors,
+                        format!("event {} warning", event.id),
+                        "expression",
+                        expression.0,
+                        counts.expressions,
+                    );
+                }
             }
             RbcAction::Assert { message, level } => {
                 reference(

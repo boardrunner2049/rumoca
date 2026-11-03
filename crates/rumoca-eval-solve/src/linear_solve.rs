@@ -1,3 +1,13 @@
+//! Dense linear solve for the interpreter's `LinearSolveComponent` op.
+//!
+//! Gaussian elimination with partial pivoting, the standard method and its
+//! standard stability argument: G. H. Golub and C. F. Van Loan, "Matrix
+//! Computations", 4th ed., Johns Hopkins University Press 2013, sections 3.2
+//! (triangular solve and elimination) and 3.4 (partial pivoting and its growth
+//! factor). Row interchange by largest pivot magnitude is what section 3.4.1
+//! prescribes; the interpreter matches the pivoting order of the compiled
+//! backends so the two agree bit for bit.
+
 use crate::tensor_policy::LinearSolveKernel;
 use crate::{EvalSolveError, get};
 use rumoca_ir_solve::StructuralPattern;
@@ -139,7 +149,7 @@ fn solve_sparse_unchecked(
     }
     let mut matrix = AugmentedMatrix::zeroed(n)?;
     for row in 0..n {
-        pattern.visit_row_columns(row, |column| {
+        pattern.visit_row_columns(row, &mut |column| {
             let offset = row * n + column;
             matrix.set(row, column, regs[matrix_start as usize + offset]);
         });
@@ -163,7 +173,7 @@ fn solve_diagonal_unchecked(
 ) -> Result<(), EvalSolveError> {
     for (component, dst) in out.iter_mut().take(n).enumerate() {
         let coeff = regs[matrix_start as usize + component * n + component];
-        if coeff.abs() <= 1.0e-14 {
+        if coeff == 0.0 || !coeff.is_finite() {
             return Err(linear_solve_error(n, Some(component), "singular diagonal"));
         }
         *dst = regs[rhs_start as usize + component] / coeff;
@@ -328,6 +338,10 @@ impl AugmentedMatrix {
     }
 }
 
+/// Reduce the augmented matrix in place by Gaussian elimination with partial
+/// pivoting, returning `None` when the pivot column is numerically singular.
+///
+/// Golub and Van Loan, "Matrix Computations", 4th ed., algorithm 3.4.1.
 pub fn gaussian_eliminate(matrix: &mut AugmentedMatrix) -> Option<()> {
     let n = matrix.n;
     for col in 0..n {
@@ -337,14 +351,17 @@ pub fn gaussian_eliminate(matrix: &mut AugmentedMatrix) -> Option<()> {
                 .abs()
                 .total_cmp(&matrix.get(b, col).abs())
         })?;
-        if matrix.get(pivot, col).abs() <= 1.0e-14 {
+        let pivot_value = matrix.get(pivot, col);
+        if pivot_value == 0.0 || !pivot_value.is_finite() {
             return None;
         }
         matrix.swap_rows(col, pivot);
         normalize_pivot_row(matrix, col);
         eliminate_column(matrix, col);
     }
-    Some(())
+    (0..n)
+        .all(|component| matrix.solution_component(component).is_finite())
+        .then_some(())
 }
 
 fn normalize_pivot_row(matrix: &mut AugmentedMatrix, col: usize) {

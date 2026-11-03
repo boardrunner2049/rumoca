@@ -1,23 +1,64 @@
 //! Constructor-only structural DAE-to-DAE lowering.
 //!
-//! Regular systems remain borrowed. A singular system is rebuilt only when a
+//! Requested states are selected before matching; already selected regular
+//! systems remain borrowed. A singular system is rebuilt when a
 //! scalar state is directly defined by a differentiable constraint. The
 //! replacement DAE demotes that state and substitutes the exact symbolic
 //! derivative of its definition at every derivative occurrence.
+//!
+//! # References
+//!
+//! Structural index reduction by differentiating a structurally singular
+//! subset and rematching is C. C. Pantelides, "The consistent initialization of
+//! differential-algebraic systems", SIAM Journal on Scientific and Statistical
+//! Computing 9(2):213-231, 1988, doi:10.1137/0909014. Demoting a state whose
+//! derivative the differentiated constraint now determines, rather than adding
+//! the derivative as a new unknown, is the dummy-derivative method of S. E.
+//! Mattsson and G. Soderlind, "Index reduction in differential-algebraic
+//! equations using dummy derivatives", SIAM Journal on Scientific Computing
+//! 14(3):677-692, 1993, doi:10.1137/0914043. Textbook treatment of both, in the
+//! Modelica setting: F. E. Cellier and E. Kofman, "Continuous System
+//! Simulation", Springer 2006, chapter 7.
 
+mod alias_quotient;
+mod auxiliary_blocks;
+mod builtin_profiles;
+mod candidate_choice;
+mod holonomic_attempt;
+#[cfg(test)]
+use holonomic_attempt::refused_holonomic_outcome;
+use holonomic_attempt::{HolonomicAttempt, attempt_holonomic_candidate};
+mod component_constraint;
+mod component_projection;
+mod constant_values;
 mod constraints;
 mod declarations;
+mod demotion_bounds;
+use candidate_choice::{PassChoice, holonomic_analysis};
+mod demotion_screen;
+mod derivative_aliases;
 mod differentiation;
 mod equalities;
+mod equation_activity;
+mod evaluable_parameters;
 mod event_owners;
 mod expressions;
+mod formal_derivatives;
+mod function_derivatives;
 mod functions;
 mod initial_pins;
+mod inline_calls;
+mod loop_guards;
+pub use loop_guards::{UnlocalizableGuard, own_loop_guarded_relations, unlocalizable_loop_guards};
 mod observation;
+mod parameter_conditionals;
 mod reconstruction;
 mod runtime_quotients;
 mod semantic_owners;
+mod sortability;
+mod source;
 mod temporal;
+mod tensor_maps;
 #[cfg(test)]
 mod tests;
 mod variables;
@@ -31,7 +72,7 @@ use self::constraints::{
     DiscardedInitialValue, direct_state_constraints, discarded_stated_initial_value,
     index_reduction_constraints,
 };
-use self::initial_pins::{represented_initial_values, transferred_initial_values};
+use self::initial_pins::{stated_initial_variables, transferred_initial_values};
 use self::observation::{
     AttemptOutcome, CandidateGroup, DirectIdentity, HolonomicIdentity, Identity, Lane,
     ReductionEvent, ReductionObserver, ReductionRecorder, StoppedOutcome,
@@ -41,15 +82,52 @@ use self::reconstruction::rebuild_with_state_demotion;
 use self::reconstruction::{
     rebuild_holonomic_constraint, rebuild_with_state_demotion_and_manifold,
 };
+use self::source::ReductionSource;
 use crate::{
     BltBlock, EquationRef, SortedDae, StructuralError, StructuredScalarBlock, UnknownId, sort,
 };
 
+pub use self::alias_quotient::{
+    AliasClassReport, AliasMemberReport, AliasQuotientReport, AliasRefusal,
+    QuotientScope as AliasQuotientScope, alias_quotient_report, formal_alias_quotient_report,
+    inspect_quotient_aliases, quotient_aliases, quotient_formal_aliases,
+};
+pub use self::constant_values::fold_constant_values;
+pub use self::evaluable_parameters::fold_evaluable_parameters;
+pub use self::formal_derivatives::{
+    FormalDerivativeStage, FormalDerivativeSystem, FormalDerivativeView, FormalStageCoordinate,
+    FormalStageEquation, FormalStateCandidate, FormalStateCandidateView, FormalStateCoordinate,
+    ReducedSelectionChart, StateSelection, construct_formal_derivatives,
+};
 pub use self::initial_pins::{InitialValuePin, InitialValueRole, PinTerm};
+pub use self::inline_calls::{inline_annotated_calls, inline_formal_calls};
 pub use self::observation::{
     ReductionCandidateGroup, ReductionIdentity, ReductionLane, ReductionOutcome, ReductionRecord,
-    ReductionReport, ReductionStop, UnmatchedKind, UnmatchedName,
+    ReductionReport, ReductionSnapshot, ReductionStop, UnmatchedKind, UnmatchedName,
 };
+
+/// One admissible reduced state-selection chart, in the finalized transformed
+/// DAE's own variable-ordinal space.
+///
+/// The reduced state selection picks a Dependent/Independent split of a
+/// definitional first-integral coordinate group. A conserved first integral has
+/// no globally injective reduced chart, so the fixed primary split folds when a
+/// dependent coordinate passes through zero. This records one alternate split of
+/// that same group: the `dependent` coordinates are reconstructed and the
+/// `independent` coordinates are integrated. Each coordinate is a
+/// `(transformed variable ordinal, scalar)` pair naming a scalar of the finalized
+/// DAE that `PreparedDae::inspect` binds. The primary split is chart index zero.
+#[derive(Clone, Debug)]
+pub struct PreparedReducedChart {
+    pub dependent: Box<[(u32, u32)]>,
+    pub independent: Box<[(u32, u32)]>,
+    /// Reciprocal conditioning of this chart's dependent Jacobian at the
+    /// construction trial point, and the singular threshold it is measured
+    /// against. The mirror of a folding coordinate may sit at or below the
+    /// threshold here because it is regular at a different configuration.
+    pub trial_rcond: f64,
+    pub trial_singular_threshold: f64,
+}
 
 /// A finalized DAE ready for Solve lowering.
 pub enum PreparedDae<'source> {
@@ -61,8 +139,16 @@ pub enum PreparedDae<'source> {
     Transformed {
         dae: Box<dae::Dae>,
         manifold: Box<[u32]>,
+        /// Redundancy classification parallel to `manifold`: `true` marks a row
+        /// of a loop-closure constraint that must reduce, `false` a conserved
+        /// first integral that may be retained.
+        manifold_redundant: Box<[bool]>,
         pins: Box<[InitialValuePin]>,
         structural: PreparedStructuralAnalysis,
+        /// Admissible reduced state-selection charts issued by the
+        /// formal-derivative selection. Empty except on the reduced-selection
+        /// path that finalizes a folding definitional first-integral group.
+        charts: Box<[PreparedReducedChart]>,
     },
 }
 
@@ -74,17 +160,35 @@ impl PreparedDae<'_> {
         }
     }
 
+    /// True when the retained manifold carries a redundant loop-closure
+    /// constraint: one whose position form is over-determining and is closed
+    /// only by differentiating to acceleration, introducing a multiplier. State
+    /// selection reduces such a system to an independent basis. A system whose
+    /// manifold constraints are all conserved first integrals returns false:
+    /// retaining its source coordinates and enforcing the invariants through the
+    /// manifold projection stays regular, whereas reducing folds when a selected
+    /// coordinate passes through zero.
+    pub fn manifold_requires_reduction(&self) -> bool {
+        match self {
+            Self::Borrowed { .. } => false,
+            Self::Transformed {
+                manifold_redundant, ..
+            } => manifold_redundant.contains(&true),
+        }
+    }
+
     pub fn inspect<R>(&self, inspect: impl for<'dae> FnOnce(PreparedSystem<'_, 'dae>) -> R) -> R {
-        let (manifold, pins, structural) = match self {
+        let (manifold, pins, structural, charts) = match self {
             Self::Borrowed {
                 pins, structural, ..
-            } => ([].as_slice(), pins, structural),
+            } => ([].as_slice(), pins, structural, [].as_slice()),
             Self::Transformed {
                 manifold,
                 pins,
                 structural,
+                charts,
                 ..
-            } => (&**manifold, pins, structural),
+            } => (&**manifold, pins, structural, &**charts),
         };
         self.as_dae().inspect(|view| {
             let manifold = manifold
@@ -99,6 +203,7 @@ impl PreparedDae<'_> {
                 manifold: &manifold,
                 pins,
                 structural: structural.bind(view),
+                charts,
             })
         })
     }
@@ -122,6 +227,10 @@ pub struct PreparedSystem<'prepared, 'dae> {
     /// Structural matching and BLT analysis issued while this exact finalized
     /// DAE was admitted by structural preparation.
     pub structural: Option<SortedDae<'dae>>,
+    /// Admissible reduced state-selection charts for a folding definitional
+    /// first-integral coordinate group, naming scalars of `view`. Empty for
+    /// every prepared system without such a group.
+    pub charts: &'prepared [PreparedReducedChart],
 }
 
 /// The structural analysis coupled to one prepared DAE root.
@@ -300,12 +409,55 @@ fn structural_analysis(model: &dae::Dae) -> Result<PreparedStructuralAnalysis, S
     model.inspect(|view| sort(view).map(PreparedStructuralAnalysis::issue))
 }
 
+/// One direct-demotion round's structural analysis, retaining the incidence so
+/// the next round can reuse the rows this demotion did not touch.
+///
+/// `reuse` supplies the prior round's incidence and the owners the demotion
+/// rewrites; when it is `None` the incidence is built from scratch. The
+/// [`ReusableIncidence`] is returned whenever the incidence built, even if the
+/// system is singular, because a singular-with-residue round is exactly the one
+/// whose incidence the next round reuses.
+fn structural_analysis_capturing(
+    model: &dae::Dae,
+    reuse: Option<&crate::incidence::ReusableIncidence>,
+    touched: Option<&[bool]>,
+) -> (
+    Result<PreparedStructuralAnalysis, StructuralError>,
+    Option<crate::incidence::ReusableIncidence>,
+) {
+    let reuse = reuse
+        .zip(touched)
+        .map(|(prev, mask)| crate::incidence::IncidenceReuse::new(prev, mask));
+    model.inspect(|view| {
+        let incidence = match reuse {
+            Some(reuse) => crate::incidence::build_incidence_reusing(view, reuse),
+            None => crate::incidence::build_incidence(view),
+        };
+        match incidence {
+            Ok(incidence) => {
+                let reusable = crate::incidence::ReusableIncidence::from_incidence(&incidence);
+                let analysis = crate::sort_from_incidence(view, &incidence)
+                    .map(PreparedStructuralAnalysis::issue);
+                (analysis, Some(reusable))
+            }
+            Err(error) => (Err(error), None),
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 struct DirectStateConstraint {
     state: u32,
-    rhs: u32,
+    rhs: StateDefinition,
     rhs_sign: self::equalities::EqualitySign,
     owner: dae::DaeProvenance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum StateDefinition {
+    Expression(u32),
+    DerivativeExpression(u32),
+    Auxiliary(u32),
 }
 
 #[derive(Clone)]
@@ -318,10 +470,74 @@ struct HolonomicConstraint {
     lifted_algebraic: Option<u32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct HolonomicOwnerKey {
+    owner: usize,
+    body: Option<usize>,
+    lifted: Option<u32>,
+    component: Option<usize>,
+}
+
+impl HolonomicConstraint {
+    fn owner_key(&self) -> HolonomicOwnerKey {
+        HolonomicOwnerKey {
+            owner: self.owner_ordinal,
+            body: self.body_ordinal,
+            lifted: self.lifted_algebraic,
+            component: self
+                .proof
+                .component
+                .as_ref()
+                .map(|component| component.scalar),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ManifoldConstraint {
     expression: u32,
     lifted: Option<LiftedManifoldOwner>,
+    /// Whether this row belongs to a redundant loop-closure constraint. A
+    /// conserved first integral (its lower-order form is implied by the ODE, so
+    /// one differentiation already reconstructs a matched state derivative) is
+    /// definitional and keeps `false`; a genuine loop closure, whose position
+    /// form is over-determining and is closed only by differentiating to
+    /// acceleration through a multiplier, is redundant and carries `true`.
+    redundant: bool,
+}
+
+/// One retained manifold constraint as the reduction pipeline hands it over: a
+/// DAE-local expression ordinal and whether it belongs to a redundant loop
+/// closure. The finalized [`PreparedDae`] stores these split into two primitive
+/// arrays so no phase-private type leaks through its public shape; state
+/// selection reads the redundancy classification through
+/// [`PreparedDae::manifold_requires_reduction`] without re-deriving structure.
+#[derive(Clone, Copy)]
+struct ManifoldEntry {
+    expression: u32,
+    redundant: bool,
+}
+
+impl ManifoldEntry {
+    fn from_constraint(constraint: ManifoldConstraint) -> Self {
+        Self {
+            expression: constraint.expression,
+            redundant: constraint.redundant,
+        }
+    }
+
+    /// Pair the rebuilt ordinals of a replayed manifold, which come back in
+    /// input order, with the redundancy classification of that input.
+    fn replayed(expressions: Vec<u32>, redundant: &[bool]) -> Vec<Self> {
+        expressions
+            .into_iter()
+            .zip(redundant.iter().copied())
+            .map(|(expression, redundant)| Self {
+                expression,
+                redundant,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,6 +546,7 @@ struct LiftedManifoldOwner {
     owner_ordinal: usize,
     body_ordinal: Option<usize>,
     residual: u32,
+    value_residual: u32,
 }
 
 /// Evidence collected from the finalized source DAE before a residual may be
@@ -338,7 +555,10 @@ struct LiftedManifoldOwner {
 struct HolonomicDifferentiationProof {
     residual: u32,
     maximum_order: u8,
+    derivative_anchors: equalities::DerivativeAnchors,
     anchored_states: Box<[u32]>,
+    component: Option<component_constraint::ComponentConstraint>,
+    lifted_value: Option<std::sync::Arc<constraints::lifted_values::LiftedValueProof>>,
 }
 
 /// Prepare a finalized DAE for Solve without admitting a weaker intermediate.
@@ -380,20 +600,59 @@ pub fn inspect_prepare_for_solve(
 ) -> (Result<PreparedDae<'_>, StructuralError>, ReductionReport) {
     let mut recorder = ReductionRecorder::default();
     let result = prepare_for_solve_with_observer(model, &mut recorder);
-    (result, recorder.finish())
+    let report = recorder.finish(result.is_err());
+    (result, report)
 }
 
 fn prepare_for_solve_with_observer<'source>(
     model: &'source dae::Dae,
     observer: &mut impl ReductionObserver,
 ) -> Result<PreparedDae<'source>, StructuralError> {
-    let singular = match structural_analysis(model) {
-        Ok(structural) => return borrowed_with_observer(model, structural, observer),
-        Err(error @ StructuralError::Singular { .. }) => error,
-        Err(StructuralError::EmptySystem) => {
+    let selected = match reconstruction::rebuild_requested_states(model) {
+        Ok(Some(selected)) => selected,
+        Ok(None) => return reduce_for_solve_with_observer(model, observer),
+        Err(error) => return observed_failure(error, observer),
+    };
+    match reduce_for_solve_with_observer(&selected, observer)? {
+        PreparedDae::Borrowed {
+            pins, structural, ..
+        } => Ok(PreparedDae::Transformed {
+            dae: Box::new(selected),
+            manifold: Box::new([]),
+            manifold_redundant: Box::new([]),
+            pins,
+            structural,
+            charts: Box::new([]),
+        }),
+        PreparedDae::Transformed {
+            dae,
+            manifold,
+            manifold_redundant,
+            pins,
+            structural,
+            charts,
+        } => Ok(PreparedDae::Transformed {
+            dae,
+            manifold,
+            manifold_redundant,
+            pins,
+            structural,
+            charts,
+        }),
+    }
+}
+
+fn reduce_for_solve_with_observer<'source>(
+    model: &'source dae::Dae,
+    observer: &mut impl ReductionObserver,
+) -> Result<PreparedDae<'source>, StructuralError> {
+    let (singular, mut current_reusable) = match structural_analysis_capturing(model, None, None) {
+        (Ok(structural), _) => return borrowed_with_observer(model, structural, observer),
+        (Err(error @ StructuralError::Singular { .. }), reusable) => (error, reusable),
+        (Err(StructuralError::EmptySystem), _) => {
             return borrowed_with_observer(model, PreparedStructuralAnalysis::empty(), observer);
         }
-        Err(error) => {
+        (Err(error), _) => {
             observer.observe(ReductionEvent::Stopped {
                 outcome: StoppedOutcome::Failure { error: &error },
             });
@@ -414,11 +673,17 @@ fn prepare_for_solve_with_observer<'source>(
             round: round_number,
             error: current_error,
         });
-        let round =
-            match demote_direct_state_with_observer(current_model, residue, &[], true, observer) {
-                Ok(round) => round,
-                Err(error) => return observed_failure(error, observer),
-            };
+        let round = match demote_direct_state_with_observer(
+            current_model,
+            residue,
+            &[],
+            true,
+            current_reusable.as_ref(),
+            observer,
+        ) {
+            Ok(round) => round,
+            Err(error) => return observed_failure(error, observer),
+        };
         match round.step {
             None => break round.blocked,
             Some(DemotionStep::Sorted {
@@ -430,11 +695,13 @@ fn prepare_for_solve_with_observer<'source>(
                 dae,
                 residue: next,
                 error,
+                reusable,
                 ..
             }) => {
                 residue = next;
                 demoted_error = Some(error);
                 demoted = Some(dae);
+                current_reusable = Some(reusable);
             }
         }
     };
@@ -447,6 +714,7 @@ fn prepare_for_solve_with_observer<'source>(
         Err(error) => return observed_failure(error, observer),
     };
     if holonomic.step.is_none() && demoted.is_some() {
+        discard_demoted_dae(demoted.take(), demoted_error.take(), observer);
         observer.observe(ReductionEvent::RetriedPristine {
             lane: Lane::Holonomic,
         });
@@ -459,10 +727,26 @@ fn prepare_for_solve_with_observer<'source>(
             blocked: pristine.blocked.or(holonomic.blocked),
         };
     }
-    match (holonomic.step, blocked.or(holonomic.blocked)) {
+    finalize_holonomic_outcome(holonomic, blocked, singular, observer)
+}
+
+/// Turn the final holonomic round into a prepared system: a reduction becomes a
+/// transformed DAE carrying the classified manifold, a blocked stated initial
+/// value surfaces as its own diagnostic, and an exhausted system reports the
+/// original singularity.
+fn finalize_holonomic_outcome(
+    holonomic: HolonomicRound,
+    outer_blocked: Option<DiscardedInitialValue>,
+    singular: StructuralError,
+    observer: &mut impl ReductionObserver,
+) -> Result<PreparedDae<'static>, StructuralError> {
+    match (holonomic.step, outer_blocked.or(holonomic.blocked)) {
         (Some((dae, manifold, structural)), _) => transformed_with_observer(
             dae,
-            manifold.into_iter().map(|entry| entry.expression).collect(),
+            manifold
+                .into_iter()
+                .map(ManifoldEntry::from_constraint)
+                .collect(),
             structural,
             observer,
         ),
@@ -487,6 +771,16 @@ fn prepare_for_solve_with_observer<'source>(
             });
             Err(singular)
         }
+    }
+}
+
+fn discard_demoted_dae(
+    model: Option<dae::Dae>,
+    error: Option<StructuralError>,
+    observer: &mut impl ReductionObserver,
+) {
+    if let (Some(model), Some(error)) = (model, error) {
+        observer.discard_stalled(model, Vec::new(), &error);
     }
 }
 
@@ -519,10 +813,11 @@ fn borrowed_with_observer<'source>(
     structural: PreparedStructuralAnalysis,
     observer: &mut impl ReductionObserver,
 ) -> Result<PreparedDae<'source>, StructuralError> {
-    let result = borrowed(model, structural);
+    let result = borrowed(model, structural).and_then(derivative_aliases::normalize);
     observer.observe(ReductionEvent::Stopped {
         outcome: match &result {
-            Ok(_) => StoppedOutcome::Borrowed,
+            Ok(PreparedDae::Borrowed { .. }) => StoppedOutcome::Borrowed,
+            Ok(PreparedDae::Transformed { .. }) => StoppedOutcome::Sorted,
             Err(error) => StoppedOutcome::Failure { error },
         },
     });
@@ -533,25 +828,33 @@ fn borrowed_with_observer<'source>(
 /// so that a demotion's new roles decide which coordinate the runtime seeds.
 fn transformed(
     model: dae::Dae,
-    manifold: Vec<u32>,
+    manifold: Vec<ManifoldEntry>,
     structural: PreparedStructuralAnalysis,
+    charts: Box<[PreparedReducedChart]>,
 ) -> Result<PreparedDae<'static>, StructuralError> {
     let pins = model.inspect(transferred_initial_values)?;
+    let (expressions, redundant): (Vec<u32>, Vec<bool>) = manifold
+        .into_iter()
+        .map(|entry| (entry.expression, entry.redundant))
+        .unzip();
     Ok(PreparedDae::Transformed {
         dae: Box::new(model),
-        manifold: manifold.into_boxed_slice(),
+        manifold: expressions.into_boxed_slice(),
+        manifold_redundant: redundant.into_boxed_slice(),
         pins: pins.into_boxed_slice(),
         structural,
+        charts,
     })
 }
 
 fn transformed_with_observer(
     model: dae::Dae,
-    manifold: Vec<u32>,
+    manifold: Vec<ManifoldEntry>,
     structural: PreparedStructuralAnalysis,
     observer: &mut impl ReductionObserver,
 ) -> Result<PreparedDae<'static>, StructuralError> {
-    let result = transformed(model, manifold, structural);
+    let result = transformed(model, manifold, structural, Box::new([]))
+        .and_then(derivative_aliases::normalize);
     observer.observe(ReductionEvent::Stopped {
         outcome: match &result {
             Ok(_) => StoppedOutcome::Sorted,
@@ -577,6 +880,9 @@ enum DemotionStep {
         manifold: Vec<ManifoldConstraint>,
         residue: usize,
         error: StructuralError,
+        /// The incidence of the reduced system, carried to the next round so it
+        /// reuses the rows this demotion did not touch.
+        reusable: crate::incidence::ReusableIncidence,
     },
 }
 
@@ -592,9 +898,12 @@ struct DemotionRound {
 }
 
 #[derive(Clone, Copy)]
-struct DemotionPassPolicy {
+struct DemotionPassPolicy<'a> {
     group: CandidateGroup,
     allow_held: bool,
+    /// The prior round's incidence, reused for owners this demotion leaves
+    /// untouched; `None` disables reuse and rebuilds the incidence in full.
+    reuse: Option<&'a crate::incidence::ReusableIncidence>,
 }
 
 /// Demote one directly defined state of `model`.
@@ -620,12 +929,14 @@ fn demote_direct_state_with_observer(
     residue: usize,
     prior_manifold: &[ManifoldConstraint],
     allow_held: bool,
+    reuse: Option<&crate::incidence::ReusableIncidence>,
     observer: &mut impl ReductionObserver,
 ) -> Result<DemotionRound, StructuralError> {
-    let candidates = model.inspect(direct_state_constraints);
-    let stated = model.inspect(represented_initial_values);
+    let source = ReductionSource::new(model);
+    let candidates = source.inspect(direct_state_constraints);
+    let stated = model.inspect(stated_initial_variables);
     let unconditional = demotion_pass_with_observer(
-        model,
+        &source,
         residue,
         &stated,
         &candidates.admissible,
@@ -633,6 +944,7 @@ fn demote_direct_state_with_observer(
         DemotionPassPolicy {
             group: CandidateGroup::DirectAdmissible,
             allow_held,
+            reuse,
         },
         observer,
     )?;
@@ -640,7 +952,7 @@ fn demote_direct_state_with_observer(
         return Ok(unconditional);
     }
     let carried = demotion_pass_with_observer(
-        model,
+        &source,
         residue,
         &stated,
         &candidates.conditional,
@@ -648,6 +960,7 @@ fn demote_direct_state_with_observer(
         DemotionPassPolicy {
             group: CandidateGroup::DirectConditional,
             allow_held,
+            reuse,
         },
         observer,
     )?;
@@ -703,21 +1016,52 @@ fn discarded_initial_after_attempt(
     }
 }
 
-/// Try one candidate, observing its identity and outcome. Every decision this
-/// makes is exactly the one the pre-observation code made at this same branch
-/// point; `observer.observe` calls are interleaved without moving, adding, or
-/// removing any of them.
+/// Try one candidate whose derivative and retained-value obligations hold,
+/// observing its identity and outcome without changing the decision.
 fn attempt_direct_candidate(
-    model: &dae::Dae,
+    source: &ReductionSource<'_>,
     residue: usize,
     stated: &[u32],
     candidate: &DirectStateConstraint,
     prior_manifold: &[ManifoldConstraint],
+    reuse: Option<&crate::incidence::ReusableIncidence>,
     observer: &mut impl ReductionObserver,
 ) -> Result<DirectAttempt, StructuralError> {
     let identity = Identity::Direct(DirectIdentity::from(candidate));
+    if !source.inspect(|view, facts| {
+        constraints::demotion_preserves_manifold_values(view, facts, candidate, prior_manifold)
+    }) {
+        observer.observe(ReductionEvent::Attempt {
+            lane: Lane::Direct,
+            identity,
+            outcome: AttemptOutcome::WouldInvalidateManifold,
+        });
+        return Ok(DirectAttempt::Rejected);
+    }
+    reconstruct_direct_candidate(
+        source,
+        residue,
+        stated,
+        candidate,
+        prior_manifold,
+        reuse,
+        observer,
+    )
+}
+
+fn reconstruct_direct_candidate(
+    source: &ReductionSource<'_>,
+    residue: usize,
+    stated: &[u32],
+    candidate: &DirectStateConstraint,
+    prior_manifold: &[ManifoldConstraint],
+    reuse: Option<&crate::incidence::ReusableIncidence>,
+    observer: &mut impl ReductionObserver,
+) -> Result<DirectAttempt, StructuralError> {
+    let model = source.model();
+    let identity = Identity::Direct(DirectIdentity::from(candidate));
     let (rebuilt, manifold) =
-        match rebuild_with_state_demotion_and_manifold(model, *candidate, prior_manifold) {
+        match rebuild_with_state_demotion_and_manifold(source, *candidate, prior_manifold) {
             Ok(rebuilt) => rebuilt,
             Err(error) => {
                 observer.observe(ReductionEvent::Attempt {
@@ -728,15 +1072,21 @@ fn attempt_direct_candidate(
                 return Err(error);
             }
         };
-    if !manifold.is_empty() && !manifold_is_state_only(&rebuilt, &manifold) {
+    if let Some(outcome) = direct_reconstruction_rejection(model, &rebuilt, &manifold) {
         observer.observe(ReductionEvent::Attempt {
             lane: Lane::Direct,
             identity,
-            outcome: AttemptOutcome::WouldInvalidateManifold,
+            outcome,
         });
         return Ok(DirectAttempt::Rejected);
     }
-    let (next, retained_error, structural) = match structural_analysis(&rebuilt) {
+    // A direct demotion with no retained manifold rewrites only the owners that
+    // reference the demoted variable, so the next round can reuse every other
+    // row of this round's incidence rather than reproject the whole system.
+    let touched = (reuse.is_some() && prior_manifold.is_empty())
+        .then(|| source.demotion_rows.touched_owners(candidate.state));
+    let (analysis, reusable) = structural_analysis_capturing(&rebuilt, reuse, touched.as_deref());
+    let (next, retained_error, structural) = match analysis {
         Ok(structural) => (None, None, Some(structural)),
         Err(error) => match unmatched_residue(&error) {
             Some(next) if next <= residue => (Some(next), Some(error), None),
@@ -806,18 +1156,42 @@ fn attempt_direct_candidate(
             manifold,
             residue: next,
             error: retained_error.expect("reduced/held candidate retains its proving error"),
+            reusable: reusable.expect("a reduced candidate built its incidence"),
         },
     })
 }
 
+fn direct_reconstruction_rejection(
+    source: &dae::Dae,
+    rebuilt: &dae::Dae,
+    manifold: &[ManifoldConstraint],
+) -> Option<AttemptOutcome<'static>> {
+    if !equation_activity::preserves_equations(source, rebuilt) {
+        Some(AttemptOutcome::WouldCreateVacuousResidual)
+    } else if !manifold.is_empty() && !manifold_is_state_only(rebuilt, manifold) {
+        Some(AttemptOutcome::WouldInvalidateManifold)
+    } else {
+        None
+    }
+}
+
 /// Try one list of demotion candidates against `model`.
+///
+/// The first strictly reducing candidate in order is taken; with none, the
+/// last residue-holding candidate is the fallback and the first blocked one
+/// the reported refusal. A candidate whose structural residue bound proves it
+/// cannot reduce (see [`demotion_screen`]) is never reconstructed while a
+/// reducing candidate is sought, which leaves the first reducing candidate
+/// unchanged; when none reduces, those candidates are reconstructed after all,
+/// from the end when a held fallback is allowed, so the fallback and the
+/// refusal are chosen over every candidate in order.
 fn demotion_pass_with_observer(
-    model: &dae::Dae,
+    source: &ReductionSource<'_>,
     residue: usize,
     stated: &[u32],
     candidates: &[DirectStateConstraint],
     prior_manifold: &[ManifoldConstraint],
-    policy: DemotionPassPolicy,
+    policy: DemotionPassPolicy<'_>,
     observer: &mut impl ReductionObserver,
 ) -> Result<DemotionRound, StructuralError> {
     observer.observe(ReductionEvent::Candidates {
@@ -825,49 +1199,88 @@ fn demotion_pass_with_observer(
         group: policy.group,
         discovered: candidates.len(),
     });
-    let mut reduced: Option<(DirectStateConstraint, usize, DemotionStep)> = None;
-    let mut held: Option<(DirectStateConstraint, usize, DemotionStep)> = None;
-    let mut blocked = None;
-    for candidate in candidates {
-        match attempt_direct_candidate(model, residue, stated, candidate, prior_manifold, observer)?
+    let screen = policy
+        .reuse
+        .filter(|_| prior_manifold.is_empty() && residue > 0)
+        .map(|base| demotion_screen::DemotionScreen::new(base, &source.demotion_rows, residue));
+    let mut choice = PassChoice::default();
+    let mut deferred = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if choice.reduced.is_some()
+            && source
+                .demotion_rows
+                .cannot_sort(candidate.state, residue, prior_manifold)
         {
-            DirectAttempt::Sorted {
-                rebuilt,
-                manifold,
-                structural,
-            } => {
-                return Ok(DemotionRound {
-                    step: Some(DemotionStep::Sorted {
-                        dae: rebuilt,
-                        manifold,
-                        structural,
-                    }),
-                    blocked: None,
-                });
-            }
-            DirectAttempt::Accepted {
-                candidate,
-                residue: next,
-                step,
-            } => {
-                let slot = if next < residue {
-                    &mut reduced
-                } else {
-                    &mut held
-                };
-                if next < residue {
-                    slot.get_or_insert((candidate, next, step));
-                } else {
-                    *slot = Some((candidate, next, step));
-                }
-            }
-            DirectAttempt::Blocked(discarded) => {
-                blocked.get_or_insert(discarded);
-            }
-            DirectAttempt::Rejected => {}
+            continue;
+        }
+        if let Some(bound) = screen.as_ref().and_then(|screen| {
+            source.inspect(|view, facts| screen.cannot_reduce(view, facts, candidate))
+        }) {
+            observer.observe(ReductionEvent::Attempt {
+                lane: Lane::Direct,
+                identity: Identity::Direct(DirectIdentity::from(candidate)),
+                outcome: AttemptOutcome::CannotReduce { bound },
+            });
+            deferred.push(index);
+            continue;
+        }
+        let attempt = attempt_direct_candidate(
+            source,
+            residue,
+            stated,
+            candidate,
+            prior_manifold,
+            policy.reuse,
+            observer,
+        )?;
+        if let Some(sorted) = choice.record(index, residue, attempt) {
+            return Ok(sorted);
         }
     }
-    match reduced.or(if policy.allow_held { held } else { None }) {
+    #[cfg(debug_assertions)]
+    candidate_choice::check_deferred(
+        source,
+        (residue, stated, prior_manifold, policy.reuse),
+        candidates,
+        &deferred,
+    )?;
+    if choice.reduced.is_none() {
+        // With a held fallback allowed, the last holding candidate in order is
+        // the choice and a refusal is reported only when none holds, so the
+        // deferred candidates are tried from the end until one holds after
+        // every holding candidate already seen.
+        if policy.allow_held {
+            deferred.reverse();
+        }
+        for index in deferred {
+            if policy.allow_held && choice.held.as_ref().is_some_and(|(last, ..)| *last > index) {
+                break;
+            }
+            let attempt = attempt_direct_candidate(
+                source,
+                residue,
+                stated,
+                &candidates[index],
+                prior_manifold,
+                policy.reuse,
+                observer,
+            )?;
+            if let Some(sorted) = choice.record(index, residue, attempt) {
+                return Ok(sorted);
+            }
+        }
+    }
+    let step = choice
+        .reduced
+        .map(|(_, candidate, next, step)| (candidate, next, step))
+        .or(if policy.allow_held {
+            choice
+                .held
+                .map(|(_, candidate, next, step)| (candidate, next, step))
+        } else {
+            None
+        });
+    match step {
         Some((candidate, residue_after, step)) => {
             observer.observe(ReductionEvent::Selected {
                 lane: Lane::Direct,
@@ -882,7 +1295,7 @@ fn demotion_pass_with_observer(
         }
         None => Ok(DemotionRound {
             step: None,
-            blocked,
+            blocked: choice.blocked.map(|(_, discarded)| discarded),
         }),
     }
 }
@@ -933,7 +1346,7 @@ struct HolonomicReductionState {
     current_error: StructuralError,
     round_number: u32,
     direct_round_number: u32,
-    differentiated_owners: BTreeSet<(usize, Option<usize>, Option<u32>)>,
+    differentiated_owners: BTreeSet<HolonomicOwnerKey>,
     blocked: Option<DiscardedInitialValue>,
 }
 
@@ -971,17 +1384,23 @@ impl HolonomicReductionState {
         self.current_error = error;
     }
 
+    fn discard_stalled(&mut self, observer: &mut impl ReductionObserver) {
+        if let Some(model) = self.reduced.take() {
+            observer.discard_stalled(
+                model,
+                std::mem::take(&mut self.manifold),
+                &self.current_error,
+            );
+        }
+    }
+
     fn accept_held(
         &mut self,
         held: (HolonomicConstraint, usize, HolonomicStep),
         observer: &mut impl ReductionObserver,
     ) {
         let (constraint, next_residue, step) = held;
-        self.differentiated_owners.insert((
-            constraint.owner_ordinal,
-            constraint.body_ordinal,
-            constraint.lifted_algebraic,
-        ));
+        self.differentiated_owners.insert(constraint.owner_key());
         observer.observe(ReductionEvent::Selected {
             lane: Lane::Holonomic,
             identity: Identity::Holonomic(HolonomicIdentity::from(&constraint)),
@@ -995,12 +1414,12 @@ impl HolonomicReductionState {
         self.accept_reduced(step);
     }
 
-    fn direct_or_held(
+    fn direct_step(
         &mut self,
         original: &dae::Dae,
-        held: Option<(HolonomicConstraint, usize, HolonomicStep)>,
+        allow_held: bool,
         observer: &mut impl ReductionObserver,
-    ) -> Result<Option<HolonomicRound>, StructuralError> {
+    ) -> Result<Option<DemotionStep>, StructuralError> {
         self.direct_round_number += 1;
         observer.observe(ReductionEvent::Round {
             lane: Lane::Direct,
@@ -1011,11 +1430,39 @@ impl HolonomicReductionState {
             self.current(original),
             self.residue,
             &self.manifold,
-            held.is_none(),
+            allow_held,
+            None,
             observer,
         )?;
         self.blocked = self.blocked.take().or(round.blocked);
-        match round.step {
+        Ok(round.step)
+    }
+
+    fn exhaust_direct(
+        &mut self,
+        original: &dae::Dae,
+        observer: &mut impl ReductionObserver,
+    ) -> Result<Option<HolonomicRound>, StructuralError> {
+        while let Some(step) = self.direct_step(original, true, observer)? {
+            match step {
+                DemotionStep::Sorted {
+                    dae,
+                    manifold,
+                    structural,
+                } => return sorted_holonomic_round(dae, manifold, structural).map(Some),
+                step @ DemotionStep::Reduced { .. } => self.accept_reduced(step.into()),
+            }
+        }
+        Ok(None)
+    }
+
+    fn direct_or_held(
+        &mut self,
+        original: &dae::Dae,
+        held: Option<(HolonomicConstraint, usize, HolonomicStep)>,
+        observer: &mut impl ReductionObserver,
+    ) -> Result<Option<HolonomicRound>, StructuralError> {
+        match self.direct_step(original, held.is_none(), observer)? {
             Some(DemotionStep::Sorted {
                 dae,
                 manifold,
@@ -1030,10 +1477,13 @@ impl HolonomicReductionState {
                     self.accept_held(held, observer);
                     Ok(None)
                 }
-                None => Ok(Some(HolonomicRound {
-                    step: None,
-                    blocked: self.blocked.take(),
-                })),
+                None => {
+                    self.discard_stalled(observer);
+                    Ok(Some(HolonomicRound {
+                        step: None,
+                        blocked: self.blocked.take(),
+                    }))
+                }
             },
         }
     }
@@ -1047,6 +1497,7 @@ impl From<DemotionStep> for HolonomicStep {
                 manifold,
                 residue,
                 error,
+                reusable: _,
             } => Self::Reduced {
                 dae,
                 manifold,
@@ -1113,9 +1564,20 @@ fn reduce_holonomic_constraint_with_observer(
     mut perturb_enumeration: impl FnMut(&mut Vec<HolonomicConstraint>),
     observer: &mut impl ReductionObserver,
 ) -> Result<HolonomicRound, StructuralError> {
-    let outcome = structural_analysis(model);
+    let mut outcome = structural_analysis(model);
+    let normalized = if matches!(outcome, Err(StructuralError::Singular { .. })) {
+        derivative_aliases::normalize_tensors(model)?
+    } else {
+        None
+    };
+    if let Some(normalized) = &normalized {
+        outcome = structural_analysis(normalized);
+    }
     let (residue, current_error) = match outcome {
-        Ok(_) => {
+        Ok(structural) => {
+            if let Some(normalized) = normalized {
+                return sorted_holonomic_round(normalized, Vec::new(), structural);
+            }
             return Ok(HolonomicRound {
                 step: None,
                 blocked: None,
@@ -1132,6 +1594,12 @@ fn reduce_holonomic_constraint_with_observer(
         },
     };
     let mut state = HolonomicReductionState::new(residue, current_error);
+    state.reduced = normalized;
+    if state.reduced.is_some()
+        && let Some(round) = state.exhaust_direct(model, observer)?
+    {
+        return Ok(round);
+    }
     loop {
         state.round_number += 1;
         observer.observe(ReductionEvent::Round {
@@ -1184,7 +1652,7 @@ fn select_dummy_states(
     StructuralError,
 > {
     loop {
-        let round = demote_direct_state_with_observer(&model, 0, &manifold, false, &mut ())?;
+        let round = demote_direct_state_with_observer(&model, 0, &manifold, false, None, &mut ())?;
         match round.step {
             Some(DemotionStep::Sorted {
                 dae,
@@ -1254,281 +1722,38 @@ fn manifold_scalar_is_state_only<'dae>(
     projected.is_ok() && valid && saw_state
 }
 
-/// What attempting one holonomic candidate against `model` found, mirroring
-/// [`DirectAttempt`]: every recorded event is already emitted by the time
-/// this returns.
-enum HolonomicAttempt {
-    Sorted {
-        dae: Box<dae::Dae>,
-        manifold: Vec<ManifoldConstraint>,
-        structural: PreparedStructuralAnalysis,
-    },
-    Accepted {
-        constraint: HolonomicConstraint,
-        residue: usize,
-        step: Box<HolonomicStep>,
-    },
-    Blocked(DiscardedInitialValue),
-    Rejected,
-}
-
-fn refused_holonomic_outcome(next: usize, residue: usize) -> AttemptOutcome<'static> {
-    debug_assert!(next >= residue);
-    if next == residue {
-        AttemptOutcome::Held { residue: next }
-    } else {
-        AttemptOutcome::Raised { residue: next }
-    }
-}
-
-fn residual_scalar_is_structurally_active<'dae>(
-    view: dae::DaeView<'dae>,
-    expression: dae::ExprId<'dae>,
-    scalar: usize,
-    domain_point: Option<(dae::DomainId<'dae>, &[i64])>,
-    cache: &mut rumoca_eval_dae::ScalarCoordinateProjectionCache<'dae>,
-) -> bool {
-    let mut active = false;
-    let projected = rumoca_eval_dae::for_each_scalar_coordinate_cached(
-        view,
-        expression,
-        scalar,
-        domain_point,
-        cache,
-        |coordinate, _| {
-            active |= matches!(
-                coordinate,
-                dae::CoordinateView::Derivative(_) | dae::CoordinateView::Algebraic(_)
-            );
-        },
-    );
-    projected.is_ok() && active
-}
-
-/// Whether the exact replacement for one holonomic owner still contributes a
-/// continuous unknown in at least one scalar equation it owns.
-///
-/// Differentiation can prove an expression admissible and nevertheless reduce
-/// it to an exact shaped zero once causal definitions are substituted. Such a
-/// residual is not a valid Pantelides replacement: retaining it would add an
-/// equation row that can never match an unknown. Check the rebuilt owner, not
-/// the source syntax, so this postcondition covers scalar residuals and compact
-/// structured families through the same scalar projection used by incidence.
-fn holonomic_replacement_is_structurally_active(
-    model: &dae::Dae,
-    constraint: &HolonomicConstraint,
-) -> bool {
-    model.inspect(|view| {
-        let Some(owner) = view.continuous_owners().nth(constraint.owner_ordinal) else {
-            return false;
-        };
-        let mut cache = rumoca_eval_dae::ScalarCoordinateProjectionCache::default();
-        match owner {
-            dae::ContinuousOwnerView::Residual { equation, .. } => {
-                let residual = equation.residual();
-                let Some(scalar_count) = view
-                    .expression(residual)
-                    .and_then(|expression| expression.value_type().scalar_count())
-                else {
-                    return false;
-                };
-                (0..scalar_count).any(|scalar| {
-                    residual_scalar_is_structurally_active(view, residual, scalar, None, &mut cache)
-                })
-            }
-            dae::ContinuousOwnerView::Structured { family, .. } => {
-                structured_replacement_is_active(view, family, constraint, &mut cache)
-            }
-        }
-    })
-}
-
-fn structured_replacement_is_active<'dae>(
-    view: dae::DaeView<'dae>,
-    family: dae::StructuredFamilyView<'dae>,
-    constraint: &HolonomicConstraint,
-    cache: &mut rumoca_eval_dae::ScalarCoordinateProjectionCache<'dae>,
-) -> bool {
-    let Some(body_ordinal) = constraint.body_ordinal else {
-        return false;
-    };
-    let Some(residual) = family.bodies().get(body_ordinal) else {
-        return false;
-    };
-    let Some(domain) = view.domain(family.domain()) else {
-        return false;
-    };
-    let structured = domain.structured();
-    (0..domain.scalar_count() as usize).any(|point| {
-        let Ok(Some(values)) = structured.index_tuple_at(point) else {
-            return false;
-        };
-        let Some(scalar) = family.scalar_view().body_scalar(point, domain.extents()) else {
-            return false;
-        };
-        residual_scalar_is_structurally_active(
-            view,
-            residual,
-            scalar,
-            Some((family.domain(), values.as_slice())),
-            cache,
-        )
-    })
-}
-
-/// Try one certificate, observing its identity and outcome. Every decision
-/// this makes is exactly the one the pre-observation code made at this same
-/// branch point.
-fn observe_discarded_holonomic_initial(
-    observer: &mut impl ReductionObserver,
-    identity: Identity,
-    discarded: &DiscardedInitialValue,
-) {
-    observer.observe(ReductionEvent::Attempt {
-        lane: Lane::Holonomic,
-        identity,
-        outcome: AttemptOutcome::WouldDiscardInitial {
-            variable: &discarded.variable,
-            span: discarded.span,
-        },
-    });
-}
-
-fn attempt_holonomic_candidate(
-    model: &dae::Dae,
-    residue: usize,
-    prior_manifold: &[ManifoldConstraint],
-    stated: &[u32],
-    constraint: HolonomicConstraint,
-    observer: &mut impl ReductionObserver,
-) -> Result<HolonomicAttempt, StructuralError> {
-    let identity = Identity::Holonomic(HolonomicIdentity::from(&constraint));
-    if let Some(discarded) = stated_initial_on_holonomic_manifold(model, stated, &constraint) {
-        observe_discarded_holonomic_initial(observer, identity, &discarded);
-        return Ok(HolonomicAttempt::Blocked(discarded));
-    }
-    let (rebuilt, manifold) = match rebuild_holonomic_constraint(model, &constraint, prior_manifold)
-    {
-        Ok(pair) => pair,
-        Err(error) => {
-            observer.observe(ReductionEvent::Attempt {
-                lane: Lane::Holonomic,
-                identity,
-                outcome: AttemptOutcome::NonSingularFailure { error: &error },
-            });
-            return Err(error);
-        }
-    };
-    if !holonomic_replacement_is_structurally_active(&rebuilt, &constraint) {
-        observer.observe(ReductionEvent::Attempt {
-            lane: Lane::Holonomic,
-            identity,
-            outcome: AttemptOutcome::WouldCreateVacuousResidual,
-        });
-        return Ok(HolonomicAttempt::Rejected);
-    }
-    let (next, retained_error, structural) = match structural_analysis(&rebuilt) {
-        Ok(structural) => (None, None, Some(structural)),
-        Err(error) => match unmatched_residue(&error) {
-            Some(next) if next <= residue => (Some(next), Some(error), None),
-            Some(next) => {
-                observer.observe(ReductionEvent::Attempt {
-                    lane: Lane::Holonomic,
-                    identity,
-                    outcome: refused_holonomic_outcome(next, residue),
-                });
-                return Ok(HolonomicAttempt::Rejected);
-            }
-            None => {
-                observer.observe(ReductionEvent::Attempt {
-                    lane: Lane::Holonomic,
-                    identity,
-                    outcome: AttemptOutcome::NonSingularFailure { error: &error },
-                });
-                return Ok(HolonomicAttempt::Rejected);
-            }
-        },
-    };
-    let discarded = discarded_initial_after_attempt(
-        model,
-        &rebuilt,
-        stated,
-        Lane::Holonomic,
-        identity,
-        observer,
-    )?;
-    if let Some(discarded) = discarded {
-        observe_discarded_holonomic_initial(observer, identity, &discarded);
-        return Ok(HolonomicAttempt::Blocked(discarded));
-    }
-    let Some(next) = next else {
-        observer.observe(ReductionEvent::Attempt {
-            lane: Lane::Holonomic,
-            identity,
-            outcome: AttemptOutcome::Sorted,
-        });
-        observer.observe(ReductionEvent::Selected {
-            lane: Lane::Holonomic,
-            identity,
-            residue_before: residue,
-            residue_after: None,
-        });
-        return Ok(HolonomicAttempt::Sorted {
-            dae: Box::new(rebuilt),
-            manifold,
-            structural: structural.expect("a sorted holonomic attempt retains its analysis"),
-        });
-    };
-    observer.observe(ReductionEvent::Attempt {
-        lane: Lane::Holonomic,
-        identity,
-        outcome: if next < residue {
-            AttemptOutcome::Reduced { residue: next }
-        } else {
-            AttemptOutcome::Held { residue: next }
-        },
-    });
-    Ok(HolonomicAttempt::Accepted {
-        constraint,
-        residue: next,
-        step: Box::new(HolonomicStep::Reduced {
-            dae: rebuilt,
-            manifold,
-            residue: next,
-            error: retained_error.expect("reduced candidate retains its proving error"),
-        }),
-    })
-}
-
-/// A stated state value that the current manifold projection certificate does
-/// not prove immutable.
-///
-/// MLS 3.6 §8.6 makes a `fixed = true` start an initialization equation. The
-/// retained manifold is projected after that initialization system settles,
-/// and today's projection certificate permits every state named by the
-/// manifold to move. Retaining the pin on the rewritten DAE is therefore not
-/// sufficient: projection could silently replace the stated value. Until the
-/// IR carries a separate initial-manifold plan that excludes initialized state
-/// owners, fail closed whenever this holonomic edge anchors a stated state.
-fn stated_initial_on_holonomic_manifold(
-    model: &dae::Dae,
-    stated: &[u32],
-    constraint: &HolonomicConstraint,
-) -> Option<DiscardedInitialValue> {
-    let variable = stated.iter().copied().find(|variable| {
-        constraint
-            .proof
-            .anchored_states
-            .binary_search(variable)
-            .is_ok()
+/// The pass's holonomic certificates in deterministic owner order, without
+/// owners already differentiated or lifts outside the overdetermined blocks.
+fn holonomic_candidates(
+    source: &ReductionSource<'_>,
+    differentiated_owners: &BTreeSet<HolonomicOwnerKey>,
+    perturb_enumeration: &mut impl FnMut(&mut Vec<HolonomicConstraint>),
+) -> Result<Vec<HolonomicConstraint>, StructuralError> {
+    let (mut candidates, incident) = source.inspect(|view, facts| {
+        let candidates = index_reduction_constraints(view, facts);
+        let incident = crate::overdetermined_block_variables(view)?;
+        Ok::<_, StructuralError>((candidates, incident))
     })?;
-    model.inspect(|view| {
-        let declaration = view.variable(view.variable_id(variable as usize)?)?;
-        Some(DiscardedInitialValue {
-            variable: declaration.name().as_str().to_string(),
-            span: declaration.declaration().span(),
-        })
-    })
+    perturb_enumeration(&mut candidates);
+    candidates.retain(|candidate| {
+        !differentiated_owners.contains(&candidate.owner_key())
+            && candidate
+                .lifted_algebraic
+                .is_none_or(|variable| incident.contains(&variable))
+    });
+    candidates.sort_by_key(|candidate| {
+        (
+            usize::from(candidate.lifted_algebraic.is_some()),
+            candidate.owner_ordinal,
+            candidate.body_ordinal,
+            candidate
+                .proof
+                .component
+                .as_ref()
+                .map(|component| component.scalar),
+        )
+    });
+    Ok(candidates)
 }
 
 /// Try every current certificate in deterministic owner order, preferring a
@@ -1537,33 +1762,15 @@ fn holonomic_pass_with_observer(
     model: &dae::Dae,
     residue: usize,
     prior_manifold: &[ManifoldConstraint],
-    differentiated_owners: &mut BTreeSet<(usize, Option<usize>, Option<u32>)>,
+    differentiated_owners: &mut BTreeSet<HolonomicOwnerKey>,
     perturb_enumeration: &mut impl FnMut(&mut Vec<HolonomicConstraint>),
     observer: &mut impl ReductionObserver,
 ) -> Result<HolonomicPass, StructuralError> {
-    let stated = model.inspect(represented_initial_values);
-    let (mut candidates, incident) = model.inspect(|view| {
-        let candidates = index_reduction_constraints(view);
-        let incident = crate::overdetermined_block_variables(view)?;
-        Ok::<_, StructuralError>((candidates, incident))
-    })?;
-    perturb_enumeration(&mut candidates);
-    candidates.retain(|candidate| {
-        !differentiated_owners.contains(&(
-            candidate.owner_ordinal,
-            candidate.body_ordinal,
-            candidate.lifted_algebraic,
-        )) && candidate
-            .lifted_algebraic
-            .is_none_or(|variable| incident.contains(&variable))
-    });
-    candidates.sort_by_key(|candidate| {
-        (
-            usize::from(candidate.lifted_algebraic.is_some()),
-            candidate.owner_ordinal,
-            candidate.body_ordinal,
-        )
-    });
+    let source = ReductionSource::new(model);
+    let stated = model.inspect(stated_initial_variables);
+    // The pass model's incidence, reused by every candidate's analysis.
+    let (_, base) = structural_analysis_capturing(model, None, None);
+    let candidates = holonomic_candidates(&source, differentiated_owners, perturb_enumeration)?;
     observer.observe(ReductionEvent::Candidates {
         lane: Lane::Holonomic,
         group: CandidateGroup::Holonomic,
@@ -1572,13 +1779,25 @@ fn holonomic_pass_with_observer(
     let mut reduced: Option<(HolonomicConstraint, usize, HolonomicStep)> = None;
     let mut held: Option<(HolonomicConstraint, usize, HolonomicStep)> = None;
     let mut blocked = None;
+    // Once a candidate reduces, the pass returns it and drops every held or
+    // blocked candidate, so only a sorting one could still change the choice.
+    let mut unsortable = Vec::new();
+    let mut screen = None;
     for constraint in candidates {
+        if reduced.is_some()
+            && let Some(base) = base.as_ref()
+            && holonomic_cannot_sort(&source, base, &mut screen, &constraint, residue)
+        {
+            unsortable.push(constraint);
+            continue;
+        }
         let attempt = attempt_holonomic_candidate(
-            model,
+            &source,
             residue,
             prior_manifold,
             &stated,
             constraint,
+            base.as_ref(),
             observer,
         )?;
         match attempt {
@@ -1615,13 +1834,17 @@ fn holonomic_pass_with_observer(
             HolonomicAttempt::Rejected => {}
         }
     }
+    #[cfg(debug_assertions)]
+    candidate_choice::check_unsortable(
+        &source,
+        (residue, prior_manifold, &stated, base.as_ref()),
+        unsortable,
+    )?;
+    #[cfg(not(debug_assertions))]
+    drop(unsortable);
     match reduced {
         Some((constraint, residue_after, step)) => {
-            differentiated_owners.insert((
-                constraint.owner_ordinal,
-                constraint.body_ordinal,
-                constraint.lifted_algebraic,
-            ));
+            differentiated_owners.insert(constraint.owner_key());
             observer.observe(ReductionEvent::Selected {
                 lane: Lane::Holonomic,
                 identity: Identity::Holonomic(HolonomicIdentity::from(&constraint)),
@@ -1656,4 +1879,33 @@ fn unmatched_residue(error: &StructuralError) -> Option<usize> {
         return None;
     };
     Some((n_equations - n_matched) + (n_unknowns - n_matched))
+}
+
+/// Whether `constraint` provably cannot sort the pass model: first by the
+/// changed-row count bound, then by the graph-only matching of the rows its
+/// replacement leaves unchanged. The screen's matching is built on first use
+/// and shared by the rest of the pass.
+fn holonomic_cannot_sort<'a>(
+    source: &ReductionSource<'_>,
+    base: &'a crate::incidence::ReusableIncidence,
+    screen: &mut Option<sortability::SortabilityScreen<'a>>,
+    constraint: &HolonomicConstraint,
+    residue: usize,
+) -> bool {
+    if source.demotion_rows.holonomic_cannot_sort(
+        constraint.owner_ordinal,
+        constraint.lifted_algebraic,
+        base.rows().len(),
+        residue,
+    ) {
+        return true;
+    }
+    let readers = constraint
+        .lifted_algebraic
+        .map_or(&[][..], |variable| source.demotion_rows.owners(variable));
+    screen
+        .get_or_insert_with(|| {
+            sortability::SortabilityScreen::new(base, source.demotion_rows.unknown_count())
+        })
+        .cannot_sort(readers.iter().copied().chain([constraint.owner_ordinal]))
 }

@@ -45,7 +45,16 @@ fn executable_publication_deduplicates_a_real_scheduled_event() {
         None,
     )
     .unwrap();
-    let options = batch_session_options(0.0, 1.0, 1e-9, 1e-11, 0.1, None).unwrap();
+    let options = batch_session_options(
+        &rumoca_ir_solve::fmi::RootLocationPlan::STANDARD,
+        0.0,
+        1.0,
+        1e-9,
+        1e-11,
+        0.1,
+        None,
+    )
+    .unwrap();
     let mut cursor = batch_output_cursor(&options).unwrap();
     let host = retained
         .into_lease_with_observer(options, Some(Box::new(Observer(rows.clone(), effects))))

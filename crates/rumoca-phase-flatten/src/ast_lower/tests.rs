@@ -355,8 +355,7 @@ fn interval_requires_the_exact_predefined_declaration_identity() {
     let context = LoweringContext {
         predefined_intrinsics: PredefinedIntrinsicIds {
             identities,
-            assertion: None,
-            array_constructor: None,
+            ..PredefinedIntrinsicIds::default()
         },
         ..LoweringContext::default()
     };

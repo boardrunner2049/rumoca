@@ -6,6 +6,11 @@
 // here.
 mod assignment_shape;
 mod dependency;
+mod materialization;
+mod projection;
+mod shared_schedule;
+mod source_outputs;
+mod staged_execution;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,15 +21,25 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(test)]
 use assignment_shape::canonical_assignment_shape_for_output;
 use assignment_shape::non_causal_assignment_operation;
+pub use assignment_shape::tensor_affine::AffineTensorProjection;
 pub use assignment_shape::{
-    derive_target_assignment_shape_for_output, derive_target_assignment_shapes,
+    OutputYReads, derive_target_assignment_shape_for_output, derive_target_assignment_shapes,
+    isolates_through_zero_coefficient, isolator_coefficient_proof, output_y_reads,
 };
 pub use dependency::ScalarProgramYDependency;
-use dependency::{assignment_y_dependencies_for_shapes, shape_value_registers};
+use dependency::assignment_y_dependencies_for_shapes;
+pub use materialization::{
+    IsolatedDivisor, IsolatedTerm, IsolatedValue, eval_isolated_value,
+    materialize_target_assignment, register_coefficient,
+};
+pub use shared_schedule::SharedAssignmentSchedule;
+pub use staged_execution::{
+    RefreshStageSchedule, StagedRefreshRefusal, StagedRefreshStep, projection_seed_rescue_targets,
+};
 
 use crate::{
-    AlgebraicProjectionPlan, BinaryOp, ComputeBlock, ComputeNode, LinearOp, ScalarProgramBlock,
-    TargetAssignmentShape, UnaryOp,
+    AlgebraicProjectionPlan, ComputeBlock, ComputeNode, LinearOp, ScalarProgramBlock,
+    TargetAssignmentShape,
 };
 
 /// Exact canonical scalar program inside one tensor-aware [`crate::ComputeBlock`].
@@ -362,6 +377,33 @@ impl RefreshPlan {
             .iter()
             .any(|stage| matches!(stage, RefreshStage::ProjectionBlock { .. }))
     }
+
+    /// Whether the ordered value stages alone settle this plan.
+    ///
+    /// Construction binds each projection stage to its complete BLT block, and
+    /// no later block may invalidate a residual row of an earlier one. Its
+    /// seeds are optional guesses; Newton solves every block coordinate even
+    /// when a particular residual cannot be isolated as an assignment. Every
+    /// executor of the staged schedule (the linked ME kernel and generated
+    /// components) reads this one certificate.
+    #[must_use]
+    pub fn value_stage_schedule_is_certified(
+        &self,
+        structural: &crate::ContinuousStructuralArtifacts,
+    ) -> bool {
+        let blocks = structural.algebraic_projection();
+        self.simultaneous_block_indices.len() == self.simultaneous_plan.blocks.len()
+            && !self.value_stages.is_empty()
+            && self
+                .simultaneous_block_indices
+                .iter()
+                .all(|&index| blocks.get(index).is_some())
+            && self
+                .simultaneous_block_indices
+                .iter()
+                .skip(1)
+                .all(|&index| structural.algebraic_invalidates_earlier(index) == Some(false))
+    }
 }
 
 /// Construction-issued proof that `remainder` is the exact ordered portion of
@@ -371,9 +413,43 @@ pub struct RefreshRemainderRelation {
     remainder: RefreshPlan,
 }
 
+/// Who orders the continuous-time evaluations of an executor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum RefreshExecutor {
+    /// An importer-driven component (FMU Model Exchange): trial evaluations
+    /// arrive in an order the model does not control.
+    ImporterDriven,
+    /// An integrator-driven run (native BDF or RK): the integrator fixes the
+    /// evaluation order.
+    #[default]
+    IntegratorDriven,
+}
+
+/// Where a continuous-time refresh starts its Newton solves (SPEC_0044
+/// ME-PROJ-005). Every executor reads this rule from the refresh owners
+/// instead of choosing its own warm start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum RefreshSeedRule {
+    /// From the committed seed: the settled coordinate at Event Mode exit or,
+    /// after a completed integrator step, the derivative refresh at the
+    /// accepted point from the previous seed. The refresh is then a function of
+    /// (t, x, p, relation memory, committed seed), never of the trial
+    /// evaluations since the last accepted point.
+    ///
+    /// Known cost: one refresh per accepted step, which a run of many short
+    /// steps pays in full (CauerLowPassSC +24%); a seed predictor from
+    /// committed data is the open item that may recover it.
+    CommittedAcceptedPoint,
+    /// From the previous evaluation, whose order the integrator fixes, so
+    /// the run is deterministic for a fixed integrator.
+    IntegratorWarmStart,
+}
+
 /// Complete construction-issued continuous refresh inventory for one model.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ContinuousRefreshOwners {
+    #[serde(skip)]
+    projection_affinities: BTreeMap<usize, bool>,
     algebraic: RefreshPlan,
     derivative: RefreshPlan,
     root: RefreshPlan,
@@ -418,6 +494,7 @@ impl AlgebraicRefreshRow {
         }
         if draft
             .assignment_shape
+            .as_ref()
             .is_some_and(|shape| shape.target_y_index() != draft.target_index)
         {
             return refresh_error(
@@ -425,10 +502,10 @@ impl AlgebraicRefreshRow {
             );
         }
         if draft.direct_assignment_certified
-            && !matches!(
-                draft.assignment_shape,
-                Some(TargetAssignmentShape::Direct { .. })
-            )
+            && !draft
+                .assignment_shape
+                .as_ref()
+                .is_some_and(TargetAssignmentShape::is_direct)
         {
             return refresh_error(
                 "continuous refresh direct certificate has no direct assignment shape".to_string(),
@@ -489,8 +566,8 @@ impl AlgebraicRefreshRow {
         self.assignment_target
     }
 
-    pub const fn assignment_shape(&self) -> Option<TargetAssignmentShape> {
-        self.assignment_shape
+    pub const fn assignment_shape(&self) -> Option<&TargetAssignmentShape> {
+        self.assignment_shape.as_ref()
     }
 
     pub const fn direct_assignment_certified(&self) -> bool {
@@ -551,6 +628,30 @@ impl<'de> Deserialize<'de> for ContinuousRefreshOwners {
 }
 
 impl ContinuousRefreshOwners {
+    /// The warm-start rule of one executor class: an importer-driven
+    /// component refreshes from the committed seed, since the order of its
+    /// trial evaluations is not the model's; an integrator-driven run keeps
+    /// its integrator's warm start, which that fixed order makes deterministic.
+    #[must_use]
+    pub const fn seed_rule(&self, executor: RefreshExecutor) -> RefreshSeedRule {
+        match executor {
+            RefreshExecutor::ImporterDriven => RefreshSeedRule::CommittedAcceptedPoint,
+            RefreshExecutor::IntegratorDriven => RefreshSeedRule::IntegratorWarmStart,
+        }
+    }
+
+    /// Owners rebuilt from wire-visible plans through the same checked
+    /// construction decoding uses.
+    pub(crate) fn from_wire_plans(
+        algebraic: RefreshPlan,
+        derivative: RefreshPlan,
+        root: RefreshPlan,
+        event: RefreshPlan,
+        clock_events: Vec<RefreshPlan>,
+    ) -> Result<Self, ContinuousRefreshConstructionError> {
+        Self::checked(algebraic, derivative, root, event, clock_events)
+    }
+
     #[must_use]
     pub const fn is_issued(&self) -> bool {
         self.root_after_derivative.is_some()
@@ -608,6 +709,7 @@ impl ContinuousRefreshOwners {
             algebraic_remainder_owner,
         )?;
         Ok(Self {
+            projection_affinities: BTreeMap::new(),
             algebraic,
             derivative,
             root,
@@ -640,16 +742,22 @@ impl ContinuousRefreshOwners {
         &self,
         implicit_rhs: &ComputeBlock,
     ) -> Result<(), ContinuousRefreshConstructionError> {
+        let outputs = source_outputs::SourceOutputs::new(implicit_rhs)?;
         for (label, plan) in [
             ("algebraic", &self.algebraic),
             ("derivative", &self.derivative),
             ("root", &self.root),
             ("event", &self.event),
         ] {
-            validate_refresh_sources(label, plan, implicit_rhs)?;
+            validate_refresh_sources(label, plan, implicit_rhs, &outputs)?;
         }
         for (clock, plan) in self.clock_events.iter().enumerate() {
-            validate_refresh_sources(&format!("clock event {clock}"), plan, implicit_rhs)?;
+            validate_refresh_sources(
+                &format!("clock event {clock}"),
+                plan,
+                implicit_rhs,
+                &outputs,
+            )?;
         }
         Ok(())
     }
@@ -662,59 +770,61 @@ impl ContinuousRefreshOwners {
             return Ok(());
         }
         self.validate_sources_against(implicit_rhs)?;
+        // The first exact program owning each row, with the row's position in
+        // it: one pass over the inventory instead of one search per row.
+        let mut owned = BTreeMap::new();
+        for program in &self.exact_assignment_programs {
+            for (position, owner) in program.row_owners.iter().enumerate() {
+                owned.entry(*owner).or_insert((program, position));
+            }
+        }
         for plan in [&self.algebraic, &self.derivative, &self.root, &self.event]
             .into_iter()
             .chain(self.clock_events.iter())
         {
             for row in &plan.rows {
-                self.validate_row_assignment_program(row)?;
+                validate_row_assignment_program(row, owned.get(&row.owner_id).copied())?;
             }
         }
         Ok(())
     }
+}
 
-    /// Checks that one refresh row and the exact assignment program inventory
-    /// agree on whether the row replays as an exact assignment.
-    fn validate_row_assignment_program(
-        &self,
-        row: &AlgebraicRefreshRow,
-    ) -> Result<(), ContinuousRefreshConstructionError> {
-        let program = self
-            .exact_assignment_programs
-            .iter()
-            .find(|program| program.row_owners.contains(&row.owner_id));
-        if !row.exact_assignment_certified {
-            if program.is_some() {
-                return refresh_error(
-                    "non-exact continuous refresh row owns an exact assignment program".to_string(),
-                );
-            }
-            return Ok(());
-        }
-        let Some(program) = program else {
+/// Checks that one refresh row and the exact assignment program inventory
+/// agree on whether the row replays as an exact assignment: `owned` is the
+/// first exact program owning the row, with the row's position in it.
+fn validate_row_assignment_program(
+    row: &AlgebraicRefreshRow,
+    owned: Option<(&ExactRefreshAssignmentProgram, usize)>,
+) -> Result<(), ContinuousRefreshConstructionError> {
+    let program = owned.map(|(program, _)| program);
+    if !row.exact_assignment_certified {
+        if program.is_some() {
             return refresh_error(
-                "exact continuous refresh row has no constructed assignment program".to_string(),
-            );
-        };
-        let Some(position) = program
-            .row_owners
-            .iter()
-            .position(|owner| *owner == row.owner_id)
-        else {
-            return refresh_error(
-                "exact continuous refresh program lost its row owner".to_string(),
-            );
-        };
-        if program.source != row.source
-            || program.target_indices.get(position) != Some(&row.target_index)
-        {
-            return refresh_error(
-                "exact continuous refresh program does not replay its row owner".to_string(),
+                "non-exact continuous refresh row owns an exact assignment program".to_string(),
             );
         }
-        Ok(())
+        return Ok(());
     }
+    let Some(program) = program else {
+        return refresh_error(
+            "exact continuous refresh row has no constructed assignment program".to_string(),
+        );
+    };
+    let Some((_, position)) = owned else {
+        return refresh_error("exact continuous refresh program lost its row owner".to_string());
+    };
+    if program.source != row.source
+        || program.target_indices.get(position) != Some(&row.target_index)
+    {
+        return refresh_error(
+            "exact continuous refresh program does not replay its row owner".to_string(),
+        );
+    }
+    Ok(())
+}
 
+impl ContinuousRefreshOwners {
     pub fn exact_assignment_program(
         &self,
         id: ExactRefreshAssignmentProgramId,
@@ -722,6 +832,11 @@ impl ContinuousRefreshOwners {
         self.exact_assignment_programs
             .iter()
             .find(|program| program.id == id)
+    }
+
+    /// Every issued exact assignment schedule.
+    pub fn exact_assignment_schedules(&self) -> &[ExactRefreshAssignmentSchedule] {
+        &self.exact_assignment_schedules
     }
 
     pub fn exact_assignment_schedule(
@@ -758,7 +873,11 @@ impl ContinuousRefreshOwners {
         implicit_rhs: &ComputeBlock,
     ) -> Result<(), ContinuousRefreshConstructionError> {
         self.validate_canonical_row_owners()?;
+        self.projection_affinities =
+            crate::affinity::projection_affinities(implicit_rhs, &self.algebraic);
+        self.omit_affine_projection_seeds();
         let Self {
+            projection_affinities: _,
             algebraic,
             derivative,
             root,
@@ -800,12 +919,21 @@ impl ContinuousRefreshOwners {
                 plan,
             )?;
         }
-        if !exact_assignment_stages_are_causal(
-            algebraic,
-            exact_assignment_programs,
-            exact_assignment_schedules,
-        ) {
-            return refresh_error("algebraic exact-assignment stages are non-causal".to_string());
+        // A remainder consumes its predecessor's settlement relation. Check
+        // the complete owners from which that ordered relation is derived.
+        for plan in [&*algebraic, &*derivative, &*root, &*event]
+            .into_iter()
+            .chain(clock_events.iter())
+        {
+            if !exact_assignment_stages_are_causal(
+                plan,
+                exact_assignment_programs,
+                exact_assignment_schedules,
+            ) {
+                return refresh_error(
+                    "continuous exact-assignment stages are non-causal".to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -870,11 +998,10 @@ fn validate_refresh_sources(
     label: &str,
     plan: &RefreshPlan,
     implicit_rhs: &ComputeBlock,
+    outputs: &source_outputs::SourceOutputs<'_>,
 ) -> Result<(), ContinuousRefreshConstructionError> {
     for row in &plan.rows {
-        let Some(equation) =
-            scalar_source_output_index(implicit_rhs, row.source, row.output_offset)?
-        else {
+        let Some(equation) = outputs.get(row.source, row.output_offset) else {
             return refresh_error(format!(
                 "{label} refresh row refers to a missing canonical scalar-program output"
             ));
@@ -908,60 +1035,16 @@ fn validate_refresh_assignment_certificate(
         ));
     }
     let exact = derived.is_some() && !program.iter().any(non_causal_assignment_operation);
-    let direct = exact && matches!(derived, Some(TargetAssignmentShape::Direct { .. }));
+    let direct = exact
+        && derived
+            .as_ref()
+            .is_some_and(TargetAssignmentShape::is_direct);
     if row.exact_assignment_certified != exact || row.direct_assignment_certified != direct {
         return refresh_error(format!(
             "{label} refresh row exact/direct certificate disagrees with its canonical source"
         ));
     }
     Ok(())
-}
-
-fn scalar_source_output_index(
-    block: &ComputeBlock,
-    source: RefreshScalarProgramSource,
-    output_offset: usize,
-) -> Result<Option<usize>, ContinuousRefreshConstructionError> {
-    let source_node = usize::try_from(source.node).map_err(|_| refresh_source_overflow("node"))?;
-    let source_program =
-        usize::try_from(source.program).map_err(|_| refresh_source_overflow("program"))?;
-    let mut output_cursor = 0usize;
-    for (node_index, node) in block.nodes.iter().enumerate() {
-        if node_index == source_node {
-            let ComputeNode::ScalarPrograms(programs) = node else {
-                return Ok(None);
-            };
-            let Some(program) = programs.programs().get(source_program) else {
-                return Ok(None);
-            };
-            if output_offset >= crate::ScalarProgramBlock::program_output_count(program) {
-                return Ok(None);
-            }
-            let preceding_outputs = programs
-                .programs()
-                .iter()
-                .take(source_program)
-                .try_fold(0usize, |count, program| {
-                    count.checked_add(crate::ScalarProgramBlock::program_output_count(program))
-                })
-                .ok_or_else(|| refresh_source_overflow("output ordinal"))?;
-            let ordinal = preceding_outputs
-                .checked_add(output_offset)
-                .ok_or_else(|| refresh_source_overflow("output ordinal"))?;
-            let outputs = programs
-                .compute_block_output_indices(
-                    "continuous.refresh_owners",
-                    node_index,
-                    output_cursor,
-                )
-                .map_err(|error| ContinuousRefreshConstructionError {
-                    reason: error.to_string(),
-                })?;
-            return Ok(outputs.get(ordinal).copied());
-        }
-        output_cursor = advance_output_cursor(node, node_index, output_cursor)?;
-    }
-    Ok(None)
 }
 
 fn construct_exact_assignment_program(
@@ -986,6 +1069,7 @@ fn construct_exact_assignment_program(
         .iter()
         .map(|row| {
             row.assignment_shape
+                .clone()
                 .ok_or_else(|| ContinuousRefreshConstructionError {
                     reason: "exact continuous refresh row has no assignment shape".to_string(),
                 })
@@ -1054,22 +1138,15 @@ fn materialize_exact_assignment_program(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let mut builder = ExactAssignmentProgramBuilder::new(&mut operations).ok_or_else(|| {
-        ContinuousRefreshConstructionError {
-            reason: "exact continuous refresh assignment program overflows registers".to_string(),
-        }
-    })?;
-    for shape in owner.assignment_shapes.iter().copied() {
-        let result =
-            builder
-                .materialize(shape)
-                .ok_or_else(|| ContinuousRefreshConstructionError {
+    for shape in &owner.assignment_shapes {
+        let (result, _) =
+            materialize_target_assignment(shape, &mut operations).ok_or_else(|| {
+                ContinuousRefreshConstructionError {
                     reason: "exact continuous refresh assignment program overflows registers"
                         .to_string(),
-                })?;
-        builder
-            .operations
-            .push(LinearOp::StoreOutput { src: result });
+                }
+            })?;
+        operations.push(LinearOp::StoreOutput { src: result });
     }
     let provenance = rumoca_core::ProvenanceSpan::new(span, "continuous refresh assignment")
         .map_err(|error| ContinuousRefreshConstructionError {
@@ -1113,14 +1190,13 @@ fn exact_rows_can_commit_together(
     };
     let dependencies = ScalarProgramYDependency::new(program);
     for row in rows {
-        let Some(shape) = row.assignment_shape else {
+        let Some(shape) = row.assignment_shape.as_ref() else {
             return Ok(false);
         };
         for other in rows {
             if other.owner_id != row.owner_id
-                && shape_value_registers(shape)
-                    .into_iter()
-                    .flatten()
+                && shape
+                    .value_registers()
                     .any(|register| dependencies.depends_on(register, other.target_index))
             {
                 return Ok(false);
@@ -1128,126 +1204,6 @@ fn exact_rows_can_commit_together(
         }
     }
     Ok(true)
-}
-
-struct ExactAssignmentProgramBuilder<'a> {
-    operations: &'a mut Vec<LinearOp>,
-    next_register: u32,
-}
-
-impl<'a> ExactAssignmentProgramBuilder<'a> {
-    fn new(operations: &'a mut Vec<LinearOp>) -> Option<Self> {
-        let next_register = operations
-            .iter()
-            .filter_map(LinearOp::dst_register)
-            .max()
-            .map_or(Some(0), |register| register.checked_add(1))?;
-        Some(Self {
-            operations,
-            next_register,
-        })
-    }
-
-    fn materialize(&mut self, shape: TargetAssignmentShape) -> Option<u32> {
-        match shape {
-            TargetAssignmentShape::Direct { expr_reg, .. } => Some(expr_reg),
-            TargetAssignmentShape::Affine {
-                offset_reg,
-                coefficient_reg,
-                offset_scale,
-                coefficient_scale,
-                ..
-            } => self.affine(offset_reg, coefficient_reg, offset_scale, coefficient_scale),
-            TargetAssignmentShape::AffineResidual {
-                target_reg,
-                residual_reg,
-                coefficient,
-                ..
-            } => self.affine_residual(target_reg, residual_reg, coefficient),
-        }
-    }
-
-    fn affine(
-        &mut self,
-        offset: u32,
-        coefficient: Option<u32>,
-        offset_scale: f64,
-        coefficient_scale: f64,
-    ) -> Option<u32> {
-        let offset_scale_reg = self.allocate()?;
-        let scaled_offset = self.allocate()?;
-        let coefficient_scale_reg = self.allocate()?;
-        let scaled_coefficient = self.allocate()?;
-        let negated_offset = self.allocate()?;
-        let result = self.allocate()?;
-        self.operations.push(LinearOp::Const {
-            dst: offset_scale_reg,
-            value: offset_scale,
-        });
-        self.operations.push(LinearOp::Binary {
-            dst: scaled_offset,
-            op: BinaryOp::Mul,
-            lhs: offset_scale_reg,
-            rhs: offset,
-        });
-        self.operations.push(LinearOp::Const {
-            dst: coefficient_scale_reg,
-            value: coefficient_scale,
-        });
-        self.operations.push(match coefficient {
-            Some(coefficient) => LinearOp::Binary {
-                dst: scaled_coefficient,
-                op: BinaryOp::Mul,
-                lhs: coefficient_scale_reg,
-                rhs: coefficient,
-            },
-            None => LinearOp::Move {
-                dst: scaled_coefficient,
-                src: coefficient_scale_reg,
-            },
-        });
-        self.operations.push(LinearOp::Unary {
-            dst: negated_offset,
-            op: UnaryOp::Neg,
-            arg: scaled_offset,
-        });
-        self.operations.push(LinearOp::Binary {
-            dst: result,
-            op: BinaryOp::Div,
-            lhs: negated_offset,
-            rhs: scaled_coefficient,
-        });
-        Some(result)
-    }
-
-    fn affine_residual(&mut self, target: u32, residual: u32, coefficient: f64) -> Option<u32> {
-        let coefficient_reg = self.allocate()?;
-        let correction = self.allocate()?;
-        let result = self.allocate()?;
-        self.operations.push(LinearOp::Const {
-            dst: coefficient_reg,
-            value: coefficient,
-        });
-        self.operations.push(LinearOp::Binary {
-            dst: correction,
-            op: BinaryOp::Div,
-            lhs: residual,
-            rhs: coefficient_reg,
-        });
-        self.operations.push(LinearOp::Binary {
-            dst: result,
-            op: BinaryOp::Sub,
-            lhs: target,
-            rhs: correction,
-        });
-        Some(result)
-    }
-
-    fn allocate(&mut self) -> Option<u32> {
-        let register = self.next_register;
-        self.next_register = self.next_register.checked_add(1)?;
-        Some(register)
-    }
 }
 
 fn advance_output_cursor(
@@ -1775,6 +1731,7 @@ fn validate_refresh_row(
 ) -> Result<(), ContinuousRefreshConstructionError> {
     if row
         .assignment_shape
+        .as_ref()
         .is_some_and(|shape| shape.target_y_index() != row.target_index)
     {
         return refresh_error(format!(

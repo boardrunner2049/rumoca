@@ -242,6 +242,52 @@ fn nested_call_preserves_function_produced_array_shape() {
     assert_eq!(slot_value(&probe.report, "der(x[2])"), 9.0);
 }
 
+/// MLS §12.2 / §4.4.2: the element values may vary with time while each
+/// call's dimensions remain known, including unequal rectangular axes.
+#[test]
+fn nested_size_extents_preserve_each_calls_shape_and_runtime_values() {
+    let source = r#"
+function takeDiagonal
+  input Real A[:,:];
+  output Real y[min(size(A,1),size(A,2))];
+algorithm
+  for i in 1:size(y,1) loop
+    y[i] := A[i,i];
+  end for;
+end takeDiagonal;
+
+model RectangularDiagonals
+  parameter Integer A = 99;
+  Real wide[2];
+  Real tall[2];
+  Real square[4];
+equation
+  wide = takeDiagonal([time,2,3,4,5; 6,7,8,9,10]);
+  tall = takeDiagonal([10,11; 12,13; 14,15; 16,17; 18,19]);
+  square = takeDiagonal([time,0,0,0; 0,2,0,0; 0,0,3,0; 0,0,0,4]);
+end RectangularDiagonals;
+"#;
+    let compiled = Compiler::new()
+        .model("RectangularDiagonals")
+        .compile_str(source, "RectangularDiagonals.mo")
+        .expect("min(size(A,1),size(A,2)) is known at each call");
+    let probe = eval_dae_at(&compiled.dae, &SimOptions::default(), &[], 2.0)
+        .expect("rectangular function calls lower and evaluate");
+    assert!(probe.report.error.is_none(), "{:?}", probe.report.error);
+    for (name, expected) in [
+        ("wide[1]", 2.0),
+        ("wide[2]", 7.0),
+        ("tall[1]", 10.0),
+        ("tall[2]", 13.0),
+        ("square[1]", 2.0),
+        ("square[2]", 2.0),
+        ("square[3]", 3.0),
+        ("square[4]", 4.0),
+    ] {
+        assert_eq!(slot_value(&probe.report, name), expected, "{name}");
+    }
+}
+
 #[test]
 fn observed_scalar_field_lowers_record_function_matrix_slice_assignments() {
     let compiled = Compiler::new()
@@ -470,7 +516,8 @@ fn incomplete_record_output_fails_before_dae_construction() {
         .compile_str(&source, "IncompleteRecord.mo")
         .expect_err("an incomplete record result must not construct a DAE");
     assert!(
-        error.to_string().contains("leaves scalar 1 undefined"),
+        error.to_string().contains("scalar 1 of `result.scalar`")
+            && error.to_string().contains("never assigned"),
         "unexpected diagnostic: {error}"
     );
 }

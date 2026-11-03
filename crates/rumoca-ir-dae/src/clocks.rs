@@ -43,6 +43,13 @@ impl ClockTransferKind {
 pub(crate) enum ClockKind {
     Periodic(PeriodicClockSchedule),
     Triggered(u32),
+    /// MLS §16.5.2 `shiftSample(u, counter)` of an event clock: the clock
+    /// `base` without its first `counter` ticks, ticking on `condition`.
+    Shifted {
+        base: u32,
+        counter: u32,
+        condition: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -73,6 +80,14 @@ pub(crate) struct ClockOwnershipEntry {
 pub enum ClockOperation<'dae> {
     Periodic(&'dae PeriodicClockSchedule),
     Triggered(ConditionId<'dae>),
+    /// MLS §16.5.2 `shiftSample(u, counter)` of the event clock `base`
+    /// (never itself shifted): it ticks at every tick of `base` after the
+    /// first `counter`, which `condition` selects.
+    Shifted {
+        base: ClockId<'dae>,
+        counter: u32,
+        condition: ConditionId<'dae>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +198,43 @@ impl<'dae> Clocks<'_, 'dae> {
             .get(condition.index() as usize)
             .ok_or_else(|| unknown("condition", condition.index(), provenance))?;
         self.insert(ClockKind::Triggered(condition.index()), provenance)
+    }
+
+    /// The MLS §16.5.2 `shiftSample(base, counter)` of the event clock `base`,
+    /// whose ticks after the first `counter` of `base` are selected by
+    /// `condition`. A shift of a shifted clock composes onto its base, so
+    /// `base` here is always an unshifted event clock.
+    pub fn shifted(
+        &mut self,
+        base: ClockId<'dae>,
+        counter: u32,
+        condition: ConditionId<'dae>,
+        provenance: DaeProvenance,
+    ) -> Result<ClockId<'dae>, DaeConstructionError> {
+        check_provenance(self.source_map, provenance)?;
+        let entry = self
+            .storage
+            .clocks
+            .get(base.index() as usize)
+            .ok_or_else(|| unknown("clock", base.index(), provenance))?;
+        if !matches!(entry.kind, ClockKind::Triggered(_)) || counter == 0 {
+            return Err(DaeConstructionError::InvalidClockedOperand {
+                operator: "shiftSample of an event clock",
+                span: provenance.span(),
+            });
+        }
+        self.storage
+            .conditions
+            .get(condition.index() as usize)
+            .ok_or_else(|| unknown("condition", condition.index(), provenance))?;
+        self.insert(
+            ClockKind::Shifted {
+                base: base.index(),
+                counter,
+                condition: condition.index(),
+            },
+            provenance,
+        )
     }
 
     pub fn own_discrete_real(

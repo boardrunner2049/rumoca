@@ -282,6 +282,7 @@ pub(super) const fn origin_name(origin: dae::VariableOrigin) -> &'static str {
 pub(super) const fn event_name(operation: dae::EventActionOperation<'_>) -> &'static str {
     match operation {
         dae::EventActionOperation::Assert { .. } => "assert",
+        dae::EventActionOperation::Warning { .. } => "warning",
         dae::EventActionOperation::Terminate { .. } => "terminate",
         dae::EventActionOperation::Reinitialize { .. } => "reinitialize",
     }
@@ -747,7 +748,8 @@ pub(super) fn lower_builtin_arguments(
         | dae::PureBuiltin::Transpose
         | dae::PureBuiltin::Diagonal
         | dae::PureBuiltin::OuterProduct
-        | dae::PureBuiltin::Skew => {
+        | dae::PureBuiltin::Skew
+        | dae::PureBuiltin::LinearSolve => {
             return Err(unsupported(
                 "builtin",
                 format!("builtin `{builtin:?}` has no scalar GALEC mapping"),

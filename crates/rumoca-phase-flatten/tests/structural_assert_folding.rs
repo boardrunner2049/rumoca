@@ -5,11 +5,12 @@
 //! parameters — is kept when proven true (the `fold-asserts` bitcode pass
 //! removes it), becomes the EF030 translation diagnostic when proven false at
 //! error level, and stays untouched in every
-//! other case: warning level, undecidable conditions, and — the load-bearing
-//! adversary — an ordinary tunable parameter whose concrete default the
-//! broader structural context happens to know. Membership in the fold's
-//! evaluation context is itself the structural proof; nothing here consults
-//! a default that a simulation run could still override.
+//! other case: undecidable conditions and, the load-bearing adversary, an
+//! ordinary tunable parameter whose concrete default the broader structural
+//! context happens to know. A warning-level assertion owns no runtime action
+//! at all. Membership in the fold's evaluation context is itself the
+//! structural proof; nothing here consults a default that a simulation run
+//! could still override.
 
 use rumoca_ir_ast as ast;
 
@@ -109,7 +110,6 @@ end P;
 /// every pin below tests `DefId` equality rather than a rendered name.
 struct Identities {
     pow2: rumoca_core::DefId,
-    warning_literal: rumoca_core::DefId,
 }
 
 fn flatten_model(
@@ -132,23 +132,10 @@ fn flatten_model(
     let instanced =
         rumoca_phase_instantiate::instantiate(resolved, model_name).expect("model instantiates");
     let ast::InstancedTree { tree, mut overlay } = instanced;
-    let warning_literal = tree
-        .scope_tree
-        .predefined_member(&rumoca_core::ComponentPath::from_parts([
-            "AssertionLevel",
-            "warning",
-        ]))
-        .expect("the predefined AssertionLevel.warning identity exists");
     rumoca_phase_typecheck::typecheck_instanced(&tree, &mut overlay, model_name)
         .expect("model typechecks");
     let flat = rumoca_phase_flatten::flatten_ref(&tree, &overlay, model_name);
-    (
-        flat,
-        Identities {
-            pow2,
-            warning_literal,
-        },
-    )
+    (flat, Identities { pow2 })
 }
 
 fn initial_asserts(flat: &rumoca_ir_flat::Model) -> Vec<&rumoca_core::Statement> {
@@ -215,46 +202,32 @@ fn proven_false_error_assert_is_a_translation_diagnostic() {
 }
 
 #[test]
-fn proven_false_warning_assert_stays_for_the_runtime_owner() {
-    let (flat, ids) = flatten_model("P.WarningKept");
+fn warning_level_assert_is_kept_in_its_settled_form() {
+    // MLS §8.3.7: a warning never aborts, so a structurally false warning is
+    // no translation failure. It stays for the runtime owner that reports it,
+    // its level settled and its condition evaluated without events.
+    let (flat, _) = flatten_model("P.WarningKept");
     let flat = flat.expect("warning-level assertions never fail translation");
     let asserts = initial_asserts(&flat);
-    assert_eq!(asserts.len(), 1);
-    let rumoca_core::Statement::Assert { message, level, .. } = asserts[0] else {
-        unreachable!("initial_asserts returns only Assert statements");
+    let [
+        rumoca_core::Statement::Assert {
+            condition, level, ..
+        },
+    ] = asserts.as_slice()
+    else {
+        panic!("the warning is kept: {asserts:?}");
     };
-    assert!(
-        matches!(
-            message.as_ref(),
-            rumoca_core::Expression::Literal {
-                value: rumoca_core::Literal::String(text),
-                ..
-            } if text == "m should be a power of two"
-        ),
-        "the retained message expression is preserved, found {message:?}"
-    );
-    let level = level
-        .as_ref()
-        .expect("the explicit AssertionLevel.warning expression is preserved");
-    let rumoca_core::Expression::VarRef { name, .. } = level.as_ref() else {
-        panic!("the retained level is the structured enum reference, found {level:?}");
-    };
-    let parts = name
-        .component_ref()
-        .expect("the level reference keeps its resolved structure")
-        .parts();
-    assert_eq!(parts.len(), 2);
-    assert_eq!(parts[0].ident, "AssertionLevel");
-    assert_eq!(parts[1].ident, "warning");
     assert_eq!(
-        parts[1].def_id, ids.warning_literal,
-        "the level literal keeps the predefined declaration identity"
+        rumoca_ir_flat::AssertionLevel::of_settled(level.as_deref()),
+        Some(rumoca_ir_flat::AssertionLevel::Warning)
     );
-    assert_eq!(
-        functions_with_identity(&flat, ids.pow2),
-        1,
-        "a retained assertion keeps its called function"
-    );
+    assert!(matches!(
+        condition,
+        rumoca_core::Expression::BuiltinCall {
+            function: rumoca_core::BuiltinFunction::NoEvent,
+            ..
+        }
+    ));
 }
 
 #[test]

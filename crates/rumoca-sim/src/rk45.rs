@@ -15,6 +15,12 @@ use crate::{BuildSimulationTimings, SimError};
 
 const INSTANCE_NAME: &str = "rk-like";
 
+const RK45_INTEGRATOR: crate::me_backend::IntegratorFactory =
+    crate::me_backend::IntegratorFactory {
+        method: "rk45",
+        build: rumoca_solver_rk45::model_exchange_integrator,
+    };
+
 pub fn simulate(
     dae_model: &dae::Dae,
     opts: &rumoca_solver::SimOptions,
@@ -46,7 +52,7 @@ pub(crate) fn simulate_artifact(
         opts,
         execution_backend,
         INSTANCE_NAME,
-        rumoca_solver_rk45::model_exchange_integrator,
+        RK45_INTEGRATOR,
     )
 }
 
@@ -112,7 +118,7 @@ impl SimulationSession {
             &opts,
             execution_backend,
             INSTANCE_NAME,
-            rumoca_solver_rk45::model_exchange_integrator,
+            RK45_INTEGRATOR,
         )?;
         let backend_build_seconds = backend_build_start.elapsed().as_secs_f64();
         Ok((
@@ -148,7 +154,7 @@ impl SimulationSession {
             &opts,
             execution_backend,
             INSTANCE_NAME,
-            rumoca_solver_rk45::model_exchange_integrator,
+            RK45_INTEGRATOR,
         )
         .map_err(|err| SimulationDiagnosticError::Solver(err.to_string()))?;
         Ok(Self { inner })

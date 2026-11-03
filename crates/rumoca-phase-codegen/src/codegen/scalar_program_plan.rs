@@ -288,15 +288,37 @@ fn validate_output_count(store_count: usize, mapping_count: usize) -> Result<(),
     }
 }
 
-fn op_field(op: &solve::LinearOp, output_targets: Option<&[usize]>, key: &str) -> Option<Value> {
+pub(super) fn op_field(
+    op: &solve::LinearOp,
+    output_targets: Option<&[usize]>,
+    key: &str,
+) -> Option<Value> {
     match key {
         "kind" => return Some(Value::from(op.kind_name())),
         "dst" => return op.dst_register().map(|value| Value::from(value as usize)),
+        "output_index"
+            if matches!(
+                op,
+                solve::LinearOp::StoreOutputFoldTensorUpdate { .. }
+                    | solve::LinearOp::StoreOutputFunctionFold { .. }
+            ) =>
+        {
+            return output_targets
+                .and_then(|targets| targets.first())
+                .map(|index| Value::from(*index));
+        }
         _ => {}
     }
     load_field(op, key)
         .or_else(|| match op {
             solve::LinearOp::PureCall {
+                input_starts, site, ..
+            } => match key {
+                "input_starts" => Some(Value::from_serialize(input_starts)),
+                "owner" => Some(Value::from(site.owner().index())),
+                _ => None,
+            },
+            solve::LinearOp::PureCallDirectional {
                 input_starts, site, ..
             } => match key {
                 "input_starts" => Some(Value::from_serialize(input_starts)),
@@ -421,7 +443,7 @@ fn load_field(op: &solve::LinearOp, key: &str) -> Option<Value> {
             "capture_count" => Some(Value::from(program.capture_count)),
             "register_count" => Some(Value::from(program.register_count)),
             "domain" => Some(Value::from_serialize(&program.domain)),
-            "update" => Some(Value::from_serialize(&program.update)),
+            "update" => Some(super::scalar_region_plan::fold_update_value(program)),
             _ => None,
         },
         LinearOp::GuardedFunctionFold {
@@ -438,7 +460,7 @@ fn load_field(op: &solve::LinearOp, key: &str) -> Option<Value> {
             "capture_count" => Some(Value::from(program.capture_count)),
             "register_count" => Some(Value::from(program.register_count)),
             "domain" => Some(Value::from_serialize(&program.domain)),
-            "update" => Some(Value::from_serialize(&program.update)),
+            "update" => Some(super::scalar_region_plan::fold_update_value(program)),
             _ => None,
         },
         LinearOp::FunctionConditional {
@@ -450,9 +472,16 @@ fn load_field(op: &solve::LinearOp, key: &str) -> Option<Value> {
             "capture_count" => Some(Value::from(program.capture_count)),
             "target_widths" => Some(Value::from_serialize(&program.target_widths)),
             "result_count" => Some(Value::from(program.result_count)),
-            "arms" => Some(Value::from_serialize(&program.arms)),
+            "arms" => Some(Value::from_object(
+                super::scalar_region_plan::PlanArmsValue {
+                    program: Arc::clone(program),
+                },
+            )),
             "fallback_register_count" => Some(Value::from(program.fallback_register_count)),
-            "fallback" => Some(Value::from_serialize(&program.fallback)),
+            "fallback" => Some(super::scalar_region_plan::region_value(
+                program,
+                super::scalar_region_plan::RegionPart::Fallback,
+            )),
             _ => None,
         },
         LinearOp::StoreOutputFoldTensorUpdate {
@@ -488,7 +517,7 @@ fn load_field(op: &solve::LinearOp, key: &str) -> Option<Value> {
             "capture_count" => Some(Value::from(program.capture_count)),
             "register_count" => Some(Value::from(program.register_count)),
             "domain" => Some(Value::from_serialize(&program.domain)),
-            "update" => Some(Value::from_serialize(&program.update)),
+            "update" => Some(super::scalar_region_plan::fold_update_value(program)),
             "result_base" => Some(Value::from(result_base)),
             "count" => Some(Value::from(count)),
             "condition" => condition.map(|condition| Value::from(condition as usize)),
@@ -803,7 +832,7 @@ fn arithmetic_field(
 // used to enumerate every field exposed by the typed template object.
 // SPEC_0021: Exception - cohesive exhaustive flow stays contiguous so ordering remains auditable.
 #[allow(clippy::too_many_lines)]
-fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
+pub(super) fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
     use solve::LinearOp;
     match op {
         LinearOp::Const { .. } => &["kind", "dst", "value", "value_class"],
@@ -967,6 +996,7 @@ fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
         }
         LinearOp::StoreOutputFoldTensorUpdate { .. } => &[
             "kind",
+            "output_index",
             "source_base",
             "source_stride",
             "dimensions",
@@ -977,6 +1007,7 @@ fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
         ],
         LinearOp::StoreOutputFunctionFold { .. } => &[
             "kind",
+            "output_index",
             "initial",
             "capture_start",
             "carried_count",

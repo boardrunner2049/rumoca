@@ -8,18 +8,15 @@
 //! hands the value over as a signed sum of time-invariant terms
 //! (`rumoca_phase_structural::InitialValuePin`).
 //!
-//! What that proof establishes decides the row it becomes. A value proved to
-//! *define* the state it names lowers to an initialization update row: the
-//! solving is already done, so the runtime assigns it. A value the proof could
-//! only place beside another stated one — the two agreeing exactly when some
-//! parameter does — lowers to an initialization *residual* instead, so the
-//! initialization instant answers with numbers what this phase cannot answer
-//! with expressions. Both rows name the same state, which is what makes the
-//! residual answerable: the state holds a value from the moment it is seeded.
+//! Every carried state value stays an equation in the joint initialization
+//! solve. A definition can still depend on an unknown parameter, so treating
+//! it as a separately replayed assignment would destroy simultaneous coupling.
 
 use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
 use rumoca_phase_structural::{InitialValuePin, InitialValueRole};
+
+use super::initial_given_states::{StartKnowledge, start_knowledge};
 
 use super::initial_parameters::InitializationParameterOwnership;
 use super::initial_projection::InitialRowIncidence;
@@ -31,10 +28,16 @@ use crate::lower::scalar::ScalarCompiler;
 /// The initialization rows one set of transferred pins lowers to.
 #[derive(Default)]
 pub(super) struct TransferredInitialValues<'dae> {
-    /// Assignments the runtime applies at the initialization instant.
-    pub(super) updates: ScalarRows,
-    /// The slot each update row writes.
-    pub(super) update_targets: Vec<solve::ScalarSlot>,
+    /// Source-fixed starts proved independent of initialization unknowns and
+    /// fixed at translation.
+    pub(super) given_state_indices: Vec<usize>,
+    /// Source-fixed starts that read a settable parameter: each state is
+    /// assigned its start from the parameter storage at initialization.
+    pub(super) assigned_state_indices: Vec<usize>,
+    /// The start assignment of each assigned state, positionally paired with
+    /// `start_update_targets`.
+    pub(super) start_updates: ScalarRows,
+    pub(super) start_update_targets: Vec<solve::ScalarSlot>,
     /// Residuals the initialization instant has to satisfy.
     pub(super) checks: ScalarRows,
     /// What each check row reads, positionally paired with `checks`, so the
@@ -81,63 +84,47 @@ pub(super) fn lower_transferred_initial_values<'dae>(
         // parameter set stored before anything was solved.
         let compiler = ScalarCompiler::new(view, layout, None)
             .with_parameter_substitutions(ownership.substitutions());
-        match pin.role {
-            InitialValueRole::Definition => {
-                let slot = variable_scalar_slot(layout, pin.coordinate, pin.scalar as usize, span)?;
-                let solve::ScalarSlot::Y { .. } = slot else {
-                    return Err(LowerError::contract(
-                        "a state carrying a transferred initial value does not occupy solver storage",
-                        span,
-                    ));
-                };
-                if coordinate.role() != dae::VariableRole::State {
-                    return Err(LowerError::contract(
-                        "a transferred initial-value definition does not target a state",
-                        span,
-                    ));
-                }
-                let program = compiler.signed_sum_program(&terms, span)?;
-                let output = lowered.updates.len();
-                lowered.updates.push(program, span, output);
-                lowered.update_targets.push(slot);
-            }
-            InitialValueRole::Check => match coordinate.role() {
-                dae::VariableRole::State => {
-                    let slot =
-                        variable_scalar_slot(layout, pin.coordinate, pin.scalar as usize, span)?;
-                    let program = compiler.slot_residual_program(slot, &terms, span)?;
-                    let output = lowered.checks.len();
-                    lowered.checks.push(program, span, output);
-                    lowered
-                        .check_incidence
-                        .push(InitialRowIncidence::CarriedValue(
-                            terms.iter().map(|(expression, _, _)| *expression).collect(),
-                        ));
-                }
-                dae::VariableRole::Algebraic | dae::VariableRole::Output => {
-                    let slot =
-                        variable_scalar_slot(layout, pin.coordinate, pin.scalar as usize, span)?;
-                    let solve::ScalarSlot::Y { .. } = slot else {
-                        return Err(LowerError::contract(
-                            "a fixed algebraic/output does not occupy solver storage",
-                            span,
-                        ));
-                    };
-                    let program = compiler.slot_residual_program(slot, &terms, span)?;
-                    let output = lowered.checks.len();
-                    lowered.checks.push(program, span, output);
-                    lowered
-                        .check_incidence
-                        .push(InitialRowIncidence::ImplicitAlgebraic);
-                }
-                _ => {
-                    return Err(LowerError::contract(
-                        "a retained continuous initial value targets a non-continuous coordinate",
-                        span,
-                    ));
-                }
-            },
+        if pin.role == InitialValueRole::Definition && coordinate.role() != dae::VariableRole::State
+        {
+            return Err(LowerError::contract(
+                "a transferred initial-value definition does not target a state",
+                span,
+            ));
         }
+        let slot = variable_scalar_slot(layout, pin.coordinate, pin.scalar as usize, span)?;
+        let solve::ScalarSlot::Y { index, .. } = slot else {
+            return Err(LowerError::contract(
+                "a retained continuous initial value does not occupy solver storage",
+                span,
+            ));
+        };
+        let incidence = match coordinate.identity() {
+            dae::VariableIdentity::State(_) => InitialRowIncidence::StateValue {
+                index,
+                terms: terms
+                    .iter()
+                    .map(|(expression, scalar, _)| (*expression, *scalar))
+                    .collect(),
+            },
+            dae::VariableIdentity::Algebraic(variable) => InitialRowIncidence::AlgebraicValue {
+                variable,
+                scalar: pin.scalar as usize,
+                terms: terms
+                    .iter()
+                    .map(|(expression, scalar, _)| (*expression, *scalar))
+                    .collect(),
+            },
+            _ => {
+                return Err(LowerError::contract(
+                    "a retained continuous initial value targets a non-continuous coordinate",
+                    span,
+                ));
+            }
+        };
+        let program = compiler.slot_residual_program(slot, &terms, span)?;
+        let output = lowered.checks.len();
+        lowered.checks.push(program, span, output);
+        lowered.check_incidence.push(incidence);
     }
     lower_unrepresented_fixed_continuous_reals(view, layout, ownership, pins, &mut lowered)?;
     Ok(lowered)
@@ -157,14 +144,19 @@ fn lower_unrepresented_fixed_continuous_reals<'dae>(
     pins: &[InitialValuePin],
     lowered: &mut TransferredInitialValues<'dae>,
 ) -> Result<(), LowerError> {
+    let mut projection_cache = rumoca_eval_dae::ScalarCoordinateProjectionCache::default();
     for (id, variable) in view.variables() {
-        if variable.fixed() != Some(true)
+        // MLS §4.8.6: each array element carries its own `fixed`, so an element
+        // is pinned independently of its siblings. A declaration with no pinned
+        // element contributes nothing here.
+        let has_fixed_element =
+            (0..variable.scalar_count()).any(|scalar| variable.fixed_scalar(scalar) == Some(true));
+        if !has_fixed_element
             || variable.value_type().scalar_type() != dae::ScalarType::Real
             || !matches!(
                 variable.role(),
-                dae::VariableRole::Algebraic | dae::VariableRole::Output
+                dae::VariableRole::State | dae::VariableRole::Algebraic | dae::VariableRole::Output
             )
-            || pins.iter().any(|pin| pin.source == id.index())
         {
             continue;
         }
@@ -192,8 +184,17 @@ fn lower_unrepresented_fixed_continuous_reals<'dae>(
             ));
         }
         for scalar in 0..variable.scalar_count() {
+            if variable.fixed_scalar(scalar) != Some(true) {
+                continue;
+            }
+            if pins
+                .iter()
+                .any(|pin| pin.source == id.index() && pin.source_scalar as usize == scalar)
+            {
+                continue;
+            }
             let slot = variable_scalar_slot(layout, id.index(), scalar, span)?;
-            let solve::ScalarSlot::Y { .. } = slot else {
+            let solve::ScalarSlot::Y { index, .. } = slot else {
                 return Err(LowerError::contract(
                     "a fixed algebraic/output does not occupy solver storage",
                     span,
@@ -205,14 +206,62 @@ fn lower_unrepresented_fixed_continuous_reals<'dae>(
             });
             let compiler = ScalarCompiler::new(view, layout, None)
                 .with_parameter_substitutions(ownership.substitutions());
+            let knowledge = match variable.role() {
+                dae::VariableRole::State => {
+                    start_knowledge(view, ownership, start, &mut projection_cache)
+                }
+                _ => StartKnowledge::Unknown,
+            };
+            if knowledge != StartKnowledge::Unknown {
+                lower_known_state_start(compiler, knowledge, (slot, index), start, span, lowered)?;
+                continue;
+            }
             let program = compiler.slot_start_residual_program(slot, start, span)?;
             let output = lowered.checks.len();
             lowered.checks.push(program, span, output);
-            lowered
-                .check_incidence
-                .push(InitialRowIncidence::ImplicitAlgebraic);
+            let incidence = match variable.identity() {
+                dae::VariableIdentity::State(_) => InitialRowIncidence::StateValue {
+                    index,
+                    terms: start.into_iter().collect(),
+                },
+                dae::VariableIdentity::Algebraic(variable) => InitialRowIncidence::AlgebraicValue {
+                    variable,
+                    scalar,
+                    terms: start.into_iter().collect(),
+                },
+                _ => {
+                    return Err(LowerError::contract(
+                        "fixed continuous value has no continuous identity",
+                        span,
+                    ));
+                }
+            };
+            lowered.check_incidence.push(incidence);
         }
     }
+    Ok(())
+}
+
+/// A fixed state whose start is known before the initialization solve: a
+/// translation-time start seeds it, and a start reading a settable parameter
+/// becomes its initialization assignment from the parameter storage.
+fn lower_known_state_start<'dae>(
+    compiler: ScalarCompiler<'_, 'dae>,
+    knowledge: StartKnowledge,
+    (slot, index): (solve::ScalarSlot, usize),
+    start: Option<(dae::ExprId<'dae>, usize)>,
+    span: rumoca_core::Span,
+    lowered: &mut TransferredInitialValues<'dae>,
+) -> Result<(), LowerError> {
+    let (StartKnowledge::Parameters, Some((expression, start_scalar))) = (knowledge, start) else {
+        lowered.given_state_indices.push(index);
+        return Ok(());
+    };
+    let output = lowered.start_updates.len();
+    let program = compiler.program(expression, start_scalar)?;
+    lowered.start_updates.push(program, span, output);
+    lowered.start_update_targets.push(slot);
+    lowered.assigned_state_indices.push(index);
     Ok(())
 }
 

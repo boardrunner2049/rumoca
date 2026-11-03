@@ -121,6 +121,13 @@ fn rebuild_source_map(model: &RbcModel) -> (SourceMap, Vec<rumoca_core::SourceId
     for connection in &model.connections {
         note(connection.provenance.span);
     }
+    for value in model
+        .initial_discrete_values
+        .iter()
+        .chain(&model.initial_parameter_values)
+    {
+        note(value.provenance.span);
+    }
     // A carried function body anchors its values, statements and loops in
     // the source too, often further into a file than any equation does.
     for span in crate::validate::function_spans(model) {
@@ -319,6 +326,26 @@ fn rebuild(
     rebuild_equations(construction, &ctx, &expressions)?;
     rebuild_families(construction, &ctx, &expressions, &domains)?;
     rebuild_discrete_real(construction, &ctx, &expressions, &variables, &conditions)?;
+    construction.initialization(|owner| {
+        for value in &model.initial_parameter_values {
+            let VariableSlot::Parameter(target) =
+                resolve(&variables, value.target.0, "initial parameter target", &ctx)?
+            else {
+                return Err(ctx.unsupported("initial parameter target is not a parameter"));
+            };
+            owner.parameter_initial_value(
+                target,
+                resolve(
+                    &expressions,
+                    value.value.0,
+                    "initial parameter expression",
+                    &ctx,
+                )?,
+                ctx.provenance(value.provenance)?,
+            )?;
+        }
+        Ok(())
+    })?;
     rebuild_events(construction, &ctx, &expressions, &variables, &conditions)?;
     rebuild_discrete_definitions(construction, &ctx, &expressions, &variables, &conditions)?;
     transactions::rebuild(
@@ -368,9 +395,14 @@ fn rebuild_discrete_definitions<'dae>(
                 .copied()
                 .map(discrete_value)
                 .collect::<Result<Vec<_>, _>>()?;
-            topology.owner(at, targets, |owner| {
+            let build = |owner: &mut dae::DiscreteValueOwner<'_, 'dae>| {
                 rebuild_discrete_branches(owner, ctx, expressions, conditions, &definition.branches)
-            })?;
+            };
+            if definition.observed {
+                topology.observed_owner(at, targets, build)?;
+            } else {
+                topology.owner(at, targets, build)?;
+            }
         }
         Ok(())
     })
@@ -863,9 +895,31 @@ fn define_variable<'dae>(
     };
     let attributes = dae::VariableAttributes {
         causality: causality_of(variable.causality),
+        declared_causality: match variable.declared_causality {
+            Some(RbcDeclaredCausality::Input) => dae::DeclaredCausality::Input,
+            Some(RbcDeclaredCausality::Output) => dae::DeclaredCausality::Output,
+            Some(RbcDeclaredCausality::None) => dae::DeclaredCausality::None,
+            None => match variable.causality {
+                RbcCausality::Input => dae::DeclaredCausality::Input,
+                RbcCausality::Output => dae::DeclaredCausality::Output,
+                _ => dae::DeclaredCausality::None,
+            },
+        },
         unit: variable.unit.clone(),
         description: variable.description.clone(),
-        fixed: variable.fixed,
+        fixed: variable
+            .fixed_elements
+            .clone()
+            .or_else(|| variable.fixed.map(|value| vec![value])),
+        evaluable: variable.evaluable,
+        is_held: variable.held,
+        state_select: match variable.state_select {
+            RbcStateSelect::Never => rumoca_core::StateSelect::Never,
+            RbcStateSelect::Avoid => rumoca_core::StateSelect::Avoid,
+            RbcStateSelect::Default => rumoca_core::StateSelect::Default,
+            RbcStateSelect::Prefer => rumoca_core::StateSelect::Prefer,
+            RbcStateSelect::Always => rumoca_core::StateSelect::Always,
+        },
         is_tunable: variable.tunable,
         origin: if variable.from_source {
             dae::VariableOrigin::Source
@@ -1183,6 +1237,16 @@ fn rebuild_events<'dae>(
     variables: &[VariableSlot<'dae>],
     conditions: &[dae::ConditionId<'dae>],
 ) -> Result<(), dae::DaeConstructionError> {
+    let legacy_warning = ctx.model.events.iter().find(|event| {
+        matches!(&event.action, RbcAction::Assert { level, .. }
+            if matches!(legacy_assertion_level(ctx, *level), Ok(dae::AssertionLevel::Warning)))
+    });
+    let legacy_condition = legacy_warning
+        .map(|event| {
+            let at = ctx.provenance(event.provenance)?;
+            construction.expressions(|owner| owner.at(at).literal(dae::DaeLiteral::Boolean(false)))
+        })
+        .transpose()?;
     construction.events(|owner| {
         for event in &ctx.model.time_events {
             let at = ctx.provenance(event.provenance)?;
@@ -1217,6 +1281,7 @@ fn rebuild_events<'dae>(
                 trigger,
                 guard,
                 at,
+                legacy_condition,
             )?;
         }
         Ok(())
@@ -1236,6 +1301,7 @@ fn rebuild_action<'dae>(
     trigger: dae::ConditionId<'dae>,
     guard: dae::ConditionId<'dae>,
     at: dae::DaeProvenance,
+    legacy_condition: Option<dae::ExprId<'dae>>,
 ) -> Result<(), dae::DaeConstructionError> {
     let expression = |id: ExprId| resolve(expressions, id.0, "expression", ctx);
     match &event.action {
@@ -1245,17 +1311,59 @@ fn rebuild_action<'dae>(
         }
         RbcAction::Assert { message, level } => {
             let message = expression(*message)?;
-            let level = match level {
-                Some(level) => Some(expression(*level)?),
-                None => None,
-            };
-            owner.assert_with_level(trigger, guard, message, level, at)?;
+            match legacy_assertion_level(ctx, *level)? {
+                dae::AssertionLevel::Error => {
+                    owner.assert(trigger, guard, message, at)?;
+                }
+                dae::AssertionLevel::Warning => {
+                    let condition = legacy_condition
+                        .ok_or_else(|| ctx.unsupported("missing legacy warning condition"))?;
+                    owner.warning(trigger, guard, condition, message, at)?;
+                }
+            }
+        }
+        RbcAction::Warning { condition, message } => {
+            owner.warning(
+                trigger,
+                guard,
+                expression(*condition)?,
+                expression(*message)?,
+                at,
+            )?;
         }
         RbcAction::Terminate { message } => {
             owner.terminate(trigger, guard, expression(*message)?, at)?;
         }
     }
     Ok(())
+}
+
+/// Old v1 assertions encoded the predefined level as an expression ordinal.
+fn legacy_assertion_level(
+    ctx: &Rebuild<'_>,
+    level: Option<ExprId>,
+) -> Result<dae::AssertionLevel, dae::DaeConstructionError> {
+    let Some(level) = level else {
+        return Ok(dae::AssertionLevel::Error);
+    };
+    let ordinal = match ctx.model.expressions.get(level.0 as usize).map(|e| &e.node) {
+        Some(RbcExprNode::Literal {
+            value: RbcLiteral::Integer { value } | RbcLiteral::Enumeration { ordinal: value },
+        }) => *value,
+        Some(RbcExprNode::Literal {
+            value: RbcLiteral::Real { value },
+        }) if *value == 1.0 || *value == 2.0 => *value as i64,
+        _ => {
+            return Err(
+                ctx.unsupported("legacy assertion level is not a literal AssertionLevel ordinal")
+            );
+        }
+    };
+    match ordinal {
+        1 => Ok(dae::AssertionLevel::Error),
+        2 => Ok(dae::AssertionLevel::Warning),
+        _ => Err(ctx.unsupported("invalid legacy AssertionLevel ordinal")),
+    }
 }
 
 /// `reinit` may only target a continuous state; anything else is a rejection,
@@ -1400,6 +1508,7 @@ fn literal_of(literal: &RbcLiteral) -> dae::DaeLiteral {
 fn builtin_of(name: &str) -> Option<dae::PureBuiltin> {
     use dae::PureBuiltin as B;
     Some(match name {
+        "LinearSolve" => B::LinearSolve,
         "abs" => B::Abs,
         "sign" => B::Sign,
         "sqrt" => B::Sqrt,

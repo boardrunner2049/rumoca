@@ -582,3 +582,43 @@ fn alg_017_function_locals_initialized_per_invocation() {
         "function locals must start from their defaults on every invocation, got {z:?}"
     );
 }
+
+// =============================================================================
+// ALG-018: The body of a while-statement is executed as long as the condition
+// is true
+// =============================================================================
+
+#[test]
+fn alg_018_bounded_while_loop_runs_until_its_condition_fails() {
+    let trace = rumoca_contracts::test_support::simulate_model(
+        r#"
+        model M
+            function F
+                input Real x;
+                output Real y;
+            protected
+                Integer i;
+            algorithm
+                y := x;
+                i := 1;
+                while i < 10 and y > 1 loop
+                    y := y / 2;
+                    i := i + 1;
+                end while;
+            end F;
+            Real t(start = 0, fixed = true);
+            Real z;
+        equation
+            der(t) = 1;
+            z = F(20.0);
+        end M;
+    "#,
+        "M",
+        1.0,
+    );
+    let z = trace.channel("z");
+    assert!(
+        z.iter().all(|&v| v == 0.625),
+        "20 halves five times to 0.625, got {z:?}"
+    );
+}

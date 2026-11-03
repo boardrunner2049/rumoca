@@ -174,7 +174,7 @@ impl ElementReferences<'_> {
             .collect();
         rumoca_core::Expression::Array {
             elements,
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span,
         }
     }

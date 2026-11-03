@@ -1,39 +1,14 @@
 use super::*;
 
-/// Validate a when-clause's own activation condition.
+/// Validate a condition evaluated in continuous context: a when-clause's own
+/// activation condition or an equation-section assertion condition (MLS §8.3.7).
 ///
-/// The condition decides whether the event happens, so it keeps
-/// [`PreContext::Continuous`]'s `pre()` rule; what it gains over
-/// a plain [`PreContext::Continuous`] condition is the enumeration-literal catalog, so an
-/// activation guard may compare against `E.lit` (MLS §4.9.5) the same way a
-/// plain equation may.
-pub(super) fn validate_when_activation_condition(
-    expression: &Expression,
-    roles: &HashMap<VarName, PlannedRole>,
-    states: &HashSet<VarName>,
-    constants: &EvalContext,
-    sample_lattices: &mut Vec<(Span, PeriodicClockSchedule)>,
-    enumeration_literals: &ShapeEnvironment,
-) -> Result<(), ToDaeError> {
-    validate_condition_expression_in_context(
-        expression,
-        roles,
-        states,
-        constants,
-        sample_lattices,
-        PreContext::Continuous,
-        Some(enumeration_literals),
-    )
-}
-
-/// Validate the condition of a continuous or initial `assert` (MLS §8.3.7).
-///
-/// It is an event-domain condition outside any when-clause, so it keeps
-/// [`PreContext::Continuous`]; like a when activation guard it may compare a
-/// coordinate against an enumeration literal (`level == Choice.a`, MLS §4.9.5),
-/// which resolves through the model's literal catalog rather than the
-/// coordinate plan.
-pub(super) fn validate_assertion_condition(
+/// A when-clause condition decides whether the event happens, so it is not yet
+/// inside that event, and an assertion is checked along the continuous
+/// trajectory: both keep [`PreContext::Continuous`]'s `pre()` rule. Both read
+/// enumeration literals through the literal catalog, so they may compare
+/// against `E.lit` (MLS §4.9.5) the same way a plain equation may.
+pub(super) fn validate_condition_expression(
     expression: &Expression,
     roles: &HashMap<VarName, PlannedRole>,
     states: &HashSet<VarName>,
@@ -59,7 +34,7 @@ pub(super) fn validate_assertion_condition(
 /// MLS §3.7.5 therefore admits `pre()` of a continuous coordinate in them for
 /// the same reason it admits one in the body's definitions. The clause's own
 /// activation condition is a different context and uses
-/// [`validate_assertion_condition`].
+/// [`validate_condition_expression`].
 pub(super) fn validate_when_condition_expression(
     expression: &Expression,
     roles: &HashMap<VarName, PlannedRole>,

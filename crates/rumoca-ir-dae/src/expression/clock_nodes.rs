@@ -20,26 +20,12 @@ impl<'dae> ExpressionAt<'_, 'dae> {
             .clocks
             .get(target_clock.index() as usize)
             .ok_or_else(|| unknown("clock", target_clock.index(), self.provenance))?;
-        let (ClockKind::Periodic(source_schedule), ClockKind::Periodic(target_schedule)) =
-            (source_entry.kind, target_entry.kind)
-        else {
-            return Err(DaeConstructionError::InvalidClockedOperand {
-                operator: "clocked value conversion",
-                span: self.provenance.span(),
-            });
-        };
-        let expected = kind
-            .target_lattice(source_schedule.lattice())
-            .map_err(|source| DaeConstructionError::InvalidClockLattice {
-                source,
-                span: self.provenance.span(),
-            })?;
-        if expected != target_schedule.lattice() {
-            return Err(DaeConstructionError::InvalidClockedOperand {
-                operator: "clocked value conversion",
-                span: self.provenance.span(),
-            });
-        }
+        require_transfer_relation(
+            kind,
+            (source_clock.index(), source_entry.kind),
+            target_entry.kind,
+            self.provenance,
+        )?;
         require_source_clock(self.storage, source.index(), source_clock, self.provenance)?;
         let ty = self.storage.expr_type(source, self.provenance)?.clone();
         let variability = self.storage.expr_variability(source, self.provenance)?;
@@ -125,5 +111,61 @@ fn require_source_clock(
             operator: "clocked value conversion",
             span: at.span(),
         })
+    }
+}
+
+/// Prove that `target` is exactly `kind` applied to `source` (MLS §16.5.2).
+///
+/// A periodic transfer maps the source lattice onto the target's. An event
+/// clock has no lattice, so its only transfer is `shiftSample(u, counter)`
+/// with resolution 1, onto the clock that skips `counter` more ticks of the
+/// same unshifted event clock.
+fn require_transfer_relation(
+    kind: ClockTransferKind,
+    (source_index, source): (u32, ClockKind),
+    target: ClockKind,
+    at: DaeProvenance,
+) -> Result<(), DaeConstructionError> {
+    let invalid = || DaeConstructionError::InvalidClockedOperand {
+        operator: "clocked value conversion",
+        span: at.span(),
+    };
+    match (source, target) {
+        (ClockKind::Periodic(source), ClockKind::Periodic(target)) => {
+            let expected = kind.target_lattice(source.lattice()).map_err(|source| {
+                DaeConstructionError::InvalidClockLattice {
+                    source,
+                    span: at.span(),
+                }
+            })?;
+            (expected == target.lattice())
+                .then_some(())
+                .ok_or_else(invalid)
+        }
+        (
+            ClockKind::Triggered(_) | ClockKind::Shifted { .. },
+            ClockKind::Shifted {
+                base,
+                counter: target_counter,
+                ..
+            },
+        ) => {
+            let (source_base, source_counter) = match source {
+                ClockKind::Shifted { base, counter, .. } => (base, counter),
+                _ => (source_index, 0),
+            };
+            let ClockTransferKind::ShiftSample {
+                counter,
+                resolution: 1,
+            } = kind
+            else {
+                return Err(invalid());
+            };
+            let shifted = i64::from(source_counter) + counter;
+            (source_base == base && shifted == i64::from(target_counter))
+                .then_some(())
+                .ok_or_else(invalid)
+        }
+        _ => Err(invalid()),
     }
 }

@@ -13,6 +13,8 @@ use super::*;
 pub(super) struct FunctionClassContext {
     pub(super) components: IndexMap<String, ast::Component>,
     pub(super) algorithms: Vec<Vec<ast::Statement>>,
+    /// The declaring class and section ordinal of each of `algorithms`.
+    algorithm_identities: Vec<Option<(rumoca_core::DefId, usize)>>,
     pub(super) imports: qualify::ImportMap,
 }
 
@@ -92,10 +94,67 @@ fn collect_function_context_recursive<'tree>(
             &mut context.imports,
             Some(member_cache),
         );
+        respell_class_aliases_visible_from(tree, class_index, class_def, &mut context.imports);
     }
     resolve_import_pairs(&class_def.imports, class_index, &mut context.imports);
-    context.algorithms.extend(class_def.algorithms.clone());
+    for (ordinal, section) in class_def.algorithms.iter().enumerate() {
+        let identity = class_def.def_id.map(|def_id| (def_id, ordinal));
+        match identity.and_then(|identity| {
+            context
+                .algorithm_identities
+                .iter()
+                .position(|known| *known == Some(identity))
+        }) {
+            // A copy of a class already reached (a redeclared `function
+            // extends` inside a modified package copy reaches its own original)
+            // is the same definition, so its section is the same section, not
+            // a second body (MLS 3.7 §12.2); the copy reached last is the one
+            // the converted class sees.
+            Some(known) => context.algorithms[known] = section.clone(),
+            None => {
+                context.algorithms.push(section.clone());
+                context.algorithm_identities.push(identity);
+            }
+        }
+    }
     context.components.extend(class_def.components.clone());
+}
+
+/// Respell every class alias a base's context contributed by the class that
+/// the extending class itself sees under that name.
+///
+/// A `function extends` body and the inherited sections are lowered against
+/// one alias map, and the base's lexical aliases are collected first. When
+/// the extending class's lookup (MLS §5.3) reaches a different class for the
+/// same name, for example a record that its package redeclares in an
+/// `extends` modification (MLS §7.3), that class is the meaning of the name;
+/// keeping the base's alias would spell the replaced declaration.
+fn respell_class_aliases_visible_from(
+    tree: &ast::ClassTree,
+    class_index: &ast::ClassDefIndex<'_>,
+    class_def: &ast::ClassDef,
+    imports: &mut qualify::ImportMap,
+) {
+    let Some(scope) = class_def.scope_id else {
+        return;
+    };
+    for (alias, qualified) in imports.iter_mut() {
+        let Some(aliased) = class_index.def_id_by_qualified_name(qualified) else {
+            continue;
+        };
+        let Some(visible) = tree
+            .scope_tree
+            .lookup(scope, &rumoca_core::ComponentPath::from_flat_path(alias))
+        else {
+            continue;
+        };
+        if visible == aliased || class_index.get(visible).is_none() {
+            continue;
+        }
+        if let Some(visible_name) = class_index.qualified_name(visible) {
+            *qualified = visible_name.to_string();
+        }
+    }
 }
 
 fn collect_lexical_ancestor_imports(
@@ -267,4 +326,25 @@ fn collect_effective_package_constant_aliases(
             }
         }
     }
+}
+
+/// Constants of the package a callable is exposed through.
+///
+/// MLS 5.3.2, 7.1: a function inherited into another package sees that
+/// package's constants, including the ones its extends modification binds, not
+/// only the constants of the package that declares it. The exposing package's
+/// effective constants therefore shadow the declaring package's.
+pub(super) fn collect_exposed_package_constant_aliases(
+    tree: &ast::ClassTree,
+    class_index: &ast::ClassDefIndex<'_>,
+    exposed_function_name: &str,
+    imports: &mut qualify::ImportMap,
+) {
+    let Some(exposing_scope) = crate::path_utils::enclosing_scope(exposed_function_name) else {
+        return;
+    };
+    if class_index.get_by_qualified_name(exposing_scope).is_none() {
+        return;
+    }
+    collect_effective_package_constant_aliases(tree, class_index, exposing_scope, imports, true);
 }

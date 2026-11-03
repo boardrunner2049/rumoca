@@ -5,7 +5,7 @@ use super::common::{
     SIM_STOP_TIME_DEFAULT, TRACE_EXCLUSIONS_FILE_REL, choose_effective_batch_size, get_git_commit,
     get_omc_version, git_worktree_is_dirty, has_fatal_omc_error, load_target_models,
     load_trace_exclusions_file, msl_load_lines, round3, summarize_batch_timings,
-    summarize_omc_error, unix_timestamp_seconds, write_pretty_json,
+    summarize_omc_error, typed_exception_reasons, unix_timestamp_seconds, write_pretty_json,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
@@ -72,6 +72,14 @@ pub struct Args {
     /// not OMC, owns parallelism.
     #[arg(long, default_value_t = OMC_THREADS_DEFAULT)]
     omc_threads: usize,
+    /// The simulation worker count of the rumoca run these references are
+    /// compared with, recorded beside OMC's own so a speed report can state
+    /// both tools' contention.
+    #[arg(long)]
+    rumoca_sim_workers: Option<usize>,
+    /// The compile-stage worker count of that rumoca run.
+    #[arg(long)]
+    rumoca_stage_workers: Option<usize>,
     /// Per-model wall timeout (seconds) for one OMC compile+simulate; on timeout
     /// the session is killed (with its process group) and respawned.
     #[arg(long = "model-timeout-seconds", value_name = "SECONDS", default_value_t = BATCH_TIMEOUT_SECONDS_DEFAULT)]
@@ -116,6 +124,16 @@ struct SimModelResult {
     total_system_seconds: Option<f64>,
     omc_wall_seconds: Option<f64>,
     result_file: Option<String>,
+    /// OMC's self-reported phase seconds (`timeFrontend` ... `timeTotal`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omc_phases: Option<omc_session::OmcPhaseSeconds>,
+    /// OMC's integration settings from `simulationOptions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omc_settings: Option<omc_session::OmcSimSettings>,
+    /// The worker count, OMC threads, and host this model's timing was taken
+    /// under; a cached timing keeps the context of its own run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omc_timing_context: Option<serde_json::Value>,
     trace_file: Option<String>,
     trace_error: Option<String>,
     rumoca_status: Option<String>,
@@ -629,6 +647,9 @@ fn run_dry_run(paths: &MslPaths, model_names: &[String], args: &Args) -> Result<
 /// and forces a re-run; otherwise cached per-model results are reused.
 fn omc_reference_cache_key(omc_version: &str, msl_dir: &Path) -> String {
     let mut hasher = blake3::Hasher::new();
+    // References made with generic services or incomplete-success acceptance
+    // cannot be reused under the corrected producer contract.
+    hasher.update(b"omc-tool-services/required-result-file/v1\0");
     hasher.update(MSL_VERSION.as_bytes());
     hasher.update(b"\0");
     hasher.update(omc_version.as_bytes());
@@ -711,21 +732,16 @@ struct SessionWorkerCtx<'a> {
     cpu_core_id: Option<usize>,
 }
 
-/// Persistent-session execution path: the OMC analogue of the rumoca warm
-/// worker queue. Each worker thread owns one [`OmcSession`] that loads the MSL
-/// once, then pulls models from a shared atomic index and simulates them. On a
-/// per-model timeout (or transport failure) the session is killed and the next
-/// model respawns a fresh one, so a single hung model never blocks the others.
-fn run_session_pending(
-    args: &Args,
-    workers: usize,
+/// Take the pending models that still need an OMC run.
+///
+/// When the cache is valid (OMC + MSL unchanged, no --force) the cached OMC
+/// reference has already been merged into `all_results`, so any model that
+/// already has a real cached result is skipped instead of re-running OMC.
+fn take_models_needing_omc(
     paths: &MslPaths,
     state: &mut SimRunState,
     reuse_cached: bool,
-) -> Result<()> {
-    // When the cache is valid (OMC + MSL unchanged, no --force) the cached OMC
-    // reference has already been merged into `all_results`, so skip any model
-    // that already has a real cached result instead of re-running OMC.
+) -> Vec<String> {
     let reuse_skip: BTreeSet<String> = if reuse_cached {
         state
             .all_results
@@ -746,6 +762,22 @@ fn run_session_pending(
             reuse_skip.len()
         );
     }
+    models
+}
+
+/// Persistent-session execution path: the OMC analogue of the rumoca warm
+/// worker queue. Each worker thread owns one [`OmcSession`] that loads the MSL
+/// once, then pulls models from a shared atomic index and simulates them. On a
+/// per-model timeout (or transport failure) the session is killed and the next
+/// model respawns a fresh one, so a single hung model never blocks the others.
+fn run_session_pending(
+    args: &Args,
+    workers: usize,
+    paths: &MslPaths,
+    state: &mut SimRunState,
+    reuse_cached: bool,
+) -> Result<()> {
+    let models = take_models_needing_omc(paths, state, reuse_cached);
     if models.is_empty() {
         return Ok(());
     }
@@ -809,6 +841,13 @@ fn run_session_pending(
     }
     drop(tx);
 
+    // Each timing collected here carries the context it was taken under, so a
+    // cached timing from another worker count or host is recognisable later.
+    let context = serde_json::json!({
+        "workers": workers,
+        "omc_threads": args.omc_threads,
+        "host": output::host_description(),
+    });
     let mut completed = 0usize;
     for outcome in rx {
         completed += 1;
@@ -821,6 +860,7 @@ fn run_session_pending(
             skipped: false,
         });
         let mut result = outcome.result;
+        result.omc_timing_context = Some(context.clone());
         carry_failed_attempts(&mut result, state.all_results.get(&outcome.model));
         state.all_results.insert(outcome.model, result);
         if completed.is_multiple_of(25) || completed == total {
@@ -931,16 +971,27 @@ const SESSION_RECYCLE_MODELS: usize = 25;
 fn build_session_model_result(outcome: &OmcSimOutcome, elapsed: f64) -> SimModelResult {
     let mut error_text = outcome.error.clone();
     let messages = outcome.messages.trim();
-    let messages_indicate_failure =
-        messages.contains("Simulation Failed") || messages.contains("does not exist");
-    if messages_indicate_failure {
+    let messages_indicate_failure = messages.contains("Simulation Failed")
+        || messages.contains("Simulation execution failed")
+        || messages.contains("does not exist");
+    let missing_result = outcome
+        .result_file
+        .as_deref()
+        .is_none_or(|path| path.trim().is_empty());
+    // Successful simulations can report warning-level assertion violations.
+    // Preserve runtime diagnostics when the outcome identifies a failure.
+    if missing_result || messages_indicate_failure || has_fatal_omc_error(&error_text) {
         if !error_text.trim().is_empty() {
             error_text.push('\n');
         }
         error_text.push_str(messages);
     }
+    if missing_result {
+        error_text.push_str("\nOMC simulation returned no result file");
+    }
     let assertion_failures = omc_assertion_failure_lines(&error_text);
-    let fatal = has_fatal_omc_error(&error_text)
+    let fatal = missing_result
+        || has_fatal_omc_error(&error_text)
         || !assertion_failures.is_empty()
         || messages_indicate_failure;
     let status = if fatal { "error" } else { "success" };
@@ -955,8 +1006,11 @@ fn build_session_model_result(outcome: &OmcSimOutcome, elapsed: f64) -> SimModel
     SimModelResult {
         status: status.to_string(),
         error,
-        sim_system_seconds: outcome.timing.time_simulation,
-        total_system_seconds: outcome.timing.time_total,
+        sim_system_seconds: outcome.timing.simulation,
+        total_system_seconds: outcome.timing.total,
+        omc_phases: Some(outcome.timing.clone()),
+        omc_settings: Some(outcome.settings.clone()),
+        omc_timing_context: None,
         omc_wall_seconds: Some(round3(elapsed)),
         result_file: outcome.result_file.clone(),
         ..empty_omc_result()
@@ -993,6 +1047,9 @@ fn empty_omc_result() -> SimModelResult {
         total_system_seconds: None,
         omc_wall_seconds: None,
         result_file: None,
+        omc_phases: None,
+        omc_settings: None,
+        omc_timing_context: None,
         trace_file: None,
         trace_error: None,
         rumoca_status: None,
@@ -1037,9 +1094,22 @@ fn omc_assertion_failure_lines(error_text: &str) -> Vec<String> {
         if line.is_empty() {
             continue;
         }
-        let lower = line.to_ascii_lowercase();
+        // An OMC log line names its stream and severity (`LOG_ASSERT | debug |
+        // ...`); only its message says whether a model assertion caused the
+        // failure. `LOG_ASSERT | debug | Simulation terminated due to too many
+        // ... event iterations` is a solver failure on the assertion stream, not
+        // a model assertion.
+        let message = if line.starts_with("LOG_") {
+            line.splitn(3, '|').nth(2).unwrap_or_default()
+        } else {
+            line
+        };
+        let lower = message.to_ascii_lowercase();
         if lower.contains("assert")
-            && (lower.contains("error") || lower.contains("violat") || lower.contains("fail"))
+            && (lower.contains("error")
+                || lower.contains("violat")
+                || lower.contains("fail")
+                || lower.contains("terminat"))
         {
             lines.push(line.to_string());
         }
@@ -1368,6 +1438,15 @@ fn hydrate_omc_fields_from_cached(current: &mut SimModelResult, cached: &SimMode
     if current.total_system_seconds.is_none() {
         current.total_system_seconds = cached.total_system_seconds;
     }
+    if current.omc_phases.is_none() {
+        current.omc_phases = cached.omc_phases.clone();
+    }
+    if current.omc_settings.is_none() {
+        current.omc_settings = cached.omc_settings.clone();
+    }
+    if current.omc_timing_context.is_none() {
+        current.omc_timing_context = cached.omc_timing_context.clone();
+    }
     if current.omc_wall_seconds.is_none() {
         current.omc_wall_seconds = cached.omc_wall_seconds;
     }
@@ -1397,7 +1476,7 @@ fn load_trace_exclusions(args: &Args, paths: &MslPaths) -> Result<BTreeMap<Strin
     if !file.is_file() {
         return Ok(BTreeMap::new());
     }
-    let exclusions = load_trace_exclusions_file(&file)?;
+    let exclusions = typed_exception_reasons(load_trace_exclusions_file(&file)?);
     if exclusions.is_empty() {
         return Ok(BTreeMap::new());
     }

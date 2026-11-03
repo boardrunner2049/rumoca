@@ -23,14 +23,29 @@ use super::super::common::apply_omc_thread_env;
 /// Poll interval while waiting for the OMC ZeroMQ port file to appear.
 const PORT_FILE_POLL: Duration = Duration::from_millis(20);
 
-/// Per-model timing self-reported by OMC's `SimulationResult` record. These are
-/// OMC's own internal phase timers, so they are independent of scheduling jitter
-/// and directly comparable to rumoca's per-phase seconds. The report derives
-/// OMC compile time as `time_total - time_simulation`.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(super) struct OmcSimTiming {
-    pub(super) time_simulation: Option<f64>,
-    pub(super) time_total: Option<f64>,
+/// Per-model phase seconds self-reported by OMC's `SimulationResult` record
+/// (`timeFrontend` ... `timeTotal`). These are OMC's own internal phase timers,
+/// so the speed report can compare like with like: compiler work is frontend
+/// through templates, `compile` is the C toolchain, `simulation` the run.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct OmcPhaseSeconds {
+    pub(super) frontend: Option<f64>,
+    pub(super) backend: Option<f64>,
+    pub(super) sim_code: Option<f64>,
+    pub(super) templates: Option<f64>,
+    pub(super) compile: Option<f64>,
+    pub(super) simulation: Option<f64>,
+    pub(super) total: Option<f64>,
+}
+
+/// The integration settings OMC reports in `simulationOptions`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct OmcSimSettings {
+    pub(super) method: Option<String>,
+    pub(super) tolerance: Option<f64>,
+    pub(super) number_of_intervals: Option<u64>,
+    pub(super) start_time: Option<f64>,
+    pub(super) stop_time: Option<f64>,
 }
 
 /// Outcome of a single `simulate(...)` request inside a session.
@@ -39,7 +54,8 @@ pub(super) struct OmcSimOutcome {
     pub(super) result_file: Option<String>,
     pub(super) messages: String,
     pub(super) error: String,
-    pub(super) timing: OmcSimTiming,
+    pub(super) timing: OmcPhaseSeconds,
+    pub(super) settings: OmcSimSettings,
 }
 
 /// Why an evaluation did not return a usable reply.
@@ -108,36 +124,26 @@ impl OmcSession {
         // after we kill the omc parent.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let child = command
-            .spawn()
-            .context("failed to spawn omc interactive session")?;
-
-        let port_file = match wait_for_port_file(work_dir, &suffix, startup_timeout) {
-            Some(path) => path,
-            None => {
-                let mut child = child;
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(anyhow!(
-                    "omc session port file for suffix '{suffix}' did not appear within {:.1}s",
-                    startup_timeout.as_secs_f64()
-                ));
-            }
-        };
-        let endpoint = std::fs::read_to_string(&port_file)
-            .with_context(|| format!("failed to read omc port file '{}'", port_file.display()))?
-            .trim()
-            .to_string();
-
         let ctx = zmq::Context::new();
         let socket = ctx
             .socket(zmq::REQ)
             .context("failed to create omc zmq REQ socket")?;
         // LINGER=0 so dropping a hung socket does not block process teardown.
-        socket.set_linger(0).ok();
-        socket
-            .connect(&endpoint)
-            .with_context(|| format!("failed to connect to omc endpoint '{endpoint}'"))?;
+        socket.set_linger(0)?;
+        let mut child = command
+            .spawn()
+            .context("failed to spawn omc interactive session")?;
+
+        let port_file = match connect_port_file(&socket, work_dir, &suffix, startup_timeout) {
+            Ok(path) => path,
+            Err(error) => {
+                kill_omc_process(&mut child);
+                if let Some(path) = find_port_file(work_dir, &format!("port.{suffix}")) {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        };
 
         let mut session = OmcSession {
             child,
@@ -202,23 +208,8 @@ impl OmcSession {
 
     /// Kill the underlying process. Used before respawning after a hang.
     pub(super) fn kill(&mut self) {
-        self.kill_process_group();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_omc_process(&mut self.child);
         let _ = std::fs::remove_file(&self.port_file);
-    }
-
-    /// SIGKILL the whole process group (omc plus any simulation executables it
-    /// spawned). `omc` is the group leader (see `process_group(0)` at spawn), so
-    /// the group id equals its pid. Uses `nix`'s safe `killpg` wrapper.
-    fn kill_process_group(&self) {
-        #[cfg(unix)]
-        if let Ok(pid) = i32::try_from(self.child.id()) {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
     }
 }
 
@@ -227,11 +218,42 @@ impl Drop for OmcSession {
         // Best-effort graceful quit, then ensure the process group is gone
         // (omc + any simulation executables it spawned).
         let _ = self.eval("quit()", Duration::from_millis(500));
-        self.kill_process_group();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.port_file);
+        self.kill();
     }
+}
+
+/// The owned child is also the process-group leader, including during startup.
+fn kill_omc_process(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn connect_port_file(
+    socket: &zmq::Socket,
+    work_dir: &Path,
+    suffix: &str,
+    timeout: Duration,
+) -> Result<PathBuf> {
+    let port_file = wait_for_port_file(work_dir, suffix, timeout).ok_or_else(|| {
+        anyhow!(
+            "omc session port file for suffix '{suffix}' was not populated within {:.1}s",
+            timeout.as_secs_f64()
+        )
+    })?;
+    let endpoint = std::fs::read_to_string(&port_file)
+        .with_context(|| format!("failed to read omc port file '{}'", port_file.display()))?;
+    let endpoint = endpoint.trim();
+    socket
+        .connect(endpoint)
+        .with_context(|| format!("failed to connect to omc endpoint '{endpoint}'"))?;
+    Ok(port_file)
 }
 
 fn unique_session_suffix() -> String {
@@ -252,7 +274,11 @@ fn wait_for_port_file(work_dir: &Path, suffix: &str, timeout: Duration) -> Optio
     let deadline = Instant::now() + timeout;
     let needle = format!("port.{suffix}");
     loop {
-        if let Some(path) = find_port_file(work_dir, &needle) {
+        // OMC creates this file before fputs/fclose publishes the endpoint.
+        // Existence alone can expose the empty file between those operations.
+        if let Some(path) = find_port_file(work_dir, &needle)
+            && std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0)
+        {
             return Some(path);
         }
         if Instant::now() >= deadline {
@@ -287,11 +313,48 @@ pub(super) fn parse_sim_record(record: &str, error: String) -> OmcSimOutcome {
         result_file: extract_record_string(record, "resultFile").filter(|value| !value.is_empty()),
         messages: extract_record_string(record, "messages").unwrap_or_default(),
         error,
-        timing: OmcSimTiming {
-            time_simulation: extract_record_f64(record, "timeSimulation"),
-            time_total: extract_record_f64(record, "timeTotal"),
+        timing: OmcPhaseSeconds {
+            frontend: extract_record_f64(record, "timeFrontend"),
+            backend: extract_record_f64(record, "timeBackend"),
+            sim_code: extract_record_f64(record, "timeSimCode"),
+            templates: extract_record_f64(record, "timeTemplates"),
+            compile: extract_record_f64(record, "timeCompile"),
+            simulation: extract_record_f64(record, "timeSimulation"),
+            total: extract_record_f64(record, "timeTotal"),
         },
+        settings: extract_record_string(record, "simulationOptions")
+            .map(|options| parse_simulation_options(&options))
+            .unwrap_or_default(),
     }
+}
+
+/// The settings in OMC's `simulationOptions` string, a comma-separated list of
+/// `key = value` pairs whose string values are single-quoted.
+fn parse_simulation_options(options: &str) -> OmcSimSettings {
+    let mut settings = OmcSimSettings::default();
+    let mut rest = options;
+    while let Some((key, after)) = rest.split_once('=') {
+        let after = after.trim_start();
+        let (value, next) = match after.strip_prefix('\'') {
+            Some(quoted) => {
+                let end = quoted.find('\'').unwrap_or(quoted.len());
+                let next = quoted[end..].split_once(',').map_or("", |(_, next)| next);
+                (&quoted[..end], next)
+            }
+            None => after.split_once(',').unwrap_or((after, "")),
+        };
+        let value = value.trim();
+        match key.trim() {
+            "method" => settings.method = Some(value.to_string()),
+            "tolerance" => settings.tolerance = value.parse().ok(),
+            "numberOfIntervals" => settings.number_of_intervals = value.parse().ok(),
+            "startTime" => settings.start_time = value.parse().ok(),
+            "stopTime" => settings.stop_time = value.parse().ok(),
+            _ => {}
+        }
+        rest = next;
+    }
+    settings
 }
 
 /// Extract `field = "<value>"` from an OMC record reply.
@@ -334,10 +397,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_port_file_is_not_a_ready_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let suffix = "empty_endpoint";
+        let path = directory
+            .path()
+            .join(format!("openmodelica.test.port.{suffix}"));
+        std::fs::write(&path, "").unwrap();
+        assert!(wait_for_port_file(directory.path(), suffix, Duration::ZERO).is_none());
+        std::fs::write(&path, "tcp://127.0.0.1:12345").unwrap();
+        assert_eq!(
+            wait_for_port_file(directory.path(), suffix, Duration::ZERO),
+            Some(path)
+        );
+    }
+
+    #[test]
     fn parse_sim_record_extracts_fields() {
         let record = r#"record SimulationResult
     resultFile = "/tmp/work/First_res.csv",
-    simulationOptions = "startTime = 0.0, stopTime = 1.0",
+    simulationOptions = "startTime = 0.0, stopTime = 1.0, numberOfIntervals = 500, tolerance = 1e-06, method = 'dassl', fileNamePrefix = 'First', options = '', outputFormat = 'csv', variableFilter = '.*', cflags = '', simflags = '-s=a,b'",
     messages = "",
     timeFrontend = 0.012,
     timeBackend = 0.034,
@@ -352,8 +431,28 @@ end SimulationResult;"#;
             outcome.result_file.as_deref(),
             Some("/tmp/work/First_res.csv")
         );
-        assert_eq!(outcome.timing.time_total, Some(0.5739));
-        assert_eq!(outcome.timing.time_simulation, Some(0.0334));
+        assert_eq!(
+            outcome.timing,
+            OmcPhaseSeconds {
+                frontend: Some(0.012),
+                backend: Some(0.034),
+                sim_code: Some(0.001),
+                templates: Some(0.002),
+                compile: Some(0.433),
+                simulation: Some(0.0334),
+                total: Some(0.5739),
+            }
+        );
+        assert_eq!(
+            outcome.settings,
+            OmcSimSettings {
+                method: Some("dassl".to_string()),
+                tolerance: Some(1e-6),
+                number_of_intervals: Some(500),
+                start_time: Some(0.0),
+                stop_time: Some(1.0),
+            }
+        );
     }
 
     #[test]
@@ -368,6 +467,86 @@ end SimulationResult;"#;
         assert_eq!(outcome.result_file, None);
         assert!(outcome.messages.contains("does not exist"));
         assert_eq!(outcome.error, "Error: boom");
+    }
+
+    #[test]
+    fn reference_outcome_preserves_runtime_assertion_failure() {
+        let record = r#"record SimulationResult
+    resultFile = "",
+    messages = "Simulation execution failed for model: ResourceUser
+LOG_ASSERT | debug | Not possible to open file modelica://Library/data.txt
+LOG_ASSERT | info | simulation terminated by an assertion at initialization
+",
+    timeSimulation = 0.014,
+    timeTotal = 0.831
+end SimulationResult;"#;
+        let outcome = parse_sim_record(
+            record,
+            "Warning: pure function calls impure function".into(),
+        );
+        let result = super::super::build_session_model_result(&outcome, 1.0);
+
+        assert_eq!(result.status, "error");
+        let error = result.error.expect("runtime failure diagnostic");
+        assert!(error.contains("Simulation execution failed"));
+        assert!(error.contains("modelica://Library/data.txt"));
+        assert_eq!(super::super::omc_assertion_failure_lines(&error).len(), 1);
+    }
+
+    #[test]
+    fn an_event_iteration_limit_is_an_omc_failure_not_a_model_assertion() {
+        let record = r#"record SimulationResult
+    resultFile = "",
+    messages = "Simulation execution failed for model: ControlledTanks
+LOG_ASSERT        | debug   | Simulation terminated due to too many, i.e. 20, event iterations.
+",
+    timeSimulation = 0.014,
+    timeTotal = 0.831
+end SimulationResult;"#;
+        let outcome = parse_sim_record(record, String::new());
+        let result = super::super::build_session_model_result(&outcome, 1.0);
+
+        assert_eq!(result.status, "error");
+        let error = result.error.expect("solver failure diagnostic");
+        assert!(error.contains("event iterations"));
+        assert!(super::super::omc_assertion_failure_lines(&error).is_empty());
+    }
+
+    #[test]
+    fn reference_outcome_requires_a_result_even_without_diagnostics() {
+        let outcome = parse_sim_record(
+            "record SimulationResult resultFile = \"\", messages = \"\" end SimulationResult;",
+            String::new(),
+        );
+        let result = super::super::build_session_model_result(&outcome, 1.0);
+
+        assert_eq!(result.status, "error");
+        assert!(
+            result
+                .error
+                .expect("missing result diagnostic")
+                .contains("result file")
+        );
+    }
+
+    #[test]
+    fn reference_outcome_accepts_result_with_nonfatal_warning() {
+        let outcome = parse_sim_record(
+            r#"record SimulationResult
+    resultFile = "result.csv",
+    messages = "LOG_ASSERT | warning | [<interactive>:1:68-1:125:writable]
+| | | The following assertion has been violated during initialization at time 0.000000
+| | | ((x < -1.0)) --> \"expected warning\"
+LOG_SUCCESS | info | The simulation finished successfully.
+"
+end SimulationResult;"#,
+            "Warning: harmless diagnostic".into(),
+        );
+        let result = super::super::build_session_model_result(&outcome, 1.0);
+
+        assert_eq!(result.status, "success");
+        assert_eq!(result.result_file.as_deref(), Some("result.csv"));
+        assert_eq!(result.error, None);
     }
 
     #[test]

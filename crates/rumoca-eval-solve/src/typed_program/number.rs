@@ -155,6 +155,9 @@ pub(super) fn eval_binary_element(
         (SolveValueKind::Boolean(lhs), SolveValueKind::Boolean(rhs)) => match operator {
             SolveBinaryOperator::And => Ok(SolveValueKind::Boolean(lhs && rhs)),
             SolveBinaryOperator::Or => Ok(SolveValueKind::Boolean(lhs || rhs)),
+            // MLS §10.3.4: `false < true`, so the least is the conjunction.
+            SolveBinaryOperator::Min => Ok(SolveValueKind::Boolean(lhs && rhs)),
+            SolveBinaryOperator::Max => Ok(SolveValueKind::Boolean(lhs || rhs)),
             _ => invalid("evaluate Boolean binary operation", provenance),
         },
         _ => invalid("evaluate binary operation", provenance),
@@ -175,6 +178,9 @@ fn eval_integer_binary(
         SolveBinaryOperator::Add => lhs.checked_add(rhs),
         SolveBinaryOperator::Subtract => lhs.checked_sub(rhs),
         SolveBinaryOperator::Multiply => lhs.checked_mul(rhs),
+        // Truncating quotient; `checked_div` refuses a zero divisor and the
+        // one overflowing quotient.
+        SolveBinaryOperator::IntegerQuotient => lhs.checked_div(rhs),
         SolveBinaryOperator::Min => Some(lhs.min(rhs)),
         SolveBinaryOperator::Max => Some(lhs.max(rhs)),
         _ => None,
@@ -197,7 +203,9 @@ fn eval_real_binary_f32(operator: SolveBinaryOperator, lhs: f32, rhs: f32) -> f3
         SolveBinaryOperator::Atan2 => lhs.atan2(rhs),
         SolveBinaryOperator::Min => lhs.min(rhs),
         SolveBinaryOperator::Max => lhs.max(rhs),
-        SolveBinaryOperator::And | SolveBinaryOperator::Or => f32::NAN,
+        SolveBinaryOperator::IntegerQuotient
+        | SolveBinaryOperator::And
+        | SolveBinaryOperator::Or => f32::NAN,
     }
 }
 
@@ -211,7 +219,9 @@ fn eval_real_binary_f64(operator: SolveBinaryOperator, lhs: f64, rhs: f64) -> f6
         SolveBinaryOperator::Atan2 => lhs.atan2(rhs),
         SolveBinaryOperator::Min => lhs.min(rhs),
         SolveBinaryOperator::Max => lhs.max(rhs),
-        SolveBinaryOperator::And | SolveBinaryOperator::Or => f64::NAN,
+        SolveBinaryOperator::IntegerQuotient
+        | SolveBinaryOperator::And
+        | SolveBinaryOperator::Or => f64::NAN,
     }
 }
 

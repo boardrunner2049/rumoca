@@ -121,6 +121,56 @@ fn append_instance_equations(
     Ok(())
 }
 
+/// The if-equations among `equations` (and the branches they select) whose
+/// branch instantiation selects by evaluating component references, each
+/// with the conditions it evaluated (SPEC_0040 DAE-C22).
+pub(super) fn parameter_branch_selections(
+    equations: &[ast::Equation],
+    origin: &ast::QualifiedName,
+    source_map: &rumoca_core::SourceMap,
+    eval_ctx: Option<&InstantiateEvalCtx<'_>>,
+) -> InstantiateResult<Vec<ast::InstanceBranchSelection>> {
+    let mut selections = Vec::new();
+    for equation in equations {
+        let Some(selected) = select_structural_if_branch(equation, eval_ctx) else {
+            continue;
+        };
+        if let ast::Equation::If { cond_blocks, .. } = equation {
+            let conditions = evaluated_conditions(cond_blocks, eval_ctx);
+            if conditions
+                .iter()
+                .any(|condition| !ast::collect_component_refs(condition).is_empty())
+            {
+                selections.push(ast::InstanceBranchSelection {
+                    conditions,
+                    origin: origin.clone(),
+                    span: equation_owner_span(equation, equation.get_location(), source_map)?,
+                });
+            }
+        }
+        selections.extend(parameter_branch_selections(
+            selected, origin, source_map, eval_ctx,
+        )?);
+    }
+    Ok(selections)
+}
+
+/// The conditions a selection evaluates: each up to and including the first
+/// that holds.
+fn evaluated_conditions(
+    cond_blocks: &[ast::EquationBlock],
+    eval_ctx: Option<&InstantiateEvalCtx<'_>>,
+) -> Vec<ast::Expression> {
+    let mut conditions = Vec::new();
+    for block in cond_blocks {
+        conditions.push(block.cond.clone());
+        if eval_ctx.and_then(|eval| evaluate_component_condition(eval, &block.cond)) == Some(true) {
+            break;
+        }
+    }
+    conditions
+}
+
 fn equation_owner_span(
     equation: &ast::Equation,
     location: Option<&rumoca_core::Location>,
@@ -177,7 +227,11 @@ fn select_structural_if_branch<'a>(
         return None;
     };
     let eval_ctx = eval_ctx?;
-    if !if_selection_is_grounded(cond_blocks, else_block.as_deref()) {
+    if !if_selection_is_grounded(cond_blocks, else_block.as_deref())
+        || cond_blocks
+            .iter()
+            .any(|block| names_possibly_non_evaluable(eval_ctx, &block.cond))
+    {
         return None;
     }
     for block in cond_blocks {
@@ -188,6 +242,35 @@ fn select_structural_if_branch<'a>(
         }
     }
     Some(else_block.as_deref().unwrap_or_default())
+}
+
+/// Whether `condition` names a component that may be a non-evaluable parameter
+/// (MLS 3.7 section 4.5): one that writes `Evaluate = false` or modifies
+/// `fixed`. Such a selection is left to flatten, which evaluates `fixed` and
+/// selects on evaluable parameters only.
+fn names_possibly_non_evaluable(
+    eval_ctx: &InstantiateEvalCtx<'_>,
+    condition: &ast::Expression,
+) -> bool {
+    ast::collect_component_refs(condition)
+        .iter()
+        .any(|reference| {
+            let Some(first) = reference.parts.first() else {
+                return false;
+            };
+            let name = first.ident.text.as_ref();
+            eval_ctx
+                .effective_components
+                .get(name)
+                .is_some_and(|component| {
+                    super::evaluate_annotation(component) == Some(false)
+                        || component.modifications.contains_key("fixed")
+                        || eval_ctx
+                            .mod_env
+                            .get(&ast::QualifiedName::from_ident(name).child("fixed"))
+                            .is_some()
+                })
+        })
 }
 
 /// True when an if-equation may be decided at instantiation time: either every

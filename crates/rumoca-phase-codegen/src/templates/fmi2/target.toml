@@ -12,7 +12,7 @@ Advertised profiles: FMI 2 Model Exchange and Co-Simulation."""
 
 [package]
 root = "{{ model_name }}"
-required_files = ["modelDescription.xml", "sources/model.c"]
+required_files = ["modelDescription.xml", "sources/model.c", "sources/model.h", "sources/rmc_rows.c", "sources/rmc_isolators.c", "sources/rmc_functions.c", "sources/rmc_assign.c", "sources/rmc_jacobian.c"]
 
 [package.archive]
 path = "{{ model_name }}.fmu"
@@ -23,6 +23,7 @@ root = "flat"
 continuous_states = true
 residual_equations = false
 exact_algebraic_assignments = true
+algebraic_projection = true
 scalar_fallback = true
 external_functions = false
 external_tables = false
@@ -42,7 +43,7 @@ host_callbacks = false
 
 [capabilities.tensor]
 matmul = "scalar"
-linsolve = "unsupported"
+linsolve = "scalar"
 elementwise = "scalar"
 stencil = "scalar"
 reductions = "scalar"
@@ -59,3 +60,27 @@ id = "fmu"
 [[files]]
 path = "sources/model.c"
 template = "model.c.jinja"
+
+[[files]]
+path = "sources/model.h"
+template = "model.h.jinja"
+
+[[files]]
+path = "sources/rmc_rows.c"
+template = "rmc_rows.c.jinja"
+
+[[files]]
+path = "sources/rmc_isolators.c"
+template = "rmc_isolators.c.jinja"
+
+[[files]]
+path = "sources/rmc_functions.c"
+template = "rmc_functions.c.jinja"
+
+[[files]]
+path = "sources/rmc_assign.c"
+template = "rmc_assign.c.jinja"
+
+[[files]]
+path = "sources/rmc_jacobian.c"
+template = "rmc_jacobian.c.jinja"

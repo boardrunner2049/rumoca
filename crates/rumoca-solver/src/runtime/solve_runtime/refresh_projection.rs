@@ -1,8 +1,20 @@
-use crate::runtime::projection::{ScaledNewtonSystem, per_row_torn_block_sweep};
+mod grouped_jacobian;
+mod grouped_residual;
+mod prepared_jacobian;
+
+pub(super) use prepared_jacobian::{
+    prepare_projection_jacobians, projection_jacobian_source, validate_projection_primal_source,
+};
+
+use crate::runtime::projection::{
+    ImplicitProjectionModel, ScaledNewtonSystem, per_row_torn_block_sweep,
+};
 use nalgebra::DVector;
+use rumoca_eval_solve::dense_basis::{DenseStageMatrix, DependentConditioning};
 use rumoca_eval_solve::{PreparedTornSweep, TornSweepStatus};
 
 use super::*;
+use crate::runtime::fallbacks::{self, ProjectionFallback, ProjectionSite};
 
 /// Prepared batched torn-block sweeps, keyed by the address of the plan's
 /// `BlockTearing`. The tearing lives inside the runtime's immutable
@@ -107,6 +119,31 @@ impl ParameterStaticGradientCache {
         true
     }
 
+    /// Copy only the requested columns of a valid cached gradient. A block
+    /// Jacobian reads just its own unknowns, so copying the complete solver-Y
+    /// gradient per row moves memory no consumer reads.
+    fn copy_columns_into(
+        &self,
+        row: usize,
+        parameter_indices: &[usize],
+        params: &[f64],
+        columns: &[usize],
+        gradient: &mut [f64],
+    ) -> bool {
+        let Some(cached) = self.valid_row(row, parameter_indices, params) else {
+            return false;
+        };
+        if cached.gradient.len() != gradient.len()
+            || columns.iter().any(|&column| column >= gradient.len())
+        {
+            return false;
+        }
+        for &column in columns {
+            gradient[column] = cached.gradient[column];
+        }
+        true
+    }
+
     fn valid_row(
         &self,
         row: usize,
@@ -207,10 +244,12 @@ pub(super) fn trace_reverse_projection_coverage(
 
 pub(super) struct RefreshProjectionModel<'a> {
     pub(super) runtime: &'a SolveRuntime,
+    #[cfg(test)]
     pub(super) plan: &'a solve::AlgebraicProjectionPlan,
     pub(super) block_indices: &'a [usize],
     pub(super) plan_validated: bool,
     pub(super) jacobian_v: ProjectionJacobian<'a>,
+    pub(super) seed_linearizations: Option<RefCell<std::cell::RefMut<'a, SeedProjectionCache>>>,
 }
 
 pub(super) struct RuntimeManifoldProjection<'a> {
@@ -218,6 +257,21 @@ pub(super) struct RuntimeManifoldProjection<'a> {
 }
 
 impl ManifoldProjectionModel for RuntimeManifoldProjection<'_> {
+    fn eval_manifold_jacobian_outputs(
+        &self,
+        selection: &solve::ProjectionOutputSelection,
+        inputs: solve_eval::JacobianEvalInputs<'_>,
+        out: &mut [f64],
+    ) -> Result<bool, RuntimeSolveError> {
+        self.runtime.manifold.eval_selected_directional(
+            selection,
+            inputs,
+            self.runtime.row_eval_context(),
+            out,
+        )?;
+        Ok(true)
+    }
+
     fn eval_manifold_residual(
         &self,
         y: &[f64],
@@ -226,9 +280,8 @@ impl ManifoldProjectionModel for RuntimeManifoldProjection<'_> {
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.runtime
-            .manifold_residual
-            .eval_with_context(y, p, t, self.runtime.row_eval_context(), out)
-            .map_err(Into::into)
+            .manifold
+            .eval_residual(y, p, t, self.runtime.row_eval_context(), out)
     }
 
     fn eval_manifold_jacobian_v(
@@ -240,22 +293,12 @@ impl ManifoldProjectionModel for RuntimeManifoldProjection<'_> {
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.runtime
-            .manifold_jacobian_v
-            .eval_with_context(
-                y,
-                p,
-                t,
-                RowEvalContext {
-                    seed: Some(v),
-                    ..self.runtime.row_eval_context()
-                },
-                out,
-            )
-            .map_err(Into::into)
+            .manifold
+            .eval_directional(y, p, t, self.runtime.row_eval_context(), v, out)
     }
 
     fn manifold_residual_len(&self) -> usize {
-        self.runtime.manifold_residual.len()
+        self.runtime.manifold.len()
     }
 
     fn manifold_projection_plan(&self) -> &solve::AlgebraicProjectionPlan {
@@ -315,9 +358,117 @@ impl<'a> ProjectionJacobian<'a> {
     fn is_solver_y_only(self) -> bool {
         matches!(self, Self::SolverY { .. })
     }
+
+    fn compiled(self, runtime: &SolveRuntime) -> Option<&dyn CompiledSolveJacobianExpression> {
+        match self {
+            Self::SolverY { .. } => runtime.compiled_implicit_projection_jacobian_v.as_deref(),
+            Self::SolverYAndParameters(_) => runtime.compiled_implicit_full_jacobian_v.as_deref(),
+        }
+    }
 }
 
 impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
+    fn linked_kernel(
+        &self,
+        request: crate::runtime::projection::KernelRequest<'_>,
+    ) -> Result<crate::runtime::projection::KernelAnswer, RuntimeSolveError> {
+        use crate::runtime::projection::{KernelAnswer, KernelRequest};
+        Ok(match request {
+            KernelRequest::BeginBlock {
+                block_index,
+                point: (y, p, t),
+            } => {
+                if let Some(&index) = self.block_indices.get(block_index) {
+                    self.runtime.begin_block_residual_split(index, y, p, t);
+                }
+                KernelAnswer::Done
+            }
+            KernelRequest::EndBlock => {
+                self.runtime.end_block_residual_split();
+                KernelAnswer::Done
+            }
+            KernelRequest::ColoredEntries {
+                structure,
+                coordinates,
+                point,
+            } => self
+                .eval_colored_tangent_entries(structure, coordinates, point)?
+                .map_or(KernelAnswer::Declined, KernelAnswer::ColoredEntries),
+            KernelRequest::TornJacobian {
+                block,
+                point: (y, p, t),
+            } if self.jacobian_v.is_solver_y_only() => self
+                .block_indices
+                .get(block.index)
+                .map(|&index| {
+                    self.runtime
+                        .torn_tangent_jacobian(index, block.tearing, y, p, t)
+                })
+                .transpose()?
+                .flatten()
+                .map_or(KernelAnswer::Declined, |jacobian| {
+                    jacobian.map_or(
+                        KernelAnswer::TornJacobianSingular,
+                        KernelAnswer::TornJacobian,
+                    )
+                }),
+            KernelRequest::TornJacobian { .. } => KernelAnswer::Declined,
+        })
+    }
+
+    fn eval_prepared_implicit_jacobian(
+        &self,
+        structure: &solve::JacobianStructure,
+        coordinates: (&[usize], &[usize]),
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        out: &mut [f64],
+    ) -> Result<bool, RuntimeSolveError> {
+        self.eval_prepared_jacobian(structure, coordinates, y, p, t, out)
+    }
+
+    fn eval_implicit_residual_outputs(
+        &self,
+        selection: &solve::ProjectionOutputSelection,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        out: &mut [f64],
+    ) -> Result<bool, RuntimeSolveError> {
+        self.eval_grouped_residual_outputs(selection, y, p, t, out)?;
+        Ok(true)
+    }
+
+    fn algebraic_seed_linearization(
+        &self,
+        block_index: usize,
+        block: &solve::AlgebraicProjectionBlock,
+        y: &[f64],
+        args: crate::runtime::projection::AlgebraicProjectionArgs<'_>,
+    ) -> Result<Rc<crate::runtime::projection::SeedBlockLinearization>, RuntimeSolveError> {
+        self.seed_block_linearization(block_index, block, y, args)
+    }
+
+    fn eval_implicit_jacobian_v_outputs(
+        &self,
+        selection: &solve::ProjectionJacobianOutputs,
+        inputs: solve_eval::JacobianEvalInputs<'_>,
+        enabled_rows: &[bool],
+        out: &mut [f64],
+    ) -> Result<bool, RuntimeSolveError> {
+        let selection = if self.jacobian_v.is_solver_y_only() {
+            selection.solver_y()
+        } else {
+            selection.solver_y_and_parameters()
+        };
+        let Some(selection) = selection else {
+            return Ok(false);
+        };
+        self.eval_grouped_jacobian_outputs(selection, inputs, enabled_rows, out)?;
+        Ok(true)
+    }
+
     fn eval_residual(
         &self,
         y: &[f64],
@@ -351,15 +502,7 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
         v: &[f64],
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
-        let compiled = match self.jacobian_v {
-            ProjectionJacobian::SolverY { .. } => self
-                .runtime
-                .compiled_implicit_projection_jacobian_v
-                .as_ref(),
-            ProjectionJacobian::SolverYAndParameters(_) => {
-                self.runtime.compiled_implicit_full_jacobian_v.as_ref()
-            }
-        };
+        let compiled = self.jacobian_v.compiled(self.runtime);
         if let Some(compiled) = compiled
             && compiled
                 .call(
@@ -402,6 +545,26 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
         else {
             return Ok(None);
         };
+        if let Some(value) = self.runtime.eval_split_residual_row(program_idx, (y, p, t)) {
+            self.runtime
+                .report_nonfinite_implicit_residual_row_inputs(t, y, row_idx, value);
+            return Ok(Some(value));
+        }
+        if let Some(compiled) = &self.runtime.compiled_implicit_rhs
+            && let Some(value) = compiled
+                .call_program_output(
+                    (program_idx, output_offset),
+                    y,
+                    p,
+                    t,
+                    self.runtime.model.external_tables.as_slice(),
+                )
+                .map_err(RuntimeSolveError::solve_ir)?
+        {
+            self.runtime
+                .report_nonfinite_implicit_residual_row_inputs(t, y, row_idx, value);
+            return Ok(Some(value));
+        }
         let value = self
             .runtime
             .implicit_scalar_rhs
@@ -447,6 +610,20 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
                 .parameter_static_gradient_cache
                 .borrow()
                 .dot_solver_y_seed(implicit_program_idx, parameter_indices, p, v)
+        {
+            return Ok(Some(value));
+        }
+        if let Some(compiled) = self.jacobian_v.compiled(self.runtime)
+            && let Some(value) = compiled
+                .call_program_output(
+                    (jvp_program_idx, output_offset),
+                    y,
+                    p,
+                    t,
+                    v,
+                    self.runtime.model.external_tables.as_slice(),
+                )
+                .map_err(RuntimeSolveError::solve_ir)?
         {
             return Ok(Some(value));
         }
@@ -518,6 +695,34 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
         Ok(evaluated)
     }
 
+    fn eval_implicit_jacobian_row_columns(
+        &self,
+        row_idx: usize,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        columns: &[usize],
+        gradient: &mut [f64],
+    ) -> Result<bool, RuntimeSolveError> {
+        if let Some((program_idx, _)) = self
+            .runtime
+            .implicit_scalar_rhs
+            .row_output_position(row_idx)
+            && let Some(parameter_indices) = self
+                .runtime
+                .implicit_scalar_rhs
+                .parameter_static_y_gradient_params(program_idx)
+            && self
+                .runtime
+                .parameter_static_gradient_cache
+                .borrow()
+                .copy_columns_into(program_idx, parameter_indices, p, columns, gradient)
+        {
+            return Ok(true);
+        }
+        self.eval_implicit_jacobian_row(row_idx, y, p, t, gradient)
+    }
+
     fn implicit_jacobian_v_row_depends_on(&self, row_idx: usize, seed_index: usize) -> bool {
         self.runtime
             .continuous_structural
@@ -551,12 +756,53 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
     }
 
     fn algebraic_projection_block_is_affine(&self, block_index: usize) -> bool {
-        self.plan.blocks.get(block_index).is_some_and(|block| {
-            block
-                .rows
-                .iter()
-                .all(|&row| self.implicit_row_is_affine(row))
+        self.block_indices.get(block_index).is_some_and(|&index| {
+            self.runtime
+                .model
+                .problem
+                .continuous
+                .refresh_owners
+                .algebraic_projection_block_is_affine(index)
         })
+    }
+
+    fn projection_site(&self, block_index: usize) -> Option<usize> {
+        self.block_indices.get(block_index).copied()
+    }
+
+    fn solve_affine_torn_delta(
+        &self,
+        block_index: usize,
+        system: ScaledNewtonSystem<'_>,
+    ) -> Option<DVector<f64>> {
+        let block_index = self.block_indices.get(block_index).copied()?;
+        let layout = self
+            .runtime
+            .continuous_structural
+            .algebraic_projection()
+            .get(block_index)?
+            .affine_elimination()?;
+        let cache = self.runtime.algebraic_newton_caches.get(block_index)?;
+        let delta = crate::runtime::projection::scaled_newton_delta_with_tearing(
+            system,
+            &mut cache.borrow_mut(),
+            layout,
+        );
+        if delta.is_none() {
+            fallbacks::note_fallback(
+                ProjectionSite::Block(block_index),
+                ProjectionFallback::AffineFullSystem,
+            );
+        }
+        delta
+    }
+
+    fn affine_jacobian_cache(
+        &self,
+        block_index: usize,
+    ) -> Option<&std::cell::RefCell<crate::runtime::projection::SparseNewtonCache>> {
+        let index = self.block_indices.get(block_index).copied()?;
+        self.runtime.algebraic_newton_caches.get(index)
     }
 
     fn solve_algebraic_newton_delta(
@@ -594,6 +840,31 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
         else {
             return Ok(None);
         };
+        if output_offset == 0
+            && let Some(compiled) = self
+                .runtime
+                .compiled_projection_assignment(program_idx, target_y_index)?
+        {
+            let mut output = [0.0];
+            compiled
+                .call(
+                    y,
+                    p,
+                    t,
+                    self.runtime.model.external_tables.as_slice(),
+                    &mut output,
+                )
+                .map_err(|error| {
+                    RuntimeSolveError::solve_ir_with_span(
+                        error,
+                        self.runtime
+                            .implicit_scalar_rhs
+                            .block()
+                            .program_span(program_idx),
+                    )
+                })?;
+            return Ok(Some(output[0]));
+        }
         self.runtime
             .implicit_scalar_rhs
             .eval_target_assignment_output_unchecked_with_context(
@@ -694,6 +965,10 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
 
     fn algebraic_projection_plan_is_validated(&self) -> bool {
         self.plan_validated
+    }
+
+    fn unlocalizable_guards(&self) -> &[solve::UnlocalizableGuard] {
+        &self.runtime.model.problem.continuous.unlocalizable_guards
     }
 
     fn target_name_for_row(&self, row_idx: usize) -> Option<&str> {
@@ -825,14 +1100,6 @@ impl RefreshProjectionModel<'_> {
             .report_nonfinite_implicit_residual_row_inputs(t, y, row, value);
         if value.is_finite() { value } else { f64::NAN }
     }
-
-    fn implicit_row_is_affine(&self, row_idx: usize) -> bool {
-        let block = &self.runtime.implicit_scalar_rhs;
-        block
-            .row_output_position(row_idx)
-            .map(|(program_idx, _)| program_idx)
-            .is_some_and(|program_idx| block.certifies_parameter_static_y_gradient(program_idx))
-    }
 }
 
 impl SolveRuntime {
@@ -893,23 +1160,7 @@ impl SolveRuntime {
     }
 
     pub(super) fn value_stage_schedule_is_certified(&self, plan: &solve::RefreshPlan) -> bool {
-        let structural = self.continuous_structural.algebraic_projection();
-        plan.simultaneous_block_indices.len() == plan.simultaneous_plan.blocks.len()
-            && !plan.value_stages.is_empty()
-            && value_stage_seed_coverage_is_complete(plan)
-            && plan
-                .simultaneous_block_indices
-                .iter()
-                .all(|&index| structural.get(index).is_some())
-            && plan
-                .simultaneous_block_indices
-                .iter()
-                .skip(1)
-                .all(|&index| {
-                    self.continuous_structural
-                        .algebraic_invalidates_earlier(index)
-                        == Some(false)
-                })
+        plan.value_stage_schedule_is_certified(&self.continuous_structural)
     }
 
     pub(super) fn refresh_slots_with_stages(
@@ -919,6 +1170,7 @@ impl SolveRuntime {
         incoming: &[f64],
     ) -> Result<(), RuntimeSolveError> {
         self.prepare_static_refresh_cache(args.params, args.solver_y.len());
+        let _call = fallbacks::begin_call(ProjectionSite::CompletePlan, 0);
         for stage in &plan.value_stages {
             if !self.execute_refresh_stage(stage, plan, args, incoming)? {
                 return Ok(());
@@ -927,7 +1179,7 @@ impl SolveRuntime {
         Ok(())
     }
 
-    fn execute_refresh_stage(
+    pub(super) fn execute_refresh_stage(
         &self,
         stage: &solve::RefreshStage,
         complete_plan: &solve::RefreshPlan,
@@ -995,6 +1247,10 @@ impl SolveRuntime {
         if seeded {
             return Ok(true);
         }
+        fallbacks::note_fallback(
+            ProjectionSite::CompletePlan,
+            ProjectionFallback::CompletePlan,
+        );
         self.project_refresh_slots(complete_plan, args, true)?;
         Ok(false)
     }
@@ -1010,13 +1266,42 @@ impl SolveRuntime {
     ) -> Result<bool, RuntimeSolveError> {
         let result =
             self.refresh_slots_once(seed.rows, seed.sequence, args.t, args.solver_y, args.params);
-        if let Err(error) = result {
-            restore_after_causal_seed_error(error, args.solver_y, incoming)?;
-            self.project_refresh_slots(complete_plan, args, true)?;
-            return Ok(false);
+        let Err(error) = result else {
+            self.project_refresh_stage(block_index, plan, args)?;
+            return Ok(true);
+        };
+        if !seed_error_allows_projection(&error) {
+            args.solver_y.copy_from_slice(incoming);
+            return Err(error);
         }
-        self.project_refresh_stage(block_index, plan, args)?;
-        Ok(true)
+        // A seed is only a warm start. Restore the seed targets and the block
+        // unknowns to their pre-stage values and project this block; the
+        // certified earlier stages keep their values. Only when the block's
+        // own projection fails does the complete simultaneous plan run.
+        if let Some(block) = plan.blocks.first() {
+            for index in solve::projection_seed_rescue_targets(seed.rows, block) {
+                args.solver_y[index] = incoming[index];
+            }
+            fallbacks::note_fallback(
+                ProjectionSite::Block(block_index),
+                ProjectionFallback::SeedRescue,
+            );
+            tracing::debug!(
+                target: "rumoca_eval_solve::refresh",
+                block_index,
+                "projection-stage seed was unavailable; projecting its block from the incoming coordinate: {error}"
+            );
+            if self.project_refresh_stage(block_index, plan, args).is_ok() {
+                return Ok(true);
+            }
+        }
+        fallbacks::note_fallback(
+            ProjectionSite::Block(block_index),
+            ProjectionFallback::CompletePlan,
+        );
+        restore_after_causal_seed_error(error, args.solver_y, incoming)?;
+        self.project_refresh_slots(complete_plan, args, true)?;
+        Ok(false)
     }
 
     fn refresh_stage_seed_sweep(
@@ -1060,6 +1345,8 @@ impl SolveRuntime {
     ) -> Result<(), RuntimeSolveError> {
         let model = RefreshProjectionModel {
             runtime: self,
+            seed_linearizations: None,
+            #[cfg(test)]
             plan,
             block_indices: std::slice::from_ref(&block_index),
             plan_validated: true,
@@ -1094,23 +1381,6 @@ impl SolveRuntime {
     }
 }
 
-pub(super) fn value_stage_seed_coverage_is_complete(plan: &solve::RefreshPlan) -> bool {
-    plan.value_stages.iter().all(|stage| match stage {
-        solve::RefreshStage::ProjectionBlock {
-            plan: projection,
-            seed_rows,
-            ..
-        } => projection.blocks.iter().all(|block| {
-            block.y_indices.iter().all(|target| {
-                plan.selected_rows(seed_rows)
-                    .iter()
-                    .any(|row| row.target_index() == *target)
-            })
-        }),
-        _ => true,
-    })
-}
-
 pub(super) fn seed_error_allows_projection(error: &RuntimeSolveError) -> bool {
     matches!(
         error,
@@ -1118,4 +1388,214 @@ pub(super) fn seed_error_allows_projection(error: &RuntimeSolveError) -> bool {
             | RuntimeSolveError::RefreshTargetUnassignable { .. }
             | RuntimeSolveError::RefreshTargetSingular { .. }
     )
+}
+
+impl SolveRuntime {
+    /// A value-projection model view over this runtime's algebraic refresh plan,
+    /// used to evaluate individual implicit residual rows and their Jacobian
+    /// rows for reduced-chart conditioning and re-seeding.
+    fn reduced_chart_projection_model(&self) -> RefreshProjectionModel<'_> {
+        RefreshProjectionModel {
+            runtime: self,
+            seed_linearizations: None,
+            #[cfg(test)]
+            plan: &self.algebraic_refresh.value_projection_plan,
+            block_indices: &self.algebraic_refresh.simultaneous_block_indices,
+            plan_validated: true,
+            jacobian_v: ProjectionJacobian::SolverY {
+                block: &self.implicit_projection_jacobian_v,
+                scalar: &self.implicit_projection_scalar_jacobian_v,
+            },
+        }
+    }
+
+    /// Evaluate the dependent-Jacobian conditioning of each reduced state
+    /// selection chart at a settled solver coordinate.
+    ///
+    /// `folding_rows` are the implicit residual rows of the folding first
+    /// integral (`g = 0`); `group_cols` are the solver-Y columns of the
+    /// constrained coordinate group; `chart_dependent_positions[j]` are the
+    /// positions within `group_cols` that chart `j` reconstructs (its dependent
+    /// coordinates). The returned conditioning per chart estimates `1/cond` of
+    /// that chart's `g_d` in the same relative pivot scale
+    /// [`rumoca_eval_solve::dense_basis::DenseStageMatrix::is_full_column_rank`]
+    /// applies, so a chart whose `rcond` falls to its `singular_threshold` is
+    /// the one folding at this coordinate.
+    pub fn reduced_chart_dependent_conditioning(
+        &self,
+        t: f64,
+        solver_y: &[f64],
+        params: &[f64],
+        folding_rows: &[usize],
+        group_cols: &[usize],
+        chart_dependent_positions: &[Vec<usize>],
+    ) -> Result<Vec<DependentConditioning>, RuntimeSolveError> {
+        if folding_rows.is_empty() || group_cols.is_empty() {
+            return Err(RuntimeSolveError::solve_ir(
+                "reduced-chart conditioning needs a non-empty folding stage",
+            ));
+        }
+        let model = self.reduced_chart_projection_model();
+        let mut seed = vec![0.0; self.solver_count];
+        let mut values = Vec::with_capacity(folding_rows.len() * group_cols.len());
+        for &row in folding_rows {
+            for &col in group_cols {
+                values.push(folding_jacobian_entry(
+                    &model, row, col, solver_y, params, t, &mut seed,
+                )?);
+            }
+        }
+        let stage = DenseStageMatrix::new(folding_rows.len(), group_cols.len(), &values).map_err(
+            |error| {
+                RuntimeSolveError::solve_ir(format!("folding stage matrix rejected: {error:?}"))
+            },
+        )?;
+        chart_dependent_positions
+            .iter()
+            .map(|dependent| {
+                stage.dependent_conditioning(dependent).map_err(|error| {
+                    RuntimeSolveError::solve_ir(format!(
+                        "reduced-chart dependent conditioning failed: {error:?}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// Evaluate selected implicit residual rows at `solver_y`.
+    pub fn evaluate_implicit_residual_rows(
+        &self,
+        t: f64,
+        solver_y: &[f64],
+        params: &[f64],
+        rows: &[usize],
+    ) -> Result<Vec<f64>, RuntimeSolveError> {
+        let model = self.reduced_chart_projection_model();
+        rows.iter()
+            .map(|&row| {
+                model
+                    .eval_implicit_residual_row(row, solver_y, params, t)?
+                    .ok_or_else(|| {
+                        RuntimeSolveError::solve_ir("implicit residual row has no scalar view")
+                    })
+            })
+            .collect()
+    }
+
+    /// The number of scalar implicit residual rows, i.e. the number of reduced
+    /// reconstruction targets the continuous projection drives to zero.
+    pub fn implicit_residual_row_count(&self) -> usize {
+        self.model.problem.continuous.implicit_row_targets.len()
+    }
+
+    /// The one solver-Y coordinate other than `state` that implicit residual
+    /// `row` reads, when it reads exactly one: the source coordinate a
+    /// state-binding row `state - source` integrates.
+    pub(crate) fn binding_row_source(&self, row: usize, state: usize) -> Option<usize> {
+        let (program, _) = self.implicit_scalar_rhs.row_output_position(row)?;
+        let mut sources = self
+            .implicit_scalar_rhs
+            .block()
+            .program(program)?
+            .iter()
+            .filter_map(|op| match op {
+                solve::LinearOp::LoadY { index, .. } if *index != state => Some(*index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        sources.sort_unstable();
+        sources.dedup();
+        match sources.as_slice() {
+            [source] => Some(*source),
+            _ => None,
+        }
+    }
+
+    /// For each generated state coordinate (solver-Y `0..state_count`), the
+    /// unique implicit residual row whose value is its identity `state - source`,
+    /// i.e. the row whose Jacobian with respect to that state column is a unit
+    /// pivot. The row's residual reconstructs the integrated source coordinate,
+    /// so `state[k] - residual[binding_row[k]]` recovers that source's value.
+    pub fn implicit_state_binding_rows(
+        &self,
+        t: f64,
+        solver_y: &[f64],
+        params: &[f64],
+        state_count: usize,
+    ) -> Result<Vec<usize>, RuntimeSolveError> {
+        let model = self.reduced_chart_projection_model();
+        let row_count = self.implicit_residual_row_count();
+        let mut seed = vec![0.0; self.solver_count];
+        (0..state_count)
+            .map(|state| {
+                let slot = seed.get_mut(state).ok_or_else(|| {
+                    RuntimeSolveError::solve_ir("state coordinate is out of solver range")
+                })?;
+                *slot = 1.0;
+                let binding = unit_binding_row(&model, row_count, solver_y, params, t, &seed);
+                seed[state] = 0.0;
+                binding
+            })
+            .collect()
+    }
+}
+
+/// One entry of the folding stage Jacobian: the derivative of implicit residual
+/// `row` with respect to solver-Y column `col`, evaluated by a unit seed. `seed`
+/// is left zeroed for reuse.
+fn folding_jacobian_entry(
+    model: &RefreshProjectionModel<'_>,
+    row: usize,
+    col: usize,
+    solver_y: &[f64],
+    params: &[f64],
+    t: f64,
+    seed: &mut [f64],
+) -> Result<f64, RuntimeSolveError> {
+    // The compiler-derived implicit pattern proves most entries structurally
+    // zero; only the rest need a Jacobian evaluation.
+    if !model.implicit_jacobian_v_row_depends_on(row, col) {
+        return Ok(0.0);
+    }
+    let slot = seed.get_mut(col).ok_or_else(|| {
+        RuntimeSolveError::solve_ir("folding group column is out of solver range")
+    })?;
+    *slot = 1.0;
+    let entry = model
+        .eval_implicit_jacobian_v_row(row, solver_y, params, t, seed)?
+        .ok_or_else(|| {
+            RuntimeSolveError::solve_ir("folding residual row has no scalar Jacobian view")
+        })?;
+    seed[col] = 0.0;
+    Ok(entry)
+}
+
+/// The unique implicit residual row whose Jacobian with respect to the state
+/// column seeded in `seed` is a unit pivot: that state coordinate's identity
+/// row. Fails when no row or more than one row carries that pivot.
+fn unit_binding_row(
+    model: &RefreshProjectionModel<'_>,
+    row_count: usize,
+    solver_y: &[f64],
+    params: &[f64],
+    t: f64,
+    seed: &[f64],
+) -> Result<usize, RuntimeSolveError> {
+    let mut binding = None;
+    for row in 0..row_count {
+        let Some(value) = model.eval_implicit_jacobian_v_row(row, solver_y, params, t, seed)?
+        else {
+            continue;
+        };
+        if value.abs() > 0.5 {
+            if binding.is_some() {
+                return Err(RuntimeSolveError::solve_ir(
+                    "state coordinate binds more than one implicit residual row",
+                ));
+            }
+            binding = Some(row);
+        }
+    }
+    binding
+        .ok_or_else(|| RuntimeSolveError::solve_ir("state coordinate has no identity residual row"))
 }

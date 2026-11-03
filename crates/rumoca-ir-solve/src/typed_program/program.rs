@@ -2,6 +2,7 @@ mod construction_error;
 pub use construction_error::SolveProgramConstructionError;
 
 mod directional;
+mod linear_solve;
 mod tensor;
 
 pub use tensor::promoted_concatenate_dimensions;
@@ -12,7 +13,7 @@ use std::marker::PhantomData;
 use rumoca_core::{Span, StructuredIndexDomain};
 use serde::{Deserialize, Serialize};
 
-use super::call::{SolvePureCallInterface, SolvePureCallOwnerId};
+use super::call::{SolvePureCallOwnerId, SolvePureCallTableView};
 use super::types::{SolveArithmeticProfile, SolveScalarType, SolveValue, SolveValueType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -151,6 +152,11 @@ pub enum SolveBinaryOperator {
     Subtract,
     Multiply,
     Divide,
+    /// The exact Integer quotient truncated toward zero (MLS §3.7.2 `div`).
+    /// A zero divisor or an unrepresentable quotient is an evaluation
+    /// failure, never a wrapped or defaulted value. `Divide` stays Real-only,
+    /// so an Integer `/` cannot bypass its explicit conversion to Real.
+    IntegerQuotient,
     Power,
     And,
     Or,
@@ -375,6 +381,12 @@ pub enum SolveOperation {
         arguments: Box<[SolveRegisterId]>,
         destinations: Box<[SolveRegisterId]>,
     },
+    /// A square Binary64 system over whole matrix/vector registers.
+    LinearSolve {
+        destination: SolveRegisterId,
+        matrix: SolveRegisterId,
+        rhs: SolveRegisterId,
+    },
 }
 
 impl SolveOperation {
@@ -397,6 +409,9 @@ impl SolveOperation {
             | Self::Compare { lhs, rhs, .. }
             | Self::MatrixMultiply { lhs, rhs, .. }
             | Self::Cross { lhs, rhs, .. } => visit_register_pair(*lhs, *rhs, &mut visit),
+            Self::LinearSolve { matrix, rhs, .. } => {
+                visit_register_pair(*matrix, *rhs, &mut visit);
+            }
             Self::Select {
                 condition,
                 if_true,
@@ -487,6 +502,7 @@ impl SolveOperation {
             | Self::Select { destination, .. }
             | Self::Map { destination, .. }
             | Self::MatrixMultiply { destination, .. }
+            | Self::LinearSolve { destination, .. }
             | Self::Scale { destination, .. }
             | Self::BroadcastBinary { destination, .. }
             | Self::Transpose { destination, .. }
@@ -626,7 +642,7 @@ impl TypedProgram {
             slot_initialized: Vec::new(),
             register_types: Vec::new(),
             operations: Vec::new(),
-            available_calls: Vec::new(),
+            available_calls: SolvePureCallTableView::default(),
             marker: PhantomData,
         };
         build(&mut builder)?;
@@ -640,7 +656,7 @@ impl TypedProgram {
 
     pub(super) fn construct_with_calls(
         arithmetic: SolveArithmeticProfile,
-        available_calls: Vec<SolvePureCallInterface>,
+        available_calls: SolvePureCallTableView<'_>,
         build: impl for<'program> FnOnce(
             &mut TypedProgramBuilder<'program>,
         ) -> Result<(), SolveProgramConstructionError>,
@@ -684,13 +700,29 @@ impl TypedProgram {
     }
 }
 
+/// Registers belong to one construction scope, even when scopes share call owners.
+///
+/// ```compile_fail,E0521
+/// use rumoca_ir_solve::{SolveArithmeticProfile, SolveUnaryOperator, SolveValue, TypedProgram};
+/// fn cross_scope(profile: SolveArithmeticProfile, span: rumoca_core::Span) {
+///     let _ = TypedProgram::construct(profile, |outer| {
+///         let value = outer.constant(SolveValue::boolean(true), span)?;
+///         TypedProgram::construct(profile, |inner| {
+///             inner.unary(SolveUnaryOperator::Not, value, span)?;
+///             Ok(())
+///         })?;
+///         Ok(())
+///     });
+/// }
+/// # let _ = cross_scope;
+/// ```
 pub struct TypedProgramBuilder<'program> {
     arithmetic: SolveArithmeticProfile,
     slots: Vec<SolveSlot>,
     slot_initialized: Vec<bool>,
     register_types: Vec<SolveValueType>,
     operations: Vec<SolveSpannedOperation>,
-    available_calls: Vec<SolvePureCallInterface>,
+    available_calls: SolvePureCallTableView<'program>,
     marker: PhantomData<&'program mut &'program ()>,
 }
 
@@ -1126,10 +1158,8 @@ impl<'program> TypedProgramBuilder<'program> {
             &[ProgramSlot<'region>],
         ) -> Result<(), SolveProgramConstructionError>,
     ) -> Result<SolveProgramRegion, SolveProgramConstructionError> {
-        let body = TypedProgram::construct_with_calls(
-            self.arithmetic,
-            self.available_calls.clone(),
-            |builder| {
+        let body =
+            TypedProgram::construct_with_calls(self.arithmetic, self.available_calls, |builder| {
                 let input_slots = declare_interface_slots(
                     builder,
                     &inputs,
@@ -1145,8 +1175,7 @@ impl<'program> TypedProgramBuilder<'program> {
                     provenance,
                 )?;
                 build(builder, &input_slots, &output_slots)
-            },
-        )?;
+            })?;
         construct_region(inputs, outputs, body, provenance)
     }
 
@@ -1675,6 +1704,15 @@ impl<'program> TypedProgramBuilder<'program> {
             .ok_or(SolveProgramConstructionError::UnknownSlot { provenance })
     }
 
+    /// The checked type of a register this builder issued.
+    pub fn value_type_of(
+        &self,
+        register: ProgramRegister<'program>,
+        provenance: Span,
+    ) -> Result<&SolveValueType, SolveProgramConstructionError> {
+        self.register_type(register, provenance)
+    }
+
     fn register_type(
         &self,
         register: ProgramRegister<'program>,
@@ -1872,9 +1910,12 @@ fn binary_operator_accepts(operator: SolveBinaryOperator, scalar: SolveScalarTyp
     match operator {
         SolveBinaryOperator::Add
         | SolveBinaryOperator::Subtract
-        | SolveBinaryOperator::Multiply
-        | SolveBinaryOperator::Min
-        | SolveBinaryOperator::Max => scalar.is_numeric(),
+        | SolveBinaryOperator::Multiply => scalar.is_numeric(),
+        // MLS §10.3.4 orders Boolean operands with `false < true`.
+        SolveBinaryOperator::Min | SolveBinaryOperator::Max => {
+            scalar.is_numeric() || scalar == SolveScalarType::Boolean
+        }
+        SolveBinaryOperator::IntegerQuotient => matches!(scalar, SolveScalarType::Integer(_)),
         SolveBinaryOperator::Divide | SolveBinaryOperator::Power | SolveBinaryOperator::Atan2 => {
             matches!(scalar, SolveScalarType::Real { .. })
         }

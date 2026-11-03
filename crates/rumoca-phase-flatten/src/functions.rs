@@ -16,14 +16,16 @@ mod call_collection;
 mod callable_scope_identity;
 mod constructor_signature;
 mod deferred_members;
+mod function_arguments;
 mod function_context;
+mod function_derivatives;
 mod function_metadata;
 mod function_output_validation;
 mod function_param_alias;
 mod function_requests;
 mod higher_order;
-mod package_constants;
 mod pure_constants;
+mod record_value_fields;
 mod record_value_modifiers;
 #[cfg(test)]
 mod tests;
@@ -41,6 +43,7 @@ use std::collections::{HashMap, HashSet};
 pub(crate) use call_args::{materialize_flat_function_call_args, rewrite_model_expressions};
 pub(crate) use call_canonicalization::{
     canonicalize_collected_function_calls, canonicalize_function_calls_in_expression_with_scope,
+    expose_inherited_function_calls,
 };
 use call_collection::collect_function_call_requests;
 #[cfg(test)]
@@ -50,10 +53,13 @@ use constructor_signature::{
     convert_constructor_signature, inherit_operator_constructor_defaults,
     normalize_function_local_references,
 };
+pub(crate) use function_arguments::specialize_function_arguments;
 use function_context::{
-    collect_function_context, collect_lexical_constant_aliases, extend_imports_if_absent,
-    function_initial_import_map, resolve_import_pairs,
+    collect_exposed_package_constant_aliases, collect_function_context,
+    collect_lexical_constant_aliases, extend_imports_if_absent, function_initial_import_map,
+    resolve_import_pairs,
 };
+use function_derivatives::*;
 pub(crate) use function_metadata::FunctionTypeCatalog;
 pub(crate) use function_metadata::lower_record_function_params;
 use function_metadata::*;
@@ -64,6 +70,7 @@ pub(crate) use function_requests::{FunctionRequest, FunctionRequests};
 pub(crate) use higher_order::specialize_function_inputs;
 pub(crate) use pure_constants::check_settled_binding_bounds;
 pub(crate) use pure_constants::specialize_frozen_bindings;
+pub(crate) use record_value_fields::split_branch_assigned_records;
 
 use crate::algorithms;
 use crate::ast_lower;
@@ -310,7 +317,7 @@ fn retain_constructor_record_type(
         .collect::<Result<Vec<_>, FlattenError>>()?;
 
     if let Some(existing) = flat.record_types.get(&record) {
-        if existing.fields != fields {
+        if !same_record_layout(&existing.fields, &fields) {
             return Err(FlattenError::missing_resolved_class_metadata(
                 function.name.as_str(),
                 "one exact record layout for the constructor declaration",
@@ -327,6 +334,24 @@ fn retain_constructor_record_type(
         },
     );
     Ok(())
+}
+
+/// Two layouts of one record declaration agree when their fields agree and
+/// every axis either has one extent or is still symbolic (`<= 0`) in one of
+/// them: a later collection may see an extent a materialized constructor
+/// already settled.
+fn same_record_layout(existing: &[flat::RecordField], collected: &[flat::RecordField]) -> bool {
+    existing.len() == collected.len()
+        && existing.iter().zip(collected).all(|(existing, collected)| {
+            existing.name == collected.name
+                && existing.def_id == collected.def_id
+                && existing.dims.len() == collected.dims.len()
+                && existing
+                    .dims
+                    .iter()
+                    .zip(&collected.dims)
+                    .all(|(a, b)| a == b || *a <= 0 || *b <= 0)
+        })
 }
 
 fn refine_existing_function_nonreplaceability(
@@ -496,7 +521,6 @@ fn lookup_function_request_with_scope<'tree>(
     if let Some((_, function)) = &mut resolved {
         function.transitively_non_replaceable =
             request_proves_transitive_non_replaceability(class_index, request);
-        package_constants::specialize_package_constants(tree, class_index, request, function)?;
     }
     Ok(resolved)
 }
@@ -565,7 +589,7 @@ fn lookup_function_request_with_scope_uncertified<'tree>(
 /// an exposure is rejected and the caller falls back to the implementation's
 /// own declaring class.
 fn request_exposed_qualified_name(
-    tree: &ast::ClassTree,
+    _tree: &ast::ClassTree,
     class_index: &ast::ClassDefIndex<'_>,
     request: &FunctionRequest,
 ) -> Option<String> {
@@ -574,10 +598,7 @@ fn request_exposed_qualified_name(
     let owner = scope.prefix_parts().last()?;
     let owner_name = class_index.qualified_name(owner.def_id)?;
     let exposed = format!("{owner_name}.{}", scope.leaf_ident()?);
-    let target = request.target_def_id?;
-    let denotes_target = resolve_function_class_with_scope(tree, class_index, &exposed, None)
-        .is_some_and(|resolution| resolution.class_def.def_id == Some(target));
-    denotes_target.then_some(exposed)
+    Some(exposed)
 }
 
 fn request_proves_transitive_non_replaceability(
@@ -590,9 +611,10 @@ fn request_proves_transitive_non_replaceability(
                 .parts()
                 .iter()
                 .all(|part| !part.ident.contains('.'))
-            && class_index.proves_transitively_non_replaceable_path(
+            && (class_index.proves_transitively_non_replaceable_path(
                 reference.parts().iter().map(|part| part.def_id),
-            )
+            ) || class_index
+                .proves_selected_function_path(reference.parts().iter().map(|part| part.def_id)))
     })
 }
 
@@ -1122,6 +1144,14 @@ fn convert_function<'tree>(
     let mut func = rumoca_core::Function::new(qualified_name, span);
     func.def_id = class_def.def_id;
     let mut context = collect_function_context(tree, class_index, class_def, member_cache);
+    // MLS 3.7 §12.2: at most one algorithm section, own or inherited.
+    if context.algorithms.len() > 1 {
+        return Err(FlattenError::MultipleFunctionBodies {
+            name: qualified_name.to_string(),
+            sections: context.algorithms.len(),
+            span,
+        });
+    }
     // MLS §7.3: a function body is converted from the class tree rather than
     // instantiated, so the member tails Resolve deferred across replaceable
     // class edges are proved here before lowering demands exact identity.
@@ -1129,6 +1159,9 @@ fn convert_function<'tree>(
         tree,
         class_index,
         qualified_name,
+        class_def
+            .def_id
+            .and_then(|def_id| class_index.qualified_name(def_id)),
         &context.components,
         &mut context.algorithms,
     );
@@ -1140,6 +1173,7 @@ fn convert_function<'tree>(
     if let Some(class_def_id) = class_def.def_id {
         collect_lexical_constant_aliases(tree, class_index, class_def_id, &mut import_map, true);
     }
+    collect_exposed_package_constant_aliases(tree, class_index, qualified_name, &mut import_map);
     let prefix = ast::QualifiedName::new();
     let function_locals: HashSet<String> = effective_components.keys().cloned().collect();
 
@@ -1211,7 +1245,7 @@ fn convert_function<'tree>(
     }
 
     // Extract derivative annotations (MLS §12.7.1)
-    func.derivatives = extract_derivative_annotations(&class_def.annotation);
+    func.derivatives = lower_derivative_annotations(&class_def.annotation, &func.inputs)?;
 
     // MLS §18.3 Inline / LateInline. Carried, not acted on here: whether a call
     // is substituted is a backend question, and this phase is the last place

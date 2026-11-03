@@ -134,6 +134,7 @@ fn assert_workspace_symbol_rebuild_snapshot_is_trimmed(snapshot: &SessionSnapsho
 
 #[test]
 fn session_workspace_symbols_keep_durable_external_roots_warm_across_local_summary_edits() {
+    let _guard = session_stats_test_guard();
     let mut session = Session::default();
     session.replace_parsed_source_set(
         "Modelica",
@@ -222,6 +223,7 @@ fn session_workspace_symbols_keep_durable_external_roots_warm_across_local_summa
 
 #[test]
 fn workspace_symbol_snapshot_rebuilds_source_set_slices_without_full_snapshot() {
+    let _guard = session_stats_test_guard();
     let mut session = Session::default();
     session.replace_parsed_source_set(
         "Modelica",
@@ -256,6 +258,7 @@ fn workspace_symbol_snapshot_rebuilds_source_set_slices_without_full_snapshot() 
 
 #[test]
 fn workspace_symbol_snapshot_prewarm_populates_source_set_symbol_slices() {
+    let _guard = session_stats_test_guard();
     let mut session = Session::default();
     session.replace_parsed_source_set(
         "Modelica",
@@ -300,6 +303,7 @@ fn workspace_symbol_snapshot_prewarm_populates_source_set_symbol_slices() {
 
 #[test]
 fn workspace_symbol_snapshot_prewarm_survives_detached_document_revisions() {
+    let _guard = session_stats_test_guard();
     let mut session = Session::default();
     session.replace_parsed_source_set(
         "Modelica",

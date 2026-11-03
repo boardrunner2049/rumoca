@@ -47,9 +47,23 @@ end ImplicitAlgebraic;
         )
         .expect("the compiler accepts the implicit algebraic model");
 
+    for (target, model_c_path) in [
+        ("fmi2", "sources/model.c"),
+        ("fmi3", "sources/model.c"),
+        ("fmi-ls-wasm", "csrc/model.c"),
+    ] {
+        let files = rumoca::render_target_files(&compiled, "ImplicitAlgebraic", target, None)
+            .expect("FMI projects the implicit algebraic block with the shared ME kernel");
+        let model_c = files
+            .iter()
+            .find(|file| file.path == model_c_path)
+            .expect("FMI emits its C kernel");
+        assert!(
+            model_c.content.contains("rmc_project_stage"),
+            "the FMI kernel must project the coupled block"
+        );
+    }
     for target in [
-        "fmi2",
-        "fmi3",
         "c-ode",
         "rust-ode",
         "rust-fixed-ode",
@@ -90,23 +104,33 @@ end ExactAlgebraic;
     for target in ["fmi2", "fmi3"] {
         let files = rumoca::render_target_files(&compiled, "ExactAlgebraic", target, None)
             .expect("FMI consumes the checked exact-assignment schedule");
-        let model_c = files
-            .iter()
-            .find(|file| file.path == "sources/model.c")
-            .expect("FMI emits its C kernel");
+        let model_c = source_unit(&files, "sources/model.c");
+        let assign_c = source_unit(&files, "sources/rmc_assign.c");
         assert!(
-            model_c.content.contains("refresh_algebraics"),
+            model_c.contains("refresh_algebraics"),
             "the FMI kernel must emit the exact algebraic refresh"
         );
         assert!(
-            model_c.content.contains("m->y[1] = r["),
+            assign_c.contains("m->y[1] = r["),
             "the FMI kernel must commit the checked algebraic target"
         );
         assert!(
-            model_c.content.contains("if (!isfinite(m->y[1]))"),
+            assign_c.contains("if (!isfinite(m->y[1]))"),
             "the FMI kernel must reject a non-finite refreshed algebraic value"
         );
-        execute_emitted_algebraic_refresh(&model_c.content, target);
+        execute_emitted_algebraic_refresh(&model_c, &assign_c, target);
+    }
+
+    // fmi-ls-wasm renders the same C kernel as fmi3, so it consumes the exact
+    // schedule through the identical translation units under csrc/.
+    {
+        let files = rumoca::render_target_files(&compiled, "ExactAlgebraic", "fmi-ls-wasm", None)
+            .expect("fmi-ls-wasm consumes the checked exact-assignment schedule");
+        let model_c = source_unit(&files, "csrc/model.c");
+        let assign_c = source_unit(&files, "csrc/rmc_assign.c");
+        assert!(model_c.contains("refresh_algebraics"));
+        assert!(assign_c.contains("m->y[1] = r["));
+        assert!(assign_c.contains("if (!isfinite(m->y[1]))"));
     }
 
     for target in [
@@ -117,7 +141,6 @@ end ExactAlgebraic;
         "jax-ode",
         "cuda-ode",
         "wgsl-ode",
-        "fmi-ls-wasm",
     ] {
         let error = rumoca::render_target_files(&compiled, "ExactAlgebraic", target, None)
             .expect_err("a target without an exact-assignment consumer must fail closed");
@@ -131,7 +154,7 @@ end ExactAlgebraic;
 }
 
 #[test]
-fn fmi2_and_fmi3_reject_a_tunable_algebraic_coefficient() {
+fn fmi2_and_fmi3_refresh_through_a_tunable_algebraic_coefficient() {
     let compiled = Compiler::new()
         .model("TunableAlgebraicCoefficient")
         .compile_str(
@@ -150,36 +173,33 @@ end TunableAlgebraicCoefficient;
         .expect("the compiler accepts an algebraic model with a tunable coefficient");
 
     for target in ["fmi2", "fmi3"] {
-        let error =
+        let files =
             rumoca::render_target_files(&compiled, "TunableAlgebraicCoefficient", target, None)
-                .expect_err(
-                    "FMI must retain a residual solver for a tunable algebraic coefficient",
-                );
+                .expect("FMI refreshes an algebraic through a tunable coefficient");
+        let refresh = source_unit(&files, "sources/rmc_assign.c");
         assert!(
-            error
-                .to_string()
-                .contains("unsupported-feature:residual_equations"),
-            "FMI returned the wrong diagnostic: {error:#}"
+            refresh.contains("m->p[0]"),
+            "the refresh reads the tunable coefficient at run time instead of a folded value"
         );
     }
 }
 
 #[test]
-fn fmi3_exact_runtime_refreshes_the_final_rk4_state() {
+fn fmi3_exact_runtime_refreshes_the_final_step_state() {
     let rendered = render_fmi3_model(
-        "FinalRk4Algebraic",
+        "FinalStepAlgebraic",
         r#"
-model FinalRk4Algebraic
+model FinalStepAlgebraic
   Real x(start = 1);
   output Real y(start = 2);
 equation
   0 = y - 2*x;
   der(x) = -x;
-end FinalRk4Algebraic;
+end FinalStepAlgebraic;
 "#,
     );
     execute_emitted_fmi3_kernel(
-        &rendered.model_c,
+        (&rendered.model_c, &rendered.assign_c),
         2,
         1,
         r#"
@@ -189,9 +209,45 @@ end FinalRk4Algebraic;
     fmi3Float64 last_time;
     if (fmi3DoStep(&model, 0.0, 1.0, fmi3True, &event_needed, &terminate,
                    &early_return, &last_time) != fmi3OK) return 1;
-    if (fabs(model.y[0] - 0.375) > 1.0e-12) return 2;
-    if (fabs(model.y[1] - 0.75) > 1.0e-12) return 3;
+    if (fabs(model.y[0] - exp(-1.0)) > 1.0e-5) return 2;
+    if (fabs(model.y[1] - 2.0 * model.y[0]) > 1.0e-12) return 3;
     if (fabs(last_time - 1.0) > 1.0e-12) return 4;
+"#,
+    );
+}
+
+/// A communication step the error controller cannot complete, here across the
+/// finite-time blow-up of `der(x) = x^2` at `t = 1`, is discarded and rolled
+/// back instead of returning a finite but meaningless state (issue #361).
+#[test]
+fn fmi3_exact_runtime_discards_a_step_its_controller_cannot_complete() {
+    let rendered = render_fmi3_model(
+        "FiniteTimeBlowUp",
+        r#"
+model FiniteTimeBlowUp
+  Real x(start = 1);
+  output Real y(start = 1);
+equation
+  der(x) = x^2;
+  0 = y - x;
+end FiniteTimeBlowUp;
+"#,
+    );
+    execute_emitted_fmi3_kernel(
+        (&rendered.model_c, &rendered.assign_c),
+        2,
+        1,
+        r#"
+    model.y[0] = 1.0; model.y[1] = 1.0;
+    model.state = MODEL_STEP; model.type = INTERFACE_CS;
+    fmi3Boolean event_needed, terminate, early_return;
+    fmi3Float64 last_time = -1.0;
+    if (fmi3DoStep(&model, 0.0, 0.5, fmi3True, &event_needed, &terminate,
+                   &early_return, &last_time) != fmi3OK) return 1;
+    if (fabs(model.y[0] - 2.0) > 1.0e-5) return 2;
+    if (fmi3DoStep(&model, 0.5, 1.0, fmi3True, &event_needed, &terminate,
+                   &early_return, &last_time) != fmi3Discard) return 3;
+    if (model.time != 0.5 || last_time != 0.5 || fabs(model.y[0] - 2.0) > 1.0e-5) return 4;
 "#,
     );
 }
@@ -207,7 +263,7 @@ model NonfiniteFinalAlgebraic
   output Real y(start = 1);
 equation
   der(x) = -x;
-  0 = y - 1/(x-u);
+  0 = y - sqrt(x-u);
 end NonfiniteFinalAlgebraic;
 "#,
     );
@@ -223,12 +279,12 @@ end NonfiniteFinalAlgebraic;
     if (fmi3SetFloat64(&model, &input_vr, 1, &input, 1) != fmi3OK) return 1;
     fmi3Float64 output;
     if (fmi3GetFloat64(&model, &output_vr, 1, &output, 1) != fmi3OK) return 2;
-    if (fabs(output - 1.6) > 1.0e-12) return 3;
+    if (fabs(output - sqrt(0.625)) > 1.0e-12) return 3;
     fmi3Boolean event_needed, terminate, early_return;
     fmi3Float64 last_time;
     if (fmi3DoStep(&model, 0.0, 1.0, fmi3True, &event_needed, &terminate,
                    &early_return, &last_time) != fmi3Error) return 4;
-    if (model.time != 0.0 || model.y[0] != 1.0 || model.y[1] != 1.6) return 5;
+    if (model.time != 0.0 || model.y[0] != 1.0 || model.y[1] != sqrt(0.625)) return 5;
     fmi3Float64 retained;
     if (fmi3GetFloat64(&model, &input_vr, 1, &retained, 1) != fmi3OK) return 6;
     if (retained != 0.375) return 7;
@@ -241,7 +297,7 @@ end NonfiniteFinalAlgebraic;
     if (fabs(last_time - 0.1) > 1.0e-12) return 12;
 "#
     );
-    execute_emitted_fmi3_kernel(&rendered.model_c, 2, 1, &body);
+    execute_emitted_fmi3_kernel((&rendered.model_c, &rendered.assign_c), 2, 1, &body);
 }
 
 #[test]
@@ -261,7 +317,7 @@ end ChainedSingletons;
 "#,
     );
     execute_emitted_fmi3_kernel(
-        &rendered.model_c,
+        (&rendered.model_c, &rendered.assign_c),
         3,
         1,
         r#"
@@ -276,6 +332,7 @@ end ChainedSingletons;
 
 struct RenderedFmi3 {
     model_c: String,
+    assign_c: String,
     model_description: String,
 }
 
@@ -312,6 +369,7 @@ fn render_fmi3_model(model: &str, source: &str) -> RenderedFmi3 {
     };
     RenderedFmi3 {
         model_c: content("sources/model.c"),
+        assign_c: content("sources/rmc_assign.c").replace("#include \"model.h\"", ""),
         model_description: files
             .iter()
             .find(|file| file.path == "modelDescription.xml")
@@ -321,12 +379,18 @@ fn render_fmi3_model(model: &str, source: &str) -> RenderedFmi3 {
     }
 }
 
-fn execute_emitted_fmi3_kernel(model_c: &str, y_len: usize, state_len: usize, body: &str) {
+fn execute_emitted_fmi3_kernel(
+    (model_c, assign_c): (&str, &str),
+    y_len: usize,
+    state_len: usize,
+    body: &str,
+) {
     let kernel_start = model_c
-        .find("static void initialize_values")
+        .find("#include \"model.h\"")
+        .map(|offset| offset + "#include \"model.h\"".len())
         .expect("rendered FMI3 C owns its initialization and integration kernels");
     let kernel_end = model_c[kernel_start..]
-        .find("static size_t value_count")
+        .find("enum RmcColumn")
         .map(|offset| kernel_start + offset)
         .expect("rendered FMI3 C terminates its integration kernel");
     let do_step_start = model_c
@@ -343,37 +407,36 @@ fn execute_emitted_fmi3_kernel(model_c: &str, y_len: usize, state_len: usize, bo
         .map(|offset| value_helpers_start + offset)
         .expect("rendered FMI3 C terminates its value helpers");
     let value_helpers = &model_c[value_helpers_start..value_helpers_end];
-    let public_values_start = model_c
-        .find("FMI_EXPORT fmi3Status fmi3GetFloat64")
-        .expect("rendered FMI3 C owns Float64 accessors");
-    let public_values_end = model_c[public_values_start..]
-        .find("FMI_EXPORT fmi3Status fmi3SetTime")
-        .map(|offset| public_values_start + offset)
-        .expect("rendered FMI3 C terminates Float64 accessors");
-    let public_values = &model_c[public_values_start..public_values_end];
     let do_step = &model_c[do_step_start..do_step_end];
     let driver = format!(
         r#"
+#include <float.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #define FMI_EXPORT
 typedef void* fmi3Instance;
 typedef double fmi3Float64;
+typedef int32_t fmi3Int32;
+typedef const char* fmi3String;
 typedef int fmi3Boolean;
 typedef unsigned int fmi3ValueReference;
-typedef enum {{ fmi3OK = 0, fmi3Error = 3 }} fmi3Status;
+typedef enum {{ fmi3OK = 0, fmi3Discard = 2, fmi3Error = 3 }} fmi3Status;
+typedef void (*fmi3LogMessageCallback)(void*, fmi3Status, fmi3String, fmi3String);
 enum {{ fmi3False = 0, fmi3True = 1 }};
 enum ModelState {{ MODEL_INSTANTIATED, MODEL_INITIALIZATION, MODEL_EVENT, MODEL_CONTINUOUS, MODEL_STEP, MODEL_TERMINATED }};
 enum InterfaceType {{ INTERFACE_ME, INTERFACE_CS }};
 #define Y_LEN {y_len}
 #define P_LEN 1
 #define STATE_LEN {state_len}
-typedef struct {{ bool assertions_initialized; bool assertion_failed; bool parameters_dirty; double time; double y[Y_LEN]; double p[P_LEN]; double derivative[STATE_LEN]; enum ModelState state; enum InterfaceType type; }} ModelInstance;
+#define RMC_API
+typedef struct {{ bool assertions_initialized; bool assertion_failed; bool parameters_dirty; void* environment; fmi3LogMessageCallback logger; double time; double tolerance; double rmc_cs_substep; double y[Y_LEN]; double p[P_LEN]; double derivative[STATE_LEN]; enum ModelState state; enum InterfaceType type; }} ModelInstance;
+{assign_c}
 {kernel}
 {value_helpers}
-{public_values}
 {do_step}
 int main(void) {{
     ModelInstance model = {{0}};
@@ -415,28 +478,35 @@ fn compile_and_run_c(driver: &str, label: &str) {
     );
 }
 
-fn execute_emitted_algebraic_refresh(model_c: &str, prefix: &str) {
+fn execute_emitted_algebraic_refresh(model_c: &str, assign_c: &str, prefix: &str) {
     let start = model_c
-        .find(&format!("static {prefix}Status refresh_parameters"))
+        .find(&format!("static {prefix}Status update_discrete_equations"))
         .expect("rendered FMI C owns parameter and algebraic refresh");
     let tail = &model_c[start..];
     let end = tail
         .find(&format!("static {prefix}Status settle_values"))
         .expect("rendered FMI C terminates the algebraic refresh kernel");
     let refresh = &tail[..end];
+    let assign = assign_c.replace("#include \"model.h\"", "");
     let driver = format!(
         r#"
 #include <math.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
+#define Y_LEN 2
 typedef enum {{ {prefix}OK = 0, {prefix}Error = 3 }} {prefix}Status;
+#define RMC_API
 typedef struct {{ bool parameters_dirty; double time; double y[2]; double p[1]; }} ModelInstance;
+{assign}
 {refresh}
 int main(void) {{
     ModelInstance model = {{0}};
+    (void)update_assertion_memory;
     model.y[0] = 3.0;
     if (refresh_algebraics(&model) != {prefix}OK) return 1;
     if (fabs(model.y[1] - 6.0) > 1.0e-12) return 2;
+    if (refresh_derivative_values(&model) != {prefix}OK || fabs(model.y[1] - 6.0) > 1.0e-12) return 4;
     model.y[0] = NAN;
     if (refresh_algebraics(&model) != {prefix}Error) return 3;
     return 0;
@@ -507,10 +577,11 @@ fn dae_template_context_exposes_checked_semantic_schema() {
 
     // Pinned to `dae_backend::TEMPLATE_SCHEMA_VERSION`: every change to the
     // projected template shape bumps that constant, and this literal must be
-    // bumped with it so template consumers see the break loudly. Version 5 is
-    // the shape carrying checked function owners, checked discrete ownership,
-    // and the proved-projection gate.
-    assert_eq!(rendered, "rumoca.checked-dae-template:5");
+    // bumped with it so template consumers see the break loudly. Version 6
+    // adds checked initialization parameter definitions on top of version 5's
+    // checked function owners, checked discrete ownership, and proved-projection
+    // gate.
+    assert_eq!(rendered, "rumoca.checked-dae-template:6");
 }
 
 #[test]
@@ -778,4 +849,14 @@ adjoint = jax.jacrev(generated.rhs, argnums=1)(0.0, jnp.array([1.0]), jnp.zeros(
 assert float(adjoint[0, 0]) == -2.0
 "#,
     );
+}
+
+/// One rendered source unit's text.
+fn source_unit(files: &[RenderedTargetFile], path: &str) -> String {
+    files
+        .iter()
+        .find(|file| file.path == path)
+        .unwrap_or_else(|| panic!("FMI emits {path}"))
+        .content
+        .clone()
 }

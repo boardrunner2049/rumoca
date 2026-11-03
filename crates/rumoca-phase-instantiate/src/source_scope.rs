@@ -17,59 +17,6 @@ pub(super) fn register_zero_sized_array_component(
     overlay.array_parent_dims.insert(parent_path, dims.to_vec());
 }
 
-/// Register every primitive field of a zero-sized record array.
-///
-/// `arms[0]` instantiates no element, so a projection such as `arms.mass`
-/// (or `arms.r_C`, shape `[0, 3]`) names no component. Registering each field
-/// path with the array's extents followed by the field's own lets a
-/// reference to it resolve to a zero-sized value of the right shape, the way
-/// a reference to a zero-sized primitive array does (MLS §10.1). A field whose
-/// extents are not literal is left unregistered.
-pub(super) fn register_zero_sized_record_fields(
-    tree: &ast::ClassTree,
-    ctx: &mut InstantiateContext,
-    overlay: &mut ast::InstanceOverlay,
-    path: &[&str],
-    dims: &[i64],
-    record: &ast::ClassDef,
-) -> super::InstantiateResult<()> {
-    for (field, comp) in super::inheritance::get_effective_components(tree, record)? {
-        if comp.shape.len() != comp.shape_expr.len() {
-            continue;
-        }
-        let mut field_dims = dims.to_vec();
-        field_dims.extend(comp.shape.iter().map(|&extent| extent as i64));
-        let mut field_path = path.to_vec();
-        field_path.push(&field);
-        let field_type = comp
-            .type_def_id
-            .or(comp.type_name.def_id)
-            .and_then(|def_id| tree.get_class_by_def_id(def_id));
-        if let Some(nested) =
-            field_type.filter(|class| class.class_type == rumoca_core::ClassType::Record)
-        {
-            register_zero_sized_record_fields(
-                tree,
-                ctx,
-                overlay,
-                &field_path,
-                &field_dims,
-                nested,
-            )?;
-            continue;
-        }
-        for part in &field_path {
-            ctx.push_path(part);
-        }
-        let component_path = ctx.current_path().to_component_path();
-        for _ in &field_path {
-            ctx.pop_path();
-        }
-        overlay.array_parent_dims.insert(component_path, field_dims);
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Default)]
 pub(super) struct SourceScopeIndex {
     component_scopes: FxHashMap<DefId, ast::QualifiedName>,

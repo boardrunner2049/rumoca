@@ -30,7 +30,7 @@ use std::ops::ControlFlow;
 use rumoca_ir_ast as ast;
 
 use crate::Context;
-use crate::boolean_eval::try_eval_boolean_with_ctx_inner;
+use crate::boolean_eval::{non_evaluable_parameter_read, try_eval_boolean_with_ctx_inner};
 
 /// True when the branches do not agree on which variables they differentiate.
 pub(super) fn branches_differ_in_der_targets(
@@ -55,12 +55,20 @@ pub(super) fn branches_differ_in_der_targets(
 ///
 /// Returns `None` when no condition can be decided, which leaves the caller's
 /// existing conditional-expression lowering in place.
+/// A condition reading a non-evaluable parameter (MLS 3.7 section 4.5) is never
+/// decided here: it stays a run-time conditional.
 pub(super) fn try_select_parameter_branch(
     cond_blocks: &[ast::EquationBlock],
     else_block: &Option<Vec<ast::Equation>>,
     ctx: &Context,
     prefix: &ast::QualifiedName,
 ) -> Option<Vec<ast::Equation>> {
+    if cond_blocks
+        .iter()
+        .any(|block| non_evaluable_parameter_read(ctx, &block.cond, prefix).is_some())
+    {
+        return None;
+    }
     for block in cond_blocks {
         match try_eval_boolean_with_ctx_inner(&block.cond, Some(ctx), prefix) {
             Some(true) => return Some(block.eqs.clone()),

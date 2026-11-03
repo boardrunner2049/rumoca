@@ -94,6 +94,14 @@ pub(super) fn lower_range<'dae>(
     {
         return lower_enumeration_range(construction, symbols, start, end, input.provenance);
     }
+    // MLS §10.4.3: a Real compact range (`0 + d:d:1`) has a floating-point
+    // cardinality that the Integer DAE range node cannot carry, so when the
+    // scope folds it to its settled elements it is lowered as that constant
+    // array. This is the same fold the shape proof uses to size the colon local
+    // the range binds, so the emitted array and the proven extent agree.
+    if let Some(elements) = symbols.shapes.folded_real_range(input.expression) {
+        return lower_real_range_array(construction, &elements, input.provenance);
+    }
     let mut bound =
         |bound: &Expression| lower_range_bound(construction, symbols, binders, bound, &input);
     let start = bound(start)?;
@@ -104,6 +112,27 @@ pub(super) fn lower_range<'dae>(
             .at(input.provenance)
             .range(start, explicit_step, end)
     })
+}
+
+/// Lower a folded Real compact range to its constant array of Real elements.
+///
+/// MLS §10.4.3 makes the range vector `{start + i*step}` for the exact element
+/// count the scope proved, so the canonical DAE owner is the array of those Real
+/// literals rather than a range node, which is Integer-only.
+fn lower_real_range_array<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    elements: &[f64],
+    provenance: dae::DaeProvenance,
+) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
+    let mut lowered = Vec::with_capacity(elements.len());
+    for value in elements {
+        lowered.push(construction.expressions(|expressions| {
+            expressions
+                .at(provenance)
+                .literal(dae::DaeLiteral::Real(*value))
+        })?);
+    }
+    construction.expressions(|expressions| expressions.at(provenance).array(lowered))
 }
 
 /// Lower one compact-range bound, folding it when the scope proves its value.
@@ -349,10 +378,10 @@ pub(super) fn lower_previous<'dae>(
         })?;
     let previous = construction.temporal(|temporal| match coordinate {
         Coordinate::DiscreteReal(variable) => {
-            temporal.previous_discrete_real(clock.into(), variable, provenance)
+            temporal.previous_discrete_real(clock, variable, provenance)
         }
         Coordinate::DiscreteValue(variable) => {
-            temporal.previous_discrete_value(clock.into(), variable, provenance)
+            temporal.previous_discrete_value(clock, variable, provenance)
         }
         _ => Err(dae::DaeConstructionError::InvalidVariableRole {
             name: name.var_name().clone(),
@@ -410,17 +439,52 @@ pub(super) fn lower_sample_event_operator<'dae>(
     let clock = symbols.functions.clocks.sample_id(schedule, span)?;
     let condition = construction.conditions(|conditions| conditions.reserve(provenance))?;
     construction.conditions(|conditions| {
-        conditions.define(
-            condition,
-            dae::ConditionInput::Clock(clock.into()),
-            provenance,
-        )
+        conditions.define(condition, dae::ConditionInput::Clock(clock), provenance)
     })?;
     construction.expressions(|expressions| {
         expressions
             .at(provenance)
             .coordinate(dae::CoordinateInput::Condition(condition))
     })
+}
+
+/// MLS §16.5.1 `sample(u, c)`: "the value of the left limit of u when c is
+/// active". A continuous-time state or algebraic `u` is continuous at the tick,
+/// so its left limit is its current value; a discrete-time `u` may change at the
+/// tick's own event, so its left limit is its pre value.
+pub(super) fn lower_value_sample<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    symbols: LoweringSymbols<'_, 'dae>,
+    binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
+    value: &Expression,
+    provenance: dae::DaeProvenance,
+) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
+    if let Expression::VarRef {
+        name, subscripts, ..
+    } = value
+        && let Some(left_limit) = discrete_left_limit(symbols.coordinates.get(name.var_name()))
+    {
+        return lower_coordinate_reference(
+            construction,
+            symbols,
+            binders,
+            left_limit,
+            subscripts,
+            provenance,
+        );
+    }
+    lower_temporal_identity(construction, symbols, binders, value, provenance)
+}
+
+/// The pre value of a discrete-time coordinate, which is its left limit.
+fn discrete_left_limit<'dae>(
+    coordinate: Option<&Coordinate<'dae>>,
+) -> Option<dae::CoordinateInput<'dae>> {
+    match coordinate? {
+        Coordinate::DiscreteReal(id) => Some(dae::CoordinateInput::PreDiscreteReal(*id)),
+        Coordinate::DiscreteValue(id) => Some(dae::CoordinateInput::PreDiscreteValue(*id)),
+        _ => None,
+    }
 }
 
 pub(super) fn lower_temporal_identity<'dae>(

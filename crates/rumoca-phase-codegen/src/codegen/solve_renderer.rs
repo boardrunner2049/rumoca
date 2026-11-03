@@ -93,12 +93,18 @@ impl SolveTemplateRenderer {
             .try_into()
             .map_err(|error| CodegenError::template(error.to_string()))?;
         require_builtin_fmi_template_domain(component.problem())?;
-        let pure_calls = Value::from_serialize(component.pure_calls());
+        let me_refresh = super::me_projection::me_refresh_value(&component)?;
+        let pure_calls = super::pure_call_families::PureCallFamilies::new(component.pure_calls())?;
         let assertion_messages = super::fmi_c_assertions::messages(component.problem())?;
+        let assertion_message_rows = assertion_messages.rows_value()?;
+        let assertion_messages = Value::from_serialize(&assertion_messages.parts);
         let handle = super::solve_lazy::SolveRenderHandle::fmi(component);
+        let fmi = handle.fmi_value();
+        require_dense_value_references(&fmi)?;
+        let text_starts = super::fmi_c_assertions::text_starts(&fmi)?;
         let context = solve_render_context_value_with_handles(handle, None, Value::default())?;
         Ok(Self {
-            context: minijinja::context! { typed_pure_calls => pure_calls, fmi_assertion_messages => assertion_messages, ..context },
+            context: minijinja::context! { typed_pure_calls => pure_calls.owners_value(), typed_directional_calls => pure_calls.directional_value(), pure_call_symbols => pure_calls.symbols_value(), fmi_assertion_messages => assertion_messages, fmi_assertion_message_rows => assertion_message_rows, fmi_text_starts => text_starts, me_refresh => me_refresh, ..context },
         })
     }
 
@@ -140,29 +146,53 @@ impl SolveTemplateRenderer {
 
 /// Prove the complete current built-in FMI template domain before a renderer
 /// exists. The event/storage inventory is already carried by the input
-/// type-state; this owns the remaining Solve capabilities the C templates do
-/// not implement.
-fn require_builtin_fmi_template_domain(problem: &solve::SolveProblem) -> Result<(), CodegenError> {
+/// type-state, and the algebraic refresh is admitted only by its checked ME
+/// refresh view; this owns the remaining Solve capabilities the C templates do
+/// not implement. The state-derivative kernel evaluates a linear-solve
+/// component with the kernel's dense elimination (`linear_solve_kernel`); the
+/// residual, projection, and initialization blocks, whose directional
+/// derivatives the C templates also render, do not.
+pub(super) fn require_builtin_fmi_template_domain(
+    problem: &solve::SolveProblem,
+) -> Result<(), CodegenError> {
     let continuous = &problem.continuous;
-    let has_algebraic_system = !continuous.implicit_rhs.is_empty()
-        || !continuous.algebraic_projection_plan.is_empty()
-        || problem.solve_layout.algebraic_scalar_count() != 0;
-    if has_algebraic_system && !super::solve_lazy::explicit_algebraic_assignment_complete(problem) {
-        return Err(CodegenError::dae_preparation_failed(
-            "built-in FMI templates cannot render residual algebraic systems",
-            None,
-        ));
-    }
-    if problem.uses_linear_solve_component()
+    if continuous.implicit_rhs.uses_linear_solve_component()
+        || continuous.residual.uses_linear_solve_component()
+        || continuous.manifold_residual.uses_linear_solve_component()
         || problem
             .initialization
-            .residual
+            .residual()
             .uses_linear_solve_component()
     {
         return Err(CodegenError::dae_preparation_failed(
-            "built-in FMI templates do not implement tensor linear-solve components",
+            "built-in FMI templates implement tensor linear-solve components only in the \
+             state-derivative kernel",
             None,
         ));
+    }
+    Ok(())
+}
+
+/// The C components index their value-reference table by the FMI 3 value
+/// reference itself: time is 0, the variables are `1..=N` in inventory order
+/// and the state derivatives start at `N + 1`. Refuse any other numbering
+/// rather than emit a table that would read the wrong storage.
+fn require_dense_value_references(fmi: &Value) -> Result<(), CodegenError> {
+    let refuse =
+        || CodegenError::template("FMI value references are not dense from 1 in inventory order");
+    let mut expected = 1_i64;
+    for variable in fmi.get_attr("variables")?.try_iter()? {
+        if variable.get_attr("value_reference_fmi3")?.as_i64() != Some(expected) {
+            return Err(refuse());
+        }
+        expected += 1;
+    }
+    if fmi
+        .get_attr("derivative_value_reference_base_fmi3")?
+        .as_i64()
+        != Some(expected)
+    {
+        return Err(refuse());
     }
     Ok(())
 }

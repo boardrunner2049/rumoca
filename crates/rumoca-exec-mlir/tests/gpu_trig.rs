@@ -137,7 +137,7 @@ fn nonlinear_drone_solve() -> SolveProblem {
         // Six states (x, y, theta, vx, vy, omega) and four parameters
         // (m, J, F, g): the derivative seed space is state columns followed by
         // parameter columns, so both extents belong to the fixture.
-        rumoca_ir_solve::VarLayout::from_parts(Default::default(), 6, 4),
+        drone_state_layout(),
     )
     .expect("fixture derivative problem is valid by construction")
 }
@@ -169,22 +169,22 @@ fn nonlinear_drone_prepared(m: f64, j: f64, f: f64, g: f64) -> rumoca_ir_solve::
                 residual: zero_block.clone(),
                 derivative_rhs: solve.continuous.derivative_rhs.clone(),
                 algebraic_projection_plan: rumoca_ir_solve::AlgebraicProjectionPlan::default(),
-                manifold_residual: ComputeBlock::default(),
-                manifold_projection_plan: rumoca_ir_solve::AlgebraicProjectionPlan::default(),
-                // Not an authored field: the refresh owners are derived from
-                // the finished problem below, so the literal only reserves the
-                // slot Solve lowering fills.
-                refresh_owners: rumoca_ir_solve::ContinuousRefreshOwners::default(),
+                // No manifold, charts, or noEvent loop switches. The refresh
+                // owners are not authored: they are derived from the finished
+                // problem below, into the slot Solve lowering fills.
+                ..ContinuousSolveSystem::default()
             },
-            initialization: InitializationSolveSystem {
-                residual: ComputeBlock::from_scalar_program_block(zero_rb.clone()),
-                row_targets: Vec::new(),
-                row_roles: Vec::new(),
-                projection_unknowns: Vec::new(),
-                projection_plan: rumoca_ir_solve::InitializationProjectionPlan::default(),
-                update_rhs: ScalarProgramBlock::default(),
-                update_targets: Vec::new(),
-            },
+            initialization: InitializationSolveSystem::construct(
+                rumoca_ir_solve::InitializationSystemInput {
+                    residual: ComputeBlock::from_scalar_program_block(zero_rb.clone()),
+                    row_roles: vec![
+                        rumoca_ir_solve::InitializationRowRole::SurplusCheck;
+                        zero_rb.len()
+                    ],
+                    ..Default::default()
+                },
+            )
+            .expect("initialization fixture has one checked owner per coordinate"),
             // The drone fixture owns no discrete variable, so the discrete
             // system is empty. A one-row RHS with no update target would claim
             // a discrete program that assigns nothing.
@@ -226,6 +226,7 @@ fn nonlinear_drone_prepared(m: f64, j: f64, f: f64, g: f64) -> rumoca_ir_solve::
         },
         pure_calls: rumoca_ir_solve::SolvePureCallTable::default(),
         artifacts: rumoca_ir_solve::SolveArtifacts {
+            discrete: Default::default(),
             continuous: rumoca_ir_solve::ContinuousSolveArtifacts {
                 structural: rumoca_ir_solve::ContinuousStructuralArtifacts::default(),
                 mass_matrix: rumoca_ir_solve::MassMatrix::Identity,
@@ -393,7 +394,7 @@ fn linear_drone_ptx_no_libdevice_needed() {
             "gpu_trig_linear_reference.mo",
         )),
         // Same six states and four parameters as the nonlinear fixture.
-        rumoca_ir_solve::VarLayout::from_parts(Default::default(), 6, 4),
+        drone_state_layout(),
     )
     .expect("fixture derivative problem is valid by construction");
 
@@ -424,4 +425,15 @@ fn linear_drone_ptx_no_libdevice_needed() {
         }
         Err(e) => panic!("Unexpected error: {e}"),
     }
+}
+
+/// The six drone states (x, y, theta, vx, vy, omega), each named at its own
+/// Y slot, followed by the four parameters (m, J, F, g).
+fn drone_state_layout() -> rumoca_ir_solve::VarLayout {
+    let bindings = ["x", "y", "theta", "vx", "vy", "omega"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| (name.to_string(), rumoca_ir_solve::scalar_slot_y(index)))
+        .collect();
+    rumoca_ir_solve::VarLayout::from_parts(bindings, 6, 4)
 }

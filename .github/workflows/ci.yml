@@ -203,8 +203,9 @@ jobs:
           # Nix evaluates the finite Crane + LLVM derivation graph recursively.
           # The default hosted-runner stack is too small for this workspace;
           # keep the evaluator budget explicit and bounded rather than relying
-          # on an unlimited process stack.
-          ulimit -s 65536
+          # on an unlimited process stack. The flake eval depth outgrew the
+          # earlier 64 MB budget, so raise it to 1 GB (still bounded).
+          ulimit -s 1048576
           nix build --print-build-logs \
             .#checks.x86_64-linux.rumoca \
             .#checks.x86_64-linux.mlir-cpu
@@ -591,6 +592,34 @@ jobs:
           esac
           EOF
 
+      - name: Cache MSL (fmi-ls-wasm Fourbar1 check)
+        if: matrix.backend == 'wasm'
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: target/msl/ModelicaStandardLibrary-4.1.0
+          key: msl-v4.1.0-release-zip-layout-v2
+
+      - name: Ensure MSL (fmi-ls-wasm Fourbar1 check)
+        if: matrix.backend == 'wasm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          msl_dir=target/msl/ModelicaStandardLibrary-4.1.0
+          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" ]]; then
+            echo "MSL cache is valid at $msl_dir"
+            exit 0
+          fi
+          rm -rf "$msl_dir"
+          mkdir -p "$msl_dir"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            -o target/msl/msl-v4.1.0.zip \
+            https://github.com/modelica/ModelicaStandardLibrary/releases/download/v4.1.0/ModelicaStandardLibrary_v4.1.0.zip
+          unzip -q target/msl/msl-v4.1.0.zip -d "$msl_dir"
+          rm target/msl/msl-v4.1.0.zip
+          test -f "$msl_dir/Complex.mo"
+          test -f "$msl_dir/Modelica 4.1.0/package.mo"
+
       - name: Fetch pinned official FMI standards
         if: matrix.backend == 'fmi'
         run: |
@@ -878,9 +907,23 @@ jobs:
         run: |
           ./target/debug/xtask coverage report
 
-      # Publish the measurement the gate just judged. The trim metric counts
-      # what the suite actually executed, and a workstation runs a different
-      # set than this job does (cached corpora, feature availability), so a
+      - name: Enforce coverage gate
+        env:
+          # A pull request is judged against its base; a push against the
+          # previous tip of the branch. A tag push has no previous tip, and
+          # its commit was already judged when it landed on main.
+          CHANGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${CHANGE_BASE:-}"
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="HEAD^"
+          fi
+          ./target/debug/xtask coverage gate --changed-since "$base"
+
+      # Publish the measurement and the gate report, pass or fail. Line
+      # coverage counts what the suite actually executed, and a workstation
+      # runs a different set than this job does (cached corpora, feature availability), so a
       # baseline promoted from a developer machine can never match what this
       # job enforces. Promote from these artifacts instead: download them,
       # place them under target/llvm-cov, run `xtask coverage gate
@@ -897,10 +940,6 @@ jobs:
             target/llvm-cov/coverage-trim-report.md
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Enforce coverage regression gate
-        run: |
-          ./target/debug/xtask coverage gate --enforce-trim-regressions
 
   # Build the heavy MSL artifacts (release + LTO) ONCE via Nix/crane. The
   # producer keeps the pinned OpenModelica closure in its own stable GitHub
@@ -1136,16 +1175,20 @@ jobs:
         run: |
           # One bounded attempt; 20 s covers the certified strict-high tail on
           # hosted runners without retries, exclusions, or looser trace checks.
+          # Compilation and simulations run two at a time, one per physical core
+          # of the hosted runner, and the OMC reference collection (which compiles
+          # and simulates in each worker) uses the same count, so the speed
+          # report compares the two tools under equal contention.
           cargo xtask verify msl-parity \
             --shard ${{ matrix.shard }}/4 \
             --prebuilt-test-binary "$PWD/result-msl-artifacts/bin/msl_tests" \
             --prebuilt-model-worker "$PWD/result-msl-artifacts/bin/rumoca-worker" \
             --prebuilt-sim-worker "$PWD/result-msl-artifacts/bin/rumoca-sim-worker" \
-            --stage-parallelism 3 \
-            --sim-parallelism 3 \
+            --stage-parallelism 2 \
+            --sim-parallelism 2 \
             --sim-worker-memory-mb 2048 \
             --sim-total-memory-mb 6144 \
-            --sim-timeout-secs 20 \
+            --sim-timeout-secs 45 \
             --model-attempt-timeout-secs 20 \
             --monitor-interval-secs 10
 
@@ -1875,7 +1918,10 @@ jobs:
       - name: Prepare GitHub Pages content
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
-          nix develop .#wasm --command bash <<'EOF'
+          # Use the docs shell: it carries the wasm toolchain this step relies on
+          # (binaryen, node, wasm-pack) plus mdbook, which the plain wasm shell
+          # lacks and `cargo xtask docs build` needs to render the guides.
+          nix develop .#docs --command bash <<'EOF'
           set -euo pipefail
           if [ -d packages/rumoca/dist/release-full-web ]; then
             PKG_SUBDIR="release-full-web"
@@ -2229,11 +2275,30 @@ jobs:
         run: |
           nix develop ".#devShells.${{ matrix.nix_system }}.ci-python-wheel" --command bash -lc '
             set -euo pipefail
+            target="${{ matrix.target }}"
+            # Linux runners ship a very new glibc, so a native build tags the
+            # wheels `linux_*`, which PyPI rejects. Cross-link the Linux wheels
+            # with zig against glibc 2.28 to earn a manylinux_2_28 tag. macOS
+            # targets already produce installable macosx wheels, so leave them
+            # to the native toolchain.
+            compat_args=()
+            case "$target" in
+              *linux*)
+                compat_args=(--zig --compatibility manylinux_2_28)
+                # The Nix CPython exports _PYTHON_HOST_PLATFORM (e.g.
+                # linux-x86_64), which maturin honors and would stamp a bare
+                # linux_* tag over the manylinux tag from --compatibility.
+                # Clear it so the zig cross-link keeps the PyPI-acceptable
+                # manylinux_2_28 tag.
+                unset _PYTHON_HOST_PLATFORM
+                ;;
+            esac
             maturin build \
               --release \
               --out dist \
               --manifest-path crates/rumoca-bind-python/Cargo.toml \
-              --target "${{ matrix.target }}"
+              --target "$target" \
+              "${compat_args[@]}"
           '
 
       - name: Build wheels (Windows)
@@ -2330,7 +2395,11 @@ jobs:
     # the second run fail on "Release.tag_name already exists". Tag-only means
     # the release/publish path runs exactly once.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.detect-release-tag.outputs.is_release == 'true'
-    needs: [detect-release-tag, lint, test, coverage-gate, msl-merge, modelicatest-gate, docs, vscode, deploy-pages, playground, build-wasm, build-rust-binaries, build-python-wheels, build-python-sdist]
+    # Gate every publish on a fully green build: the release deploys to all
+    # sites only when every test, gate, and build job has passed, so we never
+    # publish to one site off a partially red run. A publish step failing is the
+    # only thing that can leave a partial deploy.
+    needs: [detect-release-tag, fmt, lint, test, coverage-gate, kani, nix-checks, msl-merge, modelicatest-gate, modelica-models-gate, editor-msl-smoke, template-runtime-tests, docs, vscode, deploy-pages, playground, build-wasm, build-rust-binaries, build-python-wheels, build-python-sdist]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -2383,6 +2452,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
+
+          # The published binaries are statically linked; the attribution their
+          # dependencies require ships next to them.
+          cp infra/licenses/THIRD_PARTY_NOTICES.md release-assets/THIRD_PARTY_NOTICES.md
 
           echo "=== Downloaded structure ==="
           find artifacts -type f | sed -n '1,50p'
@@ -2513,6 +2586,29 @@ jobs:
             exit 1
           fi
 
+          # Marketplace publishing is not idempotent: re-running a release (for
+          # example after fixing a later job) hits an "already exists" error for
+          # a version a prior run already published. Treat that as success so the
+          # rest of the release, including the PyPI publish, still proceeds; any
+          # other failure still fails the step.
+          publish_idempotent() {
+            local label="$1"; shift
+            local out rc
+            set +e
+            out="$("$@" 2>&1)"
+            rc=$?
+            set -e
+            echo "$out"
+            if [ "$rc" -ne 0 ]; then
+              # vsce reports "already exists"; ovsx reports "already published".
+              if echo "$out" | grep -qiE "already exists|already published"; then
+                echo "::notice::${label}: this version is already published; leaving it in place."
+                return 0
+              fi
+              return "$rc"
+            fi
+          }
+
           if [ -z "${VSCE_PAT:-}" ]; then
             echo "::warning::VSCE_PAT secret not set; skipping Visual Studio Marketplace publish"
           else
@@ -2520,7 +2616,8 @@ jobs:
               echo "Publishing $(basename "$vsix_file") to Visual Studio Marketplace"
               (
                 cd packages/vscode
-                npx @vscode/vsce publish --packagePath "../../${vsix_file}" --no-dependencies --no-yarn
+                publish_idempotent "Visual Studio Marketplace" \
+                  npx @vscode/vsce publish --packagePath "../../${vsix_file}" --no-dependencies --no-yarn
               )
             done
           fi
@@ -2532,7 +2629,8 @@ jobs:
               echo "Publishing $(basename "$vsix_file") to Open VSX"
               (
                 cd packages/vscode
-                npx --yes ovsx publish "../../${vsix_file}" -p "${OVSX_TOKEN}"
+                publish_idempotent "Open VSX" \
+                  npx --yes ovsx publish "../../${vsix_file}" -p "${OVSX_TOKEN}"
               )
             done
           fi

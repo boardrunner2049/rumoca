@@ -4,10 +4,13 @@
 //! DAE construction used to make this choice itself, lowering only the
 //! selected arm of a structured body's top-level `if`. It is an optimization
 //! -- the family is the same set of equations either way at the declared
-//! values -- so it is a pass (docs/design/minimal-frontend.md), deciding with
-//! the environment construction decided with: every parameter and constant
-//! whose binding settles, except a `fixed = false` parameter, whose value
-//! only initialization determines.
+//! values -- so it is a pass (docs/design/minimal-frontend.md). It decides
+//! with constants and non-tunable parameters only (`Evaluate = true`, those
+//! construction marked evaluable, and derived parameters bound from such
+//! values), never a `fixed = false` parameter, whose value only
+//! initialization determines. A guard reading a tunable parameter stays a
+//! run-time selection (SPEC_0040 DAE-C22): setting the parameter must take
+//! effect.
 //!
 //! Scope is the bodies of equation families, initial ones included, and
 //! anything they reach. A materialized family packs its per-point bodies into
@@ -17,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::evaluate::{self, Value};
-use super::parameter_bindings::{Tunable, Values};
+use super::parameter_bindings::Values;
 use super::*;
 
 pub(super) struct SelectFamilyBranches;
@@ -30,7 +33,7 @@ impl Pass for SelectFamilyBranches {
         "replace an `if` in an equation family by the branch parameter values select"
     }
     fn run(&self, model: &mut RbcModel) -> Result<usize, PassError> {
-        let values = Values::settle(model, Tunable::Included);
+        let values = Values::settle(model);
         let mut pending: Vec<ExprId> = model
             .equation_families
             .iter()

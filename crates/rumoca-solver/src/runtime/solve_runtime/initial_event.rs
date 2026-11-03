@@ -64,16 +64,11 @@ struct InitialEventUpdate<'a> {
     initial_event: Option<RuntimeEventStop>,
 }
 
-fn initial_event_right_limit(
-    event: RuntimeEventStop,
-    event_t: f64,
-    horizon_t: f64,
-    tolerance: f64,
-) -> Option<f64> {
+fn initial_event_right_limit(event: RuntimeEventStop, event_t: f64, horizon_t: f64) -> Option<f64> {
     if !event.observe_right_limit || event.pre_mode != EventPreMode::FollowCurrent {
         return None;
     }
-    let right_t = bounded_event_right_limit_time(event_t, horizon_t, tolerance);
+    let right_t = bounded_event_right_limit_time(event_t, horizon_t);
     (right_t > event_t).then_some(right_t)
 }
 
@@ -147,7 +142,7 @@ impl SolveRuntime {
                 event_pre_p: &event_pre_p,
                 max_iters,
                 row_filter,
-                root_relation_overrides: &[],
+                root_relation_overrides: &mut Vec::new(),
             },
             project_algebraics,
         )
@@ -228,7 +223,7 @@ impl SolveRuntime {
                 action,
             });
         };
-        let right_t = initial_event_right_limit(event, t_start, t_end, tol);
+        let right_t = initial_event_right_limit(event, t_start, t_end);
         // The accepted initial-event value is the left endpoint of delay
         // history. A positive-delay query at the synthetic right-limit time
         // must read that accepted point, not remain in the initialization
@@ -255,10 +250,11 @@ impl SolveRuntime {
             EventUpdateRowFilter::Hold
         } else if event.pre_mode == EventPreMode::EventEntry {
             // A phase-zero periodic schedule ticks at the simulation start,
-            // after initialization has settled. Its EventEntry rows must see
-            // `initial() = false` at that same semantic instant. Fixed rows are
-            // initialization actions and remain excluded from this projection.
-            EventUpdateRowFilter::PostInitialClockTick
+            // after initialization has settled. MLS §16.5.1 allows a held
+            // clock value to activate an unclocked when at this instant, so
+            // the tick needs the complete SOLVE-C22 event pass. Pre-read mode
+            // does not determine activation; the checked guards do.
+            EventUpdateRowFilter::All
         } else {
             EventUpdateRowFilter::FollowCurrentOnly
         };
@@ -339,7 +335,7 @@ impl SolveRuntime {
                     event_pre_p,
                     max_iters,
                     row_filter,
-                    root_relation_overrides: &[],
+                    root_relation_overrides: &mut Vec::new(),
                 },
                 |y, p| project_algebraics(y, p, t),
             );
@@ -356,7 +352,7 @@ impl SolveRuntime {
                 event_pre_p: &event_pre_p,
                 max_iters,
                 row_filter: EventUpdateRowFilter::All,
-                root_relation_overrides: &[],
+                root_relation_overrides: &mut Vec::new(),
             },
             |y, p| project_algebraics(y, p, t),
         )

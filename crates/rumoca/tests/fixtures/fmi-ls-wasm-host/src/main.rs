@@ -1,3 +1,12 @@
+//! Wasmtime driver for a generated FMI-LS-Wasm Co-Simulation component.
+//!
+//! Two modes:
+//!   lifecycle <component> <token>
+//!       Runs generic lifecycle negative controls and prints `OK`.
+//!   trace <component> <token> <t_start> <t_stop> <dt> <vr>...
+//!       Advances the Co-Simulation from `t_start` to `t_stop` in `dt` steps
+//!       and prints a CSV trace (`time` plus one column per value reference).
+
 use anyhow::{Context, Result, bail, ensure};
 use wasmtime::component::{Component, Linker, ResourceAny};
 use wasmtime::{Config, Engine, Store};
@@ -39,66 +48,13 @@ impl fmi::fmi3::intermediate_update_callbacks::Host for HostState {
 
 impl fmi::fmi3::types::Host for HostState {}
 
-fn get_value(
-    world: &CoSimulationFmu,
-    store: &mut Store<HostState>,
+struct Fmu {
+    world: CoSimulationFmu,
+    store: Store<HostState>,
     instance: ResourceAny,
-    value_reference: u32,
-) -> Result<Option<f64>> {
-    Ok(world
-        .fmi_fmi3_co_simulation()
-        .co_simulation_instance()
-        .call_get_float64(store, instance, &[value_reference])?
-        .ok()
-        .and_then(|values| values.first().copied()))
 }
 
-fn set_value(
-    world: &CoSimulationFmu,
-    store: &mut Store<HostState>,
-    instance: ResourceAny,
-    value_reference: u32,
-    value: f64,
-) -> Result<Status> {
-    world
-        .fmi_fmi3_co_simulation()
-        .co_simulation_instance()
-        .call_set_float64(store, instance, &[value_reference], &[value])
-        .map_err(Into::into)
-}
-
-fn discover_value_references(
-    world: &CoSimulationFmu,
-    store: &mut Store<HostState>,
-    instance: ResourceAny,
-) -> Result<(u32, u32)> {
-    let mut readable = Vec::new();
-    let mut writable = Vec::new();
-    for value_reference in 1..32 {
-        let Some(value) = get_value(world, store, instance, value_reference)? else {
-            continue;
-        };
-        readable.push(value_reference);
-        if set_value(world, store, instance, value_reference, value)? == Status::Ok {
-            writable.push(value_reference);
-        }
-    }
-    ensure!(readable.len() == 2, "expected one input and one state: {readable:?}");
-    ensure!(writable.len() == 1, "expected one writable input: {writable:?}");
-    let input = writable[0];
-    let state = readable
-        .into_iter()
-        .find(|value_reference| *value_reference != input)
-        .context("state value reference")?;
-    Ok((input, state))
-}
-
-fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let component_path = args.next().context("component path argument")?;
-    let token = args.next().context("instantiation token argument")?;
-    ensure!(args.next().is_none(), "unexpected host argument");
-
+fn load(component_path: &str, token: &str) -> Result<Fmu> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     let engine = Engine::new(&config)?;
@@ -118,65 +74,167 @@ fn main() -> Result<()> {
     );
     let world = CoSimulationFmu::instantiate(&mut store, &component, &linker)?;
     ensure!(world.fmi_fmi3_common().call_get_version(&mut store)? == "3.0");
-
-    let interface = world
+    let instance = world
         .fmi_fmi3_co_simulation()
-        .co_simulation_instance();
-    let instance = interface
+        .co_simulation_instance()
         .call_instantiate_co_simulation(
-            &mut store,
-            "rumoca-test",
-            &token,
-            "",
-            false,
-            false,
-            false,
-            false,
-            &[],
+            &mut store, "rumoca-test", token, "", false, false, false, false, &[],
         )?
         .context("component rejected the checked token")?;
+    Ok(Fmu {
+        world,
+        store,
+        instance,
+    })
+}
+
+fn get_first(fmu: &mut Fmu, value_reference: u32) -> Result<Option<f64>> {
+    Ok(fmu
+        .world
+        .fmi_fmi3_co_simulation()
+        .co_simulation_instance()
+        .call_get_float64(&mut fmu.store, fmu.instance, &[value_reference])?
+        .ok()
+        .and_then(|values| values.first().copied()))
+}
+
+fn run_lifecycle(component_path: &str, token: &str) -> Result<()> {
+    let mut fmu = load(component_path, token)?;
+    let interface = fmu.world.fmi_fmi3_co_simulation().co_simulation_instance();
     ensure!(
-        interface.call_enter_initialization_mode(&mut store, instance, None, 0.0, Some(1.0))?
+        interface.call_enter_initialization_mode(&mut fmu.store, fmu.instance, None, 0.0, Some(1.0))?
             == Status::Ok
     );
-
     ensure!(
-        interface.call_set_input_derivatives(&mut store, instance, &[], &[])? == Status::Error,
+        interface.call_set_input_derivatives(&mut fmu.store, fmu.instance, &[], &[])?
+            == Status::Error,
         "unsupported input derivatives reported success"
     );
     ensure!(
-        interface.call_enter_step_mode(&mut store, instance)? == Status::Error,
-        "event-mode transition reported success"
+        interface.call_enter_step_mode(&mut fmu.store, fmu.instance)? == Status::Error,
+        "step-mode transition reported success"
     );
-    ensure!(interface.call_exit_initialization_mode(&mut store, instance)? == Status::Ok);
+    ensure!(interface.call_exit_initialization_mode(&mut fmu.store, fmu.instance)? == Status::Ok);
 
-    let (input, state) = discover_value_references(&world, &mut store, instance)?;
-    let initial_input = get_value(&world, &mut store, instance, input)?.context("input value")?;
-    let status = interface.call_set_float64(
-        &mut store,
-        instance,
-        &[input, u32::MAX],
-        &[9.0, 0.0],
-    )?;
-    ensure!(status == Status::Error, "invalid setter must reject");
-    ensure!(
-        get_value(&world, &mut store, instance, input)? == Some(initial_input),
-        "rejected setter partially mutated the input"
-    );
-    ensure!(set_value(&world, &mut store, instance, input, 0.0)? == Status::Ok);
-
-    let step = interface
-        .call_do_step(&mut store, instance, 0.0, 0.1, false)?
-        .map_err(|status| anyhow::anyhow!("valid do-step failed: {status:?}"))?;
-    ensure!((step.last_successful_time - 0.1).abs() < f64::EPSILON);
-    let x = get_value(&world, &mut store, instance, state)?.context("state value")?;
-    ensure!((x - (-0.1_f64).exp()).abs() < 1.0e-5, "RK4 state mismatch: {x}");
-
-    let before = x;
-    if interface.call_do_step(&mut store, instance, 0.0, 0.1, false)?.is_ok() {
-        bail!("mismatched communication point must reject");
+    // Find a writable value reference and prove a rejected set is transactional.
+    let mut writable = None;
+    for value_reference in 1..64u32 {
+        if get_first(&mut fmu, value_reference)?.is_none() {
+            continue;
+        }
+        let current = get_first(&mut fmu, value_reference)?.context("readable value")?;
+        let status = fmu
+            .world
+            .fmi_fmi3_co_simulation()
+            .co_simulation_instance()
+            .call_set_float64(&mut fmu.store, fmu.instance, &[value_reference], &[current])?;
+        if status == Status::Ok {
+            writable = Some((value_reference, current));
+            break;
+        }
     }
-    ensure!(get_value(&world, &mut store, instance, state)? == Some(before));
-    ensure!(interface.call_terminate(&mut store, instance)? == Status::Ok);
+    let (value_reference, original) = writable.context("no writable value reference found")?;
+    let rejected = fmu
+        .world
+        .fmi_fmi3_co_simulation()
+        .co_simulation_instance()
+        .call_set_float64(
+            &mut fmu.store,
+            fmu.instance,
+            &[value_reference, u32::MAX],
+            &[original + 1.0, 0.0],
+        )?;
+    ensure!(rejected == Status::Error, "invalid setter must reject");
+    ensure!(
+        get_first(&mut fmu, value_reference)? == Some(original),
+        "rejected setter partially mutated a value"
+    );
+    ensure!(
+        fmu.world
+            .fmi_fmi3_co_simulation()
+            .co_simulation_instance()
+            .call_terminate(&mut fmu.store, fmu.instance)?
+            == Status::Ok
+    );
+    println!("OK");
     Ok(())
+}
+
+fn run_trace(component_path: &str, token: &str, args: &[String]) -> Result<()> {
+    ensure!(args.len() >= 4, "trace needs t_start t_stop dt and value references");
+    let t_start: f64 = args[0].parse().context("t_start")?;
+    let t_stop: f64 = args[1].parse().context("t_stop")?;
+    let dt: f64 = args[2].parse().context("dt")?;
+    let references: Vec<u32> = args[3..]
+        .iter()
+        .map(|value| value.parse::<u32>().context("value reference"))
+        .collect::<Result<_>>()?;
+    ensure!(dt > 0.0 && t_stop > t_start, "invalid trace window");
+
+    let mut fmu = load(component_path, token)?;
+    let interface = fmu.world.fmi_fmi3_co_simulation().co_simulation_instance();
+    ensure!(
+        interface.call_enter_initialization_mode(
+            &mut fmu.store,
+            fmu.instance,
+            None,
+            t_start,
+            Some(t_stop),
+        )? == Status::Ok
+    );
+    ensure!(interface.call_exit_initialization_mode(&mut fmu.store, fmu.instance)? == Status::Ok);
+
+    let mut header = String::from("time");
+    for reference in &references {
+        header.push_str(&format!(",{reference}"));
+    }
+    println!("{header}");
+
+    let steps = ((t_stop - t_start) / dt).round() as i64;
+    let mut current = t_start;
+    print_row(&mut fmu, current, &references)?;
+    for _ in 0..steps {
+        let outcome = fmu
+            .world
+            .fmi_fmi3_co_simulation()
+            .co_simulation_instance()
+            .call_do_step(&mut fmu.store, fmu.instance, current, dt, false)?;
+        match outcome {
+            Ok(result) => current = result.last_successful_time,
+            Err(status) => bail!("do-step failed at t={current}: {status:?}"),
+        }
+        print_row(&mut fmu, current, &references)?;
+    }
+    ensure!(
+        fmu.world
+            .fmi_fmi3_co_simulation()
+            .co_simulation_instance()
+            .call_terminate(&mut fmu.store, fmu.instance)?
+            == Status::Ok
+    );
+    Ok(())
+}
+
+fn print_row(fmu: &mut Fmu, time: f64, references: &[u32]) -> Result<()> {
+    let mut row = format!("{time:.9}");
+    for reference in references {
+        let value = get_first(fmu, *reference)?
+            .with_context(|| format!("value reference {reference} not readable"))?;
+        row.push_str(&format!(",{value:.12e}"));
+    }
+    println!("{row}");
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    ensure!(args.len() >= 3, "usage: <mode> <component> <token> [...]");
+    let mode = args[0].as_str();
+    let component_path = args[1].as_str();
+    let token = args[2].as_str();
+    match mode {
+        "lifecycle" => run_lifecycle(component_path, token),
+        "trace" => run_trace(component_path, token, &args[3..]),
+        other => bail!("unknown mode {other}"),
+    }
 }

@@ -3,54 +3,71 @@ use rumoca_ir_solve::{LinearOp, TargetAssignmentShape};
 use crate::EvalSolveError;
 
 pub(super) fn eval_assignment_shape(
-    shape: TargetAssignmentShape,
+    shape: &TargetAssignmentShape,
     row_idx: usize,
     regs: &[f64],
     span: Option<rumoca_core::Span>,
 ) -> Result<f64, EvalSolveError> {
     match shape {
-        TargetAssignmentShape::Direct { expr_reg, .. } => read_shape_reg(regs, expr_reg, span),
+        TargetAssignmentShape::Zero { .. } => Ok(0.0),
+        TargetAssignmentShape::TensorAffine { .. } => Err(super::invalid_prepared_row(
+            "tensor-affine assignments require their prepared materialization",
+        )),
+        TargetAssignmentShape::Direct { expr_reg, .. } => read_shape_reg(regs, *expr_reg, span),
         TargetAssignmentShape::Affine {
             target_y_index,
-            offset_reg,
             coefficient_reg,
-            offset_scale,
             coefficient_scale,
             ..
         } => {
-            let offset = offset_scale * read_shape_reg(regs, offset_reg, span)?;
-            let coefficient = coefficient_scale
-                * coefficient_reg.map_or(Ok(1.0), |reg| read_shape_reg(regs, reg, span))?;
+            let coefficient = match coefficient_reg {
+                Some(register) => rumoca_ir_solve::register_coefficient(
+                    read_shape_reg(regs, *register, span)?,
+                    *coefficient_scale,
+                ),
+                None => *coefficient_scale,
+            };
             if coefficient == 0.0 || !coefficient.is_finite() {
                 return Err(EvalSolveError::SingularTargetAssignment {
                     row: row_idx,
-                    target_y_index,
+                    target_y_index: *target_y_index,
                     coefficient,
                     span,
                 });
             }
-            Ok(-offset / coefficient)
+            isolated_value(shape, regs, span)
         }
-        TargetAssignmentShape::AffineResidual {
+        TargetAssignmentShape::Additive {
             target_y_index,
-            target_reg,
-            residual_reg,
             coefficient,
             ..
         } => {
-            if coefficient == 0.0 || !coefficient.is_finite() {
+            if *coefficient == 0.0 || !coefficient.is_finite() {
                 return Err(EvalSolveError::SingularTargetAssignment {
                     row: row_idx,
-                    target_y_index,
-                    coefficient,
+                    target_y_index: *target_y_index,
+                    coefficient: *coefficient,
                     span,
                 });
             }
-            let target = read_shape_reg(regs, target_reg, span)?;
-            let residual = read_shape_reg(regs, residual_reg, span)?;
-            Ok(target - residual / coefficient)
+            isolated_value(shape, regs, span)
         }
     }
+}
+
+/// The isolated value of an affine or additive shape, in the arithmetic of
+/// its materialized isolator ([`rumoca_ir_solve::IsolatedValue`]).
+fn isolated_value(
+    shape: &TargetAssignmentShape,
+    regs: &[f64],
+    span: Option<rumoca_core::Span>,
+) -> Result<f64, EvalSolveError> {
+    rumoca_ir_solve::eval_isolated_value(shape, |register| read_shape_reg(regs, register, span))
+        .unwrap_or_else(|| {
+            Err(super::invalid_prepared_row(
+                "only affine and additive shapes have an isolated value",
+            ))
+        })
 }
 
 /// Recognize the first scalar target assignment owned by one residual row.

@@ -296,8 +296,10 @@ impl SolveRuntime {
         Ok(())
     }
 
-    /// Return the first failed checked assertion without committing any
-    /// target. Predicate values are the scalar suffix proved by SOLVE-C55.
+    /// Return the first failed error-level assertion without committing any
+    /// target. Predicate values are the scalar suffix proved by SOLVE-C55; a
+    /// failed warning-level predicate never blocks the commit (MLS §8.3.7)
+    /// and is reported through the event actions it projects to.
     pub(super) fn failed_event_transaction_assertion(
         &self,
         transaction_index: usize,
@@ -312,9 +314,23 @@ impl SolveRuntime {
                 "event transaction output scratch is not initialized",
             ));
         }
+        let actions = &self.model.problem.events.actions;
+        let action_indices = &self.model.problem.discrete.event_transactions[transaction_index]
+            .assertion_action_indices();
+        let error_level = |action: &usize| {
+            actions
+                .get(*action)
+                .is_none_or(|action| action.kind != solve::SolveEventActionKind::Warning)
+        };
+        let blocking = |assertion: usize| {
+            action_indices
+                .get(assertion)
+                .is_none_or(|indices| indices.iter().any(error_level))
+        };
         Ok(output[transaction.target_scalar_count()..]
             .iter()
-            .position(|predicate| *predicate == 0.0))
+            .enumerate()
+            .position(|(assertion, predicate)| *predicate == 0.0 && blocking(assertion)))
     }
 
     pub(super) fn event_transaction_assertion_failed(
@@ -526,16 +542,16 @@ mod tests {
                 observation_refresh: vec![false],
                 integrator_history_effects: vec![solve::IntegratorHistoryEffect::Preserve],
                 clock_owners: vec![None],
-                event_iteration_plan: solve::EventIterationPlan {
-                    runs: vec![solve::EventIterationRun {
+                event_iteration_plan: solve::EventIterationPlan::new(vec![
+                    solve::EventIterationRun {
                         variable: 0,
                         pre_binding_start: 0,
                         owner: solve::EventIterationOwner::EventTransaction {
                             program_index: 0,
                             target_index: 0,
                         },
-                    }],
-                },
+                    },
+                ]),
                 event_transactions: vec![transaction],
                 ..solve::DiscreteSolveSystem::default()
             },

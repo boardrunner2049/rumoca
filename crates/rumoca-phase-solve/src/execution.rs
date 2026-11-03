@@ -81,7 +81,7 @@ pub fn export(
         })
         .collect::<Result<_>>()?;
     if p.initialization
-        .row_roles
+        .row_roles()
         .iter()
         .any(|r| *r != s::InitializationRowRole::Solved)
     {
@@ -89,7 +89,7 @@ pub fn export(
     }
     let initial_blocks = p
         .initialization
-        .projection_plan
+        .projection_plan()
         .blocks
         .iter()
         .map(|b| {
@@ -115,7 +115,7 @@ pub fn export(
             &p.continuous.implicit_row_targets,
         )?,
         derivatives: scalar_rows(&p.continuous.derivative_rhs, &[])?,
-        initialization: scalar_rows(&p.initialization.residual, &p.initialization.row_targets)?,
+        initialization: scalar_rows(p.initialization.residual(), p.initialization.row_targets())?,
         algebraic_blocks,
         initial_blocks,
         observations,
@@ -396,21 +396,35 @@ fn restore_programs(
             rows: b.rows.clone(),
             y_indices: b.unknowns.clone(),
             tearing: None,
+            alternate_charts: Vec::new(),
         })
         .collect();
-    let init = &mut model.problem.initialization;
-    init.residual = block(&public.initialization, y, p, span)?;
-    init.row_targets = targets(&public.initialization, public.initialization.len(), y)?;
-    init.row_roles = vec![s::InitializationRowRole::Solved; public.initialization.len()];
-    init.projection_unknowns = initial_unknowns.into_iter().map(s::scalar_slot_y).collect();
-    init.projection_plan.blocks = public
-        .initial_blocks
-        .iter()
-        .map(|b| s::InitializationProjectionBlock {
-            rows: b.rows.clone(),
-            unknowns: b.unknowns.iter().copied().map(s::scalar_slot_y).collect(),
-        })
-        .collect();
+    let row_targets = targets(&public.initialization, public.initialization.len(), y)?;
+    let input = s::InitializationSystemInput {
+        residual: block(&public.initialization, y, p, span)?,
+        row_roles: vec![s::InitializationRowRole::Solved; public.initialization.len()],
+        projection_plan: s::InitializationProjectionPlan {
+            blocks: public
+                .initial_blocks
+                .iter()
+                .map(|b| s::InitializationProjectionBlock {
+                    rows: b.rows.clone(),
+                    unknowns: b.unknowns.iter().copied().map(s::scalar_slot_y).collect(),
+                    scales: vec![s::InitializationUnknownScale::Solver; b.unknowns.len()],
+                })
+                .collect(),
+        },
+        given_state_indices: (0..states)
+            .filter(|index| !initial_unknowns.contains(index))
+            .collect(),
+        ..Default::default()
+    };
+    let initialization =
+        s::InitializationSolveSystem::construct(input).map_err(|e| e.to_string())?;
+    if initialization.row_targets() != row_targets {
+        return Err("initialization row targets disagree with the projection owner".into());
+    }
+    model.problem.initialization = initialization;
     Ok(())
 }
 
@@ -434,8 +448,11 @@ fn fmi_input(
         unit: v.unit.clone(),
         description: None,
         causality,
+        declared_causality: None,
         variability,
         tunable: false,
+        evaluable: false,
+        text_start: None,
         declaration: span,
     }
 }
@@ -519,7 +536,7 @@ fn check_profile(model: &s::SolveModel) -> Result<()> {
         }
     }
     if !p.continuous.manifold_residual.nodes.is_empty()
-        || !p.initialization.update_rhs.is_empty()
+        || !p.initialization.update_rhs().is_empty()
         || p.solve_layout.initial_homotopy_parameter_index.is_some()
     {
         return Err("execution v1 does not support manifold/homotopy/initial updates".into());

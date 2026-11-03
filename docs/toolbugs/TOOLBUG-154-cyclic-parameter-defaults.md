@@ -37,11 +37,11 @@ Not changed: OpenIPSL `GENTPJ` (`Zs`) is a genuine cycle through
 * `crates/rumoca-phase-dae/src/construction/analysis/parameter_cycles.rs`
   (new): after translation-time evaluation, the bindings left unevaluated are
   checked for a cycle on the instance; a surviving cycle is the new
-  `ED023 cyclic dependency in parameter binding: p.totLen -> p.segLen -> p.totLen`.
+  `ED025 cyclic dependency in parameter binding: p.totLen -> p.segLen -> p.totLen`.
 
 ## Test
 
 `function_body_and_binding_regressions.rs::parameter_cycles_are_judged_on_the_instance`;
 `rumoca-contracts/tests/inst_contracts.rs::inst_008_no_cyclic_binding` (now
-ED023 for default bindings, ER007 for final ones) and
+ED025 for default bindings, ER007 for final ones) and
 `inst_008_modification_breaks_a_default_cycle`.

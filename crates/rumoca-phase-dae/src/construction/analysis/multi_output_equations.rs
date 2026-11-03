@@ -207,8 +207,15 @@ fn validate_receiver(
         role,
         Some(PlannedRole::State | PlannedRole::Algebraic | PlannedRole::Output)
     );
+    // A discrete receiver is defined by its result ordinal the same way a
+    // continuous one is; its owner is the discrete system (MLS Appendix B).
+    let discrete = !context.initialization
+        && matches!(
+            role,
+            Some(PlannedRole::DiscreteReal | PlannedRole::DiscreteValue)
+        );
     let initial_parameter = context.initialization && matches!(role, Some(PlannedRole::Parameter));
-    if !continuous && !initial_parameter {
+    if !continuous && !discrete && !initial_parameter {
         return Err(ToDaeError::unsupported_flat(
             "multi-output equation",
             format!(

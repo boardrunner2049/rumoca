@@ -445,13 +445,12 @@ mod tests {
             },
             binding(1, 1, Some(0.1)),
         ];
-        model.problem.discrete.event_iteration_plan = solve::EventIterationPlan {
-            runs: vec![solve::EventIterationRun {
+        model.problem.discrete.event_iteration_plan =
+            solve::EventIterationPlan::new(vec![solve::EventIterationRun {
                 variable: 0,
                 pre_binding_start: 0,
                 owner: solve::EventIterationOwner::ScalarRows { start_row: 0 },
-            }],
-        };
+            }]);
         model.problem.discrete.clock_owners = vec![None];
         model.problem.solve_layout.variable_storage_runs = vec![solve::SolveVariableStorageRun {
             base: solve::scalar_slot_p(2),

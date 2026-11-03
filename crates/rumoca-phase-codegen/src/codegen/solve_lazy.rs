@@ -417,8 +417,6 @@ fn continuous_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
     let implicit_rhs = compute_block_value(Arc::new(problem.continuous.implicit_rhs.clone()))?;
     let derivative_rhs = compute_block_value(Arc::new(problem.continuous.derivative_rhs.clone()))?;
     let residual = compute_block_value(Arc::new(problem.continuous.residual.clone()))?;
-    let (algebraic_assignment_plan, algebraic_assignment_complete) =
-        algebraic_assignment_plan(problem)?;
     Ok(lazy_map(
         &[
             "implicit_rhs",
@@ -426,8 +424,6 @@ fn continuous_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
             "algebraic_projection_plan",
             "residual",
             "derivative_rhs",
-            "algebraic_assignment_plan",
-            "algebraic_assignment_complete",
         ],
         move |k| {
             let c = &handle.problem().continuous;
@@ -435,8 +431,6 @@ fn continuous_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
                 "implicit_rhs" => Some(implicit_rhs.clone()),
                 "derivative_rhs" => Some(derivative_rhs.clone()),
                 "residual" => Some(residual.clone()),
-                "algebraic_assignment_plan" => Some(algebraic_assignment_plan.clone()),
-                "algebraic_assignment_complete" => Some(Value::from(algebraic_assignment_complete)),
                 "implicit_row_targets" => Some(Value::from_serialize(&c.implicit_row_targets)),
                 "algebraic_projection_plan" => {
                     Some(Value::from_serialize(&c.algebraic_projection_plan))
@@ -445,48 +439,6 @@ fn continuous_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
             }
         },
     ))
-}
-
-fn algebraic_assignment_plan(problem: &solve::SolveProblem) -> Result<(Value, bool), CodegenError> {
-    let owners = &problem.continuous.refresh_owners;
-    let mut programs = Vec::new();
-    let mut spans = Vec::new();
-    let mut targets = Vec::new();
-    let complete = explicit_algebraic_assignment_complete(problem);
-    for stage in &owners.algebraic().value_stages {
-        match stage {
-            solve::RefreshStage::CausalSeedSweep { .. } => {}
-            solve::RefreshStage::ExactAssignments {
-                static_sequence,
-                dynamic_sequence,
-                ..
-            } => {
-                append_issued_assignment_sequence(
-                    &problem.continuous.implicit_rhs,
-                    owners,
-                    *static_sequence,
-                    &mut programs,
-                    &mut spans,
-                    &mut targets,
-                )?;
-                append_issued_assignment_sequence(
-                    &problem.continuous.implicit_rhs,
-                    owners,
-                    *dynamic_sequence,
-                    &mut programs,
-                    &mut spans,
-                    &mut targets,
-                )?;
-            }
-            solve::RefreshStage::ProjectionBlock { .. } => {}
-        }
-    }
-    let assignments = solve::ScalarProgramBlock::with_output_indices(programs, spans, targets)
-        .map_err(|error| CodegenError::template(error.to_string()))?;
-    let plan = Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(
-        Arc::new(assignments),
-    )?);
-    Ok((plan, complete))
 }
 
 /// Target-local explicit algebraic execution profile.
@@ -540,7 +492,7 @@ pub fn explicit_algebraic_assignment_complete(problem: &solve::SolveProblem) -> 
         };
         if target != shape.target_y_index()
             || !expected_targets.contains(&target)
-            || !supported_explicit_assignment_shape(*shape)
+            || !supported_explicit_assignment_shape(shape)
             || program
                 .assignment_y_dependencies(position)
                 .is_none_or(|dependencies| {
@@ -559,15 +511,22 @@ pub fn explicit_algebraic_assignment_complete(problem: &solve::SolveProblem) -> 
     assigned == expected_targets && rows.len() == continuous.algebraic_projection_plan.blocks.len()
 }
 
-fn supported_explicit_assignment_shape(shape: solve::TargetAssignmentShape) -> bool {
+fn supported_explicit_assignment_shape(shape: &solve::TargetAssignmentShape) -> bool {
     match shape {
-        solve::TargetAssignmentShape::Direct { .. } => true,
+        solve::TargetAssignmentShape::Zero { .. } | solve::TargetAssignmentShape::Direct { .. } => {
+            true
+        }
         solve::TargetAssignmentShape::Affine {
             coefficient_reg,
             coefficient_scale,
             ..
-        } => coefficient_reg.is_none() && coefficient_scale.is_finite() && coefficient_scale != 0.0,
-        solve::TargetAssignmentShape::AffineResidual { .. } => false,
+        } => {
+            coefficient_reg.is_none() && coefficient_scale.is_finite() && *coefficient_scale != 0.0
+        }
+        solve::TargetAssignmentShape::Additive { coefficient, .. } => {
+            coefficient.is_finite() && *coefficient != 0.0
+        }
+        solve::TargetAssignmentShape::TensorAffine { .. } => false,
     }
 }
 
@@ -599,41 +558,6 @@ fn ordered_exact_algebraic_assignments(
     Some(assignments)
 }
 
-fn append_issued_assignment_sequence(
-    source: &solve::ComputeBlock,
-    owners: &solve::ContinuousRefreshOwners,
-    sequence: solve::RefreshSequenceId,
-    programs: &mut Vec<Vec<solve::LinearOp>>,
-    spans: &mut Vec<rumoca_core::Span>,
-    targets: &mut Vec<usize>,
-) -> Result<(), CodegenError> {
-    let Some(schedule) = owners.exact_assignment_schedule(sequence) else {
-        return Ok(());
-    };
-    for program_id in schedule.program_ids() {
-        let program = owners
-            .exact_assignment_program(*program_id)
-            .ok_or_else(|| {
-                CodegenError::template("issued algebraic assignment schedule has no program owner")
-            })?;
-        let block = program
-            .final_scalar_program(source)
-            .map_err(|error| CodegenError::template(error.to_string()))?;
-        let [operations] = block.programs() else {
-            return Err(CodegenError::template(
-                "issued algebraic assignment owner is not one correlated program",
-            ));
-        };
-        let span = block.program_span(0).ok_or_else(|| {
-            CodegenError::template("issued algebraic assignment owner has no provenance")
-        })?;
-        programs.push(operations.clone());
-        spans.push(span);
-        targets.extend_from_slice(program.target_indices());
-    }
-    Ok(())
-}
-
 fn discrete_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
     let scalar =
         super::discrete_render_view::DiscreteRenderView::checked(&handle.problem().discrete)?;
@@ -641,15 +565,27 @@ fn discrete_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
     let rhs_plan = Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(
         Arc::new(handle.problem().discrete.rhs.clone()),
     )?);
+    let runtime_assignment_plan =
+        Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(
+            Arc::new(handle.problem().discrete.runtime_assignment_rhs.clone()),
+        )?);
+    let post_commit_assignment_plan =
+        Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(
+            Arc::new(handle.problem().discrete.post_commit_assignment_rhs.clone()),
+        )?);
+    let guarded_assignment_plan = guarded_assignment_plan(&handle.problem().discrete)?;
     let targets = scalar.targets;
     let pre_modes = scalar.pre_modes;
     let observation_refresh = scalar.observation_refresh;
     Ok(lazy_map(
         &[
             "runtime_assignment_rhs",
+            "runtime_assignment_plan",
             "runtime_assignment_targets",
             "runtime_assignment_roles",
             "post_commit_assignment_rhs",
+            "post_commit_assignment_plan",
+            "guarded_assignment_plan",
             "post_commit_assignment_targets",
             "post_commit_assignment_runtime_rows",
             "rhs",
@@ -663,6 +599,9 @@ fn discrete_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
             match k {
                 "rhs" => Some(rhs.clone()),
                 "rhs_plan" => Some(rhs_plan.clone()),
+                "runtime_assignment_plan" => Some(runtime_assignment_plan.clone()),
+                "post_commit_assignment_plan" => Some(post_commit_assignment_plan.clone()),
+                "guarded_assignment_plan" => Some(guarded_assignment_plan.clone()),
                 "runtime_assignment_rhs" => Some(scalar_program_block_value(Arc::new(
                     d.runtime_assignment_rhs.clone(),
                 ))),
@@ -785,7 +724,7 @@ fn continuous_artifacts_value(handle: SolveRenderHandle) -> Result<Value, Codege
 pub(super) fn solve_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
     let initialization = minijinja::context! {
         update_plan => Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(
-            Arc::new(handle.problem().initialization.update_rhs.clone()),
+            Arc::new(handle.problem().initialization.update_rhs().clone()),
         )?),
         ..Value::from_serialize(&handle.problem().initialization)
     };
@@ -833,4 +772,19 @@ pub(super) fn nodes_value(block: Arc<solve::ComputeBlock>) -> Result<Value, Code
     }
     let nodes = Arc::new(nodes);
     Ok(lazy_seq(len, move |i| nodes[i].clone()))
+}
+
+/// The guarded assignments as one renderable plan, their outputs numbered in
+/// program order (the order `fmi.scalar_events.guarded_targets` lists).
+fn guarded_assignment_plan(discrete: &solve::DiscreteSolveSystem) -> Result<Value, CodegenError> {
+    let (programs, spans) = discrete
+        .guarded_assignments
+        .iter()
+        .map(|program| (program.program().to_vec(), program.span()))
+        .unzip();
+    let block = solve::ScalarProgramBlock::with_program_spans(programs, spans)
+        .map_err(|error| CodegenError::template(error.to_string()))?;
+    Ok(Value::from_object(
+        super::scalar_program_plan::ScalarProgramPlan::new(Arc::new(block))?,
+    ))
 }

@@ -266,6 +266,7 @@ fn plan_clocked_discrete_reals<'refs, 'dae>(
             continue;
         };
         let span = equation.provenance().span();
+        whole_discrete_real_definition(definition, span)?;
         let target = dae::VariableId::from(definition.target());
         if require_discrete_real_clock_owner(&clock_owners, target, span)? != clock.index() {
             continue;
@@ -747,6 +748,24 @@ fn causal_discrete_plan<'dae>(
     })
 }
 
+/// A GALEC state assignment writes a whole coordinate; one row defining a
+/// single element of an array coordinate has no assignment of that form.
+fn whole_discrete_real_definition(
+    definition: rumoca_phase_structural::DiscreteRealDefinition<'_>,
+    span: Span,
+) -> Result<(), GalecTargetError> {
+    match definition.element() {
+        None => Ok(()),
+        Some(_) => Err(unsupported(
+            "element-discrete-real-definition",
+            "a B.1b row defining one element of an array coordinate cannot be represented as one \
+             GALEC state assignment"
+                .to_owned(),
+            span,
+        )),
+    }
+}
+
 fn coupled_discrete_real_equation(span: Span) -> GalecTargetError {
     unsupported(
         "coupled-discrete-real-equation",
@@ -792,7 +811,12 @@ fn lower_event_actions<'dae>(
         .with_emission(emission);
     for (_, action) in view.event_actions() {
         let span = action.provenance().span();
-        let dae::EventActionOperation::Assert { level: None, .. } = action.operation() else {
+        // A warning-level assertion has no influence on behavior and no
+        // GALEC representation (MLS §8.3.7).
+        if let dae::EventActionOperation::Warning { .. } = action.operation() {
+            continue;
+        }
+        let dae::EventActionOperation::Assert { .. } = action.operation() else {
             return Err(unsupported(
                 "event-action",
                 format!(

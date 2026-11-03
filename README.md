@@ -452,3 +452,16 @@ Compiler-affecting changes should still follow:
 ## License
 
 Rumoca is licensed under the [Apache License 2.0](LICENSE).
+
+The published `rumoca` and `rumoca-lsp` binaries are statically linked and
+embed their Rust dependencies, so they ship under those dependencies' licenses
+too. [infra/licenses/THIRD_PARTY_NOTICES.md](infra/licenses/THIRD_PARTY_NOTICES.md)
+reproduces every one of those notices and carries the MPL-2.0
+source-availability notice for `option-ext`; it also indexes the other
+third-party content in this repository (the vendored eFMI and FMI
+layered-standard schemas, the bundled `coi-serviceworker.js`, the quoted
+specification text, and the external tools the verification rigs invoke
+without redistributing). Regenerate it with `cargo xtask licenses`.
+
+Contributions are made under the same Apache License 2.0 and require a
+`Signed-off-by` line; see [CONTRIBUTING.md](CONTRIBUTING.md).

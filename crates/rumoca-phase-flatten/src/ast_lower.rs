@@ -22,12 +22,20 @@ pub(crate) struct LoweringContext<'a> {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PredefinedIntrinsicIds {
     identities: [Option<DefId>; rumoca_core::BuiltinFunction::PREDEFINED_IDENTITY_REQUIRED.len()],
+    array_constructors: [Option<DefId>; Self::ARRAY_CONSTRUCTORS.len()],
     assertion: Option<DefId>,
-    /// The predefined `array(...)` constructor (MLS §10.4.1).
-    array_constructor: Option<DefId>,
+    array_function: Option<DefId>,
 }
 
 impl PredefinedIntrinsicIds {
+    const ARRAY_CONSTRUCTORS: [rumoca_core::BuiltinFunction; 5] = [
+        rumoca_core::BuiltinFunction::Zeros,
+        rumoca_core::BuiltinFunction::Ones,
+        rumoca_core::BuiltinFunction::Fill,
+        rumoca_core::BuiltinFunction::Identity,
+        rumoca_core::BuiltinFunction::Linspace,
+    ];
+
     pub(crate) fn from_tree(tree: &ast::ClassTree) -> Self {
         Self {
             identities: std::array::from_fn(|index| {
@@ -36,13 +44,30 @@ impl PredefinedIntrinsicIds {
                         rumoca_core::BuiltinFunction::PREDEFINED_IDENTITY_REQUIRED[index].name(),
                     ))
             }),
+            array_constructors: std::array::from_fn(|index| {
+                tree.scope_tree
+                    .predefined_member(&rumoca_core::ComponentPath::from_flat_path(
+                        Self::ARRAY_CONSTRUCTORS[index].name(),
+                    ))
+            }),
             assertion: tree
                 .scope_tree
                 .predefined_member(&rumoca_core::ComponentPath::from_flat_path("assert")),
-            array_constructor: tree
+            array_function: tree
                 .scope_tree
                 .predefined_member(&rumoca_core::ComponentPath::from_flat_path("array")),
         }
+    }
+
+    pub(crate) fn array_constructor(
+        self,
+        target: Option<DefId>,
+    ) -> Option<rumoca_core::BuiltinFunction> {
+        let target = target?;
+        self.array_constructors
+            .into_iter()
+            .zip(Self::ARRAY_CONSTRUCTORS)
+            .find_map(|(identity, intrinsic)| (identity == Some(target)).then_some(intrinsic))
     }
 
     fn resolve(self, target: Option<DefId>) -> Option<rumoca_core::BuiltinFunction> {
@@ -57,8 +82,9 @@ impl PredefinedIntrinsicIds {
         self.assertion.is_some() && self.assertion == target
     }
 
-    fn is_array_constructor(self, target: Option<DefId>) -> bool {
-        self.array_constructor.is_some() && self.array_constructor == target
+    /// The predefined array constructor function `array` (MLS §10.4).
+    fn is_array_function(self, target: Option<DefId>) -> bool {
+        self.array_function.is_some() && self.array_function == target
     }
 }
 
@@ -124,13 +150,9 @@ pub(crate) fn expression_from_ast_with_context(
             ..
         } => convert_if_with_context(branches, else_branch, expr.span(), context),
 
-        ast::Expression::Array {
-            elements,
-            is_matrix,
-            ..
-        } => Ok(rumoca_core::Expression::Array {
+        ast::Expression::Array { elements, kind, .. } => Ok(rumoca_core::Expression::Array {
             elements: convert_expr_vec_with_context(elements, context)?,
-            is_matrix: *is_matrix,
+            kind: *kind,
             span: expr.span(),
         }),
 
@@ -808,18 +830,14 @@ fn expression_from_ast_in_subscript(
             )?),
             span: expr.span(),
         }),
-        ast::Expression::Array {
-            elements,
-            is_matrix,
-            ..
-        } => Ok(rumoca_core::Expression::Array {
+        ast::Expression::Array { elements, kind, .. } => Ok(rumoca_core::Expression::Array {
             elements: elements
                 .iter()
                 .map(|element| {
                     expression_from_ast_in_subscript(element, base, dimension, owner_span, context)
                 })
                 .collect::<LowerResult<Vec<_>>>()?,
-            is_matrix: *is_matrix,
+            kind: *kind,
             span: expr.span(),
         }),
         // Nested component/index expressions establish their own nearest-array
@@ -891,25 +909,16 @@ fn convert_function_call_with_context(
         if func_name.as_ref() == rumoca_core::PURITY_WRAPPER {
             return lower_purity_wrapper(args, call_span, context);
         }
+        if context
+            .predefined_intrinsics
+            .is_array_function(comp.target_def_id())
+        {
+            return lower_array_function(args, call_span, context);
+        }
         if comp.target_def_id() == context.predefined_string_declaration
             && context.predefined_string_declaration.is_some()
         {
             return lower_string_conversion(comp, args, call_span, context);
-        }
-        // MLS §10.4.1: `array(A, B, C, ...)` is the array constructor that
-        // `{A, B, C, ...}` abbreviates.
-        if context
-            .predefined_intrinsics
-            .is_array_constructor(comp.target_def_id())
-        {
-            return Ok(rumoca_core::Expression::Array {
-                elements: args
-                    .iter()
-                    .map(|argument| expression_from_ast_with_context(argument, context))
-                    .collect::<LowerResult<Vec<_>>>()?,
-                is_matrix: false,
-                span: call_span,
-            });
         }
         if let Some(intrinsic) = context.predefined_intrinsics.resolve(comp.target_def_id()) {
             return Ok(rumoca_core::Expression::BuiltinCall {
@@ -943,6 +952,37 @@ fn convert_function_call_with_context(
     }
 
     lower_user_function_call(comp, args, call_span, context)
+}
+
+/// Lower the built-in array constructor function.
+///
+/// MLS §10.4: `array(A, B, C, ...)` constructs an array from its arguments
+/// exactly as `{A, B, C, ...}` does, and `array(e for i in r)` is the array
+/// comprehension `{e for i in r}`. A named argument has no meaning here and is
+/// rejected with its own span rather than dropped.
+fn lower_array_function(
+    args: &[ast::Expression],
+    call_span: Span,
+    context: LoweringContext<'_>,
+) -> LowerResult<rumoca_core::Expression> {
+    if let [comprehension @ ast::Expression::ArrayComprehension { .. }] = args {
+        return expression_from_ast_with_context(comprehension, context);
+    }
+    if let Some(named) = args
+        .iter()
+        .find(|arg| matches!(arg, ast::Expression::NamedArgument { .. }))
+    {
+        return Err(FlattenError::invalid_function_call_args(
+            "array",
+            "MLS §10.4 `array(…)` takes positional arguments only",
+            named.span(),
+        ));
+    }
+    Ok(rumoca_core::Expression::Array {
+        elements: convert_expr_vec_with_context(args, context)?,
+        kind: rumoca_core::ArrayConstructor::Array,
+        span: call_span,
+    })
 }
 
 /// Erase an MLS §12.3 `pure(functionCall(…))` wrapper.

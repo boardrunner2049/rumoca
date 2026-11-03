@@ -35,7 +35,7 @@ impl Pass for FoldParameterBindings {
         "replace a parameter's declaration binding by the scalar it evaluates to"
     }
     fn run(&self, model: &mut RbcModel) -> Result<usize, PassError> {
-        let values = Values::settle(model, Tunable::Excluded);
+        let values = Values::settle(model);
         let mut folded = 0;
         for index in 0..model.variables.len() {
             let variable = &model.variables[index];
@@ -96,19 +96,11 @@ fn foldable(variable: &RbcVariable) -> bool {
             .is_none_or(|contract| !contract.binding_from_modification)
 }
 
-/// Whether a tunable parameter's binding counts as its value.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Tunable {
-    /// Its declared value, as DAE construction's constant context read it.
-    Included,
-    /// Unknown: it may change on the artifact.
-    Excluded,
-}
-
-/// The value of every parameter and constant whose binding settles.
+/// The value of every parameter and constant whose binding settles from
+/// literals, constants and non-tunable parameters. A tunable parameter has
+/// no value here: it may change on the artifact (MLS §4.5).
 pub(super) struct Values<'m> {
     model: &'m RbcModel,
-    tunable: Tunable,
     settled: HashMap<VariableId, Value>,
     /// Variables being evaluated, so a cyclic binding stays unsettled.
     visiting: std::collections::HashSet<VariableId>,
@@ -117,10 +109,9 @@ pub(super) struct Values<'m> {
 }
 
 impl<'m> Values<'m> {
-    pub(super) fn settle(model: &'m RbcModel, tunable: Tunable) -> HashMap<VariableId, Value> {
+    pub(super) fn settle(model: &'m RbcModel) -> HashMap<VariableId, Value> {
         let mut values = Values {
             model,
-            tunable,
             settled: HashMap::new(),
             visiting: Default::default(),
             unsettled: Default::default(),
@@ -154,9 +145,7 @@ impl<'m> Values<'m> {
         let variable = self.model.variables.get(id.0 as usize)?;
         if !matches!(variable.role, RbcRole::Parameter | RbcRole::Constant)
             || variable.fixed == Some(false)
-            || (self.tunable == Tunable::Excluded
-                && variable.role == RbcRole::Parameter
-                && variable.tunable)
+            || (variable.role == RbcRole::Parameter && variable.tunable)
         {
             return None;
         }

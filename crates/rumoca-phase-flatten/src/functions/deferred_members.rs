@@ -30,6 +30,7 @@ pub(super) fn prove_deferred_members_in_algorithms(
     tree: &ast::ClassTree,
     class_index: &ast::ClassDefIndex<'_>,
     exposed_function_name: &str,
+    own_function_name: Option<&str>,
     components: &IndexMap<String, ast::Component>,
     algorithms: &mut [Vec<ast::Statement>],
 ) {
@@ -37,6 +38,7 @@ pub(super) fn prove_deferred_members_in_algorithms(
         tree,
         class_index,
         exposed_function_name,
+        own_function_name,
         components,
     };
     for section in algorithms.iter_mut() {
@@ -51,6 +53,7 @@ struct DeferredMemberProver<'a, 'tree> {
     tree: &'a ast::ClassTree,
     class_index: &'a ast::ClassDefIndex<'tree>,
     exposed_function_name: &'a str,
+    own_function_name: Option<&'a str>,
     components: &'a IndexMap<String, ast::Component>,
 }
 
@@ -89,44 +92,68 @@ impl DeferredMemberProver<'_, '_> {
         // not retain the occurrence DefId carried by the body reference, so
         // name ownership is the authoritative discriminator here.
         let component = self.components.get(root.ident.text.as_ref());
-        let (mut owner, reprove_members) = if let Some(component) = component {
-            let contextual_owner = self.contextual_component_type(component);
-            let declared_owner = component.type_def_id;
-            (contextual_owner, contextual_owner != declared_owner)
-        } else {
-            (
-                self.class_index.get(root_def_id).map(|_| root_def_id),
-                false,
-            )
+        let Some(component) = component else {
+            let owner = self.class_index.get(root_def_id).map(|_| root_def_id);
+            self.prove_member_tail(&mut reference.parts, owner, false);
+            return;
         };
-        for part in reference.parts.iter_mut().skip(1) {
-            let Some(owner_def_id) = owner else {
+        let declared_owner = component.type_def_id;
+        // The exposed scope may be a package alias that names only the
+        // replaceable slot's constraining class, so the selected
+        // implementation's own package scope is tried next: it owns the
+        // redeclarations that give the formal's type its members (MLS 7.3).
+        for scope in [Some(self.exposed_function_name), self.own_function_name]
+            .into_iter()
+            .flatten()
+        {
+            let owner = self.component_type_in_scope(component, scope);
+            let mut scoped_parts = reference.parts.clone();
+            if self.prove_member_tail(&mut scoped_parts, owner, owner != declared_owner) {
+                reference.parts = scoped_parts;
                 return;
+            }
+        }
+        self.prove_member_tail(&mut reference.parts, declared_owner, false);
+    }
+
+    /// Prove the member of each segment after the root, left to right, each as
+    /// a member of the class the preceding segment continues in. Returns
+    /// whether every segment was proved.
+    fn prove_member_tail(
+        &self,
+        parts: &mut [ast::ComponentRefPart],
+        mut owner: Option<DefId>,
+        reprove_members: bool,
+    ) -> bool {
+        for part in parts.iter_mut().skip(1) {
+            let Some(owner_def_id) = owner else {
+                return false;
             };
             let Some(owner_class) = self.class_index.get(owner_def_id) else {
-                return;
+                return false;
             };
             let Some(member) = member_of_class(self.class_index, owner_class, &part.ident.text)
             else {
-                return;
+                return false;
             };
             if reprove_members || part.def_id.is_none() {
                 part.def_id = Some(member.declaration);
             }
             owner = member.continues_in;
         }
+        true
     }
 
     /// Resolve a formal/local type in the exposed callable scope before using
     /// its members. The stored `type_def_id` belongs to the generic declaration
     /// and can cross a replaceable edge; the exposed scope owns the concrete
     /// redeclaration that proves the member identity.
-    fn contextual_component_type(&self, component: &ast::Component) -> Option<DefId> {
+    fn component_type_in_scope(&self, component: &ast::Component, scope: &str) -> Option<DefId> {
         super::resolve_function_class_with_scope(
             self.tree,
             self.class_index,
             &component.type_name.to_string(),
-            Some(self.exposed_function_name),
+            Some(scope),
         )
         .and_then(|resolution| resolution.class_def.def_id)
         .or(component.type_def_id)

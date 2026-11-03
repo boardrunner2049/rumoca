@@ -3,6 +3,7 @@ name = "{{ model_name | lower | replace("_", "-") }}-fmi-ls-wasm"
 version = "0.1.0"
 edition = "2024"
 publish = false
+build = "build.rs"
 
 # Generated crates are standalone even when emitted beneath another Cargo
 # workspace directory.
@@ -14,3 +15,6 @@ crate-type = ["cdylib"]
 [dependencies]
 # Must match the bindings version used by the pinned FMI-LS-Wasm revision.
 wit-bindgen = "=0.43.0"
+
+[build-dependencies]
+cc = "1"

@@ -17,6 +17,7 @@ pub(super) fn push_message_action<'dae>(
     action: dae::EventActionView<'dae>,
     message: dae::ExprId<'dae>,
     kind: solve::SolveEventActionKind,
+    holds: Option<dae::ExprId<'dae>>,
     actions: &mut Vec<solve::SolveEventAction>,
     conditions: &mut ScalarRows,
 ) -> Result<(), LowerError> {
@@ -29,16 +30,30 @@ pub(super) fn push_message_action<'dae>(
     let message = lower_message(view, layout, message)?;
     let compiler = ScalarCompiler::new(view, layout, None);
     let clock = condition_clock_owner(view, action.guard());
-    let program = match clock {
-        Some(clock) => compiler.clocked_action_condition_program(clock, action.guard(), span)?,
-        None => {
+    let program = match (clock, holds) {
+        (Some(clock), None) => {
+            compiler.clocked_action_condition_program(clock, action.guard(), span)?
+        }
+        (Some(clock), Some(holds)) => {
+            compiler.clocked_warning_condition_program(clock, action.guard(), holds, span)?
+        }
+        (None, holds) => {
             let trigger_memory = condition_memory(layout, action.trigger(), span)?;
-            compiler.edge_condition_program(
-                action.trigger(),
-                action.guard(),
-                trigger_memory,
-                span,
-            )?
+            match holds {
+                None => compiler.edge_condition_program(
+                    action.trigger(),
+                    action.guard(),
+                    trigger_memory,
+                    span,
+                )?,
+                Some(holds) => compiler.warning_condition_program(
+                    action.trigger(),
+                    action.guard(),
+                    trigger_memory,
+                    holds,
+                    span,
+                )?,
+            }
         }
     };
     conditions.push(program, span, actions.len());
@@ -109,22 +124,24 @@ fn lower_message_parts<'dae>(
             });
             Ok(())
         }
-        // A String parameter (CDL `Utilities.Assert`'s `message`) is fixed at
-        // translation time -- Solve has no String storage to tune -- so the
-        // message is its binding.
+        // MLS 3.7 §8.3.7, §8.3.8: a message is any String expression. A
+        // String parameter (`terminate(terminationText)` in
+        // `Modelica.Blocks.Logical.TerminateSimulation`) has the value of
+        // its declaration; the runtime owns no String storage, so that
+        // value is the message.
         dae::ExpressionOperation::Coordinate(dae::CoordinateView::Parameter(parameter))
             if expression.value_type().scalar_type() == dae::ScalarType::String =>
         {
-            let binding = view
-                .variable(parameter.into())
-                .and_then(|variable| variable.binding())
+            let value = view
+                .variable(dae::VariableId::from(parameter))
+                .and_then(|variable| variable.start().or_else(|| variable.binding()))
                 .ok_or_else(|| {
                     LowerError::unsupported(
-                        "event message String parameter has no binding",
+                        "a String parameter read by a Solve event message has no declared value",
                         expression.provenance().span(),
                     )
                 })?;
-            lower_message_parts(view, layout, binding, parts)
+            lower_message_parts(view, layout, value, parts)
         }
         _ => Err(LowerError::unsupported(
             "Solve event messages require String literals, concatenation, or checked String conversions",

@@ -2,9 +2,6 @@ use nalgebra::{DMatrix, DVector};
 
 use super::solve_ops::RuntimeSolveError;
 
-const FINITE_DIFFERENCE_RELATIVE_STEP: f64 = 1.490_116_119_384_765_6e-8;
-const NEWTON_LINE_SEARCH_STEPS: usize = 16;
-
 /// Backend-neutral residual interface for a discrete-frozen event solve.
 ///
 /// The adapter owns the mapping between this dense unknown vector and its
@@ -15,6 +12,14 @@ pub trait CoupledEventNewtonModel {
         &self,
         unknowns: &[f64],
         residual: &mut [f64],
+    ) -> Result<(), RuntimeSolveError>;
+
+    /// The residual's directional derivative at `unknowns` along `direction`.
+    fn eval_jacobian_v(
+        &self,
+        unknowns: &[f64],
+        direction: &[f64],
+        out: &mut [f64],
     ) -> Result<(), RuntimeSolveError>;
 
     fn variable_scale(&self, _index: usize) -> f64 {
@@ -28,21 +33,21 @@ pub trait CoupledEventNewtonModel {
 
 /// Solve a square event residual system by scaled Newton iteration.
 ///
-/// This is a recovery path after ordinary event fixed-point iteration stalls,
-/// so a numerical Jacobian keeps the interface independent of evaluator/AD
-/// implementation details. The incoming unknown vector is restored on failure.
+/// This is a recovery path after ordinary event fixed-point iteration stalls.
+/// Its Jacobian is the model's directional derivative, one unit direction per
+/// column. The incoming unknown vector is restored on failure.
 pub fn solve_coupled_event_newton<M: CoupledEventNewtonModel>(
     model: &M,
     unknowns: &mut [f64],
     tolerance: f64,
-    max_iters: usize,
+    policy: &rumoca_ir_solve::CoupledNewtonPolicy,
 ) -> Result<(), RuntimeSolveError> {
     if unknowns.is_empty() {
         return Ok(());
     }
-    validate_newton_options(tolerance, max_iters)?;
+    validate_newton_options(tolerance)?;
     let incoming = unknowns.to_vec();
-    let result = solve_coupled_event_newton_inner(model, unknowns, tolerance, max_iters);
+    let result = solve_coupled_event_newton_inner(model, unknowns, tolerance, policy);
     if result.is_err() {
         unknowns.copy_from_slice(&incoming);
     }
@@ -53,8 +58,9 @@ fn solve_coupled_event_newton_inner<M: CoupledEventNewtonModel>(
     model: &M,
     unknowns: &mut [f64],
     tolerance: f64,
-    max_iters: usize,
+    policy: &rumoca_ir_solve::CoupledNewtonPolicy,
 ) -> Result<(), RuntimeSolveError> {
+    let max_iters = policy.iteration_cap();
     let count = unknowns.len();
     let variable_scales = (0..count)
         .map(|index| valid_scale(model.variable_scale(index)))
@@ -65,7 +71,7 @@ fn solve_coupled_event_newton_inner<M: CoupledEventNewtonModel>(
     let mut residual = vec![0.0; count];
     for iteration in 0..max_iters {
         eval_finite_residual(model, unknowns, &mut residual)?;
-        let jacobian = finite_difference_jacobian(model, unknowns, &residual, &variable_scales)?;
+        let jacobian = exact_jacobian(model, unknowns)?;
         let row_scales = jacobian_row_scales(&jacobian, &variable_scales, &fallback_scales);
         if scaled_residual_norm(&residual, &row_scales) <= tolerance {
             tracing::debug!(
@@ -83,14 +89,21 @@ fn solve_coupled_event_newton_inner<M: CoupledEventNewtonModel>(
             tolerance,
         )
         .ok_or_else(|| coupled_event_error("Jacobian is singular"))?;
-        if !accept_newton_delta(model, unknowns, delta.as_slice(), &row_scales, tolerance)? {
+        if !accept_newton_delta(
+            model,
+            unknowns,
+            delta.as_slice(),
+            &row_scales,
+            tolerance,
+            policy.line_search_halvings(),
+        )? {
             return Err(coupled_event_error(
                 "line search could not reduce the residual",
             ));
         }
     }
     eval_finite_residual(model, unknowns, &mut residual)?;
-    let jacobian = finite_difference_jacobian(model, unknowns, &residual, &variable_scales)?;
+    let jacobian = exact_jacobian(model, unknowns)?;
     let row_scales = jacobian_row_scales(&jacobian, &variable_scales, &fallback_scales);
     if scaled_residual_norm(&residual, &row_scales) <= tolerance {
         return Ok(());
@@ -104,13 +117,11 @@ fn solve_coupled_event_newton_inner<M: CoupledEventNewtonModel>(
     )))
 }
 
-fn validate_newton_options(tolerance: f64, max_iters: usize) -> Result<(), RuntimeSolveError> {
-    if tolerance.is_finite() && tolerance > 0.0 && max_iters > 0 {
+fn validate_newton_options(tolerance: f64) -> Result<(), RuntimeSolveError> {
+    if tolerance.is_finite() && tolerance > 0.0 {
         return Ok(());
     }
-    Err(coupled_event_error(
-        "tolerance must be finite and positive and max_iters must be nonzero",
-    ))
+    Err(coupled_event_error("tolerance must be finite and positive"))
 }
 
 fn eval_finite_residual<M: CoupledEventNewtonModel>(
@@ -127,56 +138,26 @@ fn eval_finite_residual<M: CoupledEventNewtonModel>(
     ))
 }
 
-fn finite_difference_jacobian<M: CoupledEventNewtonModel>(
+fn exact_jacobian<M: CoupledEventNewtonModel>(
     model: &M,
     unknowns: &[f64],
-    residual: &[f64],
-    variable_scales: &[f64],
 ) -> Result<DMatrix<f64>, RuntimeSolveError> {
     let count = unknowns.len();
     let mut jacobian = DMatrix::zeros(count, count);
-    let mut probe = unknowns.to_vec();
-    let mut probe_residual = vec![0.0; count];
+    let mut direction = vec![0.0; count];
+    let mut column_values = vec![0.0; count];
     for column in 0..count {
-        let step = finite_difference_step(unknowns[column], variable_scales[column]);
-        probe[column] = unknowns[column] + step;
-        let forward = eval_finite_residual(model, &probe, &mut probe_residual);
-        let direction = if let Err(forward_error) = forward {
-            probe[column] = unknowns[column] - step;
-            if eval_finite_residual(model, &probe, &mut probe_residual).is_err() {
-                return Err(forward_error);
-            }
-            -1.0
-        } else {
-            1.0
-        };
-        write_finite_difference_column(
-            &mut jacobian,
-            column,
-            &probe_residual,
-            residual,
-            direction * step,
-        );
-        probe[column] = unknowns[column];
+        direction[column] = 1.0;
+        model.eval_jacobian_v(unknowns, &direction, &mut column_values)?;
+        direction[column] = 0.0;
+        if column_values.iter().any(|value| !value.is_finite()) {
+            return Err(coupled_event_error(
+                "Jacobian evaluation produced a non-finite value",
+            ));
+        }
+        jacobian.set_column(column, &DVector::from_column_slice(&column_values));
     }
     Ok(jacobian)
-}
-
-fn write_finite_difference_column(
-    jacobian: &mut DMatrix<f64>,
-    column: usize,
-    probe_residual: &[f64],
-    residual: &[f64],
-    step: f64,
-) {
-    for row in 0..jacobian.nrows() {
-        jacobian[(row, column)] = (probe_residual[row] - residual[row]) / step;
-    }
-}
-
-fn finite_difference_step(value: f64, scale: f64) -> f64 {
-    let magnitude = value.abs().max(valid_scale(scale));
-    FINITE_DIFFERENCE_RELATIVE_STEP * magnitude
 }
 
 fn jacobian_row_scales(
@@ -243,6 +224,7 @@ fn accept_newton_delta<M: CoupledEventNewtonModel>(
     delta: &[f64],
     row_scales: &[f64],
     tolerance: f64,
+    line_search_halvings: usize,
 ) -> Result<bool, RuntimeSolveError> {
     let incoming = unknowns.to_vec();
     let mut before_residual = vec![0.0; unknowns.len()];
@@ -250,7 +232,7 @@ fn accept_newton_delta<M: CoupledEventNewtonModel>(
     let before_norm = scaled_residual_norm(&before_residual, row_scales);
     let mut trial_residual = vec![0.0; unknowns.len()];
     let mut fraction = 1.0;
-    for _ in 0..NEWTON_LINE_SEARCH_STEPS {
+    for _ in 0..line_search_halvings {
         for ((slot, base), update) in unknowns.iter_mut().zip(&incoming).zip(delta) {
             *slot = base + fraction * update;
         }
@@ -292,6 +274,10 @@ fn coupled_event_error(reason: &str) -> RuntimeSolveError {
 mod tests {
     use super::*;
 
+    fn policy(iteration_cap: usize) -> rumoca_ir_solve::CoupledNewtonPolicy {
+        rumoca_ir_solve::CoupledNewtonPolicy::new(iteration_cap, 16).expect("a positive cap")
+    }
+
     struct OscillatingEventModel;
 
     impl CoupledEventNewtonModel for OscillatingEventModel {
@@ -306,13 +292,24 @@ mod tests {
             residual[1] = d - (2.0 - z);
             Ok(())
         }
+
+        fn eval_jacobian_v(
+            &self,
+            _unknowns: &[f64],
+            direction: &[f64],
+            out: &mut [f64],
+        ) -> Result<(), RuntimeSolveError> {
+            out[0] = direction[0] - direction[1];
+            out[1] = direction[1] + direction[0];
+            Ok(())
+        }
     }
 
     #[test]
     fn coupled_event_newton_recovers_oscillating_fixed_point() {
         let mut unknowns = [0.0, 0.0];
 
-        solve_coupled_event_newton(&OscillatingEventModel, &mut unknowns, 1.0e-12, 1)
+        solve_coupled_event_newton(&OscillatingEventModel, &mut unknowns, 1.0e-12, &policy(1))
             .expect("the square coupled system should converge");
 
         assert!((unknowns[0] - 1.0).abs() < 1.0e-10);
@@ -330,14 +327,25 @@ mod tests {
             residual.fill(1.0);
             Ok(())
         }
+
+        fn eval_jacobian_v(
+            &self,
+            _unknowns: &[f64],
+            _direction: &[f64],
+            out: &mut [f64],
+        ) -> Result<(), RuntimeSolveError> {
+            out.fill(0.0);
+            Ok(())
+        }
     }
 
     #[test]
     fn coupled_event_newton_restores_unknowns_on_failure() {
         let mut unknowns = [3.0, 4.0];
 
-        let error = solve_coupled_event_newton(&SingularEventModel, &mut unknowns, 1.0e-12, 4)
-            .expect_err("a singular residual system must fail loudly");
+        let error =
+            solve_coupled_event_newton(&SingularEventModel, &mut unknowns, 1.0e-12, &policy(4))
+                .expect_err("a singular residual system must fail loudly");
 
         assert!(
             error

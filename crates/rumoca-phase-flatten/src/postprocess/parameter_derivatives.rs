@@ -208,7 +208,7 @@ fn zero_of_extents(extents: &[i64], span: rumoca_core::Span) -> Option<Expressio
     let element = zero_of_extents(rest, span)?;
     Some(Expression::Array {
         elements: vec![element; count],
-        is_matrix: false,
+        kind: rumoca_core::ArrayConstructor::Array,
         span,
     })
 }

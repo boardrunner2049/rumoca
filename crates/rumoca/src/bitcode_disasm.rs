@@ -542,6 +542,9 @@ fn print_events(listing: &Listing<'_>) {
                     .map(|l| format!(", {}", listing.expression(l)))
                     .unwrap_or_default()
             ),
+            RbcAction::Warning { condition, message } => {
+                format!("warning ^{} ^{}", condition.0, message.0)
+            }
             RbcAction::Terminate { message } => {
                 format!("terminate({})", listing.expression(*message))
             }

@@ -36,6 +36,15 @@ pub(crate) fn canonicalize_flat_enum_literals(
     for eq in &mut flat.initial_equations {
         canonicalize_expr(&mut eq.residual, &enum_literals, &variable_names);
     }
+    for assertion in flat
+        .assert_equations
+        .iter_mut()
+        .chain(flat.initial_assert_equations.iter_mut())
+    {
+        canonicalize_expr(&mut assertion.condition, &enum_literals, &variable_names);
+        canonicalize_expr(&mut assertion.message, &enum_literals, &variable_names);
+        canonicalize_optional_expr(assertion.level.as_mut(), &enum_literals, &variable_names);
+    }
     canonicalize_structured_templates(
         &mut flat.structured_equations,
         &enum_literals,

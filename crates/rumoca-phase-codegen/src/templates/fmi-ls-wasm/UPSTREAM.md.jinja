@@ -8,3 +8,12 @@ This is an actively developed, non-normative prototype. Rumoca's target is
 therefore experimental and makes no standards-conformance claim. CI validates
 the exact vendored WIT package and the generated component against this pinned
 contract.
+
+## Vendored FMI 3 headers
+
+The C headers in `csrc/` (`fmi3Functions.h`, `fmi3FunctionTypes.h`,
+`fmi3PlatformTypes.h`) are copied verbatim from the FMI Standard 3.0.2 release
+and are licensed under the 2-Clause BSD License; see `csrc/LICENSE.txt`. The
+generated C kernel (`csrc/model.c` and the `csrc/rmc_*.c` units) includes them
+through the FMI 3 function-prefix mechanism and is the same kernel the `fmi3`
+target renders.

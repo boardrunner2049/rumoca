@@ -54,7 +54,7 @@ mod tests {
             declaration_source_scope: None,
             class_overrides: ast::ClassOverrideMap::default(),
             has_forwarding_class_redeclare: false,
-            had_redeclare: false,
+            has_unapplied_redeclare: false,
             variability: rumoca_core::Variability::Empty,
             causality: rumoca_core::Causality::Empty,
             flow: false,
@@ -78,6 +78,7 @@ mod tests {
             is_discrete_type: false,
             from_expandable_connector: false,
             evaluate: false,
+            evaluate_refused: false,
             is_final: false,
             is_overconstrained: false,
             is_protected: false,
@@ -217,7 +218,7 @@ mod tests {
     fn int_array(values: &[i64]) -> Expression {
         Expression::Array {
             elements: values.iter().copied().map(int_lit).collect(),
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         }
     }
@@ -284,7 +285,7 @@ mod tests {
                 value: rumoca_core::Literal::Integer(0),
                 span: test_span(),
             }],
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         };
         assert_eq!(infer_array_dimensions(&expr), Some(vec![1]));
@@ -305,7 +306,7 @@ mod tests {
                     span: test_span(),
                 },
             ],
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         };
         assert_eq!(infer_array_dimensions(&expr), Some(vec![3]));
@@ -313,7 +314,7 @@ mod tests {
         // {} -> [0]
         let expr = Expression::Array {
             elements: vec![],
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         };
         assert_eq!(infer_array_dimensions(&expr), Some(vec![0]));
@@ -335,7 +336,7 @@ mod tests {
                             span: test_span(),
                         },
                     ],
-                    is_matrix: false,
+                    kind: rumoca_core::ArrayConstructor::Array,
                     span: test_span(),
                 },
                 Expression::Array {
@@ -349,11 +350,11 @@ mod tests {
                             span: test_span(),
                         },
                     ],
-                    is_matrix: false,
+                    kind: rumoca_core::ArrayConstructor::Array,
                     span: test_span(),
                 },
             ],
-            is_matrix: true,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         };
         assert_eq!(infer_array_dimensions(&expr), Some(vec![2, 2]));
@@ -373,7 +374,7 @@ mod tests {
                     span: test_span(),
                 },
             ],
-            is_matrix: true,
+            kind: rumoca_core::ArrayConstructor::Horizontal,
             span: test_span(),
         };
         assert_eq!(infer_array_dimensions(&expr), Some(vec![1, 2]));
@@ -643,6 +644,28 @@ mod tests {
     }
 
     #[test]
+    fn test_get_integer_param_rejects_stale_integer_over_nonintegral_real() {
+        // A record field declared `parameter Real p = 0` seeds the integer
+        // table with the literal-0 declaration default, while the applied
+        // modifier resolves the authoritative real value (here non-integral).
+        // Reading such a parameter as an integer must report no integer value
+        // rather than the stale 0, so a relational fold such as `p <= 0` is not
+        // decided against the modifier (MLS 7.2.4).
+        let mut ctx = Context::new();
+        ctx.parameter_values
+            .insert("aimc.strayLoad.strayLoadParameters.PRef".to_string(), 0);
+        ctx.real_parameter_values.insert(
+            "aimc.strayLoad.strayLoadParameters.PRef".to_string(),
+            102.18857277543316,
+        );
+
+        assert_eq!(
+            ctx.get_integer_param("aimc.strayLoad.strayLoadParameters.PRef"),
+            None
+        );
+    }
+
+    #[test]
     fn test_propagate_unexpanded_record_array_dims_prepends_parent_dims_to_field_arrays() {
         let mut flat = flat::Model::default();
 
@@ -671,7 +694,7 @@ mod tests {
                     span: test_span(),
                 },
             ],
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         });
         flat.add_variable(field.name.clone(), field);
@@ -783,7 +806,7 @@ mod tests {
                             span: test_span(),
                         },
                     ],
-                    is_matrix: false,
+                    kind: rumoca_core::ArrayConstructor::Array,
                     span: test_span(),
                 }),
                 binding_from_modification: true,
@@ -971,7 +994,7 @@ mod tests {
                             span: test_span(),
                         },
                     ],
-                    is_matrix: false,
+                    kind: rumoca_core::ArrayConstructor::Array,
                     span: test_span(),
                 }),
                 start: Some(Expression::Array {
@@ -989,7 +1012,7 @@ mod tests {
                             span: test_span(),
                         },
                     ],
-                    is_matrix: false,
+                    kind: rumoca_core::ArrayConstructor::Array,
                     span: test_span(),
                 }),
                 ..flat::Variable::empty_with_span(test_span())
@@ -1372,7 +1395,7 @@ mod tests {
                             span: test_span(),
                         },
                     ],
-                    is_matrix: false,
+                    kind: rumoca_core::ArrayConstructor::Array,
                     span: test_span(),
                 }),
                 is_primitive: true,

@@ -24,22 +24,34 @@ pub(crate) fn project_initial_variables_with_plan<M: AlgebraicProjectionModel>(
     let combined_model = CombinedInitializationProjectionModel {
         model,
         y_len: y.len(),
-        parameter_scales: p
-            .iter()
-            .map(|value| {
-                if value.is_finite() {
-                    value.abs().max(1.0)
-                } else {
-                    1.0
-                }
-            })
-            .collect(),
+        parameter_scales: initialization_parameter_scales(plan, p),
     };
     project_initial_variables_by_plan(&combined_model, &mut values, &[], t, &combined_plan, tol)?;
     let (projected_y, projected_p) = values.split_at(y.len());
     y.copy_from_slice(projected_y);
     p.copy_from_slice(projected_p);
     Ok(())
+}
+
+/// The Newton scale of every parameter coordinate, translated from the scale
+/// Solve IR issues for each projection unknown at the guess the projection
+/// begins from. A parameter the projection does not solve is never stepped,
+/// so its entry is unused.
+fn initialization_parameter_scales(
+    plan: &solve::InitializationProjectionPlan,
+    p: &[f64],
+) -> Vec<f64> {
+    let mut scales = vec![1.0; p.len()];
+    for block in &plan.blocks {
+        for (unknown, scale) in block.unknowns.iter().zip(&block.scales) {
+            if let solve::ScalarSlot::P { index, .. } = *unknown
+                && let (Some(entry), Some(&guess)) = (scales.get_mut(index), p.get(index))
+            {
+                *entry = scale.at_guess(guess);
+            }
+        }
+    }
+    scales
 }
 
 pub(super) fn combined_initial_projection_plan(
@@ -69,6 +81,7 @@ pub(super) fn combined_initial_projection_plan(
             rows: block.rows.clone(),
             y_indices: indices,
             tearing: None,
+            alternate_charts: Vec::new(),
         });
     }
     Ok(solve::AlgebraicProjectionPlan { blocks })
@@ -95,6 +108,7 @@ pub(crate) struct InitialHomotopySystem<'a, M> {
     pub plan: &'a solve::InitializationProjectionPlan,
     pub homotopy_parameter_index: Option<usize>,
     pub tol: f64,
+    pub max_iters: usize,
 }
 
 /// Drive the initialization homotopy continuation.
@@ -112,7 +126,7 @@ pub(crate) fn project_initial_variables_with_homotopy<M, F>(
 ) -> Result<(), RuntimeSolveError>
 where
     M: AlgebraicProjectionModel,
-    F: FnMut(&mut [f64], &[f64]) -> Result<(), RuntimeSolveError>,
+    F: FnMut(&mut [f64], &mut [f64]) -> Result<(), RuntimeSolveError>,
 {
     homotopy::project_initial_variables_with_homotopy(system, y, p, continuation_dependents)
 }
@@ -851,6 +865,24 @@ pub(super) fn algebraic_block_jacobian(
     y_indices: &[usize],
     structure: Option<&solve::JacobianStructure>,
 ) -> Result<DMatrix<f64>, RuntimeSolveError> {
+    let jacobian = DMatrix::<f64>::zeros(rows.len(), y_indices.len());
+    algebraic_block_jacobian_in(model, y, p, t, (rows, y_indices), structure, jacobian)
+}
+
+/// [`algebraic_block_jacobian`] filled into `jacobian`, which must be block-shaped
+/// and zero wherever a fresh zero matrix would be read: everywhere without a
+/// structure, and at every entry with one, since every structured writer
+/// writes only pattern entries. A reused matrix that is zero outside the
+/// pattern therefore needs only its pattern entries cleared.
+pub(super) fn algebraic_block_jacobian_in(
+    model: &dyn ImplicitProjectionModel,
+    y: &[f64],
+    p: &[f64],
+    t: f64,
+    (rows, y_indices): (&[usize], &[usize]),
+    structure: Option<&solve::JacobianStructure>,
+    mut jacobian: DMatrix<f64>,
+) -> Result<DMatrix<f64>, RuntimeSolveError> {
     if let Some(structure) = structure {
         validate_projection_structure(
             structure.pattern(),
@@ -859,11 +891,24 @@ pub(super) fn algebraic_block_jacobian(
             "algebraic",
         )?;
     }
-    let mut jacobian = DMatrix::<f64>::zeros(rows.len(), y_indices.len());
+    debug_assert_eq!(jacobian.shape(), (rows.len(), y_indices.len()));
+    if let Some(structure) = structure
+        && model.eval_prepared_implicit_jacobian(
+            structure,
+            (rows, y_indices),
+            y,
+            p,
+            t,
+            jacobian.as_mut_slice(),
+        )?
+    {
+        return Ok(jacobian);
+    }
     let mut reverse_gradient = vec![0.0; y.len()];
     let mut needs_forward_jvp = vec![true; rows.len()];
     for (row, residual_idx) in rows.iter().copied().enumerate() {
-        if !model.eval_implicit_jacobian_row(residual_idx, y, p, t, &mut reverse_gradient)? {
+        let point = (y, p, t);
+        if !reverse_row(model, point, residual_idx, y_indices, &mut reverse_gradient)? {
             continue;
         }
         needs_forward_jvp[row] = false;
@@ -969,13 +1014,77 @@ fn fill_colored_algebraic_rows(
         rows,
         y_indices,
     } = block;
-    let column_rows = structure.pattern().column_rows();
+    if let KernelAnswer::ColoredEntries(entries) =
+        model.linked_kernel(KernelRequest::ColoredEntries {
+            structure,
+            coordinates: (rows, y_indices),
+            point: (y, p, t),
+        })?
+    {
+        for (row, column, value) in entries
+            .into_iter()
+            .filter(|(row, _, _)| selected_rows[*row])
+        {
+            jacobian[(row, column)] = value;
+        }
+        return Ok(());
+    }
+    let column_rows = structure.column_rows();
     // The tensor JVP certificate uses the canonical `[solver-y | parameter]`
     // seed layout. Projection colors activate only solver-y columns; parameter
     // lanes remain explicit zero seeds.
-    let mut seed = vec![0.0; y.len().saturating_add(p.len())];
-    let mut jvp = vec![0.0; y.len()];
-    for group in structure.coloring().groups() {
+    with_zero_seed(y.len().saturating_add(p.len()), y_indices, |seed| {
+        fill_colored_groups(
+            jacobian,
+            block,
+            selected_rows,
+            structure,
+            (column_rows, seed),
+        )
+    })
+}
+
+thread_local! {
+    /// An all-zero seed kept between colored Jacobian evaluations: each one
+    /// sets its colors' columns and clears them again, so no evaluation zeroes
+    /// or allocates the full seed.
+    static ZERO_SEED: std::cell::Cell<Vec<f64>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Run `body` with an all-zero seed of `len` entries, clearing `set` (the only
+/// entries `body` may set) afterwards on every exit. A nested evaluation finds
+/// the buffer taken and works on its own.
+fn with_zero_seed<R>(len: usize, set: &[usize], body: impl FnOnce(&mut [f64]) -> R) -> R {
+    let mut seed = ZERO_SEED.take();
+    if seed.len() < len {
+        seed.resize(len, 0.0);
+    }
+    let result = body(&mut seed[..len]);
+    for &index in set {
+        if let Some(value) = seed.get_mut(index) {
+            *value = 0.0;
+        }
+    }
+    ZERO_SEED.set(seed);
+    result
+}
+
+fn fill_colored_groups(
+    jacobian: &mut DMatrix<f64>,
+    block: AlgebraicBlockPoint<'_>,
+    selected_rows: &[bool],
+    structure: &solve::JacobianStructure,
+    (column_rows, seed): (&[Vec<usize>], &mut [f64]),
+) -> Result<(), RuntimeSolveError> {
+    let AlgebraicBlockPoint {
+        model,
+        y,
+        p,
+        t,
+        rows,
+        y_indices,
+    } = block;
+    for (color, group) in structure.coloring().groups().iter().enumerate() {
         let mut has_dependency = false;
         for &column in group.iter() {
             let column = column as usize;
@@ -989,9 +1098,35 @@ fn fill_colored_algebraic_rows(
             *seed_value = 1.0;
             has_dependency |= column_rows[column].iter().any(|&row| selected_rows[row]);
         }
-        if has_dependency {
-            model.eval_jacobian_v(y, p, t, &seed, &mut jvp)?;
-            fill_colored_group_rows(jacobian, group, &column_rows, selected_rows, &jvp, rows)?;
+        let prepared = structure.output_evaluation(color);
+        if has_dependency
+            && !fill_prepared_algebraic_color(
+                jacobian,
+                block,
+                selected_rows,
+                prepared,
+                seed,
+                group,
+                column_rows,
+            )?
+        {
+            let active_rows = colored_group_entries(group, column_rows, selected_rows)
+                .map(|(row, _)| rows[row])
+                .collect::<Vec<_>>();
+            let jvp = implicit_selected_jacobian_v_rows(
+                model,
+                y,
+                p,
+                t,
+                seed,
+                &active_rows,
+                "colored algebraic block Jacobian-vector product",
+            )?;
+            for ((row, column), value) in
+                colored_group_entries(group, column_rows, selected_rows).zip(jvp)
+            {
+                jacobian[(row, column)] = value;
+            }
         }
         for &column in group.iter() {
             seed[y_indices[column as usize]] = 0.0;
@@ -1000,27 +1135,51 @@ fn fill_colored_algebraic_rows(
     Ok(())
 }
 
-fn fill_colored_group_rows(
+fn fill_prepared_algebraic_color(
     jacobian: &mut DMatrix<f64>,
+    block: AlgebraicBlockPoint<'_>,
+    selected_rows: &[bool],
+    selection: Option<&solve::ProjectionJacobianOutputs>,
+    seed: &[f64],
     group: &[u32],
     column_rows: &[Vec<usize>],
-    selected_rows: &[bool],
-    jvp: &[f64],
-    rows: &[usize],
-) -> Result<(), RuntimeSolveError> {
-    for &column in group {
-        let column = column as usize;
-        for &local_row in &column_rows[column] {
-            if selected_rows[local_row] {
-                jacobian[(local_row, column)] = residual_at(
-                    jvp,
-                    rows[local_row],
-                    "colored algebraic block Jacobian-vector product",
-                )?;
-            }
-        }
+) -> Result<bool, RuntimeSolveError> {
+    let Some(selection) = selection else {
+        return Ok(false);
+    };
+    let mut values = vec![0.0; block.rows.len()];
+    let inputs = rumoca_eval_solve::JacobianEvalInputs {
+        y: block.y,
+        p: block.p,
+        t: block.t,
+        seed,
+    };
+    if !block.model.eval_implicit_jacobian_v_outputs(
+        selection,
+        inputs,
+        selected_rows,
+        &mut values,
+    )? {
+        return Ok(false);
     }
-    Ok(())
+    for (row, column) in colored_group_entries(group, column_rows, selected_rows) {
+        jacobian[(row, column)] = values[row];
+    }
+    Ok(true)
+}
+
+fn colored_group_entries<'a>(
+    group: &'a [u32],
+    column_rows: &'a [Vec<usize>],
+    selected_rows: &'a [bool],
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    group.iter().flat_map(move |&column| {
+        column_rows[column as usize]
+            .iter()
+            .copied()
+            .filter(move |&row| selected_rows[row])
+            .map(move |row| (row, column as usize))
+    })
 }
 
 fn validate_projection_structure(
@@ -1065,7 +1224,7 @@ fn fill_reverse_projection_row(jacobian: &mut DMatrix<f64>, input: ReverseProjec
         }
         return;
     };
-    structure.visit_row_columns(row, |column| {
+    structure.visit_row_columns(row, &mut |column| {
         jacobian[(row, column)] = gradient[y_indices[column]];
     });
 }
@@ -1121,7 +1280,7 @@ pub(super) fn initial_block_jacobian(
             )));
         }
         seed[y_idx] = 1.0;
-        model.eval_initial_jacobian_v(y, p, t, &seed, &mut jvp)?;
+        model.eval_initial_jacobian_v(y, p, t, &seed, Some(rows), &mut jvp)?;
         for (row_idx, residual_idx) in rows.iter().copied().enumerate() {
             jacobian[(row_idx, col)] =
                 initial_residual_at(&jvp, residual_idx, "initial block Jacobian-vector product")?;
@@ -1150,4 +1309,15 @@ pub(super) fn seed_nonfinite_projection_values(y: &mut [f64], projection_indices
             y[idx] = 0.0;
         }
     }
+}
+
+/// One block row's reverse gradient over the block's own columns.
+fn reverse_row(
+    model: &dyn ImplicitProjectionModel,
+    (y, p, t): (&[f64], &[f64], f64),
+    residual_idx: usize,
+    columns: &[usize],
+    gradient: &mut [f64],
+) -> Result<bool, RuntimeSolveError> {
+    model.eval_implicit_jacobian_row_columns(residual_idx, y, p, t, columns, gradient)
 }

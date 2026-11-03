@@ -7,10 +7,24 @@ use rumoca_phase_structural::UnknownId;
 use super::{LoweredLayout, StructuralMatching};
 use crate::LowerError;
 
+/// How one checked DAE clock ticks in Solve.
+#[derive(Clone, Copy)]
+enum LoweredClock<'dae> {
+    /// A periodic schedule of the Solve clock partition.
+    Periodic(solve::PeriodicClockId),
+    /// An MLS §16.3 event clock: its partition's equations lower to
+    /// condition-triggered guarded programs on this condition, so it has no
+    /// periodic schedule.
+    Triggered(dae::ConditionId<'dae>),
+}
+
 pub(super) struct LoweredClocks<'dae> {
     pub(super) partition: solve::SolveClockPartition,
-    dae_clocks: Vec<solve::PeriodicClockId>,
+    dae_clocks: Vec<LoweredClock<'dae>>,
     variable_owners: Vec<Option<(dae::ClockId<'dae>, solve::PeriodicClockId)>>,
+    /// The event clock, and its tick condition, of every variable an event
+    /// clock owns.
+    variable_triggers: Vec<Option<(dae::ClockId<'dae>, dae::ConditionId<'dae>)>>,
     sampled_variables: Vec<bool>,
     marker: std::marker::PhantomData<&'dae mut &'dae ()>,
 }
@@ -20,22 +34,19 @@ impl<'dae> LoweredClocks<'dae> {
         &self,
         clock: dae::ClockId<'dae>,
     ) -> Result<solve::PeriodicClockId, LowerError> {
-        self.dae_clocks
-            .get(clock.index() as usize)
-            .copied()
-            .ok_or_else(|| {
-                LowerError::unspanned_non_computable(
-                    "clock ownership refers outside the checked DAE clock arena",
-                )
-            })
+        self.clock_index(clock.index() as usize)
     }
 
     pub(super) fn clock_index(&self, index: usize) -> Result<solve::PeriodicClockId, LowerError> {
-        self.dae_clocks.get(index).copied().ok_or_else(|| {
-            LowerError::unspanned_non_computable(
+        match self.dae_clocks.get(index).copied() {
+            Some(LoweredClock::Periodic(clock)) => Ok(clock),
+            Some(LoweredClock::Triggered(_)) => Err(LowerError::unspanned_non_computable(
+                "an event clock has no periodic Solve schedule",
+            )),
+            None => Err(LowerError::unspanned_non_computable(
                 "clock ownership refers outside the checked DAE clock arena",
-            )
-        })
+            )),
+        }
     }
 
     pub(super) fn variable_owner(
@@ -43,6 +54,17 @@ impl<'dae> LoweredClocks<'dae> {
         variable: dae::VariableId<'dae>,
     ) -> Option<(dae::ClockId<'dae>, solve::PeriodicClockId)> {
         self.variable_owners
+            .get(variable.index() as usize)
+            .copied()
+            .flatten()
+    }
+
+    /// The event clock that owns `variable` and its tick condition, if any.
+    pub(super) fn variable_trigger(
+        &self,
+        variable: dae::VariableId<'dae>,
+    ) -> Option<(dae::ClockId<'dae>, dae::ConditionId<'dae>)> {
+        self.variable_triggers
             .get(variable.index() as usize)
             .copied()
             .flatten()
@@ -62,15 +84,17 @@ pub(super) fn lower_clocks<'dae>(
 ) -> Result<LoweredClocks<'dae>, LowerError> {
     let mut partition = solve::SolveClockPartition {
         periodic_event_schedules: Vec::with_capacity(view.clock_count()),
-        activation_parameter_indices: layout.clock_activations.clone(),
+        activation_parameter_indices: Vec::with_capacity(view.clock_count()),
     };
     let mut dae_clocks = Vec::with_capacity(view.clock_count());
     for (index, (_, clock)) in view.clocks().enumerate() {
-        let dae::ClockOperation::Periodic(schedule) = clock.operation() else {
-            return Err(LowerError::unsupported(
-                "triggered clocks do not yet have checked Solve scheduling",
-                clock.provenance().span(),
-            ));
+        let schedule = match clock.operation() {
+            dae::ClockOperation::Periodic(schedule) => schedule,
+            dae::ClockOperation::Triggered(condition)
+            | dae::ClockOperation::Shifted { condition, .. } => {
+                dae_clocks.push(LoweredClock::Triggered(condition));
+                continue;
+            }
         };
         let schedule = solve::PeriodicEventSchedule::from_schedule(*schedule).map_err(|error| {
             LowerError::contract(
@@ -78,31 +102,51 @@ pub(super) fn lower_clocks<'dae>(
                 clock.provenance().span(),
             )
         })?;
+        let activation = layout
+            .clock_activations
+            .get(index)
+            .copied()
+            .ok_or_else(|| {
+                LowerError::contract(
+                    "checked DAE clock has no activation slot",
+                    clock.provenance().span(),
+                )
+            })?;
         partition.periodic_event_schedules.push(schedule);
+        partition.activation_parameter_indices.push(activation);
         let solve_clock = partition
-            .periodic_clock_id(index)
+            .periodic_clock_id(partition.periodic_event_schedules.len() - 1)
             .expect("u32 checked DAE clock identity fits Solve clock identity");
-        dae_clocks.push(solve_clock);
+        dae_clocks.push(LoweredClock::Periodic(solve_clock));
     }
 
     let mut variable_owners = vec![None; view.variable_count()];
+    let mut variable_triggers = vec![None; view.variable_count()];
     let mut sampled_variables = vec![false; view.variable_count()];
     for (_, ownership) in view.clock_ownerships() {
-        let solve_clock = dae_clocks[ownership.clock().index() as usize];
-        let slot = &mut variable_owners[ownership.variable().index() as usize];
-        if slot.replace((ownership.clock(), solve_clock)).is_some() {
+        let variable = ownership.variable().index() as usize;
+        let replaced = match dae_clocks[ownership.clock().index() as usize] {
+            LoweredClock::Periodic(solve_clock) => variable_owners[variable]
+                .replace((ownership.clock(), solve_clock))
+                .is_some(),
+            LoweredClock::Triggered(condition) => variable_triggers[variable]
+                .replace((ownership.clock(), condition))
+                .is_some(),
+        };
+        if replaced {
             return Err(LowerError::contract(
                 "checked DAE variable has more than one clock owner",
                 ownership.provenance().span(),
             ));
         }
-        sampled_variables[ownership.variable().index() as usize] = ownership.sampled();
+        sampled_variables[variable] = ownership.sampled();
     }
 
     Ok(LoweredClocks {
         partition,
         dae_clocks,
         variable_owners,
+        variable_triggers,
         sampled_variables,
         marker: std::marker::PhantomData,
     })
@@ -275,12 +319,12 @@ fn collect_clocked_definitions<'dae>(
         .into_iter()
         .zip(view.discrete_real_equations())
     {
-        let Some((target, value)) = definition else {
+        let Some(definition) = definition else {
             continue;
         };
         rows.push((
-            dae::VariableId::from(target),
-            value,
+            dae::VariableId::from(definition.target()),
+            definition.value(),
             equation.provenance().span(),
         ));
     }

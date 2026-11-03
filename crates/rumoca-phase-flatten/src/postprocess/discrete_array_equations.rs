@@ -63,7 +63,7 @@ fn discrete_element_equations(
     };
     let rumoca_core::Expression::Array {
         elements,
-        is_matrix: false,
+        kind: rumoca_core::ArrayConstructor::Array,
         ..
     } = lhs.as_ref()
     else {
@@ -122,7 +122,7 @@ fn element_of(
     match array {
         rumoca_core::Expression::Array {
             elements,
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             ..
         } if elements.len() > offset => elements[offset].clone(),
         rumoca_core::Expression::VarRef {

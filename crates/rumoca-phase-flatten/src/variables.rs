@@ -251,7 +251,7 @@ pub(crate) fn create_flat_variable(
         dims: instance.dims.clone(),
         connected: false, // Will be set during connection processing
         start: attrs.start,
-        fixed: instance.fixed,
+        fixed: instance.fixed.clone(),
         min: attrs.min,
         max: attrs.max,
         nominal: attrs.nominal,
@@ -263,6 +263,7 @@ pub(crate) fn create_flat_variable(
         binding,
         binding_from_modification: instance.binding_from_modification,
         evaluate: instance.evaluate,
+        evaluate_refused: instance.evaluate_refused,
         is_final: instance.is_final,
         is_discrete_type: instance.is_discrete_type,
         is_primitive: instance.is_primitive,
@@ -470,12 +471,33 @@ fn qualify_variable_binding(
     else {
         return Ok(None);
     };
-    if ctx.instance.binding_from_modification
-        && !references_declaration_component(ctx.instance, ctx.class_index, expr)
-    {
+    if binding_uses_modification_scope(ctx.instance, ctx.class_index) {
         return qualify_modification_binding(ctx, expr).map(Some);
     }
     qualify_declaration_binding(ctx, expr).map(Some)
+}
+
+/// Whether a component's binding is qualified in the scope where its modifier
+/// was written (MLS §7.2.4) rather than in its declaration scope.
+///
+/// A record-constructor default projected into a field arrives as a
+/// modification binding: `g = X8()` gives `g.p` the default that `X8`'s
+/// `extends Geometry(p = {armMount[i, :] for i in 1:4})` wrote. Its inputs
+/// refer to the record's other fields (MLS §12.6), so it names `g.armMount`,
+/// not an `armMount` beside the `g = X8()` modifier. Every lowering of the
+/// binding (the declaration's and an eagerly unrolled comprehension's) asks
+/// this one question so they agree.
+pub(crate) fn binding_uses_modification_scope(
+    instance: &ast::InstanceData,
+    class_index: &ast::ClassDefIndex<'_>,
+) -> bool {
+    let binding = instance
+        .binding_source
+        .as_ref()
+        .or(instance.binding.as_ref());
+    instance.binding_from_modification
+        && binding
+            .is_some_and(|expr| !references_declaration_component(instance, class_index, expr))
 }
 
 fn references_declaration_component(

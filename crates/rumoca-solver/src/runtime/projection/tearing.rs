@@ -12,8 +12,8 @@
 //! exact explicit assignment for its unknown: prepare-time tearing
 //! normalization promotes any step that is not exact into the reduced Newton
 //! (its unknown becomes a tear variable and its row a reduced residual), so all
-//! nonlinearity and multi-root robustness is carried by the reduced Newton's
-//! finite-difference Jacobian and line search rather than a fragile isolated 1D
+//! nonlinearity and multi-root robustness is carried by the reduced Newton.s
+//! tangent-plan Jacobian and line search rather than a fragile isolated 1D
 //! solve. A causal step therefore never runs an inner iteration; it evaluates
 //! the certified target isolator once. The runtime still fails closed: if the
 //! exactness invariant is ever violated it declines the step rather than
@@ -36,12 +36,14 @@ use super::scaling::{
     ScaledNewtonSystem, jacobian_row_scales, model_variable_scale, scaled_correction_converged,
     scaled_newton_delta, scaled_residual_converged, scaled_residual_norm,
 };
-use super::{ImplicitProjectionModel, ProjectionBlockUpdate, RuntimeSolveError};
+use super::{
+    ImplicitProjectionModel, KernelAnswer, KernelRequest, ProjectionBlockUpdate, RuntimeSolveError,
+    TornBlock, implicit_selected_jacobian_v_rows,
+};
 
-/// Maximum reduced Newton iterations over the tear variables.
-const TORN_OUTER_MAX_ITERS: usize = 64;
-/// Maximum step halvings in the reduced Newton line search.
-const TORN_BACKTRACK_STEPS: usize = 24;
+use rumoca_eval_solve::projection_policy::{
+    TORN_BACKTRACK_STEPS, TORN_OUTER_MAX_ITERS, TORN_SUFFICIENT_DECREASE,
+};
 
 /// Attempt the torn solve of one coupled block.
 ///
@@ -54,10 +56,11 @@ pub(super) fn project_torn_algebraic_block<M: ImplicitProjectionModel>(
     y: &mut [f64],
     p: &[f64],
     t: f64,
-    tearing: &solve::BlockTearing,
+    block: TornBlock<'_>,
     tol: f64,
     certify_coordinates: bool,
 ) -> Result<Option<ProjectionBlockUpdate>, RuntimeSolveError> {
+    let tearing = block.tearing;
     if tearing.tear_y_indices.len() != tearing.residual_rows.len() {
         return Ok(None);
     }
@@ -71,11 +74,11 @@ pub(super) fn project_torn_algebraic_block<M: ImplicitProjectionModel>(
     if out_of_range {
         return Ok(None);
     }
-    let snapshot = y.to_vec();
+    let snapshot = TornValues::save(tearing, y);
 
     let mut residual = Vec::with_capacity(tearing.residual_rows.len());
     if !model.torn_block_sweep(tearing, y, p, t, &mut residual)? {
-        y.copy_from_slice(&snapshot);
+        snapshot.restore(tearing, y);
         return Ok(None);
     }
 
@@ -89,32 +92,48 @@ pub(super) fn project_torn_algebraic_block<M: ImplicitProjectionModel>(
         .collect::<Vec<_>>();
 
     if !all_finite(&residual) {
-        y.copy_from_slice(&snapshot);
+        snapshot.restore(tearing, y);
         return Ok(None);
     }
 
+    let mut step_scales: Option<Vec<f64>> = None;
     for _ in 0..TORN_OUTER_MAX_ITERS {
+        // After an exact Newton step, the step's own row scales license the
+        // residual check at the new point: it settles an uncertified refresh
+        // without forming the Jacobian again. Certification still checks the
+        // recovered coordinates' corrections, which a residual that meets
+        // tolerance through an ill-conditioned recovery does not bound.
+        if settles_on_step_scales(certify_coordinates, step_scales.as_deref(), &residual, tol) {
+            let changed = snapshot.changed(tearing, y);
+            return Ok(Some(ProjectionBlockUpdate {
+                changed,
+                settled: true,
+            }));
+        }
         match advance_torn_newton(
             model,
             y,
             p,
             t,
-            tearing,
+            block,
             &residual,
             &variable_scales,
             tol,
             certify_coordinates,
         )? {
             TornStep::Settled => {
-                let changed = slices_differ(y, &snapshot);
+                let changed = snapshot.changed(tearing, y);
                 return Ok(Some(ProjectionBlockUpdate {
                     changed,
                     settled: true,
                 }));
             }
-            TornStep::Advanced(next) => residual = next,
+            TornStep::Advanced(next, scales) => {
+                residual = next;
+                step_scales = Some(scales);
+            }
             TornStep::Decline => {
-                y.copy_from_slice(&snapshot);
+                snapshot.restore(tearing, y);
                 return Ok(None);
             }
         }
@@ -123,16 +142,31 @@ pub(super) fn project_torn_algebraic_block<M: ImplicitProjectionModel>(
     // The reduced Newton exhausted its iterations without meeting tolerance.
     // Restore the incoming values so the dense fallback starts exactly where it
     // would have without the torn attempt.
-    y.copy_from_slice(&snapshot);
+    snapshot.restore(tearing, y);
     Ok(None)
+}
+
+/// Whether an uncertified refresh settles on the row scales of the exact
+/// Newton step just taken (`None` before the first step).
+fn settles_on_step_scales(
+    certify_coordinates: bool,
+    step_scales: Option<&[f64]>,
+    residual: &[f64],
+    tol: f64,
+) -> bool {
+    match step_scales {
+        Some(scales) if !certify_coordinates => scaled_residual_converged(residual, scales, tol),
+        _ => false,
+    }
 }
 
 /// Outcome of one reduced Newton iteration over the tear variables.
 enum TornStep {
     /// The reduced residual meets tolerance; the block is solved.
     Settled,
-    /// A step was accepted; carries the reduced residual at the new point.
-    Advanced(Vec<f64>),
+    /// An exact Newton step was accepted; carries the reduced residual at the
+    /// new point and the row scales of the Jacobian the step solved.
+    Advanced(Vec<f64>, Vec<f64>),
     /// The torn solve cannot proceed; the caller falls back to the dense solve.
     Decline,
 }
@@ -148,15 +182,16 @@ fn advance_torn_newton<M: ImplicitProjectionModel>(
     y: &mut [f64],
     p: &[f64],
     t: f64,
-    tearing: &solve::BlockTearing,
+    block: TornBlock<'_>,
     residual: &[f64],
     variable_scales: &[f64],
     tol: f64,
     certify_coordinates: bool,
 ) -> Result<TornStep, RuntimeSolveError> {
+    let tearing = block.tearing;
     // A residual that is exactly zero rowwise satisfies every positive scaled
     // tolerance (`scaled_tolerance` never falls below `f64::MIN_POSITIVE`),
-    // so the fresh finite-difference Jacobian's row scales could only confirm
+    // so the fresh tangent Jacobian's row scales could only confirm
     // what is already proven; settle without paying the Jacobian sweeps. This
     // mirrors the dense block's exact-zero shortcut and, like it, settles
     // without probing the Jacobian at the solved point. It stays out of
@@ -168,24 +203,15 @@ fn advance_torn_newton<M: ImplicitProjectionModel>(
     if !certify_coordinates && residual.iter().all(|value| *value == 0.0) {
         return Ok(TornStep::Settled);
     }
-    let base = y.to_vec();
-    let Some(jacobian) =
-        reduced_jacobian(model, y, p, t, tearing, residual, variable_scales, &base)?
-    else {
+    let base = TornValues::save(tearing, y);
+    let Some(jacobian) = reduced_jacobian(model, (&*y, p, t), block, certify_coordinates)? else {
         return Ok(TornStep::Decline);
     };
-    let row_scales = jacobian_row_scales(&jacobian, variable_scales, variable_scales, None);
-    crate::diagnostics::projection(
-        "torn-projection",
-        t,
-        &tearing.residual_rows,
-        &tearing.tear_y_indices,
-        residual,
-        &jacobian,
-    );
+    let row_scales =
+        jacobian_row_scales(&jacobian.residual, variable_scales, variable_scales, None);
     let converged = scaled_residual_converged(residual, &row_scales, tol);
     let delta = scaled_newton_delta(ScaledNewtonSystem {
-        jacobian: &jacobian,
+        jacobian: &jacobian.residual,
         residual,
         row_scales: &row_scales,
         variable_scales,
@@ -195,28 +221,34 @@ fn advance_torn_newton<M: ImplicitProjectionModel>(
     let Some(delta) = delta.filter(|delta| delta.iter().all(|value| value.is_finite())) else {
         return Ok(TornStep::Decline);
     };
-    // Coordinate certification also requires the correction to be within
-    // tolerance; the ordinary boundary projection settles on the residual alone.
+    let step = LineSearchStep {
+        base: &base,
+        delta: delta.as_slice(),
+        row_scales: &row_scales,
+        before: scaled_residual_norm(residual, &row_scales),
+        tol,
+        alpha: 1.0,
+    };
+    // Small tear corrections can still produce large recovered-coordinate
+    // changes. Certification checks the undamped step through the complete
+    // causal sweep as well as the tear coordinates.
     if converged
         && (!certify_coordinates
-            || scaled_correction_converged(delta.as_slice(), variable_scales, tol))
+            || (scaled_correction_converged(delta.as_slice(), variable_scales, tol)
+                && recovered_correction_converged(
+                    model,
+                    &base,
+                    tearing,
+                    &jacobian.recovered,
+                    delta.as_slice(),
+                    tol,
+                )
+                && causal_correction_converged(model, y, (p, t), tearing, &step)?))
     {
         return Ok(TornStep::Settled);
     }
-    let before = scaled_residual_norm(residual, &row_scales);
-    match line_search(
-        model,
-        y,
-        p,
-        t,
-        tearing,
-        &base,
-        delta.as_slice(),
-        &row_scales,
-        before,
-        tol,
-    )? {
-        Some(next) => Ok(TornStep::Advanced(next)),
+    match line_search(model, y, p, t, tearing, step)? {
+        Some(next) => Ok(TornStep::Advanced(next, row_scales)),
         None => Ok(TornStep::Decline),
     }
 }
@@ -289,90 +321,223 @@ fn all_finite(values: &[f64]) -> bool {
     values.iter().all(|value| value.is_finite())
 }
 
-/// Total finite-difference Jacobian of the reduced residual with respect to the
-/// tear variables, back-substituting through each perturbation so the causal
-/// unknowns track their tear dependence. `base` holds `y` at the current point.
-// SPEC_0021: Exception - a total FD Jacobian needs model, storage, tearing, the base residual, scales, and the base point together.
-#[allow(clippy::too_many_arguments)]
+struct ReducedJacobian {
+    residual: DMatrix<f64>,
+    recovered: DMatrix<f64>,
+}
+
+/// The reduced residual's Jacobian with respect to the tear variables and the
+/// causal unknowns' sensitivities at the swept point `y`, from the block's
+/// tangent plan. A model that evaluates no plan takes the same tangents one
+/// direction at a time through its row JVPs. A singular point or a vanished
+/// row or column declines the torn solve.
 fn reduced_jacobian<M: ImplicitProjectionModel>(
     model: &M,
-    y: &mut [f64],
-    p: &[f64],
-    t: f64,
+    (y, p, t): (&[f64], &[f64], f64),
+    block: TornBlock<'_>,
+    certify_coordinates: bool,
+) -> Result<Option<ReducedJacobian>, RuntimeSolveError> {
+    let tearing = block.tearing;
+    let shape = (tearing.residual_rows.len(), tearing.tear_y_indices.len());
+    let exact = match model.linked_kernel(KernelRequest::TornJacobian {
+        block,
+        point: (y, p, t),
+    })? {
+        KernelAnswer::TornJacobian(exact) => exact,
+        KernelAnswer::TornJacobianSingular => return Ok(None),
+        _ => match model_torn_tangent(model, (y, p, t), tearing)? {
+            Some(exact) => exact,
+            None => return Ok(None),
+        },
+    };
+    Ok(tangent_reduced_jacobian(
+        &exact,
+        shape,
+        tearing,
+        certify_coordinates,
+    ))
+}
+
+/// The torn tangent of a model without a tangent plan, one direction at a time
+/// (`TornTangentEvaluator`'s one-direction form): every causal step's
+/// coefficient with its target seeded alone, then each tear column through the
+/// steps in sweep order and the reduced rows. `None` when a coefficient is
+/// not finite.
+fn model_torn_tangent(
+    model: &dyn ImplicitProjectionModel,
+    (y, p, t): (&[f64], &[f64], f64),
     tearing: &solve::BlockTearing,
-    residual: &[f64],
-    variable_scales: &[f64],
-    base: &[f64],
-) -> Result<Option<DMatrix<f64>>, RuntimeSolveError> {
-    let rows = tearing.residual_rows.len();
-    let columns = tearing.tear_y_indices.len();
-    let mut jacobian = DMatrix::zeros(rows, columns);
-    let mut perturbed = Vec::with_capacity(rows);
-    for (column, &tear_index) in tearing.tear_y_indices.iter().enumerate() {
-        y.copy_from_slice(base);
-        let h = perturbation(base[tear_index], variable_scales[column]);
-        y[tear_index] = base[tear_index] + h;
-        if !model.torn_block_sweep(tearing, y, p, t, &mut perturbed)? || !all_finite(&perturbed) {
-            y.copy_from_slice(base);
+) -> Result<Option<rumoca_eval_solve::TornTangentJacobian>, RuntimeSolveError> {
+    let tears = tearing.tear_y_indices.len();
+    let steps = &tearing.causal_steps;
+    let mut seed = vec![0.0; y.len()];
+    let tangent = |seed: &[f64], row: usize| -> Result<f64, RuntimeSolveError> {
+        let values =
+            implicit_selected_jacobian_v_rows(model, y, p, t, seed, &[row], "torn block tangent")?;
+        Ok(values[0])
+    };
+    let mut coefficients = Vec::with_capacity(steps.len());
+    for step in steps {
+        seed[step.y_index] = 1.0;
+        let coefficient = tangent(&seed, step.row)?;
+        seed[step.y_index] = 0.0;
+        if !rumoca_eval_solve::causal_coefficient_is_finite(coefficient) {
             return Ok(None);
         }
-        for row in 0..rows {
-            jacobian[(row, column)] = (perturbed[row] - residual[row]) / h;
+        coefficients.push(coefficient);
+    }
+    let mut recovered = vec![0.0; steps.len() * tears];
+    let mut residual = vec![0.0; tears * tears];
+    for (column, &tear) in tearing.tear_y_indices.iter().enumerate() {
+        seed[tear] = 1.0;
+        for (index, (step, coefficient)) in steps.iter().zip(&coefficients).enumerate() {
+            let value = -tangent(&seed, step.row)? / coefficient;
+            seed[step.y_index] = value;
+            recovered[index * tears + column] = value;
+        }
+        for (row, &residual_row) in tearing.residual_rows.iter().enumerate() {
+            residual[row * tears + column] = tangent(&seed, residual_row)?;
+        }
+        seed[tear] = 0.0;
+        for step in steps {
+            seed[step.y_index] = 0.0;
         }
     }
-    y.copy_from_slice(base);
-    if jacobian.iter().all(|value| value.is_finite()) {
-        Ok(Some(jacobian))
+    Ok(Some(rumoca_eval_solve::TornTangentJacobian {
+        residual,
+        recovered,
+    }))
+}
+
+/// The reduced Jacobian of a tangent plan, when every entry is finite and no
+/// row or column vanishes. A vanished row or column (a slope that is exactly
+/// zero at a symmetric start, such as a squared norm at the origin) leaves the
+/// Newton system singular, and the block declines to its dense solve.
+fn tangent_reduced_jacobian(
+    exact: &rumoca_eval_solve::TornTangentJacobian,
+    (rows, columns): (usize, usize),
+    tearing: &solve::BlockTearing,
+    certify_coordinates: bool,
+) -> Option<ReducedJacobian> {
+    let recovered_rows = if certify_coordinates {
+        tearing.causal_steps.len()
     } else {
-        Ok(None)
+        0
+    };
+    let recovered = exact.recovered.get(..recovered_rows * columns)?;
+    let finite = exact
+        .residual
+        .iter()
+        .chain(recovered)
+        .all(|value| value.is_finite());
+    if !finite || exact.residual.len() != rows * columns {
+        return None;
     }
+    let residual = DMatrix::from_row_slice(rows, columns, &exact.residual);
+    let vanished = residual
+        .row_iter()
+        .any(|row| row.iter().all(|value| *value == 0.0))
+        || residual
+            .column_iter()
+            .any(|column| column.iter().all(|value| *value == 0.0));
+    (!vanished).then(|| ReducedJacobian {
+        residual,
+        recovered: DMatrix::from_row_slice(recovered_rows, columns, recovered),
+    })
 }
 
 /// Backtracking line search along the reduced Newton direction. Accepts the
-/// first step that reaches tolerance or strictly reduces the scaled residual
-/// norm, returning the residual at the accepted point.
-// SPEC_0021: Exception - a backtracking search threads model, storage, tearing, the base point, step, row scales, and tolerance together.
-#[allow(clippy::too_many_arguments)]
+/// first step that reaches tolerance or removes `TORN_SUFFICIENT_DECREASE *
+/// alpha` of the scaled residual norm, returning the residual at the accepted
+/// point. Each halving is counted at the projection site.
 fn line_search<M: ImplicitProjectionModel>(
     model: &M,
     y: &mut [f64],
     p: &[f64],
     t: f64,
     tearing: &solve::BlockTearing,
-    base: &[f64],
-    delta: &[f64],
-    row_scales: &[f64],
-    before: f64,
-    tol: f64,
+    mut step: LineSearchStep<'_>,
 ) -> Result<Option<Vec<f64>>, RuntimeSolveError> {
-    let mut alpha = 1.0;
     for _ in 0..TORN_BACKTRACK_STEPS {
-        let step = LineSearchStep {
-            base,
-            delta,
-            row_scales,
-            before,
-            tol,
-            alpha,
-        };
+        // Halving cannot recover progress once every tear update rounds away.
+        if step
+            .delta
+            .iter()
+            .enumerate()
+            .all(|(tear, &delta)| step.base.tear(tear) + step.alpha * delta == step.base.tear(tear))
+        {
+            break;
+        }
         if let Some(residual) = line_search_step(model, y, p, t, tearing, &step)? {
             return Ok(Some(residual));
         }
-        alpha *= 0.5;
+        step.alpha *= 0.5;
+        crate::runtime::fallbacks::note_torn_step_halving();
     }
-    y.copy_from_slice(base);
+    step.base.restore(tearing, y);
     Ok(None)
 }
 
 /// One backtracking candidate: the base point, Newton direction, acceptance
 /// scales, and the step fraction under trial.
 struct LineSearchStep<'a> {
-    base: &'a [f64],
+    base: &'a TornValues,
     delta: &'a [f64],
     row_scales: &'a [f64],
     before: f64,
     tol: f64,
     alpha: f64,
+}
+
+fn recovered_correction_converged<M: ImplicitProjectionModel>(
+    model: &M,
+    base: &TornValues,
+    tearing: &solve::BlockTearing,
+    jacobian: &DMatrix<f64>,
+    delta: &[f64],
+    tol: f64,
+) -> bool {
+    tearing
+        .causal_steps
+        .iter()
+        .enumerate()
+        .all(|(row, causal)| {
+            let correction = jacobian
+                .row(row)
+                .iter()
+                .zip(delta)
+                .map(|(a, b)| a * b)
+                .sum();
+            let scale = model_variable_scale(model, causal.y_index, base.causal(row));
+            scaled_correction_converged(&[correction], &[scale], tol)
+        })
+}
+
+/// Whether the undamped step moves every causal target within tolerance. The
+/// trial runs in `y`, which holds the step's base on entry and on return.
+fn causal_correction_converged<M: ImplicitProjectionModel>(
+    model: &M,
+    y: &mut [f64],
+    (p, t): (&[f64], f64),
+    tearing: &solve::BlockTearing,
+    step: &LineSearchStep<'_>,
+) -> Result<bool, RuntimeSolveError> {
+    if tearing.causal_steps.is_empty() {
+        return Ok(true);
+    }
+    let accepted = line_search_step(model, y, p, t, tearing, step)?.is_some();
+    let converged = accepted
+        && tearing
+            .causal_steps
+            .iter()
+            .enumerate()
+            .all(|(row, causal)| {
+                let base = step.base.causal(row);
+                let scale = model_variable_scale(model, causal.y_index, base);
+                scaled_correction_converged(&[y[causal.y_index] - base], &[scale], step.tol)
+            });
+    step.base.restore(tearing, y);
+    Ok(converged)
 }
 
 /// Evaluate one backtracking candidate, returning its residual when accepted.
@@ -387,9 +552,14 @@ fn line_search_step<M: ImplicitProjectionModel>(
     tearing: &solve::BlockTearing,
     step: &LineSearchStep<'_>,
 ) -> Result<Option<Vec<f64>>, RuntimeSolveError> {
-    y.copy_from_slice(step.base);
-    for (&tear_index, &direction) in tearing.tear_y_indices.iter().zip(step.delta.iter()) {
-        let candidate = step.base[tear_index] + step.alpha * direction;
+    step.base.restore(tearing, y);
+    for (tear, (&tear_index, &direction)) in tearing
+        .tear_y_indices
+        .iter()
+        .zip(step.delta.iter())
+        .enumerate()
+    {
+        let candidate = step.base.tear(tear) + step.alpha * direction;
         if !candidate.is_finite() {
             return Ok(None);
         }
@@ -401,7 +571,8 @@ fn line_search_step<M: ImplicitProjectionModel>(
     }
     let norm = scaled_residual_norm(&residual, step.row_scales);
     let accepted = norm.is_finite()
-        && (scaled_residual_converged(&residual, step.row_scales, step.tol) || norm < step.before);
+        && (scaled_residual_converged(&residual, step.row_scales, step.tol)
+            || norm <= (1.0 - TORN_SUFFICIENT_DECREASE * step.alpha) * step.before);
     Ok(accepted.then_some(residual))
 }
 
@@ -417,14 +588,50 @@ fn residual_row<M: ImplicitProjectionModel + ?Sized>(
         .filter(|value| value.is_finite()))
 }
 
-fn slices_differ(a: &[f64], b: &[f64]) -> bool {
-    a != b
+/// The coordinates a torn solve writes, as they were when saved: its tear
+/// coordinates, then its causal targets. The sweep writes only causal targets
+/// and the reduced Newton only tears, so restoring these restores `y`.
+struct TornValues {
+    values: Vec<f64>,
+    tears: usize,
 }
 
-/// A finite, sign-stable perturbation for finite differencing, scaled to the
-/// variable's magnitude.
-fn perturbation(value: f64, scale: f64) -> f64 {
-    let magnitude = value.abs().max(scale.abs()).max(1.0);
-    let step = magnitude * 1.0e-7;
-    if value < 0.0 { -step } else { step }
+impl TornValues {
+    fn save(tearing: &solve::BlockTearing, y: &[f64]) -> Self {
+        let mut values =
+            Vec::with_capacity(tearing.tear_y_indices.len() + tearing.causal_steps.len());
+        values.extend(tearing.tear_y_indices.iter().map(|&index| y[index]));
+        values.extend(tearing.causal_steps.iter().map(|step| y[step.y_index]));
+        Self {
+            values,
+            tears: tearing.tear_y_indices.len(),
+        }
+    }
+
+    fn tear(&self, tear: usize) -> f64 {
+        self.values[tear]
+    }
+
+    fn causal(&self, step: usize) -> f64 {
+        self.values[self.tears + step]
+    }
+
+    fn restore(&self, tearing: &solve::BlockTearing, y: &mut [f64]) {
+        for (&index, &value) in tearing.tear_y_indices.iter().zip(&self.values) {
+            y[index] = value;
+        }
+        for (step, &value) in tearing.causal_steps.iter().zip(&self.values[self.tears..]) {
+            y[step.y_index] = value;
+        }
+    }
+
+    /// Whether the solve moved a coordinate it writes.
+    fn changed(&self, tearing: &solve::BlockTearing, y: &[f64]) -> bool {
+        let tears = tearing.tear_y_indices.iter().copied();
+        let causal = tearing.causal_steps.iter().map(|step| step.y_index);
+        tears
+            .chain(causal)
+            .zip(&self.values)
+            .any(|(index, &value)| y[index] != value)
+    }
 }

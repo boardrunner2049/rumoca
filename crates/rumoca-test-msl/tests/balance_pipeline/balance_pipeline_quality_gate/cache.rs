@@ -529,8 +529,11 @@ where
     )))
 }
 
+/// The OMC reference runs its simulations under the same worker count as
+/// rumoca's simulation stage, so neither tool's timings carry more host
+/// contention than the other's (SPEC_0025 speed report).
 pub(super) fn omc_parity_workers() -> usize {
-    msl_stage_parallelism()
+    simulation_parallelism()
 }
 
 pub(super) fn omc_parity_threads() -> usize {

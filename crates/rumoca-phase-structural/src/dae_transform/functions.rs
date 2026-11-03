@@ -10,6 +10,7 @@ pub(super) struct RebuiltFunction<'dae> {
     pub(super) id: dae::FunctionId<'dae>,
     pub(super) parameters: Vec<dae::FunctionParameterId<'dae>>,
     pub(super) values: Vec<dae::FunctionValueId<'dae>>,
+    pub(super) derivatives: Vec<dae::FunctionDerivativeId<'dae>>,
 }
 
 fn function_signature<'target>(
@@ -30,6 +31,7 @@ fn function_signature<'target>(
         results,
         function.declaration(),
     )
+    .with_inline(function.inline())
 }
 
 fn declare_parameters<'target>(
@@ -119,7 +121,7 @@ pub(super) fn rebuild_functions<'source, 'target>(
     rebuilt: &mut [Option<dae::ExprId<'target>>],
     quotients: &mut RuntimeQuotientReplayPlan<'target>,
 ) -> Result<Vec<RebuiltFunction<'target>>, dae::DaeConstructionError> {
-    let (function_use_groups, function_uses) = index_function_uses(source);
+    let function_expressions = index_function_expressions(source);
     let function_definitions = (0..source.function_count())
         .map(|index| {
             let id = source
@@ -139,14 +141,90 @@ pub(super) fn rebuild_functions<'source, 'target>(
         candidate,
         rebuilt,
         pending: Vec::new(),
-        function_use_groups,
-        function_uses,
+        function_use_groups: function_expressions.groups,
+        function_uses: function_expressions.uses,
+        function_scopes: function_expressions.scopes,
         function_definitions,
         quotients,
         active_function: None,
     };
     rebuilder.rebuild_all(target)?;
     Ok(rebuilder.functions)
+}
+
+fn rebuild_derivatives<'target>(
+    entries: &[Vec<dae::FunctionDerivativeView<'_>>],
+    target: &mut dae::DaeConstruction<'target>,
+    rebuilt: &mut [RebuiltFunction<'target>],
+) -> Result<(), dae::DaeConstructionError> {
+    loop {
+        let mut added = 0;
+        for (function, entries) in entries.iter().take(rebuilt.len()).enumerate() {
+            added += rebuild_function_derivatives(target, rebuilt, function, entries)?;
+        }
+        if added == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn rebuild_function_derivatives<'target>(
+    target: &mut dae::DaeConstruction<'target>,
+    functions: &mut [RebuiltFunction<'target>],
+    function: usize,
+    entries: &[dae::FunctionDerivativeView<'_>],
+) -> Result<usize, dae::DaeConstructionError> {
+    let before = functions[function].derivatives.len();
+    while let Some(entry) = entries.get(functions[function].derivatives.len()).copied() {
+        let Some(link) = rebuild_derivative(target, functions, entry)? else {
+            break;
+        };
+        functions[function].derivatives.push(link);
+    }
+    Ok(functions[function].derivatives.len() - before)
+}
+
+fn rebuild_derivative<'target>(
+    target: &mut dae::DaeConstruction<'target>,
+    functions: &[RebuiltFunction<'target>],
+    entry: dae::FunctionDerivativeView<'_>,
+) -> Result<Option<dae::FunctionDerivativeId<'target>>, dae::DaeConstructionError> {
+    let Some(derivative) = functions.get(entry.target().index() as usize) else {
+        return Ok(None);
+    };
+    let previous = match entry.previous() {
+        Some(previous) => {
+            let Some(mapped) = functions
+                .get(previous.function().index() as usize)
+                .and_then(|function| function.derivatives.get(previous.ordinal() as usize))
+            else {
+                return Ok(None);
+            };
+            Some(*mapped)
+        }
+        None => None,
+    };
+    let source = functions[entry.source().index() as usize].id;
+    let derivative = derivative.id;
+    target
+        .functions(|functions| match previous {
+            Some(previous) => functions.next_derivative(
+                source,
+                previous,
+                derivative,
+                entry.inputs().iter().copied(),
+                entry.priority(),
+                entry.provenance(),
+            ),
+            None => functions.first_derivative(
+                source,
+                derivative,
+                entry.inputs().iter().copied(),
+                entry.priority(),
+                entry.provenance(),
+            ),
+        })
+        .map(Some)
 }
 
 #[derive(Clone, Copy)]
@@ -165,8 +243,15 @@ struct FunctionUseGroup {
     materialized: bool,
 }
 
-fn index_function_uses(source: dae::DaeView<'_>) -> (Vec<FunctionUseGroup>, Vec<u32>) {
+struct FunctionExpressionIndex<'dae> {
+    groups: Vec<FunctionUseGroup>,
+    uses: Vec<u32>,
+    scopes: Vec<Vec<dae::ExprId<'dae>>>,
+}
+
+fn index_function_expressions(source: dae::DaeView<'_>) -> FunctionExpressionIndex<'_> {
     let mut indexed = Vec::new();
+    let mut scopes = vec![Vec::new(); source.function_count()];
     for index in 0..source.expression_count() {
         let source_id = source
             .expression_id(index)
@@ -174,6 +259,9 @@ fn index_function_uses(source: dae::DaeView<'_>) -> (Vec<FunctionUseGroup>, Vec<
         let expression = source
             .expression(source_id)
             .expect("finalized expression identity resolves");
+        if let Some(function) = expression.function_scope() {
+            scopes[function.index() as usize].push(source_id);
+        }
         if let dae::ExpressionOperation::FunctionValue { value, definition } =
             expression.operation()
         {
@@ -222,7 +310,11 @@ fn index_function_uses(source: dae::DaeView<'_>) -> (Vec<FunctionUseGroup>, Vec<
             .range
             .end = expressions.len();
     }
-    (groups, expressions)
+    FunctionExpressionIndex {
+        groups,
+        uses: expressions,
+        scopes,
+    }
 }
 
 fn function_components(source: dae::DaeView<'_>) -> Vec<rumoca_core::DependencyScc> {
@@ -260,6 +352,7 @@ struct FunctionRebuilder<'source, 'borrow, 'target> {
     pending: Vec<(dae::ExprId<'source>, bool)>,
     function_use_groups: Vec<FunctionUseGroup>,
     function_uses: Vec<u32>,
+    function_scopes: Vec<Vec<dae::ExprId<'source>>>,
     function_definitions: Vec<Vec<Option<dae::FunctionDefinitionId<'target>>>>,
     quotients: &'borrow mut RuntimeQuotientReplayPlan<'target>,
     active_function: Option<usize>,
@@ -270,12 +363,26 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
         &mut self,
         target: &mut dae::DaeConstruction<'target>,
     ) -> Result<(), dae::DaeConstructionError> {
+        let derivatives = (0..self.source.function_count())
+            .map(|index| {
+                self.source_function(index)
+                    .derivatives()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         for component in function_components(self.source) {
             if component.recursive {
                 self.rebuild_recursive_component(target, &component.members)?;
             } else {
                 self.rebuild_acyclic_function(target, component.members[0])?;
             }
+            rebuild_derivatives(&derivatives, target, &mut self.functions)?;
+        }
+        for (index, function) in self.functions.iter().enumerate() {
+            assert_eq!(
+                function.derivatives.len(),
+                self.source_function(index).derivatives().count()
+            );
         }
         self.expect_all_definitions_mapped()?;
         self.expect_all_scoped_expressions_mapped()
@@ -343,6 +450,7 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
             id: reservation.function(),
             parameters,
             values,
+            derivatives: Vec::new(),
         });
         Ok(())
     }
@@ -509,8 +617,14 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
                 dae::FunctionStatementView::Assertion {
                     condition,
                     message,
+                    level,
                     provenance,
-                } => self.rebuild_assertion(target, &mut body, condition, message, provenance)?,
+                } => self.rebuild_assertion(
+                    target,
+                    &mut body,
+                    (condition, message, level),
+                    provenance,
+                )?,
                 dae::FunctionStatementView::For {
                     fold,
                     statements,
@@ -528,13 +642,18 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
         &mut self,
         target: &mut dae::DaeConstruction<'target>,
         body: &mut dae::FunctionBody<'target>,
-        condition: dae::ExprId<'source>,
-        message: dae::ExprId<'source>,
+        (condition, message, level): (
+            dae::ExprId<'source>,
+            dae::ExprId<'source>,
+            dae::AssertionLevel,
+        ),
         provenance: dae::DaeProvenance,
     ) -> Result<(), dae::DaeConstructionError> {
         let condition = self.rebuild_expression(target, body, condition)?;
         let message = self.rebuild_expression(target, body, message)?;
-        target.functions(|functions| functions.assertion(body, condition, message, provenance))?;
+        target.functions(|functions| {
+            functions.assertion_with_level(body, condition, message, level, provenance)
+        })?;
         Ok(())
     }
 
@@ -702,6 +821,73 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
         Ok(body)
     }
 
+    /// Replay one loop nested in `parent`, as `rebuild_loop` replays a
+    /// top-level one, and return the enclosing loop.
+    fn rebuild_nested_loop(
+        &mut self,
+        target: &mut dae::DaeConstruction<'target>,
+        function: &RebuiltFunction<'target>,
+        parent: dae::FunctionLoop<'target>,
+        source_fold_id: dae::FunctionFoldId<'source>,
+        statements: dae::FunctionStatements<'source>,
+        provenance: dae::DaeProvenance,
+    ) -> Result<dae::FunctionLoop<'target>, dae::DaeConstructionError> {
+        let source_fold = self
+            .source
+            .function_fold(source_fold_id)
+            .expect("checked function fold identity resolves");
+        let targets = source_fold
+            .targets()
+            .map(|target| function.values[target.ordinal() as usize])
+            .collect::<Vec<_>>();
+        let iteration_locals = source_fold
+            .iteration_locals()
+            .map(|target| function.values[target.ordinal() as usize])
+            .collect::<Vec<_>>();
+        self.seed_current(
+            target,
+            parent.body(),
+            source_fold.targets(),
+            &targets,
+            source_fold.initial_values(),
+        )?;
+        let domain = self.identities.domains[source_fold.domain().index() as usize].id;
+        let child = target.functions(|functions| {
+            functions.begin_nested_loop_with_iteration_locals(
+                parent,
+                domain,
+                targets.clone(),
+                iteration_locals,
+                source_fold.provenance(),
+            )
+        })?;
+        self.seed_current(
+            target,
+            child.body(),
+            source_fold.targets(),
+            &targets,
+            source_fold.parameter_values(),
+        )?;
+        let child = self.rebuild_loop_statements(target, function, child, statements)?;
+        self.seed_current(
+            target,
+            child.body(),
+            source_fold.targets(),
+            &targets,
+            source_fold.update_values(),
+        )?;
+        let parent =
+            target.functions(|functions| functions.finish_nested_loop(child, provenance))?;
+        self.seed_current(
+            target,
+            parent.body(),
+            source_fold.targets(),
+            &targets,
+            source_fold.output_values(),
+        )?;
+        Ok(parent)
+    }
+
     fn rebuild_loop_statements(
         &mut self,
         target: &mut dae::DaeConstruction<'target>,
@@ -761,73 +947,6 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
             )?;
         }
         Ok(loop_body)
-    }
-
-    /// A loop nested in a loop body: the same fold rebuild as
-    /// [`Self::rebuild_loop`], begun inside the enclosing transition.
-    fn rebuild_nested_loop(
-        &mut self,
-        target: &mut dae::DaeConstruction<'target>,
-        function: &RebuiltFunction<'target>,
-        enclosing: dae::FunctionLoop<'target>,
-        source_fold_id: dae::FunctionFoldId<'source>,
-        statements: dae::FunctionStatements<'source>,
-        provenance: dae::DaeProvenance,
-    ) -> Result<dae::FunctionLoop<'target>, dae::DaeConstructionError> {
-        let source_fold = self
-            .source
-            .function_fold(source_fold_id)
-            .expect("checked function fold identity resolves");
-        let targets = source_fold
-            .targets()
-            .map(|target| function.values[target.ordinal() as usize])
-            .collect::<Vec<_>>();
-        let iteration_locals = source_fold
-            .iteration_locals()
-            .map(|target| function.values[target.ordinal() as usize])
-            .collect::<Vec<_>>();
-        self.seed_current(
-            target,
-            enclosing.body(),
-            source_fold.targets(),
-            &targets,
-            source_fold.initial_values(),
-        )?;
-        let domain = self.identities.domains[source_fold.domain().index() as usize].id;
-        let nested = target.functions(|functions| {
-            functions.begin_nested_loop_with_iteration_locals(
-                enclosing,
-                domain,
-                targets.clone(),
-                iteration_locals,
-                source_fold.provenance(),
-            )
-        })?;
-        self.seed_current(
-            target,
-            nested.body(),
-            source_fold.targets(),
-            &targets,
-            source_fold.parameter_values(),
-        )?;
-        let nested = self.rebuild_loop_statements(target, function, nested, statements)?;
-        self.seed_current(
-            target,
-            nested.body(),
-            source_fold.targets(),
-            &targets,
-            source_fold.update_values(),
-        )?;
-        let enclosing =
-            target.functions(|functions| functions.finish_nested_loop(nested, provenance))?;
-        self.seed_current(
-            target,
-            enclosing.body(),
-            source_fold.targets(),
-            &targets,
-            source_fold.output_values(),
-        )?;
-        Ok(enclosing)
     }
 
     fn rebuild_loop_assignment_group(
@@ -915,15 +1034,16 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
         let dae::FunctionStatementView::Assertion {
             condition,
             message,
+            level,
             provenance,
         } = statement
         else {
-            unreachable!("checked function loops cannot contain nested loops")
+            unreachable!("a nested loop is replayed by rebuild_nested_loop")
         };
         let condition = self.rebuild_expression(target, loop_body.body(), condition)?;
         let message = self.rebuild_expression(target, loop_body.body(), message)?;
         target.functions(|functions| {
-            functions.assertion_loop(loop_body, condition, message, provenance)
+            functions.assertion_loop_with_level(loop_body, condition, message, level, provenance)
         })
     }
 
@@ -942,20 +1062,9 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
         function: usize,
         body: &dae::FunctionBody<'target>,
     ) -> Result<(), dae::DaeConstructionError> {
-        for index in 0..self.source.expression_count() {
-            let source_id = self
-                .source
-                .expression_id(index)
-                .expect("finalized expression ordinal resolves");
-            let expression = self
-                .source
-                .expression(source_id)
-                .expect("finalized expression identity resolves");
-            if expression
-                .function_scope()
-                .is_some_and(|owner| owner.index() as usize == function)
-                && self.rebuilt[source_id.index() as usize].is_none()
-            {
+        for index in 0..self.function_scopes[function].len() {
+            let source_id = self.function_scopes[function][index];
+            if self.rebuilt[source_id.index() as usize].is_none() {
                 self.rebuild_postorder(target, source_id, Some(body))?;
             }
         }
@@ -1367,7 +1476,11 @@ impl<'source, 'target> FunctionRebuilder<'source, '_, 'target> {
         target: dae::FunctionDefinitionId<'target>,
         provenance: dae::DaeProvenance,
     ) -> Result<(), dae::DaeConstructionError> {
-        if source.function().index() != target.function().index()
+        if self
+            .functions
+            .get(source.function().index() as usize)
+            .map(|function| function.id)
+            != Some(target.function())
             || source.ordinal() != target.ordinal()
         {
             return Err(dae::DaeConstructionError::ShapeMismatch {

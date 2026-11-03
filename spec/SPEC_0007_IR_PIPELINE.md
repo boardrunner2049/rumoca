@@ -5,12 +5,8 @@ ACCEPTED
 
 ## Summary
 
-Rumoca transforms Modelica through AST → Flat → DAE → Solve IRs. Each stage
-defines its contents, ownership, and boundary.
-
-Per-stage contract rows and the structural-lowering transformation list are
-catalogued in [SPEC_0040](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md). Every row is
-normative by reference from the stage section linking it.
+[SPEC_0040](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md) catalogs stage contracts and
+structural transformations; linked rows are normative.
 
 ## Specification
 
@@ -39,7 +35,7 @@ Modelica source (.mo)
   └──────────┘                           MLIR/LLVM, CUDA C and WGSL kernels
 ```
 
-**Codegen targets the lowest proven-valid IR it needs — no lower.**
+**Codegen targets the lowest proven-valid IR it needs.**
 
 | Backend | IR level | Why |
 |---|---|---|
@@ -54,60 +50,36 @@ Modelica source (.mo)
 `rumoca-phase-codegen` renders text; execution adapters wrap toolchains and
 runtimes without owning compiler semantics.
 
-Every IR that crosses the code-generation boundary MUST already satisfy its
-stage invariants by construction. A target manifest selects the exact canonical
-or checked export IR it consumes; the compiler supplies a typed, read-only
-semantic view of that artifact to MiniJinja. Rendering MUST NOT resolve names,
-infer types or shapes, lower to another IR, mutate its input, or repair an
-invalid artifact.
+Code-generation inputs MUST satisfy stage invariants by construction. Target
+manifests select the exact canonical or checked export IR; MiniJinja receives
+its typed, read-only semantic view. Rendering MUST NOT resolve names, infer
+types/shapes, lower IRs, mutate inputs, or repair invalid artifacts.
 
-Code-generation architecture:
+This boundary covers syntax, Flat, DAE, Solve, and checked export IRs. Existing
+IRs need only a target directory; new IRs require a target-neutral semantic view
+and capability vocabulary, never a target-language Rust renderer. Export IRs
+remain projections, not canonical stages.
 
-```text
-proven-valid IR -> typed semantic template view -> target.toml + MiniJinja -> artifacts
-```
-
-This boundary applies uniformly to syntax, Flat, DAE, Solve, and checked export
-IRs. Adding a target for an already-supported IR requires only a target
-directory. Supporting a new IR requires one target-neutral semantic view and
-capability vocabulary, never a target-language renderer in Rust. Export IRs
-remain projections, never canonical pipeline stages.
-
-The checked FMI component export is the single deployment projection for FMI 2
-and FMI 3. Its constructor binds DAE-owned variable identity, causality, type,
-shape, units, and provenance to the executable Solve kernel. FMI-version
-adapters may scalarize only the external value-reference view required by that
-version; they MUST NOT repeat equation lowering, initialization, event, or
-state-machine semantics. A raw derivative-only C kernel is not an FMI component
-and MUST NOT be advertised as an FMI deployment substitute.
+Checked FMI component export is the sole FMI 2/3 deployment projection. Its
+constructor binds DAE variable identity, causality, type, shape, units, and
+provenance to the Solve kernel. Version adapters may scalarize only required
+external value references; they MUST NOT repeat equation lowering,
+initialization, events, or state-machine semantics. Derivative-only C kernels
+MUST NOT be advertised as FMI components or deployment substitutes.
 
 ### Built-in Target Product Contract
 
-A built-in target is an executable or inspectable compiler product, not a
-roadmap marker. Every directory registered below
-`rumoca-phase-codegen/src/templates/` MUST satisfy all of these rules:
+Every target registered below `rumoca-phase-codegen/src/templates/` MUST be an
+executable or inspectable product satisfying these rules:
 
-| Rule | Required evidence |
-|---|---|
-| Public names describe artifacts or interface profiles | Target IDs remain meaningful without IR knowledge |
-| Consumed IR is a separate manifest dimension | `target.toml` declares `ir`; `rumoca targets` reports it |
-| The target has a concrete present-day user workflow | `README.md` names the intended user, input IR, produced artifact, invocation, and the decision or deployment task the artifact supports |
-| The target states its semantic boundary honestly | `README.md` and `target.toml` name non-goals, unsupported semantics, readiness, and whether the artifact is source, analysis output, a runtime component, or a standards container |
-| The target emits a non-empty artifact | At least one `[[files]]` entry renders through the checked target path; manifest-only future placeholders are prohibited |
-| Unsupported input fails closed | Focused negative tests prove that unsupported semantic operations cannot become comments, stubs, zero values, omitted sections, or successful-looking artifacts |
-| The artifact is checked at the strongest practical boundary | Unit tests always cover manifest parsing and real rendering; language targets parse or compile; executable targets run a numerical fixture; package/standard targets validate metadata, lifecycle, and execution against the exact claimed revision |
-| Documentation and tests are target-local and discoverable | The target `README.md` lists the exact focused tests and external gates that support its readiness claim |
-| Experimental status narrows claims, not evidence | A readiness-zero target may expose a pinned experimental interface, but still emits and validates a useful artifact; readiness zero cannot excuse a non-product |
-
-Proposed-future-use targets stay in specs or notes until an artifact and
-evidence exist. Templates MUST fail with a span-bearing error on an unsupported
-checked construct; lossy placeholder text is never acceptable.
+The complete product and evidence requirements are normative in
+[SPEC_0040 §4](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md#4-built-in-target-product-contract-spec_0007).
 
 ---
 
 ### Stage 1 — AST (`rumoca-ir-ast`)
 
-**What it is:** Parser output: concrete syntax, comments, and spans.
+**Contents:** syntax, comments, spans.
 
 **Contract:**
 - Represents source text structure, not language semantics.
@@ -124,14 +96,23 @@ manipulation.
 
 ### Stage 2 — Flat (`rumoca-ir-flat`)
 
-**What it is:** The instantiated class hierarchy with fully-qualified names.
+**Contents:** instantiated classes with fully-qualified names.
 
 **Contract:**
 - No unresolved class references.
 - No modification chains; all modifications have been applied.
 - Virtual connection graphs satisfy MLS §9.4 forest and root invariants.
 - Arrays remain symbolic (not scalarized).
+- Array construction retains its source operation: `{...}` adds an element
+  axis, bracket commas concatenate along dimension 2, and bracket semicolons
+  concatenate along dimension 1, with MLS §10.4.2.1 promotion. AST and Flat
+  carry this distinction explicitly through rewrites and function bodies;
+  consumers MUST NOT infer the concatenation axis from child nesting. Expanded
+  comprehensions and materialized array values remain element constructors.
 - Function bodies remain structured in `functions`.
+- No function values: a call passing a function argument (MLS §12.4.2.1) calls
+  a specialization of the callee that calls it directly; no function-typed
+  input remains in `functions`.
 - `pre()`, `der()`, `initial()`, and other Modelica built-ins are still present
   as expression nodes — semantic lowering has not occurred.
 
@@ -143,15 +124,16 @@ generate simulation code.
 
 | Rule | Why |
 |---|---|
-| Instantiation and flattening are separate logical phases | Instantiation applies modifications + builds `InstanceOverlay`/`InstancedTree`; production then runs `typecheck_instanced` before flattening traverses the overlay, expands connections, and produces `flat::Model`. |
+| Instantiation and flattening are separate logical phases | Instantiate modifications/overlay → typecheck → traverse overlay, expand connections, produce `flat::Model` |
+| Scalar binding specialization follows [FLAT-C01](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md#0-flat-stage-contract-catalog-spec_0007-stage-2) | Preserves parameter dependencies |
 | Arrays stay symbolic through Flat and DAE | Backends requesting scalar form call scalarization in structural/solver layers with shape metadata, not via display-string parsing |
 | Function algorithms remain structured; conditional joins retain checked shared-branch correlation | Downstream projections preserve call cardinality without reconstructing control flow |
-| A function-algorithm `assert` is a flow action, not an ordinary call or a value expression | A value-proven function specialization may erase the statement only when its exact specialization environment proves the condition `true`. An unsettled condition may lower only through the call-specialized guarded root/action schedule in SOLVE-C25; a proven-false or otherwise unrepresentable schedule is typed-rejected. The action is never silently discarded or routed through multi-result-call lowering. |
+| A function-algorithm `assert` is a flow action, not an ordinary call or a value expression | A value-proven function specialization may erase the statement only when its exact specialization environment proves the condition `true`. An unsettled condition may lower only through the call-specialized guarded root/action schedule in SOLVE-C25; a proven-false or otherwise unrepresentable schedule is typed-rejected. It is never discarded or lowered as a multi-result call. |
 | Model algorithms lower to DAE only when they fit the declarative subset | Unsupported forms fail explicitly with `ED013` |
-| Initial sections use declarative owners: sequential scalar assignments and `if` conditionals in an `initial algorithm` determine a `parameter` declared `fixed = false` or a discrete coordinate; an explicit initial equation `m = value` or `pre(m) = value` determines the same typed discrete initial-value owner; and `assert` becomes an assertion owner carrying its enclosing branch conditions | A discrete initial value is a checked definition, not a numeric residual: its constructor proves exact scalar type, initialization-settled reads, and unique target ownership, and Solve initializes both current and `pre` storage from it. Replayed calculated-parameter values read only parameters and constants. Where each dependency is settled at parameter-set time, the parameter set computes exactly the initialization value; where one is a `fixed = false` parameter, Solve re-applies the binding after the initialization projection, so the parameter-set value is an iteration seed. Algebraic, state, output, and input algorithm targets and every loop, `when`, or non-`assert` call statement keep `ED013` because no checked initialization owner determines them |
+| Initial algorithms support sequential scalar assignments and `if` conditionals targeting `fixed=false` parameters or discrete coordinates. Initial equations `m = value` / `pre(m) = value` produce the same discrete initial-value owner. Assertions retain enclosing branch conditions. | Discrete initial definitions prove scalar type, settled reads (discrete-valued targets may read continuous coordinates, SPEC_0043 §4), and unique ownership; Solve seeds current and `pre` storage. Calculated parameters read only parameters/constants; reads of `fixed=false` parameters are re-applied after the projection. Algebraic/state/output/input algorithm targets, `when`, and non-`assert` call statements retain `ED013`. |
 | Post-resolution declaration identity is keyed by `DefId`, not strings | Hashing rendered names, `VarName`, flat names, cached display strings, rendered `ComponentPath`, or rendered `ComponentReference` after resolution is a phase-boundary bug. Carry `DefId` for declarations and structured instance identity where one declaration has multiple instantiated meanings. |
 | Flat `TypeId` is the resolved effective type of that concrete instance | Two instances originating from one `DefId` may have different effective types after redeclare or modification. DAE type catalogs key by this identity and retain `DefId` only as declaration provenance. |
-| Semantic phases do not recover name hierarchy by tokenizing flattened strings | The AST, `QualifiedName`, `ComponentReference`, `DefId`, scope tree, and phase metadata carry name structure. Splitting `a.b.c` text inside compiler/evaluator/lowering logic means structure was lost too early. Textual path parsing is allowed only at source/protocol/config/display boundaries while structured IR replaces it. |
+| Semantic phases do not recover name hierarchy by tokenizing flattened strings | The AST, `QualifiedName`, `ComponentReference`, `DefId`, scope tree, and phase metadata carry name structure. Textual path parsing is allowed only at source/protocol/config/display boundaries while structured IR replaces it. |
 
 ---
 
@@ -171,10 +153,10 @@ Modelica-specific operators: pure functions over
 | B.1d | `fc(relation(v))` | Event conditions            |
 
 **DAE representation rule:** DAE is the canonical MLS Appendix B model, not a
-solver cache. One canonical variable catalog owns stable variable identity;
-typed views classify `p`, `x`, `y`, `z`, and `m`, while input/output causality
-is orthogonal metadata. Dedicated continuous, initialization, discrete,
-condition, event, and clock systems own their respective behavior. The current
+solver cache. One catalog owns stable variable identity;
+typed views classify `p`, `x`, `y`, `z`, and `m`, while exported causality and
+the declared `input`/`output` prefix are orthogonal metadata (SPEC_0040 DAE-C24). Continuous, initialization, discrete,
+condition, event, and clock systems own behavior. The current
 `DAE_SCHEMA_VERSION` wire schema is the only supported version; every other
 version is rejected without superseded readers or adapters.
 
@@ -209,6 +191,12 @@ indexes are recomputed rather than accepted as wire inputs.
 **Contract:** rows `DAE-C01`–`DAE-C21` in
 [SPEC_0040 §1](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md#1-dae-stage-contract-catalog-spec_0007-stage-3).
 
+Non-Real `fixed=false` initialization definitions have checked owners distinct
+from translation-time bindings and numeric residuals. They retain exact
+parameter identity, matching shape/type, provenance, and unique ownership;
+values may read initialization state/algebraic unknowns. Wire replay and
+structural transformation reconstruct these owners through checked construction.
+
 **Do here:** DAE lowering, structural transformation, and separately returned
 structural analysis. **Do not:** allocate registers, lower bytecode, emit
 templates, or store backend artifacts in DAE.
@@ -224,8 +212,6 @@ operators in solver equation partitions.
 **What it is:** Typed programs with DAE and Algorithm Code roots over
 shared scalar/tensor vocabulary.
 
-Canonical terminology:
-
 | Term | Current type/name | Meaning |
 |---|---|---|
 | `ScalarProgram` | `Vec<LinearOp>` | A flat register program that produces one scalar output |
@@ -235,8 +221,7 @@ Canonical terminology:
 | `ComputeBlock` | `ComputeBlock` | Ordered mix of scalar program blocks and tensor program nodes |
 | `SolveAlgorithmBlock` | (pending: 2026-08-08 plan, M3-4) | Checked Algorithm Code execution root |
 
-New Solve-IR APIs use `ScalarProgram` / `ScalarProgramBlock` terminology, not
-`RowBlock` / `ScalarRows`.
+New Solve APIs use `ScalarProgram`/`ScalarProgramBlock`, never `RowBlock`/`ScalarRows`.
 
 `ComputeNode::AffineStencil` is source-proven: it comes from preserved DAE
 structured-family domains plus affine operand proofs. It carries the compact
@@ -247,9 +232,9 @@ Structured B.1c definitions follow the same boundary: Solve preserves their
 authoritative DAE domain as a compact map plus a compact target map, and phase
 lowering creates no parallel scalar owner (SOLVE-C20).
 
-Each scalar and structured discrete update owns a typed integrator-history
-effect derived by Solve lowering, never recovered by a runtime from model
-names, row positions, or observed numerical behavior (SOLVE-C21).
+Solve lowering derives each scalar/structured discrete update's typed integrator-history
+effect; runtime model names, row positions, or observed behavior cannot supply it
+(SOLVE-C21).
 
 One clocked partition has one equation-shaped owner: producers proved total on
 that tick exchange same-tick values through construction-issued intermediates,
@@ -261,11 +246,10 @@ SPEC_0046).
 Serialized Solve roots carry a mandatory schema version; unsupported and
 pre-versioned payloads are rejected.
 
-`SolveProblem` is the numerical DAE root. Backend products that are expensive
-or outside the canonical MLS DAE (mass-matrix form, Jacobian-vector
-scalar-program blocks) live in `SolveArtifacts`, materialized by
-`rumoca-phase-solve` only when a backend/template/runtime boundary asks.
-`lower_solve_problem` must not eagerly populate them.
+`SolveProblem` owns the numerical DAE. Expensive or noncanonical products
+(mass-matrix form, Jacobian-vector programs) belong in `SolveArtifacts`.
+`rumoca-phase-solve` materializes them only on backend/template/runtime demand;
+`lower_solve_problem` must not populate them eagerly.
 
 `SolveAlgorithmBlock` is constructed only from checked Algorithm Code under an
 explicit arithmetic profile (pending: 2026-08-08 plan, M3-4). It is not a mode
@@ -274,38 +258,69 @@ of `SolveProblem`; rows SOLVE-C32–C38 define its complete obligations.
 **Contract:** rows `SOLVE-C01`–`SOLVE-C57` in
 [SPEC_0040 §2](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md#2-solve-stage-contract-catalog-spec_0007-stage-4).
 
+Initialization planning follows matched rows through algebraic and derivative
+reads, preserving tensor-coordinate dependencies. Parameter definitions are
+substituted into residuals and committed from the solved point; seeds cannot
+discharge them. Unsupported cycles are rejected. Order matched unknowns by
+dependency; only strongly connected rows share projection blocks.
+Algebraic-dependent rows require total derivatives of the reconstructed residual.
+Unmatched checks remain required.
+
 Objectives, adjoints, sensitivities, and optimizer projections are derived
 products, not canonical root fields.
 
-**Do here:** construct either checked root and preserve typed programs,
-provenance, and its execution contract.
+**Do here:** construct checked roots preserving typed programs, provenance, and execution contracts.
 
 Sparsity follows [SPEC_0039](SPEC_0039_PROOF_CARRYING_SPARSITY.md); compact
 affine patterns originate from SPEC_0032 owners, never scalar-row recovery.
 
-**Do not:** work assigned to DAE/structural phases, concrete execution crates,
-or `rumoca-phase-codegen` by SPEC_0029.
+**Do not:** perform DAE/structural, execution, or codegen work owned elsewhere under SPEC_0029.
 
 ---
 
 ### Structural Lowering Scope
 
-Rumoca performs OpenModelica-class structural lowering between DAE and Solve.
-Structural lowering is DAE-to-DAE: each pass consumes a finalized DAE and
-returns another finalized DAE through root-owned checked changes. Partial
-mutation, independently replayable proof receipts, and mutable partition
-callbacks are prohibited.
+Transformations require checked, root-owned DAEs; partial mutation,
+replayable proof receipts, and mutable partition callbacks are prohibited.
 
-**In scope:** exactly rows `STRUCT-T01`–`STRUCT-T07` in
+**In scope:** only `STRUCT-T01`–`STRUCT-T10` in
 [SPEC_0040 §3](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md#3-structural-lowering-transformation-catalog-spec_0007-structural-lowering-scope).
-A transformation absent from that catalog is out of scope until this spec is
-amended.
+Other transformations require amendments.
+
+State selection certifies signatures, tensor-uniform offsets, formal derivatives,
+and candidate maps (STRUCT-T07). Proposals seed and prioritize from exact initial-value transfers within source preference classes.
+Trials never replace initialization; integration requires regularity.
+
+STRUCT-T03 reuses expressions only for identical source, call substitutions,
+derivative order, reconstruction mode, and provenance. Distinct calls and
+equation owners never merge. Discovery, preflight, and reconstruction share
+differentiation facts per immutable source round; replacement DAEs refresh facts
+without changing ordering or acceptance.
+
+Demotion distinguishes exact values from affine derivatives; displaced definitions
+preserve source value equations and cannot substitute manifold values.
+Tangents and non-additive lifts replay exact anchors.
+Additive lifts share acyclic source-row value/derivative proofs excluding replaced owners and lifted coordinates.
+Holonomic replacement excludes value identities; undoing lifts restores original equations.
+
+STRUCT-T03 reconstruction (aggregate rows: SPEC_0040 §3):
+
+| Rule | Owner | Why |
+|---|---|---|
+| Reconstruct a continuous Real vector only from a source-owned square linear system with state/invariant coefficients independent of that unknown | structural value and derivative proofs | Establishes the exact domain of the auxiliary solve |
+| Reconstruct dependent state vectors from affine scalar constraints and independent literal-array entries, including signed aliases; retain parent equations/projections and exclude the target from all anchors | structural state reconstruction | Close dependent kinematics without circular definitions |
+| Prefer an admitted direct source definition over an auxiliary solve for the same state | structural state selection | Avoid obscuring explicit kinematics with redundant implicit solves |
+| Follow exact function/array substitutions and independently defined derivatives; retain source residual owners and assertions | structural coefficient proof | Reconstruction must preserve source behavior |
+| Structural differentiation may select an exact whole-coordinate equality with proved state/invariant value anchors when executable causal-definition uniqueness is unavailable; selection must be acyclic and retain every source equation, including alternative definitions | structural substitution facts | Multiple equations constrain a coordinate without preventing exact substitution |
+| Differentiate `A*q=b` as `A*der(q)=der(b)-der(A)*q`, preserving exact zeros and only needed primal reads; manifold reconstruction uses proved state/invariant anchors on the same nonsingular domain | structural reconstruction | Preserve the original primal solve instead of recursively recomputing it |
 
 **Placement requirement:**
 
-DAE structural transformations live in `rumoca-phase-structural`, return a
-finalized DAE, and keep analysis products outside DAE. `rumoca-phase-solve`
-only lowers finalized DAE. General dummy derivatives, unrelated symbolic
+`rumoca-phase-structural` reconstructs finalized DAEs; analysis stays outside DAE.
+STRUCT-T02 quotients copy and negation aliases before state selection and again among formal-derivative coordinates after it, each through one checked reconstruction; eliminated members stay defined, observable variables, and every unquotiented class is explicit.
+`rumoca-phase-solve` lowers finalized DAE only. STRUCT-T09 permits exact implicit-derivative
+and mixed derivative/algebraic aliases, never scalar pivot selection or numerical
+coefficient matrices. Other dummy-derivative transformations, unrelated symbolic
 simplification, and control-design linearization require a spec update.
 
 ## References

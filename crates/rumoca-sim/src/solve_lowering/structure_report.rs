@@ -5,12 +5,57 @@ use rumoca_solver::SimOptions;
 
 use super::diagnostics::SimulationDiagnosticError;
 
+/// Report the structure Solve lowering analyzes: the STRUCT-T02 alias quotient
+/// of `model` after STRUCT-T10(a) parameter folding (with every class it left
+/// unchanged) followed by the matching and BLT of the prepared quotient, and,
+/// for a constrained system, the formal-derivative application of the quotient
+/// on the reduced candidate Solve lowering executes.
 pub fn structural_report_for_dae(
     model: &dae::Dae,
     _: &SimOptions,
 ) -> Result<rumoca_phase_structural::StructuralReport, SimulationDiagnosticError> {
-    let prepared = rumoca_phase_structural::prepare_for_solve(model).map_err(structural_error)?;
-    Ok(prepared.structural_report())
+    let folded =
+        rumoca_phase_structural::fold_evaluable_parameters(model).map_err(structural_error)?;
+    let model = folded.as_ref().unwrap_or(model);
+    let aliases = rumoca_phase_structural::alias_quotient_report(model);
+    let quotient = rumoca_phase_structural::quotient_aliases(model).map_err(structural_error)?;
+    let literal = rumoca_phase_structural::fold_constant_values(quotient.as_ref().unwrap_or(model))
+        .map_err(structural_error)?
+        .or(quotient);
+    let analyzed = literal.as_ref().unwrap_or(model);
+    let prepared =
+        rumoca_phase_structural::prepare_for_solve(analyzed).map_err(structural_error)?;
+    let mut report = prepared.structural_report();
+    report.aliases = aliases;
+    if let Ok(Some(reason)) = rumoca_phase_solve::withheld_state_preferences(model) {
+        report.notes.push(format!(
+            "the StateSelect preferences request another basis, withheld because {reason}"
+        ));
+    }
+    if rumoca_phase_solve::executes_reduced_state_selection(analyzed, &prepared)
+        .map_err(structural_error)?
+    {
+        report.notes.push(
+            "this is the structural reducer's BLT; Solve lowering instead executes a state \
+             selection built from formal derivatives (for a constrained state manifold or for \
+             the StateSelect preferences), whose blocks differ (inspect the emitted Solve IR \
+             for those)"
+                .to_string(),
+        );
+        if let Ok(names) = rumoca_phase_solve::integrated_state_names(model) {
+            report
+                .notes
+                .push(format!("Solve lowering integrates: {}", names.join(", ")));
+        }
+        // The reduced candidate is prepared only by Solve lowering; a model that
+        // does not lower still reports its reducer structure above.
+        if let Ok(lowered) =
+            rumoca_phase_solve::lower_solve_model(model, &std::collections::HashMap::new(), |_| {})
+        {
+            report.formal_aliases = lowered.formal_alias_report().clone();
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +85,14 @@ pub fn diagnose_structural_singularity(
     model: &dae::Dae,
     _: &SimOptions,
 ) -> Result<Option<SingularityDiagnosis>, SimulationDiagnosticError> {
+    let folded =
+        rumoca_phase_structural::fold_evaluable_parameters(model).map_err(structural_error)?;
+    let model = folded.as_ref().unwrap_or(model);
+    let quotient = rumoca_phase_structural::quotient_aliases(model).map_err(structural_error)?;
+    let literal = rumoca_phase_structural::fold_constant_values(quotient.as_ref().unwrap_or(model))
+        .map_err(structural_error)?
+        .or(quotient);
+    let model = literal.as_ref().unwrap_or(model);
     let error = match rumoca_phase_structural::prepare_for_solve(model) {
         Ok(_) => return Ok(None),
         Err(error) => error,
@@ -85,7 +138,7 @@ fn equation_diagnosis(
 ) -> UnmatchedEquationDiagnosis {
     let index = name
         .strip_prefix("f_x[")
-        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|rest| rest.split(']').next())
         .and_then(|digits| digits.parse::<usize>().ok());
     let provenance = index
         .and_then(|index| view.continuous_owner_for_scalar_row(index))

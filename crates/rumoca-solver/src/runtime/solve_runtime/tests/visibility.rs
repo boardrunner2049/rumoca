@@ -142,7 +142,7 @@ fn root_condition_plan_keeps_full_values_but_neutralizes_search_roots() {
         .as_ref()
         .expect("root condition plan should build");
 
-    assert_eq!(plan.evaluated_rows, vec![2, 3, 4]);
+    assert_eq!(plan.evaluated_rows, vec![0, 2, 3, 4]);
     assert_eq!(plan.search_rows, vec![4]);
 
     let full = runtime

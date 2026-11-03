@@ -6,10 +6,8 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, types,
 };
-use cranelift_codegen::settings;
-use cranelift_codegen::verify_function;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage, Module};
 use rumoca_core::ExternalTableData;
 use rumoca_eval_solve::{
@@ -30,10 +28,18 @@ mod host_runtime;
 mod input_validation;
 mod interpreter;
 mod owned_jit_module;
+mod projection_batch;
+pub(crate) mod projection_jacobian;
+mod register_constants;
+mod register_storage;
+#[cfg(test)]
+mod register_storage_tests;
+mod selected_jvp;
+mod selected_residual;
 mod status;
 pub(crate) mod typed_program;
 
-use host_runtime::{register_math_symbols, with_active_external_tables};
+use host_runtime::{host_jit_builder, register_math_symbols, with_active_external_tables};
 pub(crate) use input_validation::InputRequirements as EmitInputRequirements;
 use input_validation::{
     InputRequirements, input_compile_error, input_requirements_for_linear_ops,
@@ -42,6 +48,7 @@ use input_validation::{
 };
 use interpreter::execute_row;
 use owned_jit_module::{OwnedJitModule, declare_far_call_in_func};
+pub(crate) use projection_batch::SharedProjectionModule;
 
 // Each compiled program writes its outputs through the trailing `*mut f64`
 // pointer (one program may emit several outputs via consecutive StoreOutputs).
@@ -191,8 +198,10 @@ pub(crate) struct CompiledResidualRows {
     _pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
     rows: Vec<CompiledResidualRow>,
     jits: Vec<CompiledResidualJit>,
+    selectable: bool,
     input_requirements: InputRequirements,
     regs_scratch: RefCell<Vec<f64>>,
+    output_scratch: RefCell<Vec<f64>>,
     jit_call_count: Cell<usize>,
     _module: OwnedJitModule,
 }
@@ -348,7 +357,7 @@ impl CompiledResidualRows {
     }
 
     #[cfg(test)]
-    fn jit_call_count(&self) -> usize {
+    pub(crate) fn jit_call_count(&self) -> usize {
         self.jit_call_count.get()
     }
 }
@@ -365,11 +374,57 @@ pub(crate) struct CompiledJacobianRows {
     rows: Vec<CompiledJacobianRow>,
     input_requirements: InputRequirements,
     regs_scratch: RefCell<Vec<f64>>,
+    output_scratch: RefCell<Vec<f64>>,
     jit_call_count: Cell<usize>,
     _module: OwnedJitModule,
 }
 
 impl CompiledJacobianRows {
+    #[cfg(test)]
+    pub(crate) fn program_call_count(&self) -> usize {
+        self.jit_call_count.get()
+    }
+
+    pub(crate) fn call_program_output(
+        &self,
+        (program, offset): (usize, usize),
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        v: &[f64],
+        external_tables: &[ExternalTableData],
+    ) -> Result<f64, CompileError> {
+        let row = self.rows.get(program).ok_or_else(|| {
+            CompileError::Input(format!(
+                "Jacobian program {program} is outside compiled rows"
+            ))
+        })?;
+        let count = row.plan.output_count();
+        if offset >= count {
+            return Err(CompileError::Input(format!(
+                "Jacobian program {program} output {offset} is outside {count} outputs"
+            )));
+        }
+        validate_input_requirements(self.input_requirements, y, p, Some(v))?;
+        with_active_external_tables(external_tables, || {
+            let mut output = self.output_scratch.borrow_mut();
+            output.resize(count, 0.0);
+            self.call_jacobian_row(
+                row,
+                &mut self.regs_scratch.borrow_mut(),
+                &JacobianCallContext {
+                    y,
+                    p,
+                    t,
+                    v,
+                    external_tables,
+                },
+                &mut output,
+            )?;
+            Ok(output[offset])
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn call(
         &self,
@@ -472,6 +527,7 @@ enum ResidualFuncIds {
     Chunked(Vec<FuncId>),
 }
 
+const MAX_STATIC_MATRIX_WORK: usize = 64;
 const RESIDUAL_CHUNK_THRESHOLD: usize = 16_000;
 const RESIDUAL_CHUNK_OPS: usize = 4_000;
 const RESIDUAL_BATCH_OPS: usize = 12_000;
@@ -508,26 +564,35 @@ fn fold_signature(
 pub(crate) fn compile_residual_rows(
     rows: &[Vec<LinearOp>],
 ) -> Result<CompiledResidualRows, CompileError> {
-    compile_residual_rows_attached(rows, None)
+    compile_residual_rows_attached(rows, None, false)
 }
 
 pub(crate) fn compile_residual_rows_with_pure_calls(
     rows: &[Vec<LinearOp>],
     pure_calls: Rc<typed_program::CompiledPureCallTable>,
 ) -> Result<CompiledResidualRows, CompileError> {
-    compile_residual_rows_attached(rows, Some(pure_calls))
+    compile_residual_rows_attached(rows, Some(pure_calls), false)
+}
+
+pub(crate) fn compile_selectable_residual_rows(
+    rows: &[Vec<LinearOp>],
+    pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
+) -> Result<CompiledResidualRows, CompileError> {
+    compile_residual_rows_attached(rows, pure_calls, true)
 }
 
 fn compile_residual_rows_attached(
     rows: &[Vec<LinearOp>],
     pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
+    selectable: bool,
 ) -> Result<CompiledResidualRows, CompileError> {
     let mut emitter = CraneliftEmitter::new(pure_calls.as_deref())?;
     let plans = plan_rows(rows)?;
     for row in rows {
         validate_row_supported_by_jit(row, RowKind::Residual)?;
     }
-    let pending = compile_residual_functions(&mut emitter, rows, &plans)?;
+    let selectable = selectable && !selected_residual::has_shared_conditional_owner(rows);
+    let pending = compile_residual_functions(&mut emitter, rows, &plans, selectable)?;
     finalize_jit_module(&mut emitter.module)?;
     let input_requirements = input_requirements_for_plans(&plans);
     let compiled_rows = build_compiled_residual_rows(rows, plans)?;
@@ -536,8 +601,10 @@ fn compile_residual_rows_attached(
         _pure_calls: pure_calls,
         rows: compiled_rows,
         jits,
+        selectable,
         input_requirements,
         regs_scratch: RefCell::new(Vec::new()),
+        output_scratch: RefCell::new(Vec::new()),
         jit_call_count: Cell::new(0),
         _module: emitter.module,
     })
@@ -549,16 +616,12 @@ fn compile_residual_functions(
     emitter: &mut CraneliftEmitter,
     rows: &[Vec<LinearOp>],
     plans: &[RowPlan],
+    selectable: bool,
 ) -> Result<Vec<PendingResidual>, CompileError> {
     let mut pending = Vec::new();
     let mut row_start = 0usize;
     let mut output_start = 0usize;
-    if rows.iter().flatten().any(|operation| {
-        matches!(
-            operation,
-            LinearOp::FunctionConditional { program, .. } if program.owner.is_some()
-        )
-    }) {
+    if selected_residual::has_shared_conditional_owner(rows) {
         let output_count = plans.iter().map(RowPlan::output_count).sum();
         let func_id = emitter.compile_residual_batch(rows)?;
         pending.push((
@@ -571,7 +634,7 @@ fn compile_residual_functions(
         row_start = rows.len();
     }
     while row_start < rows.len() {
-        if residual_program_cost(&rows[row_start]) > RESIDUAL_CHUNK_THRESHOLD {
+        if selectable || residual_program_cost(&rows[row_start]) > RESIDUAL_CHUNK_THRESHOLD {
             let output_count = plans[row_start].output_count();
             pending.push((
                 emitter.compile_residual_program(&rows[row_start], row_start)?,
@@ -707,34 +770,19 @@ pub(crate) fn compile_exact_assignment_schedule(
     schedule: &rumoca_ir_solve::ExactRefreshAssignmentSchedule,
     pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
 ) -> Result<CompiledAssignmentSchedule, CompileError> {
-    let mut blocks =
-        checked_vec_with_capacity(schedule.program_ids().len(), "exact assignment rows")?;
-    let mut targets = Vec::new();
-    for id in schedule.program_ids() {
-        let program = owners.exact_assignment_program(*id).ok_or_else(|| {
-            CompileError::Input(
-                "exact assignment schedule refers to a missing constructed program".to_string(),
-            )
-        })?;
-        let block = program.final_scalar_program(source).map_err(|error| {
-            CompileError::Input(format!("exact assignment final projection failed: {error}"))
-        })?;
-        let [_] = block.programs() else {
-            return Err(CompileError::Input(
-                "exact assignment owner must contain one program".to_string(),
-            ));
-        };
-        blocks.push(block);
-        targets
-            .try_reserve_exact(program.target_indices().len())
-            .map_err(|_| {
-                CompileError::Input("exact assignment targets exceed memory".to_string())
-            })?;
-        targets.extend_from_slice(program.target_indices());
-    }
-    let rows = blocks
+    // The schedule runs as its shared-value segments (SPEC_0043 §6a), each
+    // one row committing its targets before the next.
+    let shared = schedule.shared_segments(source, owners).map_err(|error| {
+        CompileError::Input(format!("exact assignment segments failed: {error}"))
+    })?;
+    let segments = shared.segments().segments();
+    let rows = segments
         .iter()
-        .map(|block| block.programs()[0].as_slice())
+        .map(|segment| segment.ops())
+        .collect::<Vec<_>>();
+    let targets = segments
+        .iter()
+        .flat_map(|segment| segment.targets().iter().copied())
         .collect::<Vec<_>>();
     compile_assignment_schedule_slices(&rows, &targets, pure_calls)
 }
@@ -786,30 +834,31 @@ fn compile_assignment_schedule_slices(
 pub(crate) fn compile_jacobian_rows(
     rows: &[Vec<LinearOp>],
 ) -> Result<CompiledJacobianRows, CompileError> {
-    compile_jacobian_rows_attached(rows, None)
+    compile_jacobian_rows_attached(rows, None, None)
 }
 
 pub(crate) fn compile_jacobian_rows_with_pure_calls(
     rows: &[Vec<LinearOp>],
     pure_calls: Rc<typed_program::CompiledPureCallTable>,
 ) -> Result<CompiledJacobianRows, CompileError> {
-    compile_jacobian_rows_attached(rows, Some(pure_calls))
+    compile_jacobian_rows_attached(rows, Some(pure_calls), None)
 }
 
 fn compile_jacobian_rows_attached(
     rows: &[Vec<LinearOp>],
     pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
+    projection: Option<usize>,
 ) -> Result<CompiledJacobianRows, CompileError> {
     let mut emitter = CraneliftEmitter::new(pure_calls.as_deref())?;
     let plans = plan_rows(rows)?;
     let mut func_ids = checked_vec_with_capacity(rows.len(), "Jacobian row function ids")?;
     for (index, row) in rows.iter().enumerate() {
         validate_row_supported_by_jit(row, RowKind::JacobianV)?;
-        let func_id = emitter.compile_row(
-            row,
-            RowKind::JacobianV,
-            &format!("rumoca_jacobian_row_{index}"),
-        )?;
+        let name = match projection {
+            Some(block) => format!("rumoca_projection_{block}_jacobian_row_{index}"),
+            None => format!("rumoca_jacobian_row_{index}"),
+        };
+        let func_id = emitter.compile_row(row, RowKind::JacobianV, &name)?;
         func_ids.push(func_id);
     }
     finalize_jit_module(&mut emitter.module)?;
@@ -829,6 +878,7 @@ fn compile_jacobian_rows_attached(
         rows: compiled_rows,
         input_requirements,
         regs_scratch: RefCell::new(Vec::new()),
+        output_scratch: RefCell::new(Vec::new()),
         jit_call_count: Cell::new(0),
         _module: emitter.module,
     })
@@ -1004,6 +1054,12 @@ fn validate_row_supported_by_jit(row: &[LinearOp], kind: RowKind) -> Result<(), 
                 "cranelift row compiler does not support discrete random solve-IR ops".to_string(),
             ));
         }
+        if rumoca_ir_solve::tensor_lanes(op).is_some_and(|lanes| lanes > 2) {
+            return Err(CompileError::Backend(format!(
+                "cranelift row compiler supports tensor lanes up to 2; {} carries more",
+                op.kind_name()
+            )));
+        }
         if matches!(op, LinearOp::LoadSeed { .. }) && !kind.has_seed() {
             return Err(CompileError::Backend(
                 "LoadSeed in residual row without seed input".to_string(),
@@ -1040,6 +1096,10 @@ struct CraneliftEmitter {
     fold_functions: HashMap<usize, FuncId>,
     canonical_fold_functions: Vec<(Arc<rumoca_ir_solve::FunctionFoldProgram>, FuncId)>,
     conditional_functions: HashMap<rumoca_ir_solve::FunctionConditionalOwnerId, FuncId>,
+    /// Symbol namespace of `conditional_functions`. Conditional owner ids are
+    /// local to one scalar-program block, so a module that compiles programs
+    /// of several blocks names each block's conditional helpers apart.
+    conditional_scope: Option<usize>,
     pure_call_functions:
         HashMap<rumoca_ir_solve::SolvePureCallOwnerId, typed_program::PureCallImport>,
 }
@@ -1048,11 +1108,7 @@ impl CraneliftEmitter {
     fn new(
         pure_calls: Option<&typed_program::CompiledPureCallTable>,
     ) -> Result<Self, CompileError> {
-        let mut builder = JITBuilder::with_flags(
-            &[("opt_level", "speed")],
-            cranelift_module::default_libcall_names(),
-        )
-        .map_err(to_backend_err)?;
+        let mut builder = host_jit_builder()?;
         register_math_symbols(&mut builder);
         if let Some(pure_calls) = pure_calls {
             pure_calls.register_symbols(&mut builder);
@@ -1068,6 +1124,7 @@ impl CraneliftEmitter {
             fold_functions: HashMap::new(),
             canonical_fold_functions: Vec::new(),
             conditional_functions: HashMap::new(),
+            conditional_scope: None,
             pure_call_functions,
         })
     }
@@ -1170,13 +1227,13 @@ impl CraneliftEmitter {
         }
         signature.params.push(AbiParam::new(pointer_type)); // captures
         signature.params.push(AbiParam::new(pointer_type)); // results
+        let name = match self.conditional_scope {
+            Some(scope) => format!("rumoca_scope_{scope}_conditional_owner_{}", owner.get()),
+            None => format!("rumoca_conditional_owner_{}", owner.get()),
+        };
         let function = self
             .module
-            .declare_function(
-                &format!("rumoca_conditional_owner_{}", owner.get()),
-                Linkage::Local,
-                &signature,
-            )
+            .declare_function(&name, Linkage::Local, &signature)
             .map_err(to_backend_err)?;
         self.conditional_functions.insert(owner, function);
 
@@ -1243,8 +1300,6 @@ impl CraneliftEmitter {
             drop(lower);
             fb.finalize();
         }
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&context.func, &flags).map_err(to_backend_err)?;
         self.module
             .define_function(function, &mut context)
             .map_err(to_backend_err)?;
@@ -1349,8 +1404,6 @@ impl CraneliftEmitter {
             drop(lower);
             fb.finalize();
         }
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&context.func, &flags).map_err(to_backend_err)?;
         self.module
             .define_function(function, &mut context)
             .map_err(to_backend_err)?;
@@ -1461,8 +1514,6 @@ impl CraneliftEmitter {
             fb.finalize();
         }
 
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&context.func, &flags).map_err(to_backend_err)?;
         self.module
             .define_function(func_id, &mut context)
             .map_err(to_backend_err)?;
@@ -1583,8 +1634,6 @@ impl CraneliftEmitter {
             status::succeed(&mut fb);
             fb.finalize();
         }
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&context.func, &flags).map_err(to_backend_err)?;
         self.module
             .define_function(func_id, &mut context)
             .map_err(to_backend_err)?;
@@ -1656,8 +1705,6 @@ impl CraneliftEmitter {
             status::succeed(&mut fb);
             fb.finalize();
         }
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&context.func, &flags).map_err(to_backend_err)?;
         self.module
             .define_function(func_id, &mut context)
             .map_err(to_backend_err)?;
@@ -1750,8 +1797,6 @@ impl CraneliftEmitter {
             status::succeed(&mut fb);
             fb.finalize();
         }
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&context.func, &flags).map_err(to_backend_err)?;
         self.module
             .define_function(func_id, &mut context)
             .map_err(to_backend_err)?;
@@ -1765,6 +1810,9 @@ fn create_row_register_tape(
     pointer_type: cranelift_codegen::ir::Type,
     row: &[LinearOp],
 ) -> Result<Option<cranelift_codegen::ir::Value>, CompileError> {
+    if register_storage::can_use_direct_registers(row) {
+        return Ok(None);
+    }
     if !row.iter().any(|operation| {
         matches!(
             operation,
@@ -2201,13 +2249,12 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
         clippy::excessive_nesting,
         reason = "one exhaustive native dispatcher makes unsupported LinearOp variants fail closed"
     )]
-    fn lower_op(
+    fn lower_op_native(
         &mut self,
         op: LinearOp,
     ) -> Result<Option<cranelift_codegen::ir::Value>, CompileError> {
         match op {
             LinearOp::Const { dst, value } => {
-                self.known_constants.insert(dst, value);
                 let value = self.fb.ins().f64const(value);
                 self.insert(dst, value)
             }
@@ -2274,13 +2321,6 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
                     .ok_or_else(|| {
                         CompileError::Backend("invalid function-fold binder load".to_string())
                     })?;
-                if let Some(constant) = self
-                    .fold_index_constants
-                    .and_then(|values| values.get(dimension))
-                    .copied()
-                {
-                    self.known_constants.insert(dst, constant);
-                }
                 self.insert(dst, value)
             }
             LinearOp::LoadFoldCapture { dst, index } => {
@@ -2339,9 +2379,6 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
             }
             LinearOp::Move { dst, src } => {
                 let value = self.lookup(src)?;
-                if let Some(constant) = self.known_constants.get(&src).copied() {
-                    self.known_constants.insert(dst, constant);
-                }
                 self.insert(dst, value)
             }
             LinearOp::LinearSolveComponent {
@@ -2497,24 +2534,12 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
             LinearOp::Unary { dst, op, arg } => {
                 let x = self.lookup(arg)?;
                 let value = emit_unary_op(self.fb, self.module, self.math, op, x)?;
-                if let Some(constant) = self.known_constants.get(&arg).copied()
-                    && let Some(result) = fold_unary_constant(op, constant)
-                {
-                    self.known_constants.insert(dst, result);
-                }
                 self.insert(dst, value)
             }
             LinearOp::Binary { dst, op, lhs, rhs } => {
                 let l = self.lookup(lhs)?;
                 let r = self.lookup(rhs)?;
                 let value = emit_binary_op(self.fb, self.module, self.math, op, l, r)?;
-                if let (Some(lhs), Some(rhs)) = (
-                    self.known_constants.get(&lhs).copied(),
-                    self.known_constants.get(&rhs).copied(),
-                ) && let Some(result) = fold_binary_constant(op, lhs, rhs)
-                {
-                    self.known_constants.insert(dst, result);
-                }
                 self.insert(dst, value)
             }
             LinearOp::Compare { dst, op, lhs, rhs } => {
@@ -4107,7 +4132,9 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
             .checked_mul(columns)
             .and_then(|outputs| outputs.checked_mul(inner))
             .and_then(|work| work.checked_mul(lanes));
-        if self.backing_regs_ptr.is_none() || static_work.is_some_and(|work| work <= 64) {
+        if self.backing_regs_ptr.is_none()
+            || static_work.is_some_and(|work| work <= MAX_STATIC_MATRIX_WORK)
+        {
             self.lower_static_matrix_multiply(StaticMatrixMultiply {
                 dst_start,
                 lhs_start,
@@ -6376,6 +6403,18 @@ fn emit_tensor_binary_primal(
     Ok(fb.ins().select(denominator_zero, zero_over_zero, raw))
 }
 
+/// `value` when finite, else zero: `value - value` is zero exactly for a
+/// finite value and NaN otherwise.
+fn emit_finite_or_zero(
+    fb: &mut FunctionBuilder<'_>,
+    value: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let zero = fb.ins().f64const(0.0);
+    let difference = fb.ins().fsub(value, value);
+    let finite = fb.ins().fcmp(FloatCC::Equal, difference, zero);
+    fb.ins().select(finite, value, zero)
+}
+
 fn emit_tensor_binary_tangent(
     fb: &mut FunctionBuilder<'_>,
     op: BinaryOp,
@@ -6392,15 +6431,19 @@ fn emit_tensor_binary_tangent(
             let rhs_term = fb.ins().fmul(lhs_re, rhs_du);
             fb.ins().fadd(lhs_term, rhs_term)
         }
+        // `rumoca_eval_solve::reverse::division_tangent`: each local partial
+        // when finite, else zero.
         BinaryOp::Div => {
-            let lhs_term = fb.ins().fmul(lhs_du, rhs_re);
-            let rhs_term = fb.ins().fmul(lhs_re, rhs_du);
-            let numerator = fb.ins().fsub(lhs_term, rhs_term);
-            let denominator = fb.ins().fmul(rhs_re, rhs_re);
-            let quotient = fb.ins().fdiv(numerator, denominator);
-            let zero = fb.ins().f64const(0.0);
-            let denominator_zero = fb.ins().fcmp(FloatCC::Equal, rhs_re, zero);
-            fb.ins().select(denominator_zero, zero, quotient)
+            let one = fb.ins().f64const(1.0);
+            let lhs_partial = fb.ins().fdiv(one, rhs_re);
+            let lhs_partial = emit_finite_or_zero(fb, lhs_partial);
+            let negated = fb.ins().fneg(lhs_re);
+            let square = fb.ins().fmul(rhs_re, rhs_re);
+            let rhs_partial = fb.ins().fdiv(negated, square);
+            let rhs_partial = emit_finite_or_zero(fb, rhs_partial);
+            let lhs_term = fb.ins().fmul(lhs_du, lhs_partial);
+            let rhs_term = fb.ins().fmul(rhs_du, rhs_partial);
+            fb.ins().fadd(lhs_term, rhs_term)
         }
         _ => {
             return Err(CompileError::Backend(
@@ -6461,6 +6504,14 @@ fn emit_compare_op(
     }
 }
 
+/// Emit an unrolled dense linear solve: Gaussian elimination with partial
+/// pivoting followed by back substitution.
+///
+/// G. H. Golub and C. F. Van Loan, "Matrix Computations", 4th ed., Johns
+/// Hopkins University Press 2013, sections 3.2 and 3.4. The pivot search and
+/// row interchange are emitted rather than branched on, so the compiled code
+/// takes the same path as the interpreter in
+/// `rumoca_eval_solve::linear_solve` and the two agree bit for bit.
 fn emit_dense_linear_solve(
     fb: &mut FunctionBuilder<'_>,
     matrix: &mut [cranelift_codegen::ir::Value],
@@ -6534,8 +6585,11 @@ fn emit_nonzero_pivot(
     pivot: cranelift_codegen::ir::Value,
 ) -> cranelift_codegen::ir::Value {
     let abs = fb.ins().fabs(pivot);
-    let eps = fb.ins().f64const(f64::EPSILON);
-    let valid = fb.ins().fcmp(FloatCC::GreaterThan, abs, eps);
+    let zero = fb.ins().f64const(0.0);
+    let maximum = fb.ins().f64const(f64::MAX);
+    let nonzero = fb.ins().fcmp(FloatCC::GreaterThan, abs, zero);
+    let finite = fb.ins().fcmp(FloatCC::LessThanOrEqual, abs, maximum);
+    let valid = fb.ins().band(nonzero, finite);
     let nan = fb.ins().f64const(f64::NAN);
     fb.ins().select(valid, pivot, nan)
 }

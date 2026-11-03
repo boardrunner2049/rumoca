@@ -58,13 +58,11 @@ fn event_iteration_contract_fixture() -> SolveProblem {
             ..SolveLayout::default()
         },
         discrete: DiscreteSolveSystem {
-            event_iteration_plan: EventIterationPlan {
-                runs: vec![EventIterationRun {
-                    variable: 0,
-                    pre_binding_start: 0,
-                    owner: EventIterationOwner::ScalarRows { start_row: 0 },
-                }],
-            },
+            event_iteration_plan: EventIterationPlan::new(vec![EventIterationRun {
+                variable: 0,
+                pre_binding_start: 0,
+                owner: EventIterationOwner::ScalarRows { start_row: 0 },
+            }]),
             rhs: ScalarProgramBlock::with_source_span(
                 vec![vec![
                     LinearOp::Const { dst: 0, value: 1.0 },
@@ -624,6 +622,7 @@ fn representative_continuous_system() -> ContinuousSolveSystem {
                 rows: vec![0],
                 y_indices: vec![1],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
         residual: ComputeBlock::from_scalar_program_block(
@@ -640,6 +639,8 @@ fn representative_continuous_system() -> ContinuousSolveSystem {
         manifold_projection_plan: AlgebraicProjectionPlan::default(),
         derivative_rhs: representative_derivative_rhs(),
         refresh_owners: ContinuousRefreshOwners::default(),
+        reduced_chart_set: ReducedChartSet::default(),
+        unlocalizable_guards: Vec::new(),
     }
 }
 
@@ -662,9 +663,8 @@ fn representative_derivative_rhs() -> ComputeBlock {
 }
 
 fn representative_initialization_system() -> InitializationSolveSystem {
-    InitializationSolveSystem {
-        row_targets: vec![Some(scalar_slot_y(1))],
-        row_roles: vec![InitializationRowRole::Solved],
+    InitializationSolveSystem::construct(crate::InitializationSystemInput {
+        row_roles: vec![InitializationRowRole::SurplusCheck],
         residual: ComputeBlock::from_scalar_program_block(
             ScalarProgramBlock::with_source_span(
                 vec![vec![
@@ -675,11 +675,13 @@ fn representative_initialization_system() -> InitializationSolveSystem {
             )
             .expect("initial scalar fixture is computable"),
         ),
-        projection_unknowns: Vec::new(),
         projection_plan: InitializationProjectionPlan::default(),
         update_rhs: ScalarProgramBlock::default(),
         update_targets: Vec::new(),
-    }
+        manifold_row_count: 0,
+        given_state_indices: Vec::new(),
+    })
+    .expect("initialization fixture has one checked owner per coordinate")
 }
 
 fn representative_discrete_system() -> DiscreteSolveSystem {
@@ -1031,16 +1033,14 @@ fn solve_model_wire_rejects_a_forged_event_transaction_call_owner() {
         observation_refresh: vec![false; 2],
         integrator_history_effects: vec![IntegratorHistoryEffect::Preserve; 2],
         clock_owners: vec![None; 2],
-        event_iteration_plan: EventIterationPlan {
-            runs: vec![EventIterationRun {
-                variable: 0,
-                pre_binding_start: 0,
-                owner: EventIterationOwner::EventTransaction {
-                    program_index: 0,
-                    target_index: 0,
-                },
-            }],
-        },
+        event_iteration_plan: EventIterationPlan::new(vec![EventIterationRun {
+            variable: 0,
+            pre_binding_start: 0,
+            owner: EventIterationOwner::EventTransaction {
+                program_index: 0,
+                target_index: 0,
+            },
+        }]),
         event_transactions: vec![transaction.clone()],
         ..DiscreteSolveSystem::default()
     };
@@ -1649,6 +1649,114 @@ fn representative_solve_problem_bincode_roundtrip_preserves_schema_shape() {
 }
 
 #[test]
+fn reduced_chart_set_is_omitted_when_empty_and_round_trips_when_present() {
+    // Empty: dropped from human-readable JSON so a model without a folding
+    // first-integral group keeps byte-identical IR, yet retained by bincode so the
+    // positional layout still round-trips.
+    let empty = representative_continuous_system();
+    let json = serde_json::to_string(&empty).expect("serialize empty continuous system");
+    assert!(!json.contains("reduced_chart_set"));
+    let bytes = bincode::serialize(&empty).expect("serialize empty as bincode");
+    let decoded: ContinuousSolveSystem =
+        bincode::deserialize(&bytes).expect("deserialize empty from bincode");
+    assert!(decoded.reduced_chart_set.charts.is_empty());
+
+    // Present: a two-chart set (a primary and its mirror) is written to JSON and
+    // round-tripped by both formats without loss. The primary chart (index zero)
+    // carries no executable plan; the alternate carries one.
+    let mut present = representative_continuous_system();
+    present.reduced_chart_set = ReducedChartSet {
+        charts: vec![
+            ReducedChart {
+                independent_y_indices: vec![3],
+                dependent_y_indices: vec![2],
+                trial_rcond: 1.0,
+                trial_singular_threshold: 4.440892098500626e-16,
+                plan: None,
+            },
+            ReducedChart {
+                independent_y_indices: vec![2],
+                dependent_y_indices: vec![3],
+                trial_rcond: 0.0,
+                trial_singular_threshold: 4.440892098500626e-16,
+                plan: Some(ReducedChartPlan::default()),
+            },
+        ],
+        exchanges: Vec::new(),
+    };
+    let json = serde_json::to_string(&present).expect("serialize present continuous system");
+    assert!(json.contains("reduced_chart_set"));
+    // A mirror set carries no exchange coverage, so the record stays out of JSON.
+    assert!(!json.contains("exchanges"));
+    // A partition-only chart omits its plan from JSON; an alternate keeps it, so a
+    // model that predates the field stays byte-identical while the alternate gains
+    // exactly one executable kernel.
+    let primary_only =
+        serde_json::to_string(&present.reduced_chart_set.charts[0]).expect("serialize primary");
+    assert!(!primary_only.contains("plan"));
+    let alternate_only =
+        serde_json::to_string(&present.reduced_chart_set.charts[1]).expect("serialize alternate");
+    assert!(alternate_only.contains("\"plan\""));
+
+    // Both formats round-trip the present set without loss: re-serializing the
+    // decoded system reproduces the original bytes exactly.
+    let from_json: ContinuousSolveSystem =
+        serde_json::from_str(&json).expect("deserialize present from json");
+    assert_eq!(
+        serde_json::to_string(&from_json).expect("re-serialize present from json"),
+        json
+    );
+    let bytes = bincode::serialize(&present).expect("serialize present as bincode");
+    let from_bincode: ContinuousSolveSystem =
+        bincode::deserialize(&bytes).expect("deserialize present from bincode");
+    assert_eq!(
+        bincode::serialize(&from_bincode).expect("re-serialize present from bincode"),
+        bytes
+    );
+
+    // An exchange coverage record is written and round-trips through both formats.
+    present.reduced_chart_set.exchanges = vec![
+        ChartExchange {
+            dependent: ChartCoordinate {
+                variable: "x".to_string(),
+                scalar: 0,
+            },
+            incoming: ChartCoordinate {
+                variable: "y".to_string(),
+                scalar: 0,
+            },
+            status: ChartExchangeStatus::Issued { chart: 1 },
+        },
+        ChartExchange {
+            dependent: ChartCoordinate {
+                variable: "x".to_string(),
+                scalar: 0,
+            },
+            incoming: ChartCoordinate {
+                variable: "z".to_string(),
+                scalar: 0,
+            },
+            status: ChartExchangeStatus::WithheldByCap,
+        },
+    ];
+    let json = serde_json::to_string(&present).expect("serialize exchange coverage");
+    assert!(json.contains("\"exchanges\""));
+    let from_json: ContinuousSolveSystem =
+        serde_json::from_str(&json).expect("deserialize exchange coverage from json");
+    assert_eq!(
+        from_json.reduced_chart_set.exchanges,
+        present.reduced_chart_set.exchanges
+    );
+    let bytes = bincode::serialize(&present).expect("serialize exchange coverage as bincode");
+    let from_bincode: ContinuousSolveSystem =
+        bincode::deserialize(&bytes).expect("deserialize exchange coverage from bincode");
+    assert_eq!(
+        from_bincode.reduced_chart_set.exchanges,
+        present.reduced_chart_set.exchanges
+    );
+}
+
+#[test]
 fn solve_problem_shape_contract_rejects_bad_schema_version() {
     let mut problem = representative_solve_problem_fixture();
     problem.schema_version = SOLVE_SCHEMA_VERSION + 1;
@@ -1845,17 +1953,17 @@ fn solve_problem_shape_contract_rejects_a_projection_target_mismatch() {
 
 #[test]
 fn solve_problem_shape_contract_rejects_duplicate_initial_projection_unknown() {
-    let mut problem = representative_solve_problem_fixture();
-    problem.initialization.projection_unknowns = vec![scalar_slot_y(1), scalar_slot_y(1)];
-
-    assert_eq!(
-        problem.validate_shape_contract(),
-        Err(SolveProblemShapeContractError::DuplicateProjectionUnknown {
-            context: "initialization.projection_unknowns",
-            unknown: format!("{:?}", scalar_slot_y(1)),
-            span: None,
-        })
-    );
+    let mut input = representative_solve_problem_fixture()
+        .initialization
+        .into_input();
+    input.projection_plan = InitializationProjectionPlan {
+        blocks: vec![InitializationProjectionBlock {
+            rows: vec![0, 0],
+            unknowns: vec![scalar_slot_y(1), scalar_slot_y(1)],
+            scales: vec![InitializationUnknownScale::Solver; 2],
+        }],
+    };
+    assert!(InitializationSolveSystem::construct(input).is_err());
 }
 
 #[test]
@@ -2149,4 +2257,111 @@ fn clock_partition_order_excludes_transaction_owned_producers() {
             .contains("scalar step names a transaction-owned row"),
         "unexpected rejection: {error}"
     );
+}
+
+#[test]
+fn empty_alternate_charts_are_omitted_from_serialization() {
+    let block = AlgebraicProjectionBlock {
+        rows: vec![0, 1],
+        y_indices: vec![0, 1, 2],
+        tearing: Some(BlockTearing {
+            tear_y_indices: vec![0],
+            residual_rows: vec![0],
+            causal_steps: vec![CausalStep {
+                row: 1,
+                y_index: 1,
+                ..Default::default()
+            }],
+        }),
+        alternate_charts: Vec::new(),
+    };
+    let value = serde_json::to_value(&block).expect("block serializes");
+    let map = value.as_object().expect("a block is a JSON object");
+    assert!(
+        !map.contains_key("alternate_charts"),
+        "an empty alternate-chart set must not appear in the serialized block: {value}"
+    );
+    // A block carrying only the pre-existing fields is the byte-identical shape.
+    let legacy = serde_json::json!({
+        "rows": [0, 1],
+        "y_indices": [0, 1, 2],
+        "tearing": {
+            "tear_y_indices": [0],
+            "residual_rows": [0],
+            "causal_steps": [{ "row": 1, "y_index": 1 }],
+        },
+    });
+    assert_eq!(
+        value, legacy,
+        "an empty alternate-chart set changed the serialized block shape"
+    );
+    let restored: AlgebraicProjectionBlock =
+        serde_json::from_value(value).expect("block deserializes");
+    assert_eq!(
+        restored, block,
+        "serialization round-trip must preserve the block"
+    );
+    // A block whose serialization predates the field still deserializes.
+    let restored_legacy: AlgebraicProjectionBlock =
+        serde_json::from_value(legacy).expect("a block without the field deserializes");
+    assert!(
+        restored_legacy.alternate_charts.is_empty(),
+        "a missing alternate-chart set must default to empty"
+    );
+}
+
+#[test]
+fn nonempty_alternate_charts_are_serialized() {
+    let block = AlgebraicProjectionBlock {
+        rows: vec![0],
+        y_indices: vec![0, 1],
+        tearing: Some(BlockTearing {
+            tear_y_indices: vec![0],
+            residual_rows: vec![0],
+            causal_steps: vec![],
+        }),
+        alternate_charts: vec![BlockTearing {
+            tear_y_indices: vec![1],
+            residual_rows: vec![0],
+            causal_steps: vec![],
+        }],
+    };
+    let value = serde_json::to_value(&block).expect("block serializes");
+    assert!(
+        value
+            .as_object()
+            .expect("a block is a JSON object")
+            .contains_key("alternate_charts"),
+        "a non-empty alternate-chart set must be serialized: {value}"
+    );
+    let restored: AlgebraicProjectionBlock =
+        serde_json::from_value(value).expect("block deserializes");
+    assert_eq!(
+        restored, block,
+        "serialization round-trip must preserve the block"
+    );
+}
+
+/// An ES016 fact is omitted from human-readable Solve IR when absent, and
+/// round-trips both ways when present.
+#[test]
+fn unlocalizable_guards_round_trip_and_are_omitted_when_empty() {
+    let empty = representative_continuous_system();
+    let json = serde_json::to_value(&empty).expect("serialize");
+    assert!(json.get("unlocalizable_guards").is_none());
+    let mut guarded = empty;
+    guarded.unlocalizable_guards = vec![UnlocalizableGuard {
+        y_indices: vec![0],
+        relation: "V0*v_in > vps".to_string(),
+        unknown_names: "`v_out`, `v_in`".to_string(),
+    }];
+    let text = serde_json::to_string(&guarded).expect("serialize");
+    let back: ContinuousSolveSystem = serde_json::from_str(&text).expect("deserialize");
+    assert_eq!(back.unlocalizable_guards, guarded.unlocalizable_guards);
+    assert_eq!(
+        UnlocalizableGuard::covering(&back.unlocalizable_guards, 0)
+            .map(|guard| guard.relation.as_str()),
+        Some("V0*v_in > vps")
+    );
+    assert!(UnlocalizableGuard::covering(&back.unlocalizable_guards, 1).is_none());
 }

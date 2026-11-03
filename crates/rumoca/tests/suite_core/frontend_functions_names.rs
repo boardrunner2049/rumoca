@@ -12,16 +12,6 @@ fn compile(source: &str, model: &str) -> rumoca::CompilationResult {
         .unwrap_or_else(|error| panic!("{model} compiles: {error}"))
 }
 
-fn compile_error(source: &str, model: &str) -> String {
-    match Compiler::new()
-        .model(model)
-        .compile_str(source, &format!("{model}.mo"))
-    {
-        Ok(_) => panic!("{model} must be refused"),
-        Err(error) => format!("{error:?}"),
-    }
-}
-
 // TOOLBUG-100: `AssertionLevel.error` inside a function body is the default
 // severity (MLS §8.3.7); it resolved at the model level but not in a function.
 const FUNCTION_ASSERTION_LEVEL: &str = r#"
@@ -74,12 +64,18 @@ fn function_assertion_with_error_level_is_the_default_assertion() {
 }
 
 #[test]
-fn function_assertion_with_warning_level_is_refused_not_promoted() {
-    let error = compile_error(FUNCTION_ASSERTION_WARNING, "FunctionAssertionWarning");
-    assert!(
-        error.contains("non-default assertion level"),
-        "a warning-level function assertion must not lower as an error: {error}"
-    );
+fn function_assertion_with_warning_level_keeps_running() {
+    let compiled = compile(FUNCTION_ASSERTION_WARNING, "FunctionAssertionWarning");
+    let result = simulate_dae_with_diagnostics(
+        &compiled.dae,
+        &SimOptions {
+            t_end: 3.0,
+            ..Default::default()
+        },
+    )
+    .expect("main supports warning-level assertions without turning them into errors");
+    assert!(result.termination.is_none());
+    assert_eq!(result.times.last().copied(), Some(3.0));
 }
 
 // TOOLBUG-101: a call inside an array constructor whose argument reads the

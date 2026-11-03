@@ -57,7 +57,7 @@ fn initial_equations_for(
         let target = rumoca_core::component_ref_to_base_reference(comp);
         let variable = flat.variables.get(target.var_name())?;
         if !matches!(variable.variability, Variability::Parameter(_))
-            || variable.fixed != Some(false)
+            || variable.fixed_uniform() != Some(false)
             || variable.binding.is_some()
             || !variable.dims.is_empty()
         {

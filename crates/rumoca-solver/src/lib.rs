@@ -22,12 +22,21 @@ mod verification;
 #[cfg(not(kani))]
 pub use report_payload::{
     SimulationRequestSummary, SimulationRunMetrics, build_simulation_metrics_value,
-    build_simulation_payload,
+    build_simulation_payload, projection_fallbacks_value,
 };
 #[cfg(not(kani))]
 pub use runtime::eval_at::{EvalAtReport, EvalAtSlot};
 #[cfg(not(kani))]
 pub use runtime::event_newton::{CoupledEventNewtonModel, solve_coupled_event_newton};
+#[cfg(not(kani))]
+pub use runtime::fallbacks::{
+    ProjectionFallback, ProjectionFallbackCounts, ProjectionFallbackReport, ProjectionSite,
+    projection_fallbacks, reset_projection_fallbacks, shared_value_proof_failures,
+};
+#[cfg(not(kani))]
+pub use runtime::hotpath_stats::{
+    HotpathStatsSnapshot, note_integrator, reset as reset_step_counts, snapshot as step_counts,
+};
 #[cfg(not(kani))]
 pub use runtime::jacobian::{
     JacobianReport, ObjectiveGradientReport, ParameterJacobianReport, SteadyStateSensitivityReport,
@@ -68,11 +77,13 @@ pub use runtime::solve_ops::{
 };
 #[cfg(not(kani))]
 pub use runtime::solve_runtime::{
-    AlgebraicLinearization, AlgebraicSettle, CompiledSolveAssignmentSchedule,
-    CompiledSolveEventTransaction, CompiledSolveExpression, CompiledSolveJacobianExpression,
-    EventTransactionExecution, EventUpdateRowFilter, InitialEventObservation,
-    ProjectedEventUpdateInput, ProjectedInitialEventInput, ProjectedInitialEventOutcome,
-    ProjectedPostInitialEventInput, SolveExecutionBackend, SolveRuntime,
+    AlgebraicLinearization, AlgebraicSettle, BlockResidualSplitCounts,
+    CompiledSolveAssignmentSchedule, CompiledSolveEventTransaction, CompiledSolveExpression,
+    CompiledSolveJacobianExpression, CompiledSolveProjectionJacobian, EventTransactionExecution,
+    EventUpdateRowFilter, InitialEventObservation, ProjectedEventUpdateInput,
+    ProjectedInitialEventInput, ProjectedInitialEventOutcome, ProjectedPostInitialEventInput,
+    SolveExecutionBackend, SolveRuntime, block_residual_split_counts,
+    reset_block_residual_split_counts,
 };
 #[cfg(not(kani))]
 pub use runtime::time::{
@@ -86,6 +97,6 @@ pub use runtime::timeout::{
 };
 #[cfg(not(kani))]
 pub use solver::{
-    DiffsolMethod, SimBackend, SimExecutionPolicy, SimOptions, SimPacingMode, SimResult,
-    SimSolverMode, SimTermination, SimVariableMeta,
+    DiffsolMethod, SimBackend, SimDiagnostic, SimExecutionPolicy, SimOptions, SimPacingMode,
+    SimResult, SimSolverMode, SimTermination, SimVariableMeta, WARNING_ASSERTION_CODE,
 };

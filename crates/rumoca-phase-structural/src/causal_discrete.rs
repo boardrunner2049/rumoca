@@ -20,6 +20,7 @@ pub enum CausalDiscreteError {
 pub struct DiscreteRealDefinition<'dae> {
     equation: u32,
     target: dae::DiscreteRealId<'dae>,
+    element: Option<u32>,
     value: dae::ExprId<'dae>,
 }
 
@@ -32,6 +33,13 @@ impl<'dae> DiscreteRealDefinition<'dae> {
     #[must_use]
     pub const fn target(self) -> dae::DiscreteRealId<'dae> {
         self.target
+    }
+
+    /// The row-major scalar element of [`Self::target`] the row defines, or
+    /// `None` when it defines the whole coordinate.
+    #[must_use]
+    pub const fn element(self) -> Option<u32> {
+        self.element
     }
 
     #[must_use]
@@ -78,7 +86,41 @@ impl<'dae> CausalDiscretePlan<'dae> {
     }
 }
 
-type Candidate<'dae> = (dae::DiscreteRealId<'dae>, dae::ExprId<'dae>);
+/// One side of a row a discrete Real coordinate, or one static scalar element
+/// of it, could be defined by.
+#[derive(Clone, Copy)]
+struct Candidate<'dae> {
+    target: dae::DiscreteRealId<'dae>,
+    element: Option<u32>,
+    value: dae::ExprId<'dae>,
+}
+
+/// The coordinate units already defined: whole coordinates and single scalar
+/// elements. A whole definition covers every element, and any element
+/// definition leaves the whole coordinate no longer free.
+#[derive(Default)]
+struct DefinedUnits(BTreeSet<(u32, Option<u32>)>);
+
+impl DefinedUnits {
+    fn insert(&mut self, candidate: &Candidate<'_>) {
+        self.0.insert((candidate.target.index(), candidate.element));
+    }
+
+    fn covers(&self, candidate: &Candidate<'_>) -> bool {
+        let variable = candidate.target.index();
+        match candidate.element {
+            Some(_) => {
+                self.0.contains(&(variable, candidate.element))
+                    || self.0.contains(&(variable, None))
+            }
+            None => self
+                .0
+                .range((variable, None)..=(variable, Some(u32::MAX)))
+                .next()
+                .is_some(),
+        }
+    }
+}
 
 fn orient_discrete_real<'dae>(
     view: dae::DaeView<'dae>,
@@ -102,10 +144,10 @@ fn orient_discrete_real<'dae>(
         }
     }
 
-    let mut defined = BTreeSet::new();
+    let mut defined = DefinedUnits::default();
     for (index, row) in candidates.iter().enumerate() {
         if let [definition] = row.as_slice() {
-            defined.insert(definition.0.index());
+            defined.insert(definition);
             resolved[index] = Some(*definition);
             pending -= 1;
         }
@@ -132,11 +174,12 @@ fn orient_discrete_real<'dae>(
         .into_iter()
         .enumerate()
         .map(|(equation, definition)| {
-            definition.map(|(target, value)| DiscreteRealDefinition {
+            definition.map(|candidate: Candidate<'dae>| DiscreteRealDefinition {
                 equation: u32::try_from(equation)
                     .expect("checked DAE equation capacity is bounded by u32"),
-                target,
-                value,
+                target: candidate.target,
+                element: candidate.element,
+                value: candidate.value,
             })
         })
         .collect())
@@ -145,17 +188,15 @@ fn orient_discrete_real<'dae>(
 fn force_rows<'dae>(
     candidates: &[Vec<Candidate<'dae>>],
     resolved: &mut [Option<Candidate<'dae>>],
-    defined: &mut BTreeSet<u32>,
+    defined: &mut DefinedUnits,
 ) -> usize {
     let mut forced = 0;
     for (index, row) in candidates.iter().enumerate() {
-        let mut open = row
-            .iter()
-            .filter(|(target, _)| !defined.contains(&target.index()));
+        let mut open = row.iter().filter(|candidate| !defined.covers(candidate));
         let (None, Some(definition), None) = (resolved[index], open.next(), open.next()) else {
             continue;
         };
-        defined.insert(definition.0.index());
+        defined.insert(definition);
         resolved[index] = Some(*definition);
         forced += 1;
     }
@@ -275,26 +316,80 @@ fn definition_candidates<'dae>(
     [(lhs, rhs), (rhs, lhs)]
         .into_iter()
         .filter_map(|(side, value)| {
-            compatible_definition(view, whole_discrete_real(view, side)?, value)
+            let (target, element) = discrete_real_side(view, side)?;
+            compatible_definition(view, target, element, value)
         })
         .collect()
 }
 
+/// The value must match the defined unit's shape: the whole coordinate's
+/// dimensions, or a scalar for one element. A value reading the target
+/// coordinate at all is not a definition of it.
 fn compatible_definition<'dae>(
     view: dae::DaeView<'dae>,
     target: dae::DiscreteRealId<'dae>,
+    element: Option<u32>,
     value: dae::ExprId<'dae>,
 ) -> Option<Candidate<'dae>> {
     let variable = view.variable(dae::VariableId::from(target))?;
     let expression = view.expression(value)?;
-    (variable.value_type().dimensions() == expression.value_type().dimensions()
+    let shaped = match element {
+        Some(_) => expression.value_type().is_scalar(),
+        None => variable.value_type().dimensions() == expression.value_type().dimensions(),
+    };
+    (shaped
         && variable.value_type().scalar_type() == dae::ScalarType::Real
         && matches!(
             expression.value_type().scalar_type(),
             dae::ScalarType::Real | dae::ScalarType::Integer
         )
         && !reads_current_target(view, value, target))
-    .then_some((target, value))
+    .then_some(Candidate {
+        target,
+        element,
+        value,
+    })
+}
+
+/// A whole discrete Real coordinate, or one of its scalar elements named by
+/// literal one-based subscripts on every dimension (row-major offset).
+fn discrete_real_side<'dae>(
+    view: dae::DaeView<'dae>,
+    expression: dae::ExprId<'dae>,
+) -> Option<(dae::DiscreteRealId<'dae>, Option<u32>)> {
+    if let Some(variable) = whole_discrete_real(view, expression) {
+        return Some((variable, None));
+    }
+    let dae::ExpressionOperation::Index { base, subscripts } =
+        view.expression(expression)?.operation()
+    else {
+        return None;
+    };
+    let variable = whole_discrete_real(view, base)?;
+    let dimensions = view
+        .variable(dae::VariableId::from(variable))?
+        .value_type()
+        .dimensions();
+    if dimensions.is_empty() || dimensions.len() != subscripts.len() {
+        return None;
+    }
+    let mut element = 0_u32;
+    for (subscript, extent) in subscripts.iter().zip(dimensions) {
+        let dae::SubscriptView::Index { expression, .. } = subscript else {
+            return None;
+        };
+        let dae::ExpressionOperation::Literal(dae::DaeLiteral::Integer(index)) =
+            view.expression(expression)?.operation()
+        else {
+            return None;
+        };
+        let coordinate = u32::try_from(*index).ok()?.checked_sub(1)?;
+        if coordinate >= *extent {
+            return None;
+        }
+        element = element.checked_mul(*extent)?.checked_add(coordinate)?;
+    }
+    Some((variable, Some(element)))
 }
 
 fn reads_current_target<'dae>(

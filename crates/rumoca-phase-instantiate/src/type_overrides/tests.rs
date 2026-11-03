@@ -1212,8 +1212,13 @@ end Env;
         span: rumoca_core::Span::DUMMY,
         qualified_display_name: None,
     };
-    let identities =
-        super::selected_class_members::resolve_member_reference_in_class(&tree, env, &reference, 1)
-            .expect("undeclared expandable member is accepted");
+    let identities = super::selected_class_members::resolve_member_reference_in_class(
+        &tree,
+        env,
+        &reference,
+        1,
+        &mut |_| Ok(None),
+    )
+    .expect("undeclared expandable member is accepted");
     assert_eq!(identities.len(), 1, "only `bus` has a declaration");
 }

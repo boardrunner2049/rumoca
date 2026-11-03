@@ -25,8 +25,7 @@
 //! derivative questions. Every reader picks the layer its claim needs, so an
 //! offset can never leak into a substitution that names a value.
 
-use rumoca_core::StateSelect;
-use rumoca_eval_dae::NumericEvaluator;
+use rumoca_eval_dae::{FunctionCallContext, NumericEvaluator};
 use rumoca_ir_dae as dae;
 
 /// The class member whose time derivative is known.
@@ -37,7 +36,14 @@ pub(super) enum EqualityAnchor {
     /// equals when the pinning residual states that value directly, and is
     /// `None` when the residual only proves the class constant. `ordinal` is
     /// the pinning residual, which keeps anchor selection deterministic.
-    Invariant { value: Option<u32>, ordinal: u32 },
+    /// `zero` records a residual that is the lone signed member itself
+    /// (`x = 0` as an unconnected flow states it): the class is pinned to zero
+    /// although no expression names that value.
+    Invariant {
+        value: Option<u32>,
+        zero: bool,
+        ordinal: u32,
+    },
     /// The state the class keeps; every other state in the class is redundant.
     State(u32),
 }
@@ -48,6 +54,14 @@ pub(super) enum EqualityAnchor {
 pub(super) enum EqualitySign {
     Same,
     Opposite,
+}
+
+/// Equality layer consumed by a captured derivative reconstruction proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(super) enum DerivativeAnchors {
+    #[default]
+    Affine,
+    Exact,
 }
 
 /// One exact scalar projection of a Real variable whose whole payload has one
@@ -228,8 +242,8 @@ pub(super) struct SystemEqualities {
     affine: SignedClasses,
     /// Whether each variable ordinal is declared a continuous state.
     state: Vec<bool>,
-    /// Lowest whole-model coordinate expression ordinal naming each variable.
-    coordinate: Vec<Option<u32>>,
+    /// Whole-model coordinate views naming each state payload.
+    coordinate: Vec<StateCoordinates>,
     /// One asserted equality incident to each variable, for candidate owners.
     witness: Vec<Option<dae::DaeProvenance>>,
 }
@@ -331,31 +345,74 @@ impl SystemEqualities {
     /// The class member whose derivative is known, and how `variable` signs
     /// against it, if the system proves the class has such a member.
     ///
-    /// The offset-free class is reported whenever it has an anchor, and the
-    /// displaced class otherwise. Both prove the same derivative, so preferring
-    /// the offset-free one keeps a derivative claim on the same witness a value
-    /// claim about the variable would use.
+    /// The affine class includes every offset-free edge and also reaches
+    /// independent state derivatives across constant displacements. A narrower
+    /// value anchor must not hide that derivative relation.
     pub(super) fn anchor_of(&self, variable: u32) -> Option<(EqualityAnchor, EqualitySign)> {
+        self.affine.anchor_of(variable)
+    }
+
+    pub(super) fn derivative_anchor(
+        &self,
+        variable: u32,
+        anchors: DerivativeAnchors,
+    ) -> Option<(EqualityAnchor, EqualitySign)> {
+        match anchors {
+            DerivativeAnchors::Affine => self.anchor_of(variable),
+            DerivativeAnchors::Exact => self.value_anchor_of(variable),
+        }
+    }
+
+    /// Differentiate a demotion's definition through an independent state.
+    /// Prefer its exact class; a displaced class may supply the derivative
+    /// when the exact anchor is the very state being demoted.
+    pub(super) fn anchor_for_demotion(
+        &self,
+        variable: u32,
+        demoted: u32,
+    ) -> Option<(EqualityAnchor, EqualitySign)> {
+        let independent = |(anchor, _): &(EqualityAnchor, EqualitySign)| {
+            *anchor != EqualityAnchor::State(demoted)
+        };
         self.exact
             .anchor_of(variable)
-            .or_else(|| self.affine.anchor_of(variable))
+            .filter(independent)
+            .or_else(|| self.affine.anchor_of(variable).filter(independent))
     }
 
     /// The class anchor of `variable` on the offset-free layer only.
     ///
-    /// [`Self::anchor_of`] answers derivative questions and may fall back on the
-    /// displaced layer, where members share a derivative but not a value. A
-    /// caller reasoning about a *value* — an initial condition, say — must not
-    /// see that fallback, so it reads this instead.
+    /// [`Self::anchor_of`] answers derivative questions on the displaced layer,
+    /// where members share a derivative but not necessarily a value. A caller
+    /// reasoning about a *value* — an initial condition, say — reads this instead.
     pub(super) fn value_anchor_of(&self, variable: u32) -> Option<(EqualityAnchor, EqualitySign)> {
         self.exact.value_anchor_of(variable)
     }
 
     /// The source expression a demotion onto `anchor` differentiates.
-    pub(super) fn anchor_expression(&self, anchor: EqualityAnchor) -> Option<u32> {
+    pub(super) fn anchor_expression(
+        &self,
+        view: dae::DaeView<'_>,
+        anchor: EqualityAnchor,
+        expected: &dae::ValueType,
+    ) -> Option<u32> {
         match anchor {
             EqualityAnchor::Invariant { value, .. } => value,
-            EqualityAnchor::State(state) => self.coordinate[state as usize],
+            EqualityAnchor::State(state) => {
+                self.coordinate[state as usize].matching(view, expected)
+            }
+        }
+    }
+
+    /// Source payload for a consumer that reconstructs the receiving shape
+    /// with `shape_equality_anchor`; singleton equality can cross ranks.
+    pub(super) fn payload_anchor_expression(&self, anchor: EqualityAnchor) -> Option<u32> {
+        match anchor {
+            EqualityAnchor::Invariant { value, .. } => value,
+            EqualityAnchor::State(state) => {
+                let coordinate = self.coordinate[state as usize];
+                coordinate.whole.or(coordinate.scalar)
+            }
         }
     }
 
@@ -392,7 +449,7 @@ impl SystemEqualities {
             let index = id.index();
             if variable.role() != dae::VariableRole::State
                 || !is_real_payload(variable)
-                || self.coordinate[index as usize].is_none()
+                || self.coordinate[index as usize].is_empty()
             {
                 continue;
             }
@@ -410,14 +467,13 @@ impl SystemEqualities {
     /// Close connector balances after construction-proved invariant operands
     /// have become available.
     ///
-    /// A balance with exactly two non-invariant algebraic coordinates proves
+    /// A balance with exactly two non-invariant continuous coordinates proves
     /// those two coordinates share a derivative up to sign: every eliminated
     /// coordinate and explicit invariant term has derivative zero. It proves
     /// their values equal only when every eliminated offset is an exact literal
-    /// zero. Limiting the derived edge to algebraics keeps this connector
-    /// closure from selecting or demoting a state through a multi-coordinate
-    /// component equation. Each accepted edge is retained in the union-find
-    /// relation; no source owner is removed or rewritten here.
+    /// zero. The relation changes neither variable roles nor source equations;
+    /// state selection and stated-initial-value preservation remain downstream.
+    /// Each accepted edge is retained in the union-find relation.
     fn close_invariant_balances(
         &mut self,
         view: dae::DaeView<'_>,
@@ -474,7 +530,9 @@ fn anchor_rank(view: dae::DaeView<'_>, anchor: EqualityAnchor) -> (u8, u8, u8) {
     match anchor {
         // A time-invariant pin proves the whole class constant, which is
         // strictly more information than any state selection.
-        EqualityAnchor::Invariant { value, .. } => (u8::MAX, u8::from(value.is_some()), u8::MAX),
+        EqualityAnchor::Invariant { value, zero, .. } => {
+            (u8::MAX, u8::from(value.is_some() || zero), u8::MAX)
+        }
         EqualityAnchor::State(variable) => {
             let Some(variable) = view
                 .variable_id(variable as usize)
@@ -482,15 +540,8 @@ fn anchor_rank(view: dae::DaeView<'_>, anchor: EqualityAnchor) -> (u8, u8, u8) {
             else {
                 return (0, 0, 0);
             };
-            let selection = match variable.state_select() {
-                StateSelect::Never => 0,
-                StateSelect::Avoid => 1,
-                StateSelect::Default => 2,
-                StateSelect::Prefer => 3,
-                StateSelect::Always => 4,
-            };
-            // Reconstruction demotes only scalar state declarations. When a
-            // scalar and an exact singleton projection have the same explicit
+            let selection = variable.state_select().rank();
+            // When a scalar and an exact singleton projection have the same explicit
             // state preference and initial-value strength, keep the singleton
             // aggregate and demote the scalar member. This is a construction
             // capability tie-break, never a name or equation-order heuristic.
@@ -499,7 +550,7 @@ fn anchor_rank(view: dae::DaeView<'_>, anchor: EqualityAnchor) -> (u8, u8, u8) {
             );
             (
                 selection,
-                u8::from(variable.fixed() == Some(true)),
+                u8::from(variable.fixed_any_true()),
                 singleton_aggregate,
             )
         }
@@ -615,6 +666,7 @@ impl AdditiveOperands {
                 variable,
                 anchor: EqualityAnchor::Invariant {
                     value: self.pinned_value(negated),
+                    zero: self.invariants.is_empty(),
                     ordinal: residual,
                 },
             }),
@@ -648,30 +700,35 @@ impl AdditiveOperands {
         let [(left, left_negated), (right, right_negated)] = *remaining.as_slice() else {
             return None;
         };
-        (left != right && is_algebraic_variable(view, left) && is_algebraic_variable(view, right))
-            .then_some(InferredEqualityEdge {
-                left,
-                right,
-                opposite: left_negated == right_negated,
-                displaced: !offset_free,
-            })
+        (left != right
+            && is_state_or_algebraic_variable(view, left)
+            && is_state_or_algebraic_variable(view, right))
+        .then_some(InferredEqualityEdge {
+            left,
+            right,
+            opposite: left_negated == right_negated,
+            displaced: !offset_free,
+        })
     }
 }
 
-fn is_algebraic_variable(view: dae::DaeView<'_>, variable: u32) -> bool {
+fn is_state_or_algebraic_variable(view: dae::DaeView<'_>, variable: u32) -> bool {
     view.variable_id(variable as usize)
         .and_then(|variable| view.variable(variable))
-        .is_some_and(|variable| variable.role() == dae::VariableRole::Algebraic)
+        .is_some_and(|variable| {
+            matches!(
+                variable.role(),
+                dae::VariableRole::State | dae::VariableRole::Algebraic
+            )
+        })
 }
 
 fn invariant_anchor_is_zero(view: dae::DaeView<'_>, anchor: EqualityAnchor) -> bool {
-    let EqualityAnchor::Invariant {
-        value: Some(value), ..
-    } = anchor
-    else {
+    let EqualityAnchor::Invariant { value, zero, .. } = anchor else {
         return false;
     };
-    view.expression_id(value as usize)
+    zero || value
+        .and_then(|value| view.expression_id(value as usize))
         .is_some_and(|value| is_zero_literal(view, value))
 }
 
@@ -683,7 +740,7 @@ fn invariant_anchor_is_zero(view: dae::DaeView<'_>, anchor: EqualityAnchor) -> b
 /// body writes `flange_a.s = s - L/2`. A residual that reaches a leaf which is
 /// neither a shape-compatible Real coordinate nor a time-invariant expression proves
 /// nothing this closure may use, and is dropped whole.
-fn additive_operands<'dae>(
+pub(super) fn additive_operands<'dae>(
     view: dae::DaeView<'dae>,
     residual: dae::ExprId<'dae>,
 ) -> Option<AdditiveOperands> {
@@ -709,6 +766,17 @@ pub(super) fn flatten_additive<'dae>(
     negated: bool,
     operands: &mut AdditiveOperands,
 ) -> bool {
+    flatten_additive_with_projection(view, expression, negated, operands, &|_| None)
+}
+
+/// Read the same additive grammar with additional source-proved component identities.
+pub(super) fn flatten_additive_with_projection<'dae>(
+    view: dae::DaeView<'dae>,
+    expression: dae::ExprId<'dae>,
+    negated: bool,
+    operands: &mut AdditiveOperands,
+    projection: &impl Fn(dae::ExprId<'dae>) -> Option<u32>,
+) -> bool {
     let Some(node) = whole_model_expression(view, expression) else {
         return false;
     };
@@ -716,26 +784,26 @@ pub(super) fn flatten_additive<'dae>(
         dae::ExpressionOperation::Unary {
             operator: dae::UnaryOperator::Plus,
             operand,
-        } => flatten_additive(view, operand, negated, operands),
+        } => flatten_additive_with_projection(view, operand, negated, operands, projection),
         dae::ExpressionOperation::Unary {
             operator: dae::UnaryOperator::Negate,
             operand,
-        } => flatten_additive(view, operand, !negated, operands),
+        } => flatten_additive_with_projection(view, operand, !negated, operands, projection),
         dae::ExpressionOperation::Binary {
             operator: dae::BinaryOperator::Add,
             lhs,
             rhs,
         } => {
-            flatten_additive(view, lhs, negated, operands)
-                && flatten_additive(view, rhs, negated, operands)
+            flatten_additive_with_projection(view, lhs, negated, operands, projection)
+                && flatten_additive_with_projection(view, rhs, negated, operands, projection)
         }
         dae::ExpressionOperation::Binary {
             operator: dae::BinaryOperator::Subtract,
             lhs,
             rhs,
         } => {
-            flatten_additive(view, lhs, negated, operands)
-                && flatten_additive(view, rhs, !negated, operands)
+            flatten_additive_with_projection(view, lhs, negated, operands, projection)
+                && flatten_additive_with_projection(view, rhs, !negated, operands, projection)
         }
         dae::ExpressionOperation::Coordinate(dae::CoordinateView::State(state)) => {
             push_variable(view, state.index(), negated, operands)
@@ -744,17 +812,27 @@ pub(super) fn flatten_additive<'dae>(
             push_variable(view, algebraic.index(), negated, operands)
         }
         dae::ExpressionOperation::Index { .. } => {
-            let variable = match singleton_real_projection(view, expression) {
-                Some(
-                    SingletonRealProjection::State(variable)
-                    | SingletonRealProjection::Algebraic(variable),
-                ) => variable,
-                _ => return false,
+            let variable = projection(expression).or_else(|| {
+                match singleton_real_projection(view, expression) {
+                    Some(
+                        SingletonRealProjection::State(variable)
+                        | SingletonRealProjection::Algebraic(variable),
+                    ) => Some(variable),
+                    _ => None,
+                }
+            });
+            let Some(variable) = variable else {
+                return false;
             };
             operands.variables.push((variable, negated));
             true
         }
         _ => {
+            if let Some(argument) = forwarded_call_argument(view, expression) {
+                return flatten_additive_with_projection(
+                    view, argument, negated, operands, projection,
+                );
+            }
             if !is_time_invariant(view, expression) {
                 return false;
             }
@@ -835,158 +913,6 @@ pub(super) fn is_time_invariant<'dae>(
     }
 }
 
-/// The caller argument returned by a one-statement Modelica function.
-///
-/// This is a semantic proof, not name-based inlining: the sole statement must
-/// assign the selected result directly from one of that function's parameters.
-/// Such a call is exactly the argument at every instant and may participate in
-/// the same equality and differentiation reasoning as that argument.
-#[derive(Clone, Copy)]
-struct FunctionCallFrame<'dae> {
-    function: dae::FunctionId<'dae>,
-    arguments: dae::ExpressionOperands<'dae>,
-}
-
-/// One exact instantiation context for expressions read from checked Modelica
-/// function bodies.
-///
-/// A function-body expression is not a whole-model value until each of its
-/// parameter coordinates has been substituted by the corresponding caller
-/// argument. Keeping that environment explicit lets structural proofs inspect
-/// a body without cloning it into the source DAE or confusing two call sites.
-#[derive(Clone, Default)]
-pub(super) struct FunctionCallContext<'dae> {
-    frames: Vec<FunctionCallFrame<'dae>>,
-}
-
-impl<'dae> FunctionCallContext<'dae> {
-    pub(super) fn is_empty(&self) -> bool {
-        self.frames.is_empty()
-    }
-
-    /// Restrict substitutions to the lexical owner of one checked expression.
-    ///
-    /// Following a parameter argument or a model-level causal definition can
-    /// leave the current callee. Keeping deeper frames active there would let
-    /// an unrelated call site capture record projections or nested calls.
-    pub(super) fn scoped_to_expression(
-        &self,
-        view: dae::DaeView<'dae>,
-        expression: dae::ExprId<'dae>,
-    ) -> Self {
-        let Some(owner) = view
-            .expression(expression)
-            .and_then(|node| node.function_scope())
-        else {
-            return Self::default();
-        };
-        let Some(frame) = self
-            .frames
-            .iter()
-            .rposition(|frame| frame.function == owner)
-        else {
-            return Self::default();
-        };
-        Self {
-            frames: self.frames[..=frame].to_vec(),
-        }
-    }
-
-    pub(super) fn parameter_argument(
-        &self,
-        parameter: dae::FunctionParameterId<'dae>,
-    ) -> Option<dae::ExprId<'dae>> {
-        self.frames
-            .iter()
-            .rev()
-            .find(|frame| frame.function == parameter.function())
-            .and_then(|frame| frame.arguments.get(parameter.ordinal() as usize))
-    }
-
-    /// Enter the selected result of a call only when its checked Modelica body
-    /// is one straight-line assignment to that result.
-    pub(super) fn call_result(
-        &self,
-        view: dae::DaeView<'dae>,
-        expression: dae::ExprId<'dae>,
-    ) -> Option<(dae::ExprId<'dae>, Self)> {
-        let node = view.expression(expression)?;
-        let dae::ExpressionOperation::Call {
-            function,
-            output,
-            arguments,
-            ..
-        } = node.operation()
-        else {
-            return None;
-        };
-        if self.frames.iter().any(|frame| frame.function == function) {
-            return None;
-        }
-        let result = single_assignment_result(view, function, output)?;
-        let mut nested = self.clone();
-        nested.frames.push(FunctionCallFrame {
-            function,
-            arguments,
-        });
-        Some((result, nested))
-    }
-
-    /// Resolve a field projection through records, caller arguments, and
-    /// straight-line function results until it names an existing expression.
-    pub(super) fn projected_field(
-        &self,
-        view: dae::DaeView<'dae>,
-        mut base: dae::ExprId<'dae>,
-        field: u32,
-    ) -> Option<(dae::ExprId<'dae>, Self)> {
-        let mut context = self.clone();
-        loop {
-            let node = view.expression(base)?;
-            match node.operation() {
-                dae::ExpressionOperation::Coordinate(dae::CoordinateView::FunctionParameter(
-                    parameter,
-                )) => base = context.parameter_argument(parameter)?,
-                dae::ExpressionOperation::Record(fields) => {
-                    return Some((fields.get(field as usize)?, context));
-                }
-                dae::ExpressionOperation::Call { .. } => {
-                    (base, context) = context.call_result(view, base)?;
-                }
-                _ => return None,
-            }
-        }
-    }
-}
-
-fn single_assignment_result<'dae>(
-    view: dae::DaeView<'dae>,
-    function: dae::FunctionId<'dae>,
-    output: u32,
-) -> Option<dae::ExprId<'dae>> {
-    let function = view.function(function)?;
-    if function.is_external() {
-        return None;
-    }
-    let result = function.result_values().get(output as usize)?;
-    // A body of assignments and assignment groups (an `if` statement's merged
-    // definitions) defines each output as one expression DAG over the
-    // parameters and earlier definitions (`FunctionValue`), which is exactly
-    // the call's value. Loops (folds) are not straight-line; assertions do not
-    // contribute to the value.
-    function
-        .statements()
-        .all(|statement| {
-            matches!(
-                statement,
-                dae::FunctionStatementView::Assignment { .. }
-                    | dae::FunctionStatementView::AssignmentGroup { .. }
-                    | dae::FunctionStatementView::Assertion { .. }
-            )
-        })
-        .then(|| result.rhs())
-}
-
 pub(super) fn forwarded_call_argument<'dae>(
     view: dae::DaeView<'dae>,
     expression: dae::ExprId<'dae>,
@@ -1006,7 +932,10 @@ pub(super) fn forwarded_call_argument<'dae>(
         .or_else(|| arguments.get(parameter.ordinal() as usize))
 }
 
-fn is_zero_literal<'dae>(view: dae::DaeView<'dae>, expression: dae::ExprId<'dae>) -> bool {
+pub(super) fn is_zero_literal<'dae>(
+    view: dae::DaeView<'dae>,
+    expression: dae::ExprId<'dae>,
+) -> bool {
     view.expression(expression).is_some_and(|expression| {
         matches!(
             expression.operation(),
@@ -1074,11 +1003,7 @@ pub(super) fn singleton_real_projection<'dae>(
     let dae::ExpressionOperation::Index { base, subscripts } = node.operation() else {
         return None;
     };
-    if subscripts.is_empty()
-        || !subscripts
-            .iter()
-            .all(|subscript| is_static_one_subscript(view, subscript))
-    {
+    if subscripts.is_empty() {
         return None;
     }
     let coordinate = match whole_model_expression(view, base)?.operation() {
@@ -1101,10 +1026,16 @@ pub(super) fn singleton_real_projection<'dae>(
         _ => return None,
     };
     let declaration = view.variable(view.variable_id(variable as usize)?)?;
-    (!declaration.value_type().is_scalar()
-        && is_single_scalar_real_payload(declaration)
-        && subscripts.len() == declaration.value_type().dimensions().len())
-    .then_some(projection)
+    if declaration.value_type().is_scalar()
+        || !is_single_scalar_real_payload(declaration)
+        || subscripts.len() != declaration.value_type().dimensions().len()
+    {
+        return None;
+    }
+    subscripts
+        .iter()
+        .all(|subscript| is_static_one_subscript(view, subscript))
+        .then_some(projection)
 }
 
 fn is_static_one_subscript<'dae>(
@@ -1121,6 +1052,9 @@ fn is_static_one_subscript<'dae>(
     {
         return false;
     }
+    if let dae::ExpressionOperation::Literal(dae::DaeLiteral::Integer(value)) = node.operation() {
+        return *value == 1;
+    }
     NumericEvaluator::new(view)
         .expression(expression)
         .is_ok_and(|value| value.as_slice() == [1.0])
@@ -1131,8 +1065,31 @@ fn is_static_one_subscript<'dae>(
 /// A demotion hands one of these ordinals to reconstruction as the definition
 /// it differentiates, so a scoped expression must never be indexed here: its
 /// identity is only meaningful inside its function or comprehension.
-fn coordinate_expressions(view: dae::DaeView<'_>) -> Vec<Option<u32>> {
-    let mut coordinates = vec![None; view.variable_count()];
+#[derive(Clone, Copy, Default)]
+struct StateCoordinates {
+    whole: Option<u32>,
+    scalar: Option<u32>,
+}
+
+impl StateCoordinates {
+    fn is_empty(self) -> bool {
+        self.whole.is_none() && self.scalar.is_none()
+    }
+
+    fn matching(self, view: dae::DaeView<'_>, expected: &dae::ValueType) -> Option<u32> {
+        [self.whole, self.scalar]
+            .into_iter()
+            .flatten()
+            .find(|&index| {
+                view.expression_id(index as usize)
+                    .and_then(|id| view.expression(id))
+                    .is_some_and(|expression| expression.value_type() == expected)
+            })
+    }
+}
+
+fn coordinate_expressions(view: dae::DaeView<'_>) -> Vec<StateCoordinates> {
+    let mut coordinates = vec![StateCoordinates::default(); view.variable_count()];
     for index in 0..view.expression_count() {
         let Some(expression_id) = view.expression_id(index) else {
             continue;
@@ -1148,18 +1105,19 @@ fn coordinate_expressions(view: dae::DaeView<'_>) -> Vec<Option<u32>> {
                 let Some(variable) = view.variable(variable_id) else {
                     continue;
                 };
-                if is_real_payload(variable)
-                    && (variable.value_type().is_scalar()
-                        || variable.value_type().scalar_count() != Some(1))
-                {
-                    coordinates[state.index() as usize].get_or_insert(index as u32);
+                if is_real_payload(variable) {
+                    coordinates[state.index() as usize]
+                        .whole
+                        .get_or_insert(index as u32);
                 }
             }
             dae::ExpressionOperation::Index { .. } => {
                 if let Some(SingletonRealProjection::State(state)) =
                     singleton_real_projection(view, expression_id)
                 {
-                    coordinates[state as usize].get_or_insert(index as u32);
+                    coordinates[state as usize]
+                        .scalar
+                        .get_or_insert(index as u32);
                 }
             }
             _ => {}

@@ -48,9 +48,17 @@ pub(super) fn lower_discrete_and_events<'dae>(
     ),
     LowerError,
 > {
-    let mut discrete = DiscreteRows::new(view);
+    let mut discrete = DiscreteRows::new(view)?;
     lower_discrete_real_equations(view, layout, clocks, &mut discrete)?;
     lower_discrete_value_owners(view, layout, clocks, &mut discrete)?;
+    let mut event_clock_targets = std::mem::take(&mut discrete.event_clock_targets);
+    lower_guarded_targets(
+        view,
+        layout,
+        &mut discrete,
+        &mut event_clock_targets,
+        solve::DiscreteRowRole::Equation,
+    )?;
     let mut event_actions = Vec::new();
     let mut action_conditions = ScalarRows::default();
     lower_event_actions(
@@ -62,7 +70,7 @@ pub(super) fn lower_discrete_and_events<'dae>(
         &mut action_conditions,
     )?;
     lower_condition_memory(view, layout, clocks, &mut discrete)?;
-    let roots = lower_roots(view, layout, clocks, &discrete.relation_memory_owners)?;
+    let roots = lower_roots(view, layout, clocks)?;
     let (scheduled_time_events, dynamic_time_event_rhs) = lower_time_events(view, layout)?;
     let delays = lower_delays(view, layout)?;
     let mut event_transactions =
@@ -187,7 +195,7 @@ fn build_event_iteration_plan<'dae>(
         });
     }
     runs.sort_by_key(|run| run.pre_binding_start);
-    Ok(solve::EventIterationPlan { runs })
+    Ok(solve::EventIterationPlan::new(runs))
 }
 
 fn lower_delays<'dae>(
@@ -266,11 +274,13 @@ struct DiscreteRows<'dae> {
     structured_updates: Vec<solve::StructuredDiscreteUpdate>,
     guarded_assignments: Vec<PendingGuardedAssignment>,
     structured_output_cursor: usize,
-    relation_memory_owners: RelationMemoryOwners<'dae>,
     event_iteration_owners: Vec<Option<EventIterationOwnerClaim>>,
     /// Exact same-tick definitions (SOLVE-C57), derived once per DAE. Program
     /// granularity consults it while lowering, and the issued order replays it.
     same_tick_definitions: rumoca_phase_structural::SameTickDefinitions<'dae>,
+    /// The guarded targets of every MLS §16.3 event clock, lowered together
+    /// so the same-tick order spans all of an event partition's owners.
+    event_clock_targets: Vec<GuardedTarget<'dae>>,
     /// Clock-owned producers pending SOLVE-C57 same-tick order issuance.
     clocked_producers: Vec<PendingClockedProducer<'dae>>,
     /// The issued clock-partition schedule (SOLVE-C57), filled by
@@ -279,6 +289,9 @@ struct DiscreteRows<'dae> {
     clock_partition_intermediates: ScalarRows,
     clock_partition_intermediate_targets: Vec<solve::ScalarSlot>,
     clock_partition_intermediate_clocks: Vec<Vec<solve::PeriodicClockId>>,
+    /// Rows of observed B.1c owners (SPEC_0022 EXPR-012): unread
+    /// observations refreshed at every output point.
+    observed_rows: Vec<usize>,
 }
 
 struct PendingGuardedAssignment {
@@ -288,6 +301,47 @@ struct PendingGuardedAssignment {
     role: solve::DiscreteRowRole,
     pre_mode: solve::DiscreteEventPreMode,
     clock_owner: Option<solve::PeriodicClockId>,
+}
+
+/// The post-commit plan under construction and the runtime targets it copies.
+struct PostCommitIssue<'rows> {
+    rows: &'rows mut ScalarRows,
+    targets: &'rows mut Vec<solve::ScalarSlot>,
+    runtime_targets: &'rows [solve::ScalarSlot],
+}
+
+/// Copy every relation-free, root-reachable runtime row into the post-commit
+/// plan, returning the copied runtime row of each post-commit row.
+fn issue_post_commit_rows(
+    issue: PostCommitIssue<'_>,
+    runtime_assignment_rhs: &solve::ScalarProgramBlock,
+    runtime_assignment_roles: &[solve::RuntimeAssignmentRole],
+    root_reachable: Vec<bool>,
+) -> Vec<usize> {
+    let mut runtime_rows = Vec::new();
+    for (runtime_row, (role, reachable)) in runtime_assignment_roles
+        .iter()
+        .zip(root_reachable)
+        .enumerate()
+    {
+        if *role != solve::RuntimeAssignmentRole::RelationFree || !reachable {
+            continue;
+        }
+        let output = issue.targets.len();
+        issue.rows.push(
+            runtime_assignment_rhs
+                .program(runtime_row)
+                .expect("runtime assignment certificate is row-aligned")
+                .to_vec(),
+            runtime_assignment_rhs
+                .program_span(runtime_row)
+                .expect("runtime assignment provenance is checked"),
+            output,
+        );
+        issue.targets.push(issue.runtime_targets[runtime_row]);
+        runtime_rows.push(runtime_row);
+    }
+    runtime_rows
 }
 
 /// Join the integrator-history effect across every target range of one pending
@@ -334,16 +388,15 @@ enum EventIterationOwnerClaim {
 }
 
 impl<'dae> DiscreteRows<'dae> {
-    fn new(view: dae::DaeView<'dae>) -> Self {
-        let causal = rumoca_phase_structural::CausalDefinitions::derive(view);
-        Self {
+    fn new(view: dae::DaeView<'dae>) -> Result<Self, LowerError> {
+        let plan = causal_discrete_plan(view)?;
+        Ok(Self {
             same_tick_definitions: rumoca_phase_structural::SameTickDefinitions::derive(
-                view, &causal,
+                view, &plan,
             ),
-            relation_memory_owners: RelationMemoryOwners::new(view),
             event_iteration_owners: vec![None; view.variable_count()],
             ..Self::default()
-        }
+        })
     }
 
     fn claim_scalar_event_owner(
@@ -749,6 +802,7 @@ impl<'dae> DiscreteRows<'dae> {
         state_scalar_count: usize,
     ) -> Result<solve::DiscreteSolveSystem, LowerError> {
         self.partition_root_relation_refresh(root_relation_targets);
+        let observed_rows = std::mem::take(&mut self.observed_rows);
         let runtime_assignment_rhs = self.runtime_rows.into_scalar_block()?;
         let runtime_assignment_roles = solve::derive_runtime_assignment_roles(
             &runtime_assignment_rhs,
@@ -767,30 +821,16 @@ impl<'dae> DiscreteRows<'dae> {
             root_relation_targets,
             &runtime_assignment_roles,
         )?;
-        let mut post_commit_assignment_runtime_rows = Vec::new();
-        for (runtime_row, (role, reachable)) in runtime_assignment_roles
-            .iter()
-            .zip(root_reachable)
-            .enumerate()
-        {
-            if *role != solve::RuntimeAssignmentRole::RelationFree || !reachable {
-                continue;
-            }
-            let output = self.post_commit_targets.len();
-            self.post_commit_rows.push(
-                runtime_assignment_rhs
-                    .program(runtime_row)
-                    .expect("runtime assignment certificate is row-aligned")
-                    .to_vec(),
-                runtime_assignment_rhs
-                    .program_span(runtime_row)
-                    .expect("runtime assignment provenance is checked"),
-                output,
-            );
-            self.post_commit_targets
-                .push(self.runtime_targets[runtime_row]);
-            post_commit_assignment_runtime_rows.push(runtime_row);
-        }
+        let post_commit_assignment_runtime_rows = issue_post_commit_rows(
+            PostCommitIssue {
+                rows: &mut self.post_commit_rows,
+                targets: &mut self.post_commit_targets,
+                runtime_targets: &self.runtime_targets,
+            },
+            &runtime_assignment_rhs,
+            &runtime_assignment_roles,
+            root_reachable,
+        );
         let post_commit_assignment_rhs = self.post_commit_rows.into_scalar_block()?;
         let clock_partition_intermediates =
             self.clock_partition_intermediates.into_scalar_block()?;
@@ -848,7 +888,11 @@ impl<'dae> DiscreteRows<'dae> {
         if let Some(sensitive) = history_sensitive.as_ref() {
             apply_integrator_history_effects(&mut discrete, sensitive, state_scalar_count);
         }
-        derive_observation_refresh(&mut discrete, clock_activation_parameter_indices)?;
+        derive_observation_refresh(
+            &mut discrete,
+            clock_activation_parameter_indices,
+            &observed_rows,
+        )?;
         Ok(discrete)
     }
 
@@ -950,62 +994,6 @@ struct RootRefreshCandidate {
     target: solve::ScalarSlot,
 }
 
-#[derive(Clone, Copy, Default)]
-enum RelationMemoryOwner {
-    #[default]
-    Unclaimed,
-    Unique(solve::ScalarSlot),
-    Ambiguous,
-}
-
-#[derive(Default)]
-struct RelationMemoryOwners<'dae> {
-    relation_by_expression: Vec<Option<dae::RelationId<'dae>>>,
-    owners: Vec<RelationMemoryOwner>,
-}
-
-impl<'dae> RelationMemoryOwners<'dae> {
-    fn new(view: dae::DaeView<'dae>) -> Self {
-        let mut relation_by_expression = vec![None; view.expression_count()];
-        for (relation, entry) in view.relations() {
-            relation_by_expression[entry.expression().index() as usize] = Some(relation);
-        }
-        Self {
-            relation_by_expression,
-            owners: vec![RelationMemoryOwner::Unclaimed; view.relation_count()],
-        }
-    }
-
-    fn claim_exact_expression(&mut self, expression: dae::ExprId<'dae>, target: solve::ScalarSlot) {
-        let solve::ScalarSlot::P { .. } = target else {
-            return;
-        };
-        let Some(relation) = self
-            .relation_by_expression
-            .get(expression.index() as usize)
-            .copied()
-            .flatten()
-        else {
-            return;
-        };
-        let owner = &mut self.owners[relation.index() as usize];
-        *owner = match *owner {
-            RelationMemoryOwner::Unclaimed => RelationMemoryOwner::Unique(target),
-            RelationMemoryOwner::Unique(existing) if existing == target => *owner,
-            RelationMemoryOwner::Unique(_) | RelationMemoryOwner::Ambiguous => {
-                RelationMemoryOwner::Ambiguous
-            }
-        };
-    }
-
-    fn target(&self, relation: dae::RelationId<'dae>) -> Option<solve::ScalarSlot> {
-        match self.owners.get(relation.index() as usize).copied() {
-            Some(RelationMemoryOwner::Unique(target)) => Some(target),
-            Some(RelationMemoryOwner::Unclaimed | RelationMemoryOwner::Ambiguous) | None => None,
-        }
-    }
-}
-
 fn lower_discrete_real_equations<'dae>(
     view: dae::DaeView<'dae>,
     layout: &LoweredLayout<'dae>,
@@ -1014,16 +1002,57 @@ fn lower_discrete_real_equations<'dae>(
 ) -> Result<(), LowerError> {
     let definitions = resolve_discrete_real_definitions(view)?;
     let mut conditional = Vec::new();
+    let mut event_clocked = Vec::new();
+    let mut element_units = BTreeMap::<u32, (dae::VariableId<'dae>, Span, Vec<_>)>::new();
     for (definition, equation) in definitions.into_iter().zip(view.discrete_real_equations()) {
-        let Some((target, value)) = definition else {
+        let Some(definition) = definition else {
             continue;
         };
+        let (value, element) = (definition.value(), definition.element());
         let span = equation.provenance().span();
-        let variable = dae::VariableId::from(target);
+        let variable = dae::VariableId::from(definition.target());
+        // MLS §16.3: an event clock's partition is active only on its ticks,
+        // so its rows, unconditional or under `when c`, are guarded updates on
+        // the clock's tick condition.
+        if let Some((event_clock, tick)) = clocks.variable_trigger(variable) {
+            if let dae::DiscreteRealActivation::When { trigger, guard } = equation.activation()
+                && (condition_clock_owner(view, trigger).is_none()
+                    || condition_clock_owner(view, guard).is_none())
+            {
+                return Err(LowerError::non_computable(
+                    "an event-clock row is activated by a condition other than its clock",
+                    span,
+                ));
+            }
+            event_clocked.push(EventUpdate {
+                trigger: tick,
+                guard: tick,
+                variable,
+                element,
+                value,
+                span,
+                clock: None,
+                event_clock: Some(event_clock),
+            });
+            continue;
+        }
         match equation.activation() {
+            dae::DiscreteRealActivation::Always if element.is_some() => {
+                element_units
+                    .entry(variable.index())
+                    .or_insert_with(|| (variable, span, Vec::new()))
+                    .2
+                    .push((element, value));
+            }
             dae::DiscreteRealActivation::Always => {
                 lower_unconditional_discrete_real(
-                    view, layout, clocks, rows, variable, value, span,
+                    view,
+                    layout,
+                    clocks,
+                    rows,
+                    variable,
+                    &[(None, value)],
+                    span,
                 )?;
             }
             dae::DiscreteRealActivation::When { trigger, guard } => {
@@ -1031,15 +1060,22 @@ fn lower_discrete_real_equations<'dae>(
                     trigger,
                     guard,
                     variable,
+                    element,
                     value,
                     span,
                     clock: checked_discrete_real_activation_clock(
                         view, clocks, variable, guard, span,
                     )?,
+                    event_clock: None,
                 });
             }
         }
     }
+    for (variable, span, units) in element_units.into_values() {
+        lower_unconditional_discrete_real(view, layout, clocks, rows, variable, &units, span)?;
+    }
+    let event_clock_targets = guarded_targets_of(view, layout, clocks, &event_clocked)?;
+    rows.event_clock_targets.extend(event_clock_targets);
     lower_guarded_updates(
         view,
         layout,
@@ -1077,34 +1113,40 @@ fn checked_discrete_real_activation_clock<'dae>(
     }
 }
 
+/// One unconditional discrete Real definition unit: the whole coordinate
+/// (`None`) or one row-major scalar element of an array coordinate.
+type DefinitionUnit<'dae> = (Option<u32>, dae::ExprId<'dae>);
+
+/// Lower every unconditional definition of one discrete Real coordinate. The
+/// element definitions of one array coordinate are issued as consecutive rows
+/// of a single producer, so the same-tick schedule still sees one writer per
+/// coordinate (SOLVE-C57).
 fn lower_unconditional_discrete_real<'dae>(
     view: dae::DaeView<'dae>,
     layout: &LoweredLayout<'dae>,
     clocks: &LoweredClocks<'dae>,
     rows: &mut DiscreteRows<'dae>,
     variable: dae::VariableId<'dae>,
-    value: dae::ExprId<'dae>,
+    units: &[DefinitionUnit<'dae>],
     span: Span,
 ) -> Result<(), LowerError> {
-    let value_type = view
-        .expression(value)
-        .expect("checked discrete definition value resolves")
-        .value_type();
     let clock = clocks.variable_owner(variable);
     let sampled = clocks.variable_is_sampled(variable);
-    let scalar_count = value_type
-        .scalar_count()
-        .expect("checked expression scalar capacity");
-    if let Some((clock_id, solve_clock)) = clock
-        && scalar_count > 1
+    let value_reads = if sampled {
+        Vec::new()
+    } else {
+        units.iter().map(|(_, value)| *value).collect()
+    };
+    if let (Some((clock_id, solve_clock)), [(None, value)]) = (clock, units)
+        && scalar_count(view, *value) > 1
     {
         let compiler = ScalarCompiler::new(view, layout, None);
         let program = if sampled {
-            compiler.sampled_aggregate_program(clock_id, value)?
+            compiler.sampled_aggregate_program(clock_id, *value)?
         } else {
-            compiler.clocked_aggregate_program(clock_id, value)?
+            compiler.clocked_aggregate_program(clock_id, *value)?
         };
-        let targets = (0..scalar_count)
+        let targets = (0..scalar_count(view, *value))
             .map(|scalar| variable_scalar_slot(layout, variable.index(), scalar, span))
             .collect::<Result<Vec<_>, _>>()?;
         let start_row = rows.targets.len();
@@ -1115,7 +1157,7 @@ fn lower_unconditional_discrete_real<'dae>(
             },
             solve_clock,
             vec![variable],
-            if sampled { Vec::new() } else { vec![value] },
+            value_reads,
             Vec::new(),
             span,
         );
@@ -1126,47 +1168,55 @@ fn lower_unconditional_discrete_real<'dae>(
             ContiguousGroupMetadata {
                 span,
                 role: solve::DiscreteRowRole::Equation,
-                pre_mode: expression_pre_mode(view, value, sampled),
+                pre_mode: expression_pre_mode(view, *value, sampled),
                 clock_owner: Some(solve_clock),
             },
         );
     }
     let first_row = rows.targets.len();
-    for scalar in 0..scalar_count {
-        let program = match clock {
-            Some((clock, _)) if sampled => {
-                ScalarCompiler::new(view, layout, None).sampled_program(clock, value, scalar)?
-            }
-            Some((clock, _)) => {
-                ScalarCompiler::new(view, layout, None).clocked_program(clock, value, scalar)?
-            }
-            None => ScalarCompiler::new(view, layout, None).program(value, scalar)?,
-        };
-        let target = variable_scalar_slot(layout, variable.index(), scalar, span)?;
-        rows.claim_scalar_event_owner(variable, target, span)?;
-        rows.push(
-            program,
-            span,
-            target,
-            solve::DiscreteRowRole::Equation,
-            expression_pre_mode(view, value, sampled),
-            clock.map(|(_, solve)| solve),
-        );
+    for &(element, value) in units {
+        for scalar in 0..scalar_count(view, value) {
+            let compiler = ScalarCompiler::new(view, layout, None);
+            let program = match clock {
+                Some((clock, _)) if sampled => compiler.sampled_program(clock, value, scalar)?,
+                Some((clock, _)) => compiler.clocked_program(clock, value, scalar)?,
+                None => compiler.program(value, scalar)?,
+            };
+            let offset = element.map_or(scalar, |element| element as usize);
+            let target = variable_scalar_slot(layout, variable.index(), offset, span)?;
+            rows.claim_scalar_event_owner(variable, target, span)?;
+            rows.push(
+                program,
+                span,
+                target,
+                solve::DiscreteRowRole::Equation,
+                expression_pre_mode(view, value, sampled),
+                clock.map(|(_, solve)| solve),
+            );
+        }
     }
     if let Some((_, clock_owner)) = clock {
         rows.record_clocked_producer(
             PendingClockedStep::ScalarRows {
                 start_row: first_row,
-                count: scalar_count,
+                count: rows.targets.len() - first_row,
             },
             clock_owner,
             vec![variable],
-            if sampled { Vec::new() } else { vec![value] },
+            value_reads,
             Vec::new(),
             span,
         );
     }
     Ok(())
+}
+
+fn scalar_count<'dae>(view: dae::DaeView<'dae>, value: dae::ExprId<'dae>) -> usize {
+    view.expression(value)
+        .expect("checked discrete definition value resolves")
+        .value_type()
+        .scalar_count()
+        .expect("checked expression scalar capacity")
 }
 
 /// Orients every discrete `Real` row toward the coordinate that row defines.
@@ -1187,20 +1237,25 @@ fn lower_unconditional_discrete_real<'dae>(
 /// reported at its own span, never guessed.
 pub(super) fn resolve_discrete_real_definitions<'dae>(
     view: dae::DaeView<'dae>,
-) -> Result<Vec<Option<(dae::DiscreteRealId<'dae>, dae::ExprId<'dae>)>>, LowerError> {
-    let plan = rumoca_phase_structural::CausalDiscretePlan::derive(view).map_err(|error| {
+) -> Result<Vec<Option<rumoca_phase_structural::DiscreteRealDefinition<'dae>>>, LowerError> {
+    let plan = causal_discrete_plan(view)?;
+    Ok((0..view.discrete_real_equation_count())
+        .map(|index| plan.discrete_real_definition(index))
+        .collect())
+}
+
+/// The causal orientation of every discrete Real row, or the row it cannot
+/// orient reported at its own span.
+fn causal_discrete_plan<'dae>(
+    view: dae::DaeView<'dae>,
+) -> Result<rumoca_phase_structural::CausalDiscretePlan<'dae>, LowerError> {
+    rumoca_phase_structural::CausalDiscretePlan::derive(view).map_err(|error| {
         let rumoca_phase_structural::CausalDiscreteError::NonComputable { span } = error;
         LowerError::non_computable(
             "coupled discrete Real residual is not an explicit computable definition",
             span,
         )
-    })?;
-    Ok((0..view.discrete_real_equation_count())
-        .map(|index| {
-            plan.discrete_real_definition(index)
-                .map(|definition| (definition.target(), definition.value()))
-        })
-        .collect())
+    })
 }
 
 fn lower_event_actions<'dae>(
@@ -1214,8 +1269,7 @@ fn lower_event_actions<'dae>(
     let mut updates = Vec::new();
     for (_, action) in view.event_actions() {
         match action.operation() {
-            dae::EventActionOperation::Assert { message, level } => {
-                let kind = assertion_kind(view, level, action.provenance().span())?;
+            dae::EventActionOperation::Assert { message } => {
                 push_message_action(
                     MessageActionContext {
                         view,
@@ -1224,7 +1278,23 @@ fn lower_event_actions<'dae>(
                     },
                     action,
                     message,
-                    kind,
+                    solve::SolveEventActionKind::Assert,
+                    None,
+                    actions,
+                    action_conditions,
+                )?;
+            }
+            dae::EventActionOperation::Warning { message, condition } => {
+                push_message_action(
+                    MessageActionContext {
+                        view,
+                        layout,
+                        clocks,
+                    },
+                    action,
+                    message,
+                    solve::SolveEventActionKind::Warning,
+                    Some(condition),
                     actions,
                     action_conditions,
                 )?;
@@ -1239,6 +1309,7 @@ fn lower_event_actions<'dae>(
                     action,
                     message,
                     solve::SolveEventActionKind::Terminate,
+                    None,
                     actions,
                     action_conditions,
                 )?;
@@ -1248,9 +1319,11 @@ fn lower_event_actions<'dae>(
                     trigger: action.trigger(),
                     guard: action.guard(),
                     variable: dae::VariableId::from(state),
+                    element: None,
                     value,
                     span: action.provenance().span(),
                     clock: condition_clock_owner(view, action.guard()),
+                    event_clock: None,
                 });
             }
         }
@@ -1265,40 +1338,17 @@ fn lower_event_actions<'dae>(
     )
 }
 
-/// The event action an `assert` lowers to, from its `level` argument.
-///
-/// The predefined `AssertionLevel` is `enumeration(warning, error)` (MLS
-/// §4.9.7, declared by the flattener), so a level is the ordinal 1 or 2. It must be known at translation time: which kind of action
-/// a violation is decides whether the simulation stops.
-fn assertion_kind<'dae>(
-    view: dae::DaeView<'dae>,
-    level: Option<dae::ExprId<'dae>>,
-    span: Span,
-) -> Result<solve::SolveEventActionKind, LowerError> {
-    let Some(level) = level else {
-        return Ok(solve::SolveEventActionKind::Assert);
-    };
-    let unsupported = || {
-        LowerError::unsupported(
-            "assertion level is not a translation-time AssertionLevel value",
-            span,
-        )
-    };
-    match super::ScalarSelector::new(view, None).constant_real(level, 0) {
-        Ok(1.0) => Ok(solve::SolveEventActionKind::Warning),
-        Ok(2.0) => Ok(solve::SolveEventActionKind::Assert),
-        _ => Err(unsupported()),
-    }
-}
-
 #[derive(Clone, Copy)]
 struct EventUpdate<'dae> {
     trigger: dae::ConditionId<'dae>,
     guard: dae::ConditionId<'dae>,
     variable: dae::VariableId<'dae>,
+    element: Option<u32>,
     value: dae::ExprId<'dae>,
     span: Span,
     clock: Option<dae::ClockId<'dae>>,
+    /// The MLS §16.3 event clock whose tick guards this update, if any.
+    event_clock: Option<dae::ClockId<'dae>>,
 }
 
 pub(in crate::lower) type GuardedAssignment<'dae> = (
@@ -1316,6 +1366,9 @@ pub(in crate::lower) struct GuardedTarget<'dae> {
     pub(in crate::lower) branches: Vec<GuardedAssignment<'dae>>,
     pub(in crate::lower) pre_mode: solve::DiscreteEventPreMode,
     pub(in crate::lower) clock: Option<(dae::ClockId<'dae>, solve::PeriodicClockId)>,
+    /// The MLS §16.3 event clock whose tick guards the target: the program is
+    /// compiled under it, though it has no periodic schedule.
+    pub(in crate::lower) event_clock: Option<dae::ClockId<'dae>>,
     pub(in crate::lower) dynamic_branch_count: usize,
     pub(in crate::lower) fallback_branch: Option<usize>,
 }
@@ -1328,6 +1381,16 @@ fn lower_guarded_updates<'dae>(
     updates: &[EventUpdate<'dae>],
     role: solve::DiscreteRowRole,
 ) -> Result<(), LowerError> {
+    let mut targets = guarded_targets_of(view, layout, clocks, updates)?;
+    lower_guarded_targets(view, layout, rows, &mut targets, role)
+}
+
+fn guarded_targets_of<'dae>(
+    view: dae::DaeView<'dae>,
+    layout: &LoweredLayout<'dae>,
+    clocks: &LoweredClocks<'dae>,
+    updates: &[EventUpdate<'dae>],
+) -> Result<Vec<GuardedTarget<'dae>>, LowerError> {
     let mut targets = Vec::<GuardedTarget<'dae>>::new();
     for update in updates {
         let expression = view
@@ -1344,7 +1407,9 @@ fn lower_guarded_updates<'dae>(
             .value_type()
             .scalar_count()
             .expect("checked event update scalar capacity");
-        let target_base = variable_scalar_slot(layout, update.variable.index(), 0, update.span)?;
+        let offset = update.element.map_or(0, |element| element as usize);
+        let target_base =
+            variable_scalar_slot(layout, update.variable.index(), offset, update.span)?;
         let clock = update
             .clock
             .map(|clock| clocks.clock(clock).map(|solve| (clock, solve)))
@@ -1359,12 +1424,13 @@ fn lower_guarded_updates<'dae>(
                 width,
                 pre_mode,
                 span: update.span,
+                event_clock: update.event_clock,
             },
             branch,
             clock,
         )?;
     }
-    lower_guarded_targets(view, layout, rows, &mut targets, role)
+    Ok(targets)
 }
 
 fn lower_guarded_targets<'dae>(
@@ -1379,10 +1445,17 @@ fn lower_guarded_targets<'dae>(
     // proof at this single boundary prevents a new DAE owner route from
     // silently constructing a hold-only program with the default plan fields.
     plan_guarded_targets(view, targets);
+    // SOLVE-C58 / MLS §8.5: the equations of one event instant are simultaneous, so a
+    // producer is issued before every target that reads its current value, and
+    // the runtime evaluates the issued programs in that order.
+    let order =
+        SameTickExchange::derive(view, &rows.same_tick_definitions, targets).producer_order();
+    apply_permutation(targets, &order);
     let exchange = SameTickExchange::derive(view, &rows.same_tick_definitions, targets);
     let mut first = 0;
     while first < targets.len() {
         let clock = targets[first].clock;
+        let event_clock = targets[first].event_clock;
         let pre_mode = targets[first].pre_mode;
         let mut end = first + 1;
         // Family fusion is restored: a fused program is one entry read, so two
@@ -1390,13 +1463,15 @@ fn lower_guarded_targets<'dae>(
         // other on the tick. SOLVE-C57's same-tick exchange is driven by the
         // issued order over the producers that *do* observe each other, never
         // by splitting every clock-owned family into one program per target.
-        // An unclocked family is not a clock-partition member at all, so its
-        // grouping is untouched.
+        // An unclocked family obeys the same rule: its program performs one
+        // entry read too, so a member that observes another is issued as its
+        // own program after that producer.
         while end < targets.len()
             && targets[end].clock == clock
+            && targets[end].event_clock == event_clock
             && targets[end].pre_mode == pre_mode
             && same_guarded_control(&targets[first], &targets[end])
-            && (clock.is_none() || exchange.fusable_with_range(first, end))
+            && exchange.fusable_with_range(first, end)
         {
             end += 1;
         }
@@ -1409,7 +1484,10 @@ fn lower_guarded_targets<'dae>(
         let conditional_owners = RefCell::new(FunctionConditionalOwnerRegistry::default());
         let program = ScalarCompiler::new(view, layout, None)
             .with_function_conditional_owners(&conditional_owners)
-            .guarded_assignment_group_program(clock.map(|(clock, _)| clock), group)?;
+            .guarded_assignment_group_program(
+                clock.map(|(clock, _)| clock).or(event_clock),
+                group,
+            )?;
         let program_index = rows.guarded_assignments.len();
         rows.push_group(program, group, role)?;
         if let Some((_, clock_owner)) = clock {
@@ -1442,8 +1520,12 @@ fn record_guarded_target<'dae>(
         width,
         pre_mode,
         span,
+        event_clock,
     } = target;
-    let Some(group) = targets.iter_mut().find(|group| group.variable == variable) else {
+    let Some(group) = targets
+        .iter_mut()
+        .find(|group| group.variable == variable && group.target_base == target_base)
+    else {
         targets.push(GuardedTarget {
             variable,
             target_base,
@@ -1452,6 +1534,7 @@ fn record_guarded_target<'dae>(
             branches: vec![branch],
             pre_mode,
             clock,
+            event_clock,
             dynamic_branch_count: 0,
             fallback_branch: None,
         });
@@ -1469,7 +1552,7 @@ fn record_guarded_target<'dae>(
             span,
         ));
     }
-    if group.clock != clock {
+    if group.clock != clock || group.event_clock != event_clock {
         return Err(LowerError::non_computable(
             "one event target has incompatible clock activation owners",
             span,
@@ -1487,6 +1570,7 @@ struct GuardedTargetMetadata<'dae> {
     width: usize,
     pre_mode: solve::DiscreteEventPreMode,
     span: Span,
+    event_clock: Option<dae::ClockId<'dae>>,
 }
 
 fn same_guarded_control<'dae>(lhs: &GuardedTarget<'dae>, rhs: &GuardedTarget<'dae>) -> bool {
@@ -1497,6 +1581,21 @@ fn same_guarded_control<'dae>(lhs: &GuardedTarget<'dae>, rhs: &GuardedTarget<'da
             .iter()
             .zip(rhs)
             .all(|(lhs, rhs)| lhs.0 == rhs.0 && lhs.1 == rhs.1 && lhs.3 == rhs.3)
+}
+
+/// Reorder `items` so position `k` holds the element formerly at `order[k]`.
+fn apply_permutation<T>(items: &mut [T], order: &[usize]) {
+    let mut position = (0..items.len()).collect::<Vec<_>>();
+    let mut holder = position.clone();
+    for (slot, &source) in order.iter().enumerate() {
+        let current = position[source];
+        items.swap(slot, current);
+        let displaced = holder[slot];
+        position[displaced] = current;
+        holder[current] = displaced;
+        position[source] = slot;
+        holder[slot] = source;
+    }
 }
 
 fn plan_guarded_targets<'dae>(view: dae::DaeView<'dae>, targets: &mut [GuardedTarget<'dae>]) {
@@ -1558,9 +1657,9 @@ fn lower_condition_memory<'dae>(
             target,
             solve::DiscreteRowRole::ConditionMemory,
             solve::DiscreteEventPreMode::FollowCurrent,
-            clock.map(|(_, solve)| solve),
+            clock.and_then(|(_, solve)| solve),
         );
-        if let Some((_, clock_owner)) = clock {
+        if let Some((_, Some(clock_owner))) = clock {
             // A clocked activation buffer targets no DAE variable; it joins
             // the issued order purely as a consumer so it observes this tick's
             // settled operand values.
@@ -1590,10 +1689,10 @@ fn condition_operand_clock<'dae>(
     clocks: &LoweredClocks<'dae>,
     condition: dae::ConditionId<'dae>,
     span: Span,
-) -> Result<Option<(dae::ClockId<'dae>, solve::PeriodicClockId)>, LowerError> {
-    let mut owner: Option<(dae::ClockId<'dae>, solve::PeriodicClockId)> = None;
+) -> Result<Option<(dae::ClockId<'dae>, Option<solve::PeriodicClockId>)>, LowerError> {
+    let mut owner: Option<(dae::ClockId<'dae>, Option<solve::PeriodicClockId>)> = None;
     let mut conflict = false;
-    let mut visit = |found: (dae::ClockId<'dae>, solve::PeriodicClockId)| match owner {
+    let mut visit = |found: (dae::ClockId<'dae>, Option<solve::PeriodicClockId>)| match owner {
         Some((clock, _)) if clock != found.0 => conflict = true,
         Some(_) => {}
         None => owner = Some(found),
@@ -1702,7 +1801,6 @@ fn lower_roots<'dae>(
     view: dae::DaeView<'dae>,
     layout: &LoweredLayout<'dae>,
     clocks: &LoweredClocks<'dae>,
-    relation_memory_owners: &RelationMemoryOwners<'dae>,
 ) -> Result<LoweredRoots, LowerError> {
     let mut rows = ScalarRows::default();
     let mut zero_domains = Vec::with_capacity(view.root_count());
@@ -1723,7 +1821,7 @@ fn lower_roots<'dae>(
         owner_span = Some(span);
         owner_relations.push(root.relation());
         zero_domains.push(root_zero_domain(view, relation.expression()));
-        relation_memory_targets.push(relation_memory_owners.target(root.relation()));
+        relation_memory_targets.push(layout.buffered_relations.target(root.relation()));
     }
     flush_root_owner(view, layout, &mut rows, &mut owner_relations, owner_span)?;
     lower_structured_roots(
@@ -1817,32 +1915,15 @@ fn expression_clock_owner<'dae>(
     view: dae::DaeView<'dae>,
     clocks: &LoweredClocks<'dae>,
     expression: dae::ExprId<'dae>,
-) -> Option<(dae::ClockId<'dae>, solve::PeriodicClockId)> {
-    let mut owner = None;
-    dae::for_each_expression(view, expression, |_, node| {
-        if owner.is_some() {
-            return;
-        }
-        let dae::ExpressionOperation::Coordinate(coordinate) = node.operation() else {
-            return;
-        };
-        if let dae::CoordinateView::Previous(previous) = coordinate {
-            let clock = view
-                .previous(previous)
-                .expect("checked previous identity resolves")
-                .clock();
-            let solve = clocks
-                .clock(clock)
-                .expect("checked previous history names a lowered clock");
-            owner = Some((clock, solve));
-            return;
-        }
-        owner = super::coordinate_variable(coordinate)
-            .or_else(|| super::pre_coordinate_variable(coordinate))
-            .and_then(|index| view.variable_id(index as usize))
-            .and_then(|id| clocks.variable_owner(id));
-    });
-    owner
+) -> Option<(dae::ClockId<'dae>, Option<solve::PeriodicClockId>)> {
+    let owner = super::clock_ownership::expression_clock_owner(view, expression, |variable| {
+        clocks
+            .variable_owner(variable)
+            .map(|(clock, _)| clock)
+            .or_else(|| clocks.variable_trigger(variable).map(|(clock, _)| clock))
+    })?;
+    // An MLS §16.3 event clock owns a partition but has no periodic schedule.
+    Some((owner, clocks.clock(owner).ok()))
 }
 
 fn root_zero_domain<'dae>(

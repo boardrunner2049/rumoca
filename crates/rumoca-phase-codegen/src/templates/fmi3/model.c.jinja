@@ -1,42 +1,73 @@
 {%- set model_identifier = "Rumoca_" ~ (artifact.identities.fmu | replace("-", "_")) %}
-{%- if not solve.continuous.algebraic_assignment_complete %}{{ fail("unsupported-feature:fmi3.coupled-or-non-isolable-algebraic-projection") }}{% endif %}
-{%- from "fmi-c-kernel.jinja" import scalar_op, refresh_algebraics, assertions, assertion_lifecycle %}
-{%- from "fmi-typed-functions.jinja" import functions %}
-#include <math.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <string.h>
-#define FMI3_FUNCTION_PREFIX {{ model_identifier }}_
-#include "fmi3Functions.h"
-#define FMI_EXPORT FMI3_Export
-enum ModelState { MODEL_INSTANTIATED, MODEL_INITIALIZATION, MODEL_EVENT, MODEL_CONTINUOUS, MODEL_STEP, MODEL_TERMINATED };
-enum InterfaceType { INTERFACE_ME, INTERFACE_CS };
-#define Y_LEN {{ solve.layout.y_scalars if solve.layout.y_scalars > 0 else 1 }}
-#define P_LEN {{ solve.layout.p_scalars if solve.layout.p_scalars > 0 else 1 }}
-#define STATE_LEN {{ solve.solve_layout.state_scalar_count if solve.solve_layout.state_scalar_count > 0 else 1 }}
-typedef struct { bool assertions_initialized; bool assertion_failed; bool parameters_dirty; fmi3InstanceEnvironment environment; fmi3LogMessageCallback logger; double time; double y[Y_LEN]; double p[P_LEN]; double derivative[STATE_LEN]; enum ModelState state; enum InterfaceType type; } ModelInstance;
-{{ functions(typed_pure_calls) }}
+{%- from "fmi-c-kernel.jinja" import scalar_op, assertions, assertion_lifecycle, value_array, rmc_kind, text_fields, text_table, cs_integrator, cs_integrator_function %}
+{%- set cs_integrate = cs_integrator(fmi) %}
+{%- from "fmi-me-projection.jinja" import refresh_values, workspace_fields, workspace_reset %}
+{%- from "fmi-scalar-events.jinja" import scalar_events, event_reset, cs_events %}
+#include "model.h"
+{{ text_table(fmi_text_starts) }}
 
 static void initialize_values(ModelInstance* m) {
-    m->assertions_initialized=false; m->assertion_failed=false; m->parameters_dirty=true;
-    memset(m->y, 0, sizeof(m->y)); memset(m->p, 0, sizeof(m->p)); m->time = 0.0;
-{%- for value in fmi.initial_y %}
-    m->y[{{ loop.index0 }}] = {{ value }};
-{%- endfor %}
-{%- for value in fmi.initial_parameters %}
-    m->p[{{ loop.index0 }}] = {{ value }};
-{%- endfor %}
+{{- value_array("initial_y", "Y_LEN", fmi.initial_y) }}
+{{- value_array("initial_p", "P_LEN", fmi.initial_parameters) }}
+    m->assertions_initialized=false; m->assertion_failed=false; m->parameters_dirty=true; m->tolerance=0.0; m->rmc_cs_substep=0.0; rmc_release_text(m);{% if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %} memset(m->rmc_warned, 0, sizeof(m->rmc_warned));{% endif %}{{ workspace_reset(me_refresh) }}{{ event_reset(fmi) }}
+    memcpy(m->y, initial_y, sizeof(m->y)); memcpy(m->p, initial_p, sizeof(m->p)); m->time = 0.0;
 }
-{% if fmi.assertions %}
+{% if fmi.assertions and (solve.events.actions | rejectattr("kind", "equalto", "Warning") | list | length > 0) %}
 static void log_assertion(ModelInstance* m, const char* message) { if (m->logger) m->logger(m->environment, fmi3Error, "assertion", message); }
 {% endif %}
-{{ assertions(solve, fmi, fmi_assertion_messages, "fmi3") }}
-{{ refresh_algebraics(solve, "fmi3") }}
-{{ assertion_lifecycle("fmi3") }}
+{% if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %}
+static void log_warning(ModelInstance* m, const char* message) { if (m->logger) m->logger(m->environment, fmi3Warning, "warning", message); }
+{% endif %}
+#define RMC_LOG(m, message) do { if ((m)->logger) (m)->logger((m)->environment, fmi3Error, "error", (message)); } while (0)
+#define RMC_LOG_AT(m, category, message) do { if ((m)->logger) (m)->logger((m)->environment, fmi3Warning, (category), (message)); } while (0)
+{%- if me_refresh.switching %}
+#define RMC_INFO(m, category, message) do { if ((m)->logger) (m)->logger((m)->environment, fmi3OK, (category), (message)); } while (0)
+{%- endif %}
+{{ assertions(solve, fmi, fmi_assertion_messages, fmi_assertion_message_rows, "fmi3") }}
+{{ refresh_values(solve, me_refresh, "fmi3") }}
+{{ assertion_lifecycle("fmi3", fmi.scalar_events) }}
+{%- if fmi.scalar_events %}
+{{ scalar_events(solve, fmi, "fmi3") }}
+{%- endif %}
+{%- if me_refresh.switching %}
+{%- macro derivative_programs(plan) %}
+{%- for program in plan.programs %}{% for op in program.ops %}
+{%- if loop.first %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- endif %}
+{{ scalar_op(op) }}
+{%- if loop.last %}
+    }
+{%- endif %}
+{%- endfor %}{% endfor %}
+{%- endmacro %}
+{#- Each chart's derivative kernel; the active chart's runs (kernel.rs: the
+    component's runtime is the active chart's). #}
+{%- for chart in me_refresh.charts %}
+static fmi3Status rmc_derivative_c{{ loop.index0 }}(ModelInstance* m) {
+{{- derivative_programs(solve_blocks.continuous.derivative_rhs.scalar_plan if loop.first else chart.rhs) }}
+    return fmi3OK;
+}
+{%- endfor %}
 static fmi3Status evaluate_derivatives(ModelInstance* m) {
-    if (settle_values(m) != fmi3OK) return fmi3Error;
+    fmi3Status status = fmi3Error;
+    if (settle_derivative_values(m) != fmi3OK) return fmi3Error;
+    switch (m->rmc_chart) {
+{%- for chart in me_refresh.charts %}
+    case {{ loop.index0 }}: status = rmc_derivative_c{{ loop.index0 }}(m); break;
+{%- endfor %}
+    default: break;
+    }
+    if (status != fmi3OK) return status;
+    for (size_t i = 0, n = {{ solve.solve_layout.state_scalar_count }}; i < n; ++i) {
+        if (!isfinite(m->derivative[i])) return fmi3Error;
+    }
+    return fmi3OK;
+}
+{%- else %}
+static fmi3Status evaluate_derivatives(ModelInstance* m) {
+    if (settle_derivative_values(m) != fmi3OK) return fmi3Error;
 {% set plan = solve_blocks.continuous.derivative_rhs.scalar_plan %}
 {% for program in plan.programs %}{% for op in program.ops %}
 {% if loop.first %}    {
@@ -46,115 +77,166 @@ static fmi3Status evaluate_derivatives(ModelInstance* m) {
 {% if loop.last %}    }
 {% endif %}
 {% endfor %}{% endfor %}
-    for (size_t i = 0; i < {{ solve.solve_layout.state_scalar_count }}; ++i) {
+    for (size_t i = 0, n = {{ solve.solve_layout.state_scalar_count }}; i < n; ++i) {
         if (!isfinite(m->derivative[i])) return fmi3Error;
     }
     return fmi3OK;
 }
-static fmi3Status integrate_rk4(ModelInstance* m, fmi3Float64 start, fmi3Float64 step) {
-    double initial[STATE_LEN]; double k1[STATE_LEN]; double k2[STATE_LEN]; double k3[STATE_LEN]; double k4[STATE_LEN];
-    size_t count = {{ solve.solve_layout.state_scalar_count }};
-    for (size_t i=0;i<count;++i) initial[i]=m->y[i];
-    m->time=start; if(evaluate_derivatives(m)!=fmi3OK)return fmi3Error;
-    for(size_t i=0;i<count;++i){k1[i]=m->derivative[i];m->y[i]=initial[i]+0.5*step*k1[i];}
-    m->time=start+0.5*step; if(evaluate_derivatives(m)!=fmi3OK)return fmi3Error;
-    for(size_t i=0;i<count;++i){k2[i]=m->derivative[i];m->y[i]=initial[i]+0.5*step*k2[i];}
-    if(evaluate_derivatives(m)!=fmi3OK)return fmi3Error;
-    for(size_t i=0;i<count;++i){k3[i]=m->derivative[i];m->y[i]=initial[i]+step*k3[i];}
-    m->time=start+step; if(evaluate_derivatives(m)!=fmi3OK)return fmi3Error;
-    for(size_t i=0;i<count;++i){k4[i]=m->derivative[i];m->y[i]=initial[i]+step*(k1[i]+2.0*k2[i]+2.0*k3[i]+k4[i])/6.0;if(!isfinite(m->y[i]))return fmi3Error;}
-    return settle_assertion_event(m);
-}
-static size_t value_count(fmi3ValueReference vr) {
-    switch (vr) {
-    case 0: return 1;
-{%- for variable in fmi.variables %}
-    case {{ variable.value_reference_fmi3 }}: return {{ variable.storage.scalar_count }};
+{%- endif %}
+{{ cs_integrator_function(fmi, solve, "fmi3") }}
+{%- if fmi.scalar_events %}
+{{ cs_events(fmi, cs_integrate, "fmi3") }}
+{%- endif %}
+{#- One row per FMI 3 value reference, indexed by the reference itself: time
+    is 0, the variables are 1..N in inventory order and the state derivatives
+    follow (the renderer refuses any other numbering). Integer and
+    enumeration values are Int32 and Boolean values Boolean, all held in the
+    numeric storage run; String values live in the instance text table. -#}
+enum RmcColumn { RMC_COLUMN_TIME, RMC_COLUMN_Y, RMC_COLUMN_P, RMC_COLUMN_DERIVATIVE, RMC_COLUMN_TEXT, RMC_COLUMN_INDICATOR };
+enum RmcKind { RMC_KIND_FLOAT64, RMC_KIND_INT32, RMC_KIND_BOOLEAN, RMC_KIND_STRING };
+enum RmcAccess { RMC_ACCESS_FIXED, RMC_ACCESS_STATE, RMC_ACCESS_INPUT, RMC_ACCESS_PARAMETER, RMC_ACCESS_TUNABLE_PARAMETER };
+typedef struct { unsigned char column; unsigned char kind; unsigned char access; unsigned char marks_parameters; size_t base; size_t count; } RmcValueReference;
+static const RmcValueReference rmc_value_references[] = {
+    {RMC_COLUMN_TIME, RMC_KIND_FLOAT64, RMC_ACCESS_FIXED, 0, 0, 1},
+{%- set text = namespace(base=0) %}
+{%- for variable in fmi.variables %}{% if loop.index0 % 6 == 0 %}
+   {% endif %} {
+{%- if variable.value_kind == "String" %}RMC_COLUMN_TEXT{% elif variable.storage.column == "y" %}RMC_COLUMN_Y{% elif variable.storage.column == "p" %}RMC_COLUMN_P{% else %}{{ fail("unsupported-feature:fmi.c.value-reference-column " ~ variable.storage.column) }}{% endif %}, {{ rmc_kind(variable) }}, {% if variable.role == "State" %}RMC_ACCESS_STATE{% elif variable.causality == "input" %}RMC_ACCESS_INPUT{% elif variable.causality == "parameter" %}{% if variable.tunable %}RMC_ACCESS_TUNABLE_PARAMETER{% else %}RMC_ACCESS_PARAMETER{% endif %}{% else %}RMC_ACCESS_FIXED{% endif %}, {{ 1 if variable.causality == "parameter" and variable.value_kind != "String" else 0 }}, {% if variable.value_kind == "String" %}{{ text.base }}{% set text.base = text.base + variable.storage.scalar_count %}{% else %}{{ variable.storage.base }}{% endif %}, {{ variable.storage.scalar_count }}},
 {%- endfor %}
-{%- set derivative_ordinal = namespace(value=0) %}
-{%- for variable in fmi.variables %}{% if variable.role == "State" %}
-    case {{ fmi.derivative_value_reference_base_fmi3 + derivative_ordinal.value }}: return {{ variable.storage.scalar_count }};
-{%- set derivative_ordinal.value = derivative_ordinal.value + 1 %}{% endif %}{% endfor %}
-    default: return 0;
-    }
-}
-static fmi3Status get_float64(ModelInstance* m, fmi3ValueReference vr, double* values) {
-    if (settle_values(m) != fmi3OK) return fmi3Error;
-    switch (vr) {
-    case 0: values[0] = m->time; return fmi3OK;
-{%- for variable in fmi.variables %}
-    case {{ variable.value_reference_fmi3 }}:{% for scalar in range(variable.storage.scalar_count) %} values[{{ scalar }}] = m->{{ variable.storage.column }}[{{ variable.storage.base + scalar }}];{% endfor %} return fmi3OK;
+{%- set derivative = namespace(ordinal=0, base=0) %}
+{%- for variable in fmi.variables %}{% if variable.role == "State" %}{% if derivative.ordinal % 6 == 0 %}
+   {% endif %} {RMC_COLUMN_DERIVATIVE, RMC_KIND_FLOAT64, RMC_ACCESS_FIXED, 0, {{ derivative.base }}, {{ variable.storage.scalar_count }}},
+{%- set derivative.ordinal = derivative.ordinal + 1 %}{% set derivative.base = derivative.base + variable.storage.scalar_count %}{% endif %}{% endfor %}
+{%- for root in fmi.event_indicator_roots %}
+    {RMC_COLUMN_INDICATOR, RMC_KIND_FLOAT64, RMC_ACCESS_FIXED, 0, {{ loop.index0 }}, 1},
 {%- endfor %}
-{%- set derivative_ordinal.value = 0 %}{%- set derivative_base = namespace(value=0) %}
-{%- for variable in fmi.variables %}{% if variable.role == "State" %}
-    case {{ fmi.derivative_value_reference_base_fmi3 + derivative_ordinal.value }}: if (evaluate_derivatives(m) != fmi3OK) return fmi3Error;{% for scalar in range(variable.storage.scalar_count) %} values[{{ scalar }}] = m->derivative[{{ derivative_base.value + scalar }}];{% endfor %} return fmi3OK;
-{%- set derivative_ordinal.value = derivative_ordinal.value + 1 %}{%- set derivative_base.value = derivative_base.value + variable.storage.scalar_count %}{% endif %}{% endfor %}
-    default: return fmi3Error;
-    }
+};
+#define RMC_VALUE_REFERENCES (sizeof(rmc_value_references) / sizeof(rmc_value_references[0]))
+static const RmcValueReference* rmc_reference(fmi3ValueReference vr, unsigned char kind) {
+    return vr < RMC_VALUE_REFERENCES && rmc_value_references[vr].kind == kind ? &rmc_value_references[vr] : NULL;
 }
-static fmi3Boolean can_set_float64(const ModelInstance* m, fmi3ValueReference vr) {
-    switch (vr) {
-{%- for variable in fmi.variables %}
-    case {{ variable.value_reference_fmi3 }}:
-{%- if variable.role == "State" %}
+static fmi3Boolean rmc_can_set(const ModelInstance* m, const RmcValueReference* ref) {
+    switch (ref->access) {
+    case RMC_ACCESS_STATE:
         return m->state == MODEL_INSTANTIATED || m->state == MODEL_INITIALIZATION
             || (m->type == INTERFACE_ME && m->state == MODEL_CONTINUOUS);
-{%- elif variable.causality == "input" %}
+    case RMC_ACCESS_INPUT:
         return m->state == MODEL_INSTANTIATED || m->state == MODEL_INITIALIZATION
             || (m->type == INTERFACE_ME && (m->state == MODEL_EVENT || m->state == MODEL_CONTINUOUS))
             || (m->type == INTERFACE_CS && m->state == MODEL_STEP);
-{%- elif variable.causality == "parameter" %}
-        return m->state == MODEL_INSTANTIATED || m->state == MODEL_INITIALIZATION{% if variable.tunable %}
+    case RMC_ACCESS_PARAMETER:
+        return m->state == MODEL_INSTANTIATED || m->state == MODEL_INITIALIZATION;
+    case RMC_ACCESS_TUNABLE_PARAMETER:
+        return m->state == MODEL_INSTANTIATED || m->state == MODEL_INITIALIZATION
             || (m->type == INTERFACE_ME && m->state == MODEL_EVENT)
-            || (m->type == INTERFACE_CS && m->state == MODEL_STEP){% endif %};
-{%- else %}
-        return fmi3False;
-{%- endif %}
-{%- endfor %}
+            || (m->type == INTERFACE_CS && m->state == MODEL_STEP);
     default: return fmi3False;
     }
 }
-static fmi3Status set_float64(ModelInstance* m, fmi3ValueReference vr, const double* values) {
-    switch (vr) {
-{%- for variable in fmi.variables %}
-    case {{ variable.value_reference_fmi3 }}:{% for scalar in range(variable.storage.scalar_count) %} m->{{ variable.storage.column }}[{{ variable.storage.base + scalar }}] = values[{{ scalar }}];{% endfor %}{% if variable.causality == "parameter" %} m->parameters_dirty=true;{% endif %} return fmi3OK;
-{%- endfor %}
-    default: return fmi3Error;
+/* One typed request: every reference names a variable of `kind` (settable
+   in the current state when `setting`) and the counts cover `nvalues`. */
+static bool rmc_request(const ModelInstance* m, const fmi3ValueReference vr[], size_t nvr, size_t nvalues, unsigned char kind, bool setting) {
+    size_t total = 0;
+    for (size_t k = 0; k < nvr; ++k) {
+        const RmcValueReference* ref = rmc_reference(vr[k], kind);
+        if (!ref || (setting && !rmc_can_set(m, ref)) || ref->count > nvalues - total) return false;
+        total += ref->count;
     }
+    return total == nvalues;
+}
+/* The settled numeric storage one reference reads; NULL on a failed refresh. */
+static const double* rmc_numeric_source(ModelInstance* m, const RmcValueReference* ref) {
+    if (settle_values(m) != fmi3OK) return NULL;
+    switch (ref->column) {
+    case RMC_COLUMN_TIME: return &m->time;
+    case RMC_COLUMN_Y: return m->y;
+    case RMC_COLUMN_P: return m->p;
+    case RMC_COLUMN_DERIVATIVE: return evaluate_derivatives(m) == fmi3OK ? m->derivative : NULL;
+{%- if fmi.scalar_events %}
+    case RMC_COLUMN_INDICATOR: return rmc_event_indicators(m, m->rmc_indicator) == fmi3OK ? m->rmc_indicator : NULL;
+{%- endif %}
+    default: return NULL;
+    }
+}
+#define RMC_GET_NUMERIC(Name, Type, KIND, CONVERT) \
+FMI_EXPORT fmi3Status fmi3Get##Name(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, Type values[], size_t nvalues) { \
+    ModelInstance* m = i; size_t cursor = 0; \
+    if (!m || (!vr && nvr) || (!values && nvalues) || !rmc_request(m, vr, nvr, nvalues, KIND, false)) return fmi3Error; \
+    for (size_t k = 0; k < nvr; ++k) { \
+        const RmcValueReference* ref = &rmc_value_references[vr[k]]; const double* source = rmc_numeric_source(m, ref); \
+        if (!source) return fmi3Error; \
+        for (size_t j = 0; j < ref->count; ++j) { double value = source[ref->base + j]; values[cursor++] = CONVERT; } \
+    } \
+    return fmi3OK; \
+}
+#define RMC_SET_NUMERIC(Name, Type, KIND, VALID, STORE) \
+FMI_EXPORT fmi3Status fmi3Set##Name(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, const Type values[], size_t nvalues) { \
+    ModelInstance* m = i; size_t cursor = 0; \
+    if (!m || (!vr && nvr) || (!values && nvalues) || !rmc_request(m, vr, nvr, nvalues, KIND, true)) return fmi3Error; \
+    for (size_t k = 0; k < nvalues; ++k) { Type value = values[k]; (void)value; if (!(VALID)) return fmi3Error; } \
+    for (size_t k = 0; k < nvr; ++k) { \
+        const RmcValueReference* ref = &rmc_value_references[vr[k]]; double* target = ref->column == RMC_COLUMN_Y ? m->y : m->p; \
+        for (size_t j = 0; j < ref->count; ++j) { Type value = values[cursor++]; target[ref->base + j] = STORE; } \
+        if (ref->marks_parameters) m->parameters_dirty = true; \
+    } \
+    return fmi3OK; \
+}
+RMC_GET_NUMERIC(Float64, fmi3Float64, RMC_KIND_FLOAT64, value)
+RMC_SET_NUMERIC(Float64, fmi3Float64, RMC_KIND_FLOAT64, isfinite(value), value)
+RMC_GET_NUMERIC(Int32, fmi3Int32, RMC_KIND_INT32, (fmi3Int32)value)
+RMC_SET_NUMERIC(Int32, fmi3Int32, RMC_KIND_INT32, true, (double)value)
+RMC_GET_NUMERIC(Boolean, fmi3Boolean, RMC_KIND_BOOLEAN, value != 0.0)
+RMC_SET_NUMERIC(Boolean, fmi3Boolean, RMC_KIND_BOOLEAN, true, value ? 1.0 : 0.0)
+FMI_EXPORT fmi3Status fmi3GetString(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, fmi3String values[], size_t nvalues) {
+    ModelInstance* m = i; size_t cursor = 0;
+    if (!m || (!vr && nvr) || (!values && nvalues) || !rmc_request(m, vr, nvr, nvalues, RMC_KIND_STRING, false)) return fmi3Error;
+    for (size_t k = 0; k < nvr; ++k) {
+        const RmcValueReference* ref = &rmc_value_references[vr[k]];
+        for (size_t j = 0; j < ref->count; ++j) values[cursor++] = rmc_text(m, ref->base + j);
+    }
+    return fmi3OK;
+}
+FMI_EXPORT fmi3Status fmi3SetString(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, const fmi3String values[], size_t nvalues) {
+    ModelInstance* m = i; size_t cursor = 0;
+    if (!m || (!vr && nvr) || (!values && nvalues) || !rmc_request(m, vr, nvr, nvalues, RMC_KIND_STRING, true)) return fmi3Error;
+    for (size_t k = 0; k < nvalues; ++k) if (!values[k]) return fmi3Error;
+    for (size_t k = 0; k < nvr; ++k) {
+        const RmcValueReference* ref = &rmc_value_references[vr[k]];
+        for (size_t j = 0; j < ref->count; ++j) if (!rmc_set_text(m, ref->base + j, values[cursor++])) return fmi3Error;
+    }
+    return fmi3OK;
 }
 FMI_EXPORT const char* fmi3GetVersion(void) { return "3.0"; }
 FMI_EXPORT fmi3Instance fmi3InstantiateModelExchange(fmi3String name, fmi3String token, fmi3String resources, fmi3Boolean visible, fmi3Boolean loggingOn, fmi3InstanceEnvironment environment, fmi3LogMessageCallback logger) {
     (void)name; (void)resources; (void)visible; (void)loggingOn; (void)environment; (void)logger;
     if (!token || strcmp(token, "{{ artifact.identities.fmu }}") != 0) return NULL;
-    ModelInstance* m = calloc(1, sizeof(ModelInstance)); if (!m) return NULL; initialize_values(m); m->environment=environment; m->logger=logger; m->type=INTERFACE_ME; m->state = MODEL_INSTANTIATED; return m;
+    ModelInstance* m = calloc(1, sizeof(ModelInstance)); if (!m) return NULL; initialize_values(m); m->environment=environment; m->logger=logger;{% if me_refresh.switching %} m->rmc_chart_log=loggingOn;{% endif %} m->type=INTERFACE_ME; m->state = MODEL_INSTANTIATED; return m;
 }
 FMI_EXPORT fmi3Instance fmi3InstantiateCoSimulation(fmi3String name, fmi3String token, fmi3String resources, fmi3Boolean visible, fmi3Boolean loggingOn, fmi3Boolean eventModeUsed, fmi3Boolean earlyReturnAllowed, const fmi3ValueReference requiredIntermediateVariables[], size_t nRequiredIntermediateVariables, fmi3InstanceEnvironment environment, fmi3LogMessageCallback logger, fmi3IntermediateUpdateCallback intermediateUpdate) {
     (void)name;(void)resources;(void)visible;(void)loggingOn;(void)earlyReturnAllowed;(void)environment;(void)logger;(void)intermediateUpdate;
     (void)requiredIntermediateVariables;
     if(eventModeUsed || nRequiredIntermediateVariables!=0 || !token || strcmp(token,"{{ artifact.identities.fmu }}")!=0)return NULL;
-    ModelInstance* m=calloc(1,sizeof(ModelInstance));if(!m)return NULL;initialize_values(m);m->environment=environment;m->logger=logger;m->type=INTERFACE_CS;m->state=MODEL_INSTANTIATED;return m;
+    ModelInstance* m=calloc(1,sizeof(ModelInstance));if(!m)return NULL;initialize_values(m);m->environment=environment;m->logger=logger;{% if me_refresh.switching %}m->rmc_chart_log=loggingOn;{% endif %}m->type=INTERFACE_CS;m->state=MODEL_INSTANTIATED;return m;
 }
 FMI_EXPORT fmi3Instance fmi3InstantiateScheduledExecution(fmi3String name, fmi3String token, fmi3String resources, fmi3Boolean visible, fmi3Boolean loggingOn, fmi3InstanceEnvironment environment, fmi3LogMessageCallback logger, fmi3ClockUpdateCallback clockUpdate, fmi3LockPreemptionCallback lockPreemption, fmi3UnlockPreemptionCallback unlockPreemption) { (void)name;(void)token;(void)resources;(void)visible;(void)loggingOn;(void)environment;(void)logger;(void)clockUpdate;(void)lockPreemption;(void)unlockPreemption;return NULL; }
-FMI_EXPORT void fmi3FreeInstance(fmi3Instance instance) { free(instance); }
-FMI_EXPORT fmi3Status fmi3SetDebugLogging(fmi3Instance i, fmi3Boolean loggingOn, size_t n, const fmi3String categories[]) { (void)loggingOn; return i && (categories || n == 0) ? fmi3OK : fmi3Error; }
-FMI_EXPORT fmi3Status fmi3EnterInitializationMode(fmi3Instance i, fmi3Boolean td, fmi3Float64 tol, fmi3Float64 start, fmi3Boolean sd, fmi3Float64 stop) { ModelInstance* m=i; if (!m || m->state != MODEL_INSTANTIATED || !isfinite(start) || (td && (!isfinite(tol) || tol < 0.0)) || (sd && (!isfinite(stop) || stop < start))) return fmi3Error; m->time=start; m->state=MODEL_INITIALIZATION; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3ExitInitializationMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->state != MODEL_INITIALIZATION || initialize_assertions(m) != fmi3OK || evaluate_derivatives(m) != fmi3OK) return fmi3Error; m->state=m->type==INTERFACE_ME?MODEL_EVENT:MODEL_STEP; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3EnterEventMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || (m->state != MODEL_EVENT && m->state != MODEL_CONTINUOUS)) return fmi3Error; m->state=MODEL_EVENT; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3UpdateDiscreteStates(fmi3Instance i, fmi3Boolean* need, fmi3Boolean* terminate, fmi3Boolean* nominalsChanged, fmi3Boolean* valuesChanged, fmi3Boolean* nextDefined, fmi3Float64* nextTime) { ModelInstance* m=i; if (!m || m->state != MODEL_EVENT || !need || !terminate || !nominalsChanged || !valuesChanged || !nextDefined || !nextTime) return fmi3Error; if (settle_assertion_event(m) != fmi3OK) return fmi3Error; *need=0; *terminate=0; *nominalsChanged=0; *valuesChanged=0; *nextDefined=0; *nextTime=0.0; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3EnterContinuousTimeMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state != MODEL_EVENT) return fmi3Error; m->state=MODEL_CONTINUOUS; return fmi3OK; }
+FMI_EXPORT void fmi3FreeInstance(fmi3Instance instance) { if (instance) rmc_release_text(instance); free(instance); }
+FMI_EXPORT fmi3Status fmi3SetDebugLogging(fmi3Instance i, fmi3Boolean loggingOn, size_t n, const fmi3String categories[]) { {% if me_refresh.switching %}if (i && (categories || n == 0)) ((ModelInstance*)i)->rmc_chart_log = loggingOn;{% else %}(void)loggingOn;{% endif %} return i && (categories || n == 0) ? fmi3OK : fmi3Error; }
+FMI_EXPORT fmi3Status fmi3EnterInitializationMode(fmi3Instance i, fmi3Boolean td, fmi3Float64 tol, fmi3Float64 start, fmi3Boolean sd, fmi3Float64 stop) { ModelInstance* m=i; if (!m || m->state != MODEL_INSTANTIATED || !isfinite(start) || (td && (!isfinite(tol) || tol < 0.0)) || (sd && (!isfinite(stop) || stop < start))) return fmi3Error; m->time=start; m->tolerance=td ? tol : 0.0; {% if fmi.scalar_events %}m->rmc_scan = sd ? rmc_scan_resolution(stop - start) : 0.0; {% endif %}m->state=MODEL_INITIALIZATION; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3ExitInitializationMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->state != MODEL_INITIALIZATION || {% if me_refresh.init.rows > 0 %}rmc_initialize(m, m->tolerance) != fmi3OK || {% else %}rmc_apply_updates(m, true) < 0 || {% endif %}{% if fmi.scalar_events %}rmc_events_initialize(m){% else %}initialize_assertions(m){% endif %} != fmi3OK || evaluate_derivatives(m) != fmi3OK) return fmi3Error; m->state=m->type==INTERFACE_ME?MODEL_EVENT:MODEL_STEP; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3EnterEventMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || (m->state != MODEL_EVENT && m->state != MODEL_CONTINUOUS)) return fmi3Error; rmc_seed_suspend(m); m->state=MODEL_EVENT; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3UpdateDiscreteStates(fmi3Instance i, fmi3Boolean* need, fmi3Boolean* terminate, fmi3Boolean* nominalsChanged, fmi3Boolean* valuesChanged, fmi3Boolean* nextDefined, fmi3Float64* nextTime) { ModelInstance* m=i; if (!m || m->state != MODEL_EVENT || !need || !terminate || !nominalsChanged || !valuesChanged || !nextDefined || !nextTime) return fmi3Error; {% if fmi.scalar_events %}bool reinit = false; if (rmc_events_update(m, &reinit) != fmi3OK) return fmi3Error; {% endif %}{% if me_refresh.switching %}bool changed = false, nominals = false; if (m->rmc_chart_pending ? rmc_chart_transfer(m, &changed, &nominals) != fmi3OK : settle_assertion_event(m) != fmi3OK) return fmi3Error; *need=0; *terminate=0; *nominalsChanged=nominals; *valuesChanged=changed; {% else %}{% if not fmi.scalar_events %}if (settle_assertion_event(m) != fmi3OK) return fmi3Error; {% endif %}*need=0; *terminate=0; *nominalsChanged=0; *valuesChanged=0; {% endif %}{% if fmi.scalar_events %}if (reinit) *valuesChanged=fmi3True; {% endif %}*nextDefined=0; *nextTime=0.0; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3EnterContinuousTimeMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state != MODEL_EVENT{% if fmi.scalar_events %} || rmc_events_continuous(m) != fmi3OK{% endif %}) return fmi3Error; rmc_seed_commit(m); m->state=MODEL_CONTINUOUS; return fmi3OK; }
 FMI_EXPORT fmi3Status fmi3Terminate(fmi3Instance i) { ModelInstance* m=i; if (!m || (m->state != MODEL_EVENT && m->state != MODEL_CONTINUOUS && m->state != MODEL_STEP)) return fmi3Error; m->state=MODEL_TERMINATED; return fmi3OK; }
 FMI_EXPORT fmi3Status fmi3Reset(fmi3Instance i) { ModelInstance* m=i; if (!m) return fmi3Error; initialize_values(m); m->state=MODEL_INSTANTIATED; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3GetFloat64(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, fmi3Float64 values[], size_t nvalues) { ModelInstance* m=i; if (!m || (!vr && nvr) || (!values && nvalues)) return fmi3Error; size_t cursor=0; for (size_t k=0;k<nvr;++k) { size_t count=value_count(vr[k]); if (!count || cursor+count>nvalues || get_float64(m,vr[k],values+cursor)!=fmi3OK) return fmi3Error; cursor+=count; } return cursor==nvalues?fmi3OK:fmi3Error; }
-FMI_EXPORT fmi3Status fmi3SetFloat64(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, const fmi3Float64 values[], size_t nvalues) { ModelInstance* m=i; if (!m || (!vr && nvr) || (!values && nvalues)) return fmi3Error; size_t cursor=0; for (size_t k=0;k<nvr;++k) { size_t count=value_count(vr[k]); if (!count || cursor+count>nvalues || !can_set_float64(m,vr[k])) return fmi3Error; for (size_t j=0;j<count;++j) if (!isfinite(values[cursor+j])) return fmi3Error; cursor+=count; } if (cursor!=nvalues) return fmi3Error; cursor=0; for (size_t k=0;k<nvr;++k) { size_t count=value_count(vr[k]); if (set_float64(m,vr[k],values+cursor)!=fmi3OK) return fmi3Error; cursor+=count; } return fmi3OK; }
 FMI_EXPORT fmi3Status fmi3SetTime(fmi3Instance i, fmi3Float64 time) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state != MODEL_CONTINUOUS || !isfinite(time)) return fmi3Error; m->time=time; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3SetContinuousStates(fmi3Instance i, const fmi3Float64 x[], size_t nx) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state != MODEL_CONTINUOUS || nx != {{ solve.solve_layout.state_scalar_count }} || (!x && nx)) return fmi3Error; for(size_t k=0;k<nx;++k)if(!isfinite(x[k]))return fmi3Error; for(size_t k=0;k<nx;++k)m->y[k]=x[k]; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3SetContinuousStates(fmi3Instance i, const fmi3Float64 x[], size_t nx) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state != MODEL_CONTINUOUS || nx != {{ solve.solve_layout.state_scalar_count }} || (!x && nx)) return fmi3Error; {% if not me_refresh.switching %}for(size_t k=0;k<nx;++k)if(!isfinite(x[k]))return fmi3Error; {% endif %}for(size_t k=0;k<nx;++k)m->y[k]=x[k]; return fmi3OK; }
 FMI_EXPORT fmi3Status fmi3GetContinuousStates(fmi3Instance i, fmi3Float64 x[], size_t nx) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state == MODEL_INSTANTIATED || m->state == MODEL_STEP || nx != {{ solve.solve_layout.state_scalar_count }} || (!x && nx)) return fmi3Error; for(size_t k=0;k<nx;++k)x[k]=m->y[k]; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3GetContinuousStateDerivatives(fmi3Instance i, fmi3Float64 dx[], size_t nx) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state == MODEL_INSTANTIATED || m->state == MODEL_STEP || nx != {{ solve.solve_layout.state_scalar_count }} || (!dx && nx) || evaluate_derivatives(m)!=fmi3OK) return fmi3Error; for(size_t k=0;k<nx;++k)dx[k]=m->derivative[k]; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3GetNominalsOfContinuousStates(fmi3Instance i, fmi3Float64 values[], size_t nx) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || nx != {{ solve.solve_layout.state_scalar_count }} || (!values && nx)) return fmi3Error; for(size_t k=0;k<nx;++k)values[k]=1.0; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3GetEventIndicators(fmi3Instance i, fmi3Float64 values[], size_t ni) { ModelInstance* m=i; (void)values; return m && m->type == INTERFACE_ME && m->state != MODEL_INSTANTIATED && m->state != MODEL_STEP && ni==0?fmi3OK:fmi3Error; }
+FMI_EXPORT fmi3Status fmi3GetContinuousStateDerivatives(fmi3Instance i, fmi3Float64 dx[], size_t nx) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state == MODEL_INSTANTIATED || m->state == MODEL_STEP || nx != {{ solve.solve_layout.state_scalar_count }} || (!dx && nx){% if not me_refresh.switching %} || evaluate_derivatives(m)!=fmi3OK{% endif %}) return fmi3Error; {% if me_refresh.switching %}if (!rmc_all_finite(m->y, nx) || evaluate_derivatives(m) != fmi3OK) return fmi3Discard; {% endif %}for(size_t k=0;k<nx;++k)dx[k]=m->derivative[k]; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3GetNominalsOfContinuousStates(fmi3Instance i, fmi3Float64 values[], size_t nx) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || nx != {{ solve.solve_layout.state_scalar_count }} || (!values && nx)) return fmi3Error; for(size_t k=0;k<nx;++k)values[k]={% if me_refresh.switching %}rmc_chart_nominals[m->rmc_chart][k]{% else %}1.0{% endif %}; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3GetEventIndicators(fmi3Instance i, fmi3Float64 values[], size_t ni) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state == MODEL_INSTANTIATED || m->state == MODEL_STEP || ni != {% if fmi.scalar_events %}RMC_EVENT_INDICATORS{% else %}0{% endif %} || (!values && ni)) return fmi3Error; {% if fmi.scalar_events %}return rmc_event_indicators(m, values);{% else %}(void)values; return fmi3OK;{% endif %} }
 FMI_EXPORT fmi3Status fmi3GetNumberOfContinuousStates(fmi3Instance i, size_t* nx) { ModelInstance* m=i; if(!m||m->type!=INTERFACE_ME||!nx)return fmi3Error; *nx={{ solve.solve_layout.state_scalar_count }}; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3GetNumberOfEventIndicators(fmi3Instance i, size_t* ni) { ModelInstance* m=i; if(!m||m->type!=INTERFACE_ME||!ni)return fmi3Error; *ni=0; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3CompletedIntegratorStep(fmi3Instance i, fmi3Boolean noSetState, fmi3Boolean* enterEventMode, fmi3Boolean* terminate) { (void)noSetState; ModelInstance* m=i; if(!m||m->type!=INTERFACE_ME||m->state!=MODEL_CONTINUOUS||!enterEventMode||!terminate)return fmi3Error; *enterEventMode=fmi3False; *terminate=fmi3False; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3GetNumberOfEventIndicators(fmi3Instance i, size_t* ni) { ModelInstance* m=i; if(!m||m->type!=INTERFACE_ME||!ni)return fmi3Error; *ni={% if fmi.scalar_events %}RMC_EVENT_INDICATORS{% else %}0{% endif %}; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3CompletedIntegratorStep(fmi3Instance i, fmi3Boolean noSetState, fmi3Boolean* enterEventMode, fmi3Boolean* terminate) { (void)noSetState; ModelInstance* m=i; if(!m||m->type!=INTERFACE_ME||m->state!=MODEL_CONTINUOUS||!enterEventMode||!terminate)return fmi3Error; *enterEventMode=fmi3False; *terminate=fmi3False; rmc_seed_mark(m); {% if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %}if (m->assertions_initialized && (refresh_algebraics(m) != fmi3OK || report_warnings(m) != fmi3OK)) return fmi3Error; {% endif %}{% if me_refresh.switching %}bool request = false; if (rmc_chart_completed(m, &request) != fmi3OK) return fmi3Error; *enterEventMode = request; {% endif %}{% if fmi.scalar_events %}bool event = false; if (rmc_events_completed(m, &event) != fmi3OK) return fmi3Error; if (event) *enterEventMode = fmi3True; {% endif %}return fmi3OK; }
 
 #define UNSUPPORTED_GET_SET(Type, Name) \
 FMI_EXPORT fmi3Status fmi3Get##Name(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, Type values[], size_t nvalues) { (void)vr;(void)values;return i&&nvr==0&&nvalues==0?fmi3OK:fmi3Error; } \
@@ -164,12 +246,9 @@ UNSUPPORTED_GET_SET(fmi3Int8, Int8)
 UNSUPPORTED_GET_SET(fmi3UInt8, UInt8)
 UNSUPPORTED_GET_SET(fmi3Int16, Int16)
 UNSUPPORTED_GET_SET(fmi3UInt16, UInt16)
-UNSUPPORTED_GET_SET(fmi3Int32, Int32)
 UNSUPPORTED_GET_SET(fmi3UInt32, UInt32)
 UNSUPPORTED_GET_SET(fmi3Int64, Int64)
 UNSUPPORTED_GET_SET(fmi3UInt64, UInt64)
-UNSUPPORTED_GET_SET(fmi3Boolean, Boolean)
-UNSUPPORTED_GET_SET(fmi3String, String)
 
 FMI_EXPORT fmi3Status fmi3GetBinary(fmi3Instance i,const fmi3ValueReference vr[],size_t nvr,size_t sizes[],fmi3Binary values[],size_t nvalues){(void)vr;(void)sizes;(void)values;return i&&nvr==0&&nvalues==0?fmi3OK:fmi3Error;}
 FMI_EXPORT fmi3Status fmi3SetBinary(fmi3Instance i,const fmi3ValueReference vr[],size_t nvr,const size_t sizes[],const fmi3Binary values[],size_t nvalues){(void)vr;(void)sizes;(void)values;return i&&nvr==0&&nvalues==0?fmi3OK:fmi3Error;}
@@ -178,9 +257,32 @@ FMI_EXPORT fmi3Status fmi3SetClock(fmi3Instance i,const fmi3ValueReference vr[],
 
 FMI_EXPORT fmi3Status fmi3GetNumberOfVariableDependencies(fmi3Instance i,fmi3ValueReference vr,size_t* count){(void)i;(void)vr;(void)count;return fmi3Error;}
 FMI_EXPORT fmi3Status fmi3GetVariableDependencies(fmi3Instance i,fmi3ValueReference dependent,size_t dependentElements[],fmi3ValueReference independents[],size_t independentElements[],fmi3DependencyKind kinds[],size_t count){(void)i;(void)dependent;(void)dependentElements;(void)independents;(void)independentElements;(void)kinds;(void)count;return fmi3Error;}
-FMI_EXPORT fmi3Status fmi3GetFMUState(fmi3Instance i,fmi3FMUState* state){(void)i;(void)state;return fmi3Error;}
-FMI_EXPORT fmi3Status fmi3SetFMUState(fmi3Instance i,fmi3FMUState state){(void)i;(void)state;return fmi3Error;}
-FMI_EXPORT fmi3Status fmi3FreeFMUState(fmi3Instance i,fmi3FMUState* state){(void)i;(void)state;return fmi3Error;}
+/* An FMU state is a copy of the instance: values, parameters, texts, the
+   refresh policy, and the active reduced chart with any latched basis change.
+   The lifecycle state, interface, and logging environment stay the
+   instance's own. */
+FMI_EXPORT fmi3Status fmi3GetFMUState(fmi3Instance i, fmi3FMUState* state) {
+    ModelInstance* m = i; if (!m || !state) return fmi3Error;
+    ModelInstance* saved = *state ? (ModelInstance*)*state : malloc(sizeof(ModelInstance));
+    if (!saved) return fmi3Error;
+    if (*state) rmc_release_text(saved);
+    memcpy(saved, m, sizeof(ModelInstance));
+    if (!rmc_own_text(saved, m)) { if (!*state) free(saved); return fmi3Error; }
+    *state = saved; return fmi3OK;
+}
+FMI_EXPORT fmi3Status fmi3SetFMUState(fmi3Instance i, fmi3FMUState state) {
+    ModelInstance* m = i; const ModelInstance* saved = state; if (!m || !saved) return fmi3Error;
+    enum ModelState mode = m->state; enum InterfaceType type = m->type; fmi3InstanceEnvironment environment = m->environment; fmi3LogMessageCallback logger = m->logger;
+    rmc_release_text(m);
+    memcpy(m, saved, sizeof(ModelInstance));
+    m->state = mode; m->type = type; m->environment = environment; m->logger = logger;
+    return rmc_own_text(m, saved) ? fmi3OK : fmi3Error;
+}
+FMI_EXPORT fmi3Status fmi3FreeFMUState(fmi3Instance i, fmi3FMUState* state) {
+    if (!i || !state) return fmi3Error;
+    if (*state) { rmc_release_text(*state); free(*state); *state = NULL; }
+    return fmi3OK;
+}
 FMI_EXPORT fmi3Status fmi3SerializedFMUStateSize(fmi3Instance i,fmi3FMUState state,size_t* size){(void)i;(void)state;(void)size;return fmi3Error;}
 FMI_EXPORT fmi3Status fmi3SerializeFMUState(fmi3Instance i,fmi3FMUState state,fmi3Byte bytes[],size_t size){(void)i;(void)state;(void)bytes;(void)size;return fmi3Error;}
 FMI_EXPORT fmi3Status fmi3DeserializeFMUState(fmi3Instance i,const fmi3Byte bytes[],size_t size,fmi3FMUState* state){(void)i;(void)bytes;(void)size;(void)state;return fmi3Error;}
@@ -206,7 +308,12 @@ FMI_EXPORT fmi3Status fmi3DoStep(fmi3Instance i,fmi3Float64 current,fmi3Float64 
     if(!m||m->type!=INTERFACE_CS||m->state!=MODEL_STEP||!eventNeeded||!terminate||!earlyReturn||!lastTime||!isfinite(current)||!isfinite(step)||step<=0.0)return fmi3Error;
     if(fabs(current-m->time)>1e-12*fmax(1.0,fmax(fabs(current),fabs(m->time))))return fmi3Error;
     double old_y[Y_LEN];for(size_t k=0;k<Y_LEN;++k)old_y[k]=m->y[k];
-    if(integrate_rk4(m,current,step)!=fmi3OK){for(size_t k=0;k<Y_LEN;++k)m->y[k]=old_y[k];m->time=current;return fmi3Error;}
+    fmi3Status advanced={% if fmi.scalar_events %}rmc_cs_advance{% else %}{{ cs_integrate }}{% endif %}(m,current,step);
+    if(advanced!=fmi3OK){for(size_t k=0;k<Y_LEN;++k)m->y[k]=old_y[k];m->time=current;if(advanced!=fmi3Discard)return fmi3Error;*eventNeeded=fmi3False;*terminate=fmi3False;*earlyReturn=fmi3False;*lastTime=current;return fmi3Discard;}
+{%- if me_refresh.switching %}
+    bool request = false, changed = false, nominals = false;
+    if (rmc_chart_completed(m, &request) != fmi3OK || (request && rmc_chart_transfer(m, &changed, &nominals) != fmi3OK)) { for(size_t k=0;k<Y_LEN;++k)m->y[k]=old_y[k]; m->time=current; return fmi3Error; }
+{%- endif %}
     *eventNeeded=fmi3False;*terminate=fmi3False;*earlyReturn=fmi3False;*lastTime=m->time;return fmi3OK;
 }
 FMI_EXPORT fmi3Status fmi3ActivateModelPartition(fmi3Instance i,fmi3ValueReference clock,fmi3Float64 activationTime){(void)i;(void)clock;(void)activationTime;return fmi3Error;}

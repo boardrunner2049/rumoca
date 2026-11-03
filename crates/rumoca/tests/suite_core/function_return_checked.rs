@@ -2,6 +2,53 @@ use rumoca::Compiler;
 use rumoca_ir_dae as dae;
 use rumoca_sim::{SimOptions, simulate_dae};
 
+/// MLS 3.7 §11.2.6: a top-level `return` ends the algorithm, so a trailing one
+/// (`Electrical.Analog.Basic.OpAmpDetailed`'s limiters) leaves the function
+/// its preceding statements; statements after it never run.
+const TRAILING_RETURN: &str = r#"
+function limit
+  input Real x;
+  output Real y;
+algorithm
+  if x > 1 then
+    y := 1;
+  else
+    y := x;
+  end if;
+  return;
+  y := -100;
+end limit;
+
+model TrailingReturn
+  Real x(start = 0, fixed = true);
+  Real y;
+equation
+  der(x) = 2;
+  y = limit(x);
+end TrailingReturn;
+"#;
+
+#[test]
+fn a_trailing_top_level_return_ends_the_algorithm() {
+    let compiled = Compiler::new()
+        .model("TrailingReturn")
+        .compile_str(TRAILING_RETURN, "trailing_return.mo")
+        .expect("a trailing return constructs checked DAE");
+    let simulation =
+        simulate_dae(&compiled.dae, &SimOptions::default()).expect("the limiter simulates");
+    let column = |name: &str| {
+        let index = simulation
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+            .expect("the result records the column");
+        &simulation.data[index]
+    };
+    for (x, y) in column("x").iter().zip(column("y")) {
+        assert!((y - x.min(1.0)).abs() <= 1.0e-8, "limit({x}) = {y}");
+    }
+}
+
 const GUARDED_RETURN: &str = r#"
 function magnitude
   input Real x;
@@ -428,4 +475,80 @@ fn a_declared_output_default_is_the_live_seed_of_the_lowered_body() {
              which runs on some paths only. Stores:\n  {rendered}"
         );
     });
+}
+
+/// MLS 3.7 §11.2.6 for a conditional only some of whose branches return
+/// (`Modelica.Fluid.Utilities.regRoot2_utility` returns from its else part):
+/// the statements after it run exactly on the branches that do not return,
+/// and they read the values those branches define.
+const BRANCH_RETURN: &str = r#"
+function scaled
+  input Real x;
+  input Real k1;
+  input Real k2;
+  output Real y;
+protected
+  Real x2;
+algorithm
+  if k2 > 0 then
+    x2 := -k2/k1;
+  elseif k1 > 0 then
+    x2 := -1;
+  else
+    y := 0;
+    return;
+  end if;
+  if x <= x2 then
+    y := -1;
+  else
+    y := x - x2;
+  end if;
+end scaled;
+
+model BranchReturn
+  Real x(start = -2, fixed = true);
+  Real k1 = 2;
+  Real k2 = if time < 0.5 then 1 else 0;
+  Real k0 = 0;
+  Real y = scaled(x, k1, k2);
+  Real z = scaled(x, k0, k0);
+equation
+  der(x) = 4;
+end BranchReturn;
+"#;
+
+#[test]
+fn statements_after_a_partially_returning_conditional_continue_its_other_branches() {
+    let compiled = Compiler::new()
+        .model("BranchReturn")
+        .compile_str(BRANCH_RETURN, "branch_return.mo")
+        .expect("a partially returning conditional constructs checked DAE");
+    let simulation = simulate_dae(
+        &compiled.dae,
+        &SimOptions {
+            t_end: 1.0,
+            ..SimOptions::default()
+        },
+    )
+    .expect("BranchReturn simulates");
+    let column = |name: &str| {
+        let index = simulation
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+            .expect("the result records the column");
+        &simulation.data[index]
+    };
+    for (((time, x), y), z) in simulation
+        .times
+        .iter()
+        .zip(column("x"))
+        .zip(column("y"))
+        .zip(column("z"))
+    {
+        let x2 = if *time < 0.5 { -0.5 } else { -1.0 };
+        let expected = if *x <= x2 { -1.0 } else { x - x2 };
+        assert!((y - expected).abs() <= 1.0e-8, "y({time}) = {y}");
+        assert!(z.abs() <= 1.0e-12, "z({time}) = {z}");
+    }
 }

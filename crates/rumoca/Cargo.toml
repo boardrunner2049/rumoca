@@ -52,7 +52,7 @@ transport-udp = ["rumoca-sim/transport-udp"]
 transport-zenoh = ["rumoca-sim/transport-zenoh"]
 viewer-web = ["rumoca-sim/viewer-web"]
 process-control = ["rumoca-sim/process-control"]
-native-allocator = ["dep:mimalloc"]
+native-allocator = ["dep:rumoca-allocator"]
 fmi = ["rumoca-sim/fmi"]
 fmu-packaging = ["dep:zip", "fmi"]
 examples-smoke-tests = []
@@ -90,11 +90,11 @@ rumoca-phase-resolve = { workspace = true }
 rumoca-sim = { workspace = true, default-features = false, features = ["native-solvers"] }
 rumoca-tool-fmt = { workspace = true }
 rumoca-tool-lint = { workspace = true }
+# Binary-only global allocator; gated behind `native-allocator` (see [features]).
+rumoca-allocator = { workspace = true, optional = true }
 
 # External dependencies
 anyhow = { workspace = true }
-# Binary-only global allocator; gated behind `native-allocator` (see [features]).
-mimalloc = { workspace = true, optional = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 miette = { workspace = true }
@@ -178,9 +178,9 @@ name = "suite_galec_fmu"
 path = "tests/suite_galec_fmu/main.rs"
 
 [dev-dependencies]
+rumoca-eval-dae = { workspace = true }
 crossterm = { workspace = true }
 tungstenite = { workspace = true }
-mimalloc = { workspace = true }
 walkdir = { workspace = true }
 serde = { workspace = true }
 syn = { workspace = true }
@@ -190,6 +190,7 @@ rumoca-ir-ast = { workspace = true }
 rumoca-ir-flat = { workspace = true }
 rumoca-ir-dae = { workspace = true }
 rumoca-phase-flatten = { workspace = true }
+rumoca-phase-structural = { workspace = true }
 rumoca-phase-instantiate = { workspace = true }
 rumoca-phase-parse = { workspace = true }
 rumoca-phase-codegen = { workspace = true }

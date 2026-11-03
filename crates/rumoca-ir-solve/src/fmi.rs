@@ -33,24 +33,36 @@
 //! encoding is available only after one of those admission proofs.
 
 mod c_codegen;
+mod co_simulation;
 mod event_free;
+mod indicator_plan;
 mod max_step_duration;
 mod metadata;
 mod parameter_updates;
+mod root_location;
+mod scalar_events;
 mod static_assertions;
 #[cfg(test)]
 mod tests;
 
 pub use c_codegen::{FmiCCodegenError, FmiCCodegenView};
+pub use co_simulation::{
+    CoSimulationController, CoSimulationMethod, CoSimulationStepPlan, CoSimulationSubstep,
+};
 pub use event_free::{FmiEventFreeCodegenView, FmiEventFreeError};
+pub use indicator_plan::{
+    FmiIndicatorPlan, IndicatorEntry, IndicatorPlanError, IndicatorPlanInputs,
+    IndicatorPlanRejection, IndicatorReading, IndicatorZeroSide,
+};
 pub use max_step_duration::{
     MAX_STEP_DURATION_DESCRIPTION, MAX_STEP_DURATION_NAME, MAX_STEP_DURATION_UNCONSTRAINED,
     MAX_STEP_DURATION_UNIT,
 };
 pub use metadata::{
-    FmiCausality, FmiInitial, FmiStorageColumn, FmiStorageRun, FmiValueBacking, FmiVariability,
-    FmiVariable, FmiVariableInput,
+    FmiCausality, FmiDeclaredCausality, FmiInitial, FmiStorageColumn, FmiStorageRun,
+    FmiValueBacking, FmiVariability, FmiVariable, FmiVariableInput,
 };
+pub use root_location::{RootLocationPlan, RootTieBreak};
 
 /// Configuration-Mode capability declared by the checked FMI component.
 ///
@@ -68,7 +80,7 @@ pub enum FmiConfigurationCapability {
 
 use crate::{
     ScalarSlot, SolveArtifacts, SolveModel, SolveProblem, SolveVariableDeclaration,
-    SolveVariableStorageRole, SolveVariableStorageRun,
+    SolveVariableStorageRole, SolveVariableStorageRun, SolveVariableValueKind,
 };
 use rumoca_core::Span;
 use std::collections::BTreeSet;
@@ -93,6 +105,8 @@ pub enum FmiComponentError {
     StorageTypeMismatch { name: String, span: Span },
     #[error("FMI variable `{name}` is stored in a non-addressable Solve slot")]
     NonAddressableStorage { name: String, span: Span },
+    #[error("FMI variable `{name}` records a declared causality its exported causality states")]
+    RedundantDeclaredCausality { name: String, span: Span },
     #[error("FMI 3 value-reference space exceeds u32")]
     ValueReferenceOverflow,
     #[error("FMI state scalar count {actual} does not match Solve state count {expected}")]
@@ -113,7 +127,8 @@ impl FmiComponentError {
             Self::ScalarCount { span, .. }
             | Self::DuplicateName { span, .. }
             | Self::StorageTypeMismatch { span, .. }
-            | Self::NonAddressableStorage { span, .. } => Some(*span),
+            | Self::NonAddressableStorage { span, .. }
+            | Self::RedundantDeclaredCausality { span, .. } => Some(*span),
             Self::ReservedMaxStepDurationName { declaration, .. } => Some(*declaration),
             Self::EventIndicatorInventory { span, .. } => *span,
             Self::InvalidSolve(_)
@@ -147,33 +162,19 @@ impl FmiEventIndicatorSource {
     }
 }
 
-/// How a row that reads `time` but no live continuous state is owned.
-///
-/// Solver-`Y` dependencies do not describe `time`, so the two blocks below
-/// need different readings of an empty dependency set. A root condition *is*
-/// its own indicator, so one that reads `time` sweeps continuously between
-/// events and has to be monitored. A dynamic-time deadline is reported
-/// relative to the evaluation time and its event is owned by the time
-/// schedule, which announces a state-independent deadline exactly.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TimeReadOwner {
-    /// Reading `time` makes the row vary during integration: monitor it.
-    Monitored,
-    /// The time schedule announces this row exactly: do not monitor it.
-    Announced,
-}
-
 #[derive(Debug)]
 pub struct FmiEventIndicatorInventory {
     sources: Box<[FmiEventIndicatorSource]>,
+    /// The positional reading of `sources` every executor uses: where each
+    /// position reads its value, the side an exact zero takes, and the
+    /// relation memory a crossing reseeds (SPEC_0044 ME-EVENT-005).
+    plan: FmiIndicatorPlan,
 }
 
 impl FmiEventIndicatorInventory {
     pub fn derive(model: &SolveModel) -> Result<Self, FmiComponentError> {
         if static_assertions::validate(model).is_ok() {
-            return Ok(Self {
-                sources: Box::default(),
-            });
+            return Self::resolved(model, Vec::new());
         }
         let static_y = model
             .problem
@@ -191,28 +192,66 @@ impl FmiEventIndicatorInventory {
             .iter()
             .map(|root| root.root_index)
             .collect::<BTreeSet<_>>();
-        let mut sources = dependency_backed_indicator_sources(
-            &model.problem.events.root_conditions,
-            &static_y,
-            TimeReadOwner::Monitored,
-            |index| {
-                (!scheduled.contains(&index))
-                    .then_some(FmiEventIndicatorSource::RootCondition { index })
-            },
-        )?;
+        // The searched roots are the Solve IR's own classification, the one
+        // every executor evaluates during integration (ME-EVENT-005).
+        let roots = &model.problem.events.root_conditions;
+        let mut sources = Vec::new();
+        for ordinal in crate::RootSearchPlan::derive(&model.problem).searched() {
+            let index = roots
+                .output_indices()
+                .get(ordinal)
+                .copied()
+                .ok_or_else(|| FmiComponentError::EventIndicatorInventory {
+                    message: "a searched root has no checked output identity".to_string(),
+                    span: roots.first_source_span(),
+                })?;
+            if !scheduled.contains(&index) {
+                sources.push(FmiEventIndicatorSource::RootCondition { index });
+            }
+        }
         sources.extend(dependency_backed_indicator_sources(
             &model.problem.events.dynamic_time_event_rhs,
             &static_y,
-            TimeReadOwner::Announced,
             |index| Some(FmiEventIndicatorSource::DynamicTimeEvent { index }),
         )?);
         sources.extend(
             (0..model.problem.events.delays.delay_time_rhs.output_count())
                 .map(|index| FmiEventIndicatorSource::DelayDiscontinuity { index }),
         );
+        Self::resolved(model, sources)
+    }
+
+    /// Resolve `sources` against the model's root, delay, and deadline rows.
+    fn resolved(
+        model: &SolveModel,
+        sources: Vec<FmiEventIndicatorSource>,
+    ) -> Result<Self, FmiComponentError> {
+        let events = &model.problem.events;
+        let model_root_count = events.root_conditions.output_count();
+        let plan = FmiIndicatorPlan::derive(
+            &sources,
+            IndicatorPlanInputs {
+                root_value_count: model_root_count + events.delays.delay_time_rhs.output_count(),
+                model_root_count,
+                deadline_count: events.dynamic_time_event_rhs.output_count(),
+                root_zero_domains: &events.root_zero_domains,
+                root_relation_memory_targets: &events.root_relation_memory_targets,
+            },
+        )
+        .map_err(|error| FmiComponentError::EventIndicatorInventory {
+            message: error.to_string(),
+            span: None,
+        })?;
         Ok(Self {
             sources: sources.into_boxed_slice(),
+            plan,
         })
+    }
+
+    /// The resolved positional reading of this inventory.
+    #[must_use]
+    pub const fn plan(&self) -> &FmiIndicatorPlan {
+        &self.plan
     }
 
     #[must_use]
@@ -234,16 +273,13 @@ impl FmiEventIndicatorInventory {
 /// Select the rows of `block` that can change value during continuous
 /// integration, in checked output order.
 ///
-/// A row varies between events when it reads a solver-`Y` coordinate the
-/// static causality does not fix, and, for a [`TimeReadOwner::Monitored`]
-/// block, when it reads `time`. The `time` half is not redundant: a `time`
-/// relation whose instant the schedule cannot own, such as `time > 0` at the
-/// start of the interval, reads no `Y` at all, so a `Y`-only reading would
-/// call it invariant and drop the only surface its event has.
+/// A dynamic-time deadline varies between events when it reads a solver-`Y`
+/// coordinate the static causality does not fix. It is reported relative to
+/// the evaluation time and the time schedule owns a state-independent
+/// deadline exactly, so reading `time` alone does not make it an indicator.
 fn dependency_backed_indicator_sources(
     block: &crate::ScalarProgramBlock,
     static_y: &BTreeSet<usize>,
-    time_reads: TimeReadOwner,
     mut source: impl FnMut(usize) -> Option<FmiEventIndicatorSource>,
 ) -> Result<Vec<FmiEventIndicatorSource>, FmiComponentError> {
     let mut sources = Vec::new();
@@ -255,24 +291,7 @@ fn dependency_backed_indicator_sources(
                 message: error.to_string(),
                 span,
             })?;
-        let time_dependencies = match time_reads {
-            TimeReadOwner::Monitored => crate::StructuralPattern::derive_output_time_dependencies(
-                program, span,
-            )
-            .map_err(|error| FmiComponentError::EventIndicatorInventory {
-                message: error.to_string(),
-                span,
-            })?,
-            TimeReadOwner::Announced => vec![false; dependencies.len()],
-        };
-        if time_dependencies.len() != dependencies.len() {
-            return Err(FmiComponentError::EventIndicatorInventory {
-                message: "indicator solver-Y and time dependencies disagree on output count"
-                    .to_string(),
-                span,
-            });
-        }
-        for (dependencies, reads_time) in dependencies.into_iter().zip(time_dependencies) {
+        for dependencies in dependencies {
             let output_index = block
                 .output_indices()
                 .get(output_ordinal)
@@ -281,7 +300,7 @@ fn dependency_backed_indicator_sources(
                     message: "indicator output has no checked scalar identity".to_string(),
                     span,
                 })?;
-            if (!dependencies.is_subset(static_y) || reads_time)
+            if !dependencies.is_subset(static_y)
                 && let Some(source) = source(output_index)
             {
                 sources.push(source);
@@ -376,6 +395,8 @@ impl FmiMetadata {
 pub struct FmiComponent {
     metadata: FmiMetadata,
     event_indicators: FmiEventIndicatorInventory,
+    root_location: RootLocationPlan,
+    co_simulation: CoSimulationStepPlan,
     model: Arc<SolveModel>,
 }
 
@@ -398,6 +419,8 @@ impl FmiComponent {
         Ok(Self {
             metadata,
             event_indicators,
+            root_location: RootLocationPlan::STANDARD,
+            co_simulation: CoSimulationStepPlan::STANDARD,
             model: Arc::new(model),
         })
     }
@@ -410,6 +433,13 @@ impl FmiComponent {
     #[must_use]
     pub const fn event_indicators(&self) -> &FmiEventIndicatorInventory {
         &self.event_indicators
+    }
+
+    /// The root-location rules every executor of this component reads
+    /// (SPEC_0044 ME-EVENT-004).
+    #[must_use]
+    pub const fn root_location(&self) -> &RootLocationPlan {
+        &self.root_location
     }
 
     #[must_use]
@@ -477,6 +507,7 @@ impl FmiComponent {
             model: &self.model,
             metadata: &self.metadata,
             event_indicators: &self.event_indicators,
+            root_location: &self.root_location,
         }
     }
 
@@ -489,6 +520,8 @@ impl FmiComponent {
         FmiCodegenView {
             metadata: self.metadata,
             event_indicators: self.event_indicators,
+            root_location: self.root_location,
+            co_simulation: self.co_simulation,
             model: self.model,
         }
     }
@@ -504,6 +537,7 @@ pub struct FmiRuntimeView<'component> {
     model: &'component SolveModel,
     metadata: &'component FmiMetadata,
     event_indicators: &'component FmiEventIndicatorInventory,
+    root_location: &'component RootLocationPlan,
 }
 
 impl<'component> FmiRuntimeView<'component> {
@@ -525,6 +559,12 @@ impl<'component> FmiRuntimeView<'component> {
     #[must_use]
     pub fn event_indicators(&self) -> &'component FmiEventIndicatorInventory {
         self.event_indicators
+    }
+
+    /// The component's root-location rules (SPEC_0044 ME-EVENT-004).
+    #[must_use]
+    pub fn root_location(&self) -> &'component RootLocationPlan {
+        self.root_location
     }
 
     /// The checked maximum-step-duration entry, when the component is
@@ -567,6 +607,8 @@ impl<'component> FmiRuntimeView<'component> {
 pub struct FmiCodegenView {
     metadata: FmiMetadata,
     event_indicators: FmiEventIndicatorInventory,
+    root_location: RootLocationPlan,
+    co_simulation: CoSimulationStepPlan,
     model: Arc<SolveModel>,
 }
 
@@ -707,6 +749,15 @@ fn checked_variable(
             span: input.declaration,
         });
     }
+    if input
+        .declared_causality
+        .is_some_and(|declared| declared.exported() == input.causality)
+    {
+        return Err(FmiComponentError::RedundantDeclaredCausality {
+            name: input.name,
+            span: input.declaration,
+        });
+    }
     let (column, base) = match run.base {
         ScalarSlot::Y { index, .. } => (FmiStorageColumn::Y, index),
         ScalarSlot::P { index, .. } => (FmiStorageColumn::P, index),
@@ -716,6 +767,23 @@ fn checked_variable(
                 span: input.declaration,
             });
         }
+    };
+    let text_start = match input.text_start {
+        Some(_) if input.value_kind != SolveVariableValueKind::String => {
+            return Err(FmiComponentError::StorageTypeMismatch {
+                name: input.name,
+                span: input.declaration,
+            });
+        }
+        Some(values) if values.len() != scalar_count => {
+            return Err(FmiComponentError::ScalarCount {
+                name: input.name,
+                actual: values.len(),
+                expected: scalar_count,
+                span: input.declaration,
+            });
+        }
+        text_start => text_start,
     };
     let initial = metadata::initial_for_storage(input.role, input.causality, input.variability);
     let start = if initial == Some(FmiInitial::Calculated)
@@ -742,12 +810,15 @@ fn checked_variable(
         minimum: input.minimum,
         maximum: input.maximum,
         nominal: input.nominal,
+        text_start,
         unit: input.unit,
         description: input.description,
         causality: input.causality,
+        declared_causality: input.declared_causality,
         variability: input.variability,
         initial,
         tunable: input.tunable,
+        evaluable: input.evaluable,
         declaration: Some(input.declaration),
         value_reference_fmi3,
     })

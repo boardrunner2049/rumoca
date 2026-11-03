@@ -104,7 +104,12 @@ pub(crate) fn collect_component_constructor_aliases_for_class(
         else {
             continue;
         };
-        if !is_receiver_alias_type(&target_ref.class_def.class_type) {
+        // MLS §4.7: no component is an instance of a package. A package here is
+        // the root of a qualified type name (`Medium` in `Medium.MassFlowRate`),
+        // not the component's type, and selects nothing.
+        if !is_receiver_alias_type(&target_ref.class_def.class_type)
+            || target_ref.class_def.class_type == rumoca_core::ClassType::Package
+        {
             continue;
         }
         // Derived classes should override inherited aliases with the same name.
@@ -169,8 +174,13 @@ fn nested_package_alias_target_ref<'a>(
     })
 }
 
+// A package that only extends another is an alias of it unless the extends
+// modification binds constants or redeclares members: the modified package
+// is then a distinct selection (MLS 7.3) whose constants and members the
+// instance must see.
 fn is_package_alias_definition(class_def: &rumoca_ir_ast::ClassDef) -> bool {
     class_def.extends.len() == 1
+        && class_def.extends[0].modifications.is_empty()
         && class_def.imports.is_empty()
         && class_def.classes.is_empty()
         && class_def.components.is_empty()

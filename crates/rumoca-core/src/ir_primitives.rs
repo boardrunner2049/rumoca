@@ -1021,6 +1021,8 @@ pub enum BuiltinFunction {
     Previous,
     /// Interval of the owning clock: interval(u)
     Interval,
+    /// First tick of the owning clock: firstTick(u)
+    FirstTick,
     /// Integer sub-clock conversion: subSample(u, factor)
     SubSample,
     /// Integer super-clock conversion: superSample(u, factor)
@@ -1102,6 +1104,7 @@ impl BuiltinFunction {
         Self::Hold,
         Self::Previous,
         Self::Interval,
+        Self::FirstTick,
         Self::SubSample,
         Self::SuperSample,
         Self::ShiftSample,
@@ -1146,6 +1149,7 @@ impl BuiltinFunction {
         Self::Hold,
         Self::Previous,
         Self::Interval,
+        Self::FirstTick,
         Self::SubSample,
         Self::SuperSample,
         Self::ShiftSample,
@@ -1190,6 +1194,7 @@ impl BuiltinFunction {
                 | Self::Hold
                 | Self::Previous
                 | Self::Interval
+                | Self::FirstTick
                 | Self::SubSample
                 | Self::SuperSample
                 | Self::ShiftSample
@@ -1306,6 +1311,7 @@ impl BuiltinFunction {
             Self::Hold => "hold",
             Self::Previous => "previous",
             Self::Interval => "interval",
+            Self::FirstTick => "firstTick",
             Self::SubSample => "subSample",
             Self::SuperSample => "superSample",
             Self::ShiftSample => "shiftSample",
@@ -1356,6 +1362,22 @@ pub enum StateSelect {
     Prefer,
     /// Always use as state.
     Always,
+}
+
+impl StateSelect {
+    /// The MLS 3.7 §4.9.7.1 preference order `never` < `avoid` < `default` <
+    /// `prefer` < `always`, as a rank where a higher value is kept as a state
+    /// before a lower one.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Never => 0,
+            Self::Avoid => 1,
+            Self::Default => 2,
+            Self::Prefer => 3,
+            Self::Always => 4,
+        }
+    }
 }
 
 /// A Modelica literal value (shared by flat and DAE IRs).
@@ -1441,24 +1463,28 @@ pub enum InlineAnnotation {
     Unstated,
     /// `annotation(Inline = true)` or `annotation(LateInline = true)`.
     Requested,
+    /// `annotation(InlineAfterIndexReduction = true)` without an `Inline` or
+    /// `LateInline` request: substitute the body only after the function has
+    /// been differentiated for index reduction.
+    AfterIndexReduction,
     /// `annotation(Inline = false)`. Absolute: no policy raises it.
     Never,
 }
 
-/// Function derivative annotation (MLS §12.7.1).
-///
-/// Specifies the derivative function for automatic differentiation.
-/// Shared by the flat and DAE IRs.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// One original function input's role in an MLS §12.7.1 derivative call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FunctionDerivativeInput {
+    Differentiate,
+    ZeroDerivative,
+    NoDerivative,
+}
+
+/// Resolved source derivative annotation, aligned with the function inputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DerivativeAnnotation {
-    /// Name of the derivative function.
-    pub derivative_function: String,
-    /// Derivative order (default is 1).
+    pub derivative_function: Reference,
     pub order: u32,
-    /// Input variables whose derivatives are zero (treated as constants).
-    pub zero_derivative: Vec<String>,
-    /// Input variables with no derivative (not differentiated at all).
-    pub no_derivative: Vec<String>,
+    pub inputs: Vec<FunctionDerivativeInput>,
 }
 
 /// Loaded external table descriptor.
@@ -1474,6 +1500,57 @@ pub struct ExternalTableData {
     pub columns: Vec<usize>,
     pub smoothness: i64,
     pub extrapolation: i64,
+}
+
+/// Source array construction, retained independently of operand shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArrayConstructor {
+    /// `{a, b}`: add an outer element dimension.
+    Array,
+    /// `[a, b]`: promote operands and concatenate along dimension 2.
+    Horizontal,
+    /// `[a; b]`: promote operands and concatenate along dimension 1.
+    Vertical,
+}
+
+impl ArrayConstructor {
+    /// Zero-based concatenation axis; element construction has no such axis.
+    pub fn concatenation_axis(self) -> Option<usize> {
+        match self {
+            Self::Array => None,
+            Self::Horizontal => Some(1),
+            Self::Vertical => Some(0),
+        }
+    }
+
+    /// Construct dimensions from fully known operand dimensions. Unknown
+    /// dimensions must be resolved by the caller before entering this check.
+    pub fn checked_dimensions(self, operands: &[Vec<usize>]) -> Option<Vec<usize>> {
+        let Some(axis) = self.concatenation_axis() else {
+            let mut dimensions = vec![operands.len()];
+            let Some(first) = operands.first() else {
+                return Some(dimensions);
+            };
+            if operands.iter().any(|shape| shape != first) {
+                return None;
+            }
+            dimensions.extend_from_slice(first);
+            return Some(dimensions);
+        };
+        let rank = operands.iter().map(Vec::len).max()?.max(2);
+        let mut dimensions = operands.first()?.clone();
+        dimensions.resize(rank, 1);
+        for operand in &operands[1..] {
+            if dimensions.iter().enumerate().any(|(index, expected)| {
+                index != axis && *expected != operand.get(index).copied().unwrap_or(1)
+            }) {
+                return None;
+            }
+            dimensions[axis] =
+                dimensions[axis].checked_add(operand.get(axis).copied().unwrap_or(1))?;
+        }
+        Some(dimensions)
+    }
 }
 
 /// Semantic expression tree shared by Flat and DAE IR.
@@ -1567,7 +1644,7 @@ pub enum Expression {
     },
     Array {
         elements: Vec<Expression>,
-        is_matrix: bool,
+        kind: ArrayConstructor,
         #[serde(
             default = "Span::source_free_serde_default",
             skip_serializing_if = "Span::is_dummy"
@@ -1816,18 +1893,14 @@ impl StringConversionFormat {
     }
 }
 
-struct ContainsExpressionChecker<'a, F>
-where
-    F: FnMut(&Expression) -> bool,
-{
+/// One shared visitor for every predicate type, so callers do not each compile
+/// a copy of the traversal methods.
+struct ContainsExpressionChecker<'a> {
     found: bool,
-    predicate: &'a mut F,
+    predicate: &'a mut dyn FnMut(&Expression) -> bool,
 }
 
-impl<F> crate::ExpressionVisitor for ContainsExpressionChecker<'_, F>
-where
-    F: FnMut(&Expression) -> bool,
-{
+impl crate::ExpressionVisitor for ContainsExpressionChecker<'_> {
     fn visit_expression(&mut self, expr: &Expression) {
         if self.found {
             return;

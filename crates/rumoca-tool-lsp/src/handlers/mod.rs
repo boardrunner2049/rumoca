@@ -27,6 +27,8 @@ mod signature_help;
 pub use diagnostics::compute_diagnostics;
 #[cfg(feature = "server")]
 pub(crate) use diagnostics::compute_diagnostics_with_options;
+#[cfg(feature = "server")]
+pub(crate) use diagnostics::compute_diagnostics_with_strict_compile;
 pub use document_symbols::handle_document_symbols;
 pub use semantic_tokens::{get_semantic_token_legend, handle_semantic_tokens};
 
@@ -44,7 +46,7 @@ pub use goto_definition::handle_goto_definition;
 pub use code_actions::handle_code_actions;
 pub use code_lens::handle_code_lens;
 pub use document_links::handle_document_links;
-pub use inlay_hints::handle_inlay_hints;
+pub use inlay_hints::{ParameterNameHintMode, handle_inlay_hints};
 pub use signature_help::handle_signature_help;
 
 #[cfg(feature = "server")]

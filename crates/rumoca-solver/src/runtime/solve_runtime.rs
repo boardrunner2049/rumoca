@@ -29,11 +29,22 @@ use crate::{
 };
 use rumoca_eval_solve::refresh_plan::trace_refresh_plan;
 use rumoca_eval_solve::{
-    EvalSolveError, PreparedComputeBlock, PreparedEventTransactionProgram,
+    EvalSolveError, PreparedComputeBlock, PreparedEvaluationBlock, PreparedEventTransactionProgram,
     PreparedGuardedAssignmentProgram, PreparedScalarProgramBlock, RowEvalContext,
     to_scalar_program_block,
 };
 
+/// The algebraic projection an event walk runs between its steps, reporting
+/// whether it changed the coordinate.
+pub(super) type ProjectAlgebraics<'a> =
+    dyn FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError> + 'a;
+
+mod block_residual_split;
+pub use block_residual_split::{
+    BlockResidualSplitCounts, block_residual_split_counts, reset_block_residual_split_counts,
+};
+mod chart_sharing;
+use chart_sharing::BlockReuse;
 mod coupled_event;
 mod discrete_rows;
 mod event_transactions;
@@ -44,6 +55,9 @@ mod guarded_assignments;
 mod initial_continuation;
 mod initial_event;
 mod initial_projection;
+mod interpreted_schedules;
+mod manifold_execution;
+mod native_projection_assignments;
 mod native_specialization;
 use native_specialization::{RowEvalPoint, SpecializedRows};
 mod plans;
@@ -51,8 +65,12 @@ mod refresh_batch;
 mod refresh_execution;
 mod refresh_projection;
 mod relation_memory;
+mod seed_linearization;
 mod sensitivity;
+mod singular_mode;
 mod support;
+mod tangent_evaluators;
+mod warnings;
 use discrete_rows::PreparedStructuredDiscreteRows;
 pub use discrete_rows::SeededConditionMemory;
 #[cfg(test)]
@@ -69,22 +87,52 @@ pub use initial_event::{
 use plans::{
     RootConditionPlan, RootConditionPlanEntry, VisibleValuePlan, VisibleValuePlanEntry,
     copy_grouped_expression_values, direct_time_root_search_default, direct_time_root_value,
-    direct_visible_value, prepare_manifold_projection_programs, root_condition_plan,
-    total_root_condition_count, visible_value_plan,
+    direct_visible_value, root_condition_plan, total_root_condition_count, visible_value_plan,
 };
 use refresh_execution::static_refresh_parameter_indices;
 use refresh_projection::*;
+use seed_linearization::SeedProjectionCache;
 use support::{
-    build_visible_name_index, copy_runtime_values, copy_runtime_values_into,
-    fill_inactive_root_output, optional_compiled, reserve_runtime_index_map_capacity,
-    reserve_runtime_vec_capacity, resize_runtime_values, validate_finite_runtime_output,
-    validate_runtime_output_len, visible_value_index_error, zero_runtime_values,
+    build_visible_name_index, compiled_expression, compiled_jacobian, copy_runtime_values,
+    copy_runtime_values_into, fill_inactive_root_output, optional_compiled,
+    reserve_runtime_index_map_capacity, reserve_runtime_vec_capacity, resize_runtime_values,
+    validate_finite_runtime_output, validate_runtime_output_len, visible_value_index_error,
+    zero_runtime_values,
 };
+use tangent_evaluators::{colored_tangent_evaluators, torn_tangent_evaluators};
 
 /// Backend-neutral callable produced from one checked Solve-IR expression
 /// block. Native execution adapters implement this contract; the runtime
 /// retains the prepared evaluator as the correctness fallback.
 pub trait CompiledSolveExpression {
+    /// Execute all local outputs of one retained source program. A decline
+    /// occurs before execution; admitted execution errors must propagate.
+    fn call_program_outputs(
+        &self,
+        _program: usize,
+        _y: &[f64],
+        _p: &[f64],
+        _t: f64,
+        _external_tables: &[rumoca_core::ExternalTableData],
+        _out: &mut Vec<f64>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Evaluate one source program output at `(program index, output offset)`.
+    /// Other programs must not execute. `None` declines this optional entry
+    /// point; an admitted execution error must propagate to the caller.
+    fn call_program_output(
+        &self,
+        _coordinate: (usize, usize),
+        _y: &[f64],
+        _p: &[f64],
+        _t: f64,
+        _external_tables: &[rumoca_core::ExternalTableData],
+    ) -> Result<Option<f64>, String> {
+        Ok(None)
+    }
+
     fn call(
         &self,
         y: &[f64],
@@ -97,12 +145,58 @@ pub trait CompiledSolveExpression {
 
 /// Backend-neutral callable for a checked forward-mode Solve-IR expression.
 pub trait CompiledSolveJacobianExpression {
+    fn prepare_projection(
+        &self,
+        _application: &solve::ProjectionJacobianApplication,
+    ) -> Result<Option<Rc<dyn CompiledSolveProjectionJacobian>>, String> {
+        Ok(None)
+    }
+    /// Execute one already compiled program and return all of its local
+    /// outputs. `false` declines this optional entry point before execution.
+    fn call_program_outputs(
+        &self,
+        _program: usize,
+        _inputs: solve_eval::JacobianEvalInputs<'_>,
+        _external_tables: &[rumoca_core::ExternalTableData],
+        _out: &mut Vec<f64>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn call(
         &self,
         y: &[f64],
         p: &[f64],
         t: f64,
         seed: &[f64],
+        external_tables: &[rumoca_core::ExternalTableData],
+        out: &mut [f64],
+    ) -> Result<(), String>;
+
+    /// Evaluate one output of one already compiled program. `coordinate` is
+    /// `(program index, output offset)`, as issued by the prepared scalar view,
+    /// not a visible-output index. Other programs must not execute. `None`
+    /// declines this optional entry point; an execution error is not a decline.
+    fn call_program_output(
+        &self,
+        _coordinate: (usize, usize),
+        _y: &[f64],
+        _p: &[f64],
+        _t: f64,
+        _seed: &[f64],
+        _external_tables: &[rumoca_core::ExternalTableData],
+    ) -> Result<Option<f64>, String> {
+        Ok(None)
+    }
+}
+
+/// Complete application of an issued colored Jacobian at fresh coordinates.
+pub trait CompiledSolveProjectionJacobian {
+    fn call(
+        &self,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
         external_tables: &[rumoca_core::ExternalTableData],
         out: &mut [f64],
     ) -> Result<(), String>;
@@ -129,10 +223,24 @@ pub trait CompiledSolveEventTransaction {
 
 /// Optional execution adapter injected by a concrete simulation backend.
 pub trait SolveExecutionBackend {
+    fn pure_call_execution(&self) -> Option<&dyn solve_eval::PureCallExecution> {
+        None
+    }
+
     fn compile_expression(
         &self,
         block: &solve::ScalarProgramBlock,
     ) -> Result<Rc<dyn CompiledSolveExpression>, String>;
+
+    /// Prepare an expression used through both whole-block and selected-program
+    /// calls. Backends may retain batching when separate entry points would
+    /// split a shared owner; the selected call then explicitly declines.
+    fn compile_selectable_expression(
+        &self,
+        block: &solve::ScalarProgramBlock,
+    ) -> Result<Rc<dyn CompiledSolveExpression>, String> {
+        self.compile_expression(block)
+    }
 
     fn compile_jacobian_expression(
         &self,
@@ -245,14 +353,26 @@ pub struct SolveRuntime {
     implicit_projection_jacobian_v: PreparedComputeBlock,
     implicit_projection_scalar_jacobian_v: PreparedScalarProgramBlock,
     implicit_scalar_rhs: PreparedScalarProgramBlock,
+    /// Tangent plan of each algebraic projection block's tearing, aligned
+    /// with the block list; `None` for an untorn block or one without a plan.
+    torn_tangents: Rc<[Option<rumoca_eval_solve::TornTangentEvaluator>]>,
+    /// Colored tangent plan of each algebraic projection block, aligned with
+    /// the block list and its structural artifacts.
+    colored_tangents: Rc<[Option<rumoca_eval_solve::ColoredTangentEvaluator>]>,
+    /// Block residual splits aligned with the projection plan's blocks.
+    block_splits: Rc<[Option<Rc<block_residual_split::BlockSplits>>]>,
+    /// Invariant values of the block projection call in progress.
+    active_split: block_residual_split::ActiveSplitSlot,
+    /// Output buffer of a single-row split evaluation.
+    split_row_scratch: std::cell::RefCell<Vec<f64>>,
     refresh_program_rows: FxHashMap<solve::RefreshScalarProgramSource, usize>,
-    manifold_residual: PreparedComputeBlock,
-    manifold_jacobian_v: PreparedComputeBlock,
+    manifold: manifold_execution::PreparedManifoldProjection,
     initial_residual: PreparedComputeBlock,
     initial_residual_jacobian_v: PreparedComputeBlock,
     initial_scalar_residual: PreparedScalarProgramBlock,
     compiled_implicit_rhs: Option<Rc<dyn CompiledSolveExpression>>,
     compiled_implicit_projection_jacobian_v: Option<Rc<dyn CompiledSolveJacobianExpression>>,
+    compiled_algebraic_jacobians: Vec<Option<Rc<dyn CompiledSolveProjectionJacobian>>>,
     compiled_implicit_full_jacobian_v: Option<Rc<dyn CompiledSolveJacobianExpression>>,
     compiled_initial_residual: Option<Rc<dyn CompiledSolveExpression>>,
     compiled_initial_residual_jacobian_v: Option<Rc<dyn CompiledSolveJacobianExpression>>,
@@ -262,11 +382,11 @@ pub struct SolveRuntime {
     /// (`d(der)/d(y)·v`), lowered to `LinearOp`s with `LoadSeed`. Applied — with a
     /// seed completed by `seed_refresh_derivative_dependencies` — to form
     /// the exact state Jacobian for the state-only BDF path.
-    derivative_jacobian_v: PreparedScalarProgramBlock,
+    derivative_jacobian_v: PreparedEvaluationBlock,
     /// Primal state-derivative scalar program `der = f(solver_y, p, t)`. Reversed
     /// by [`Self::reverse_state_derivative_vjp`] to form the reverse-mode VJP
     /// `(∂der/∂[solver_y|p])ᵀ·λ` (Track A scalar reverse core).
-    derivative_scalar: PreparedScalarProgramBlock,
+    derivative_scalar: PreparedEvaluationBlock,
     /// Per-row forward-mode AD Jacobian-vector product of `implicit_rhs`
     /// (`d(residual_row)/d[y|p]·v`). Used to propagate state and parameter seeds
     /// through the algebraic projection row by row.
@@ -274,7 +394,13 @@ pub struct SolveRuntime {
     continuous_structural: solve::ContinuousStructuralArtifacts,
     initialization_structural: solve::InitializationStructuralArtifacts,
     algebraic_newton_caches: Vec<RefCell<crate::runtime::projection::SparseNewtonCache>>,
+    seed_projection_cache: RefCell<SeedProjectionCache>,
     algebraic_refresh: solve::RefreshPlan,
+    /// Per initialization residual row, the positions of the algebraic
+    /// refresh blocks it reads directly or through other blocks; `None` when
+    /// a block Jacobian must carry its direction through every block
+    /// ([`initial_projection::settled_read_cones`]).
+    settled_read_cones: Option<Box<[Box<[usize]>]>>,
     derivative_refresh: solve::RefreshPlan,
     root_refresh: solve::RefreshPlan,
     event_refresh: solve::RefreshPlan,
@@ -351,9 +477,13 @@ pub struct SolveRuntime {
     failed_visible_rows: RefCell<BTreeSet<usize>>,
     compiled_event_action_rows: RefCell<FxHashMap<usize, Vec<CompiledDiscreteSpecialization>>>,
     failed_event_action_rows: RefCell<BTreeSet<usize>>,
+    /// Warning-level assertion sites reported so far (MLS §8.3.7).
+    warning_log: RefCell<warnings::WarningLog>,
     compiled_assignment_schedules: RefCell<
         FxHashMap<solve::RefreshSequenceId, Option<Rc<dyn CompiledSolveAssignmentSchedule>>>,
     >,
+    interpreted_assignment_schedules: interpreted_schedules::InterpretedSchedules,
+    native_projection_assignments: native_projection_assignments::NativeProjectionAssignments,
     compiled_output_scratch: RefCell<Vec<f64>>,
     clock_activation_cache: RefCell<ClockActivationCache>,
 }
@@ -378,12 +508,49 @@ impl SolveRuntime {
         Self::new(&model)
     }
 
-    // SPEC_0021: Exception - construction-issued owner binding stays contiguous for auditability.
-    #[allow(clippy::too_many_lines)]
     pub fn new_with_execution_backend(
         model: &solve::SolveModel,
         execution_backend: Option<Rc<dyn SolveExecutionBackend>>,
     ) -> Result<Self, EvalSolveError> {
+        Self::construct(model, execution_backend, None)
+    }
+
+    /// The runtime of an alternate reduced chart over `model`, sharing this
+    /// primary runtime's prepared and compiled programs wherever `model`
+    /// carries the same ones (see [`chart_sharing`]).
+    pub(crate) fn new_alternate(&self, model: &solve::SolveModel) -> Result<Self, EvalSolveError> {
+        Self::construct(model, self.execution_backend.clone(), Some(self))
+    }
+
+    // SPEC_0021: Exception - construction-issued owner binding stays contiguous for auditability.
+    #[allow(clippy::too_many_lines)]
+    fn construct(
+        model: &solve::SolveModel,
+        execution_backend: Option<Rc<dyn SolveExecutionBackend>>,
+        primary: Option<&SolveRuntime>,
+    ) -> Result<Self, EvalSolveError> {
+        let prepare = |pick: fn(&SolveRuntime) -> &PreparedScalarProgramBlock,
+                       block: solve::ScalarProgramBlock| {
+            let base = primary.map(pick);
+            BlockReuse::of(base, &block).prepared(base, block)
+        };
+        // The state-derivative programs are evaluated, differentiated, and
+        // reversed, never solved for a target, so they derive no assignment
+        // certificates (one materialized program per output of a tensor row).
+        let prepare_evaluation =
+            |pick: fn(&SolveRuntime) -> &PreparedEvaluationBlock,
+             block: solve::ScalarProgramBlock| {
+                let base = primary.map(pick);
+                BlockReuse::of_programs(base.map(PreparedEvaluationBlock::block), &block)
+                    .prepared_evaluation(base, block)
+            };
+        let prepare_compute =
+            |pick: fn(&SolveRuntime) -> &PreparedComputeBlock,
+             block: &solve::ComputeBlock,
+             label: &'static str| match primary.map(pick) {
+                Some(base) => PreparedComputeBlock::with_shared_programs(base, block, label),
+                None => PreparedComputeBlock::new_with_label(block, label),
+            };
         if !model.problem.continuous.refresh_owners.is_issued() {
             return Err(EvalSolveError::InvalidRow {
                 message: "Solve model has no construction-issued continuous refresh owners"
@@ -416,34 +583,88 @@ impl SolveRuntime {
             }
         }
         let implicit_scalar_programs = implicit_scalar_projection.into_block();
-        let compiled_implicit_rhs = execution_backend.as_ref().and_then(|backend| {
-            optional_compiled(
-                "implicit_rhs",
-                backend.compile_expression(&implicit_scalar_programs),
-            )
-        });
-        let implicit_projection_scalar_jacobian =
-            to_scalar_program_block(&model.artifacts.continuous.implicit_jacobian_v)?;
-        let compiled_implicit_projection_jacobian_v =
-            execution_backend.as_ref().and_then(|backend| {
-                optional_compiled(
+        refresh_projection::validate_projection_primal_source(
+            &implicit_scalar_programs,
+            &continuous_structural,
+        )?;
+        let implicit_reuse = BlockReuse::of(
+            primary.map(|primary| &primary.implicit_scalar_rhs),
+            &implicit_scalar_programs,
+        );
+        let compiled_implicit_rhs = implicit_reuse.expression(
+            primary.and_then(|primary| primary.compiled_implicit_rhs.as_ref()),
+            &implicit_scalar_programs,
+            &mut |block| {
+                execution_backend.as_ref().and_then(|backend| {
+                    optional_compiled("implicit_rhs", backend.compile_selectable_expression(block))
+                })
+            },
+        );
+        let implicit_projection_scalar_jacobian = refresh_projection::projection_jacobian_source(
+            &model.artifacts.continuous.implicit_jacobian_v,
+            &continuous_structural,
+        )?;
+        let projection_reuse = BlockReuse::of(
+            primary.map(|primary| &primary.implicit_projection_scalar_jacobian_v),
+            &implicit_projection_scalar_jacobian,
+        );
+        let compiled_implicit_projection_jacobian_v = projection_reuse.jacobian(
+            primary.and_then(|primary| primary.compiled_implicit_projection_jacobian_v.as_ref()),
+            &implicit_projection_scalar_jacobian,
+            &mut |block| {
+                compiled_jacobian(
+                    execution_backend.as_ref(),
                     "implicit_projection_jacobian_v",
-                    backend.compile_jacobian_expression(&implicit_projection_scalar_jacobian),
+                    block,
                 )
-            });
+            },
+        );
         let implicit_full_jacobian_v = model
             .artifacts
             .continuous
             .implicit_jacobian_v_scalar
             .clone();
-        let compiled_implicit_full_jacobian_v = execution_backend.as_ref().and_then(|backend| {
-            optional_compiled(
-                "implicit_full_jacobian_v",
-                backend.compile_jacobian_expression(&implicit_full_jacobian_v),
-            )
-        });
-        let implicit_scalar_rhs = PreparedScalarProgramBlock::new(implicit_scalar_programs)?;
-        let (manifold_residual, manifold_jacobian_v) = prepare_manifold_projection_programs(model)?;
+        let full_reuse = BlockReuse::of(
+            primary.map(|primary| &primary.implicit_jacobian_v),
+            &implicit_full_jacobian_v,
+        );
+        let compiled_implicit_full_jacobian_v = full_reuse.jacobian(
+            primary.and_then(|primary| primary.compiled_implicit_full_jacobian_v.as_ref()),
+            &implicit_full_jacobian_v,
+            &mut |block| {
+                compiled_jacobian(
+                    execution_backend.as_ref(),
+                    "implicit_full_jacobian_v",
+                    block,
+                )
+            },
+        );
+        let replaced_rows = implicit_reuse
+            .replaced_outputs(&implicit_scalar_programs)
+            .into_iter()
+            .chain(projection_reuse.replaced_outputs(&implicit_projection_scalar_jacobian))
+            .collect::<BTreeSet<_>>();
+        let implicit_scalar_rhs = implicit_reuse.prepared(
+            primary.map(|primary| &primary.implicit_scalar_rhs),
+            implicit_scalar_programs,
+        )?;
+        let compiled_algebraic_jacobians = match primary {
+            Some(primary) => chart_sharing::shared_projection_jacobians(
+                primary,
+                &continuous_structural,
+                &replaced_rows,
+            ),
+            None => refresh_projection::prepare_projection_jacobians(
+                &continuous_structural,
+                &implicit_scalar_rhs,
+                &implicit_projection_scalar_jacobian,
+                compiled_implicit_projection_jacobian_v.as_deref(),
+            )?,
+        };
+        let manifold = manifold_execution::PreparedManifoldProjection::new(
+            model,
+            execution_backend.as_deref(),
+        )?;
         let derivative_scalar_rhs =
             to_scalar_program_block(&model.problem.continuous.derivative_rhs)?;
         // Scalarization is an evaluator-boundary view of the compact
@@ -489,12 +710,15 @@ impl SolveRuntime {
                 })
             })
             .collect();
-        let compiled_derivative_rhs = execution_backend.as_ref().and_then(|backend| {
-            optional_compiled(
-                "derivative_rhs",
-                backend.compile_expression(&derivative_scalar_rhs),
-            )
-        });
+        let compiled_derivative_rhs = BlockReuse::of_programs(
+            primary.map(|primary| primary.derivative_scalar.block()),
+            &derivative_scalar_rhs,
+        )
+        .expression(
+            primary.and_then(|primary| primary.compiled_derivative_rhs.as_ref()),
+            &derivative_scalar_rhs,
+            &mut |block| compiled_expression(execution_backend.as_ref(), "derivative_rhs", block),
+        );
         let refresh_owners = &model.problem.continuous.refresh_owners;
         let algebraic_refresh = refresh_owners.algebraic().clone();
         let derivative_refresh = refresh_owners.derivative().clone();
@@ -519,6 +743,11 @@ impl SolveRuntime {
                 });
             }
         }
+        let settled_read_cones = initial_projection::settled_read_cones(
+            model,
+            &continuous_structural,
+            &algebraic_refresh.simultaneous_plan,
+        );
         trace_refresh_plan(model, "algebraic", &algebraic_refresh);
         trace_refresh_plan(model, "derivative", &derivative_refresh);
         trace_refresh_plan(model, "root", &root_refresh);
@@ -549,33 +778,52 @@ impl SolveRuntime {
         }
         trace_reverse_projection_coverage(model, &implicit_scalar_rhs);
         let visible_value_plan = visible_value_plan(model);
-        let root_condition_plan = root_condition_plan(model, &root_refresh);
-        let compiled_root_conditions = execution_backend.as_ref().and_then(|backend| {
-            optional_compiled(
-                "root_conditions",
-                backend.compile_expression(&model.problem.events.root_conditions),
-            )
-        });
+        let root_condition_plan = root_condition_plan(model);
+        let compiled_root_conditions = BlockReuse::of(
+            primary.map(|primary| &primary.root_condition_rows),
+            &model.problem.events.root_conditions,
+        )
+        .expression(
+            primary.and_then(|primary| primary.compiled_root_conditions.as_ref()),
+            &model.problem.events.root_conditions,
+            &mut |block| compiled_expression(execution_backend.as_ref(), "root_conditions", block),
+        );
         let (initial_scalar_residual, initial_continuation) =
             InitialContinuationCoverage::certify_runtime_blocks(
                 model,
                 &implicit_scalar_rhs,
                 &algebraic_refresh,
             )?;
-        let compiled_initial_residual = execution_backend.as_ref().and_then(|backend| {
-            optional_compiled(
-                "initial_residual",
-                backend.compile_expression(&initial_scalar_residual),
-            )
-        });
+        let compiled_initial_residual = BlockReuse::of(
+            primary.map(|primary| &primary.initial_scalar_residual),
+            &initial_scalar_residual,
+        )
+        .expression(
+            primary.and_then(|primary| primary.compiled_initial_residual.as_ref()),
+            &initial_scalar_residual,
+            &mut |block| compiled_expression(execution_backend.as_ref(), "initial_residual", block),
+        );
         let initial_scalar_jacobian =
             to_scalar_program_block(&model.artifacts.initialization.residual_jacobian_v)?;
-        let compiled_initial_residual_jacobian_v = execution_backend.as_ref().and_then(|backend| {
-            optional_compiled(
-                "initial_residual_jacobian_v",
-                backend.compile_jacobian_expression(&initial_scalar_jacobian),
-            )
-        });
+        let primary_initial_jacobian = primary
+            .map(|primary| {
+                to_scalar_program_block(&primary.model.artifacts.initialization.residual_jacobian_v)
+            })
+            .transpose()?;
+        let compiled_initial_residual_jacobian_v =
+            BlockReuse::of_programs(primary_initial_jacobian.as_ref(), &initial_scalar_jacobian)
+                .jacobian(
+                    primary
+                        .and_then(|primary| primary.compiled_initial_residual_jacobian_v.as_ref()),
+                    &initial_scalar_jacobian,
+                    &mut |block| {
+                        compiled_jacobian(
+                            execution_backend.as_ref(),
+                            "initial_residual_jacobian_v",
+                            block,
+                        )
+                    },
+                );
         let delay_runtime = DelayRuntime::new(&model.problem.events.delays)?;
         let root_condition_count =
             total_root_condition_count(model, delay_runtime.event_root_count())?;
@@ -586,36 +834,75 @@ impl SolveRuntime {
             structured_discrete_rows.rows(),
         );
         let clock_partition_clocks = discrete_rows::clock_partition_clocks(&model.problem.discrete);
+        let block_splits = block_residual_split::block_residual_splits(
+            &model.problem.continuous.refresh_owners,
+            &model.problem.continuous.algebraic_projection_plan,
+            &continuous_structural,
+            &implicit_scalar_rhs,
+            execution_backend.as_deref(),
+            primary.map(|primary| {
+                block_residual_split::SharedSplits::new(
+                    &primary.model.problem.continuous.algebraic_projection_plan,
+                    &primary.block_splits,
+                    &replaced_rows,
+                )
+            }),
+        )
+        .into();
         Ok(Self {
             model: model.clone(),
             state_count: model.state_scalar_count(),
             solver_count: model.solver_scalar_count(),
-            implicit_rhs: PreparedComputeBlock::new_with_label(
+            implicit_rhs: prepare_compute(
+                |primary| &primary.implicit_rhs,
                 &model.problem.continuous.implicit_rhs,
                 "runtime_implicit_rhs",
             )?,
-            implicit_projection_jacobian_v: PreparedComputeBlock::new_with_label(
+            implicit_projection_jacobian_v: prepare_compute(
+                |primary| &primary.implicit_projection_jacobian_v,
                 &model.artifacts.continuous.implicit_jacobian_v,
                 "runtime_implicit_projection_jacobian_v",
             )?,
-            implicit_projection_scalar_jacobian_v: PreparedScalarProgramBlock::new(
+            torn_tangents: torn_tangent_evaluators(
+                &model.problem.continuous.algebraic_projection_plan,
+                &implicit_projection_scalar_jacobian,
+                compiled_implicit_projection_jacobian_v.is_some(),
+            ),
+            // A backend-compiled JVP evaluates the colors natively, so the
+            // colored lanes are built only for the interpreted runtime.
+            colored_tangents: if compiled_implicit_projection_jacobian_v.is_some() {
+                Rc::from(Vec::new())
+            } else {
+                colored_tangent_evaluators(
+                    &model.problem.continuous.algebraic_projection_plan,
+                    &continuous_structural,
+                )
+            },
+            block_splits,
+            active_split: std::cell::Cell::new(None),
+            split_row_scratch: std::cell::RefCell::new(Vec::new()),
+            implicit_projection_scalar_jacobian_v: projection_reuse.prepared(
+                primary.map(|primary| &primary.implicit_projection_scalar_jacobian_v),
                 implicit_projection_scalar_jacobian,
             )?,
             implicit_scalar_rhs,
             refresh_program_rows,
-            manifold_residual,
-            manifold_jacobian_v,
+            manifold,
             initial_residual: PreparedComputeBlock::new_with_label(
-                &model.problem.initialization.residual,
+                model.problem.initialization.residual(),
                 "runtime_initial_residual",
             )?,
             initial_residual_jacobian_v: PreparedComputeBlock::new_with_label(
                 &model.artifacts.initialization.residual_jacobian_v,
                 "runtime_initial_residual_jacobian_v",
             )?,
-            initial_scalar_residual: PreparedScalarProgramBlock::new(initial_scalar_residual)?,
+            initial_scalar_residual: prepare(
+                |primary| &primary.initial_scalar_residual,
+                initial_scalar_residual,
+            )?,
             compiled_implicit_rhs,
             compiled_implicit_projection_jacobian_v,
+            compiled_algebraic_jacobians,
             compiled_implicit_full_jacobian_v,
             compiled_initial_residual,
             compiled_initial_residual_jacobian_v,
@@ -624,35 +911,50 @@ impl SolveRuntime {
                 "runtime_derivative_rhs",
             )?,
             compiled_derivative_rhs,
-            derivative_jacobian_v: PreparedScalarProgramBlock::new(
+            derivative_jacobian_v: prepare_evaluation(
+                |primary| &primary.derivative_jacobian_v,
                 model.artifacts.continuous.full_jacobian_v.clone(),
             )?,
-            derivative_scalar: PreparedScalarProgramBlock::new(derivative_scalar_rhs)?,
-            implicit_jacobian_v: PreparedScalarProgramBlock::new(implicit_full_jacobian_v)?,
+            derivative_scalar: prepare_evaluation(
+                |primary| &primary.derivative_scalar,
+                derivative_scalar_rhs,
+            )?,
+            implicit_jacobian_v: full_reuse.prepared(
+                primary.map(|primary| &primary.implicit_jacobian_v),
+                implicit_full_jacobian_v,
+            )?,
             continuous_structural,
             initialization_structural,
             algebraic_newton_caches,
+            seed_projection_cache: RefCell::new(SeedProjectionCache::default()),
             algebraic_refresh,
+            settled_read_cones,
             derivative_refresh,
             root_refresh,
             event_refresh,
             root_refresh_after_derivative,
             clock_event_refresh_after_event,
             initial_continuation,
-            root_condition_rows: PreparedScalarProgramBlock::new(
+            root_condition_rows: prepare(
+                |primary| &primary.root_condition_rows,
                 model.problem.events.root_conditions.clone(),
             )?,
             compiled_root_conditions,
-            event_action_conditions: PreparedScalarProgramBlock::new(
+            event_action_conditions: prepare(
+                |primary| &primary.event_action_conditions,
                 model.problem.events.action_conditions.clone(),
             )?,
             event_action_active_row_indices: RefCell::new(Vec::new()),
             root_condition_plan,
-            discrete_rhs: PreparedScalarProgramBlock::new(model.problem.discrete.rhs.clone())?,
+            discrete_rhs: prepare(
+                |primary| &primary.discrete_rhs,
+                model.problem.discrete.rhs.clone(),
+            )?,
             observation_refresh_scalar_rows,
             observation_refresh_p_scratch: RefCell::new(Vec::new()),
             observation_refresh_values_scratch: RefCell::new(Vec::new()),
-            clock_partition_intermediates: PreparedScalarProgramBlock::new(
+            clock_partition_intermediates: prepare(
+                |primary| &primary.clock_partition_intermediates,
                 model.problem.discrete.clock_partition_intermediates.clone(),
             )?,
             clock_partition_clocks,
@@ -662,16 +964,21 @@ impl SolveRuntime {
             guarded_assignment_programs,
             event_transaction_programs,
             event_transaction_coverage,
-            runtime_assignment_rhs: PreparedScalarProgramBlock::new(
+            runtime_assignment_rhs: prepare(
+                |primary| &primary.runtime_assignment_rhs,
                 model.problem.discrete.runtime_assignment_rhs.clone(),
             )?,
-            post_commit_assignment_rhs: PreparedScalarProgramBlock::new(
+            post_commit_assignment_rhs: prepare(
+                |primary| &primary.post_commit_assignment_rhs,
                 model.problem.discrete.post_commit_assignment_rhs.clone(),
             )?,
             update_values_scratch: RefCell::new(Vec::new()),
             structured_discrete_rows,
             visible_name_index: build_visible_name_index(model),
-            visible_value_rows: PreparedScalarProgramBlock::new(model.visible_value_rows.clone())?,
+            visible_value_rows: prepare(
+                |primary| &primary.visible_value_rows,
+                model.visible_value_rows.clone(),
+            )?,
             visible_value_plan,
             visible_scratch: RefCell::new(Vec::new()),
             refresh_snapshot_scratch: RefCell::new(Vec::new()),
@@ -704,7 +1011,11 @@ impl SolveRuntime {
             failed_visible_rows: RefCell::new(BTreeSet::new()),
             compiled_event_action_rows: RefCell::new(FxHashMap::default()),
             failed_event_action_rows: RefCell::new(BTreeSet::new()),
+            warning_log: RefCell::new(warnings::WarningLog::default()),
             compiled_assignment_schedules: RefCell::new(FxHashMap::default()),
+            interpreted_assignment_schedules:
+                interpreted_schedules::InterpretedSchedules::construct(model)?,
+            native_projection_assignments: Default::default(),
             compiled_output_scratch: RefCell::new(Vec::new()),
             clock_activation_cache: RefCell::new(ClockActivationCache::default()),
         })
@@ -954,10 +1265,70 @@ impl SolveRuntime {
         }
     }
 
+    /// The reduced tear Jacobian of a torn block from its tangent plan (see
+    /// [`KernelRequest::TornJacobian`](crate::runtime::projection::KernelRequest)):
+    /// `None` when the block has no plan, and a singular answer when a causal
+    /// coefficient vanishes at this point. `index` is the block's position in
+    /// the algebraic projection plan, the same index its tangent plan was
+    /// issued under, so the lookup is direct.
+    pub(crate) fn torn_tangent_jacobian(
+        &self,
+        index: usize,
+        tearing: &solve::BlockTearing,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+    ) -> Result<Option<Option<rumoca_eval_solve::TornTangentJacobian>>, RuntimeSolveError> {
+        debug_assert!(
+            self.model
+                .problem
+                .continuous
+                .algebraic_projection_plan
+                .blocks
+                .get(index)
+                .is_some_and(|block| block.tearing.as_ref() == Some(tearing)),
+            "a torn block index names the plan block that owns its tearing"
+        );
+        let evaluator = self.torn_tangents.get(index).and_then(Option::as_ref);
+        let Some(evaluator) = evaluator else {
+            return Ok(None);
+        };
+        let tables = self.model.external_tables.as_slice();
+        let compiled = self.compiled_implicit_projection_jacobian_v.as_deref();
+        let mut call = |program: usize, seed: &[f64], out: &mut Vec<f64>| {
+            compiled.is_some_and(|compiled| {
+                compiled
+                    .call_program_outputs(
+                        program,
+                        solve_eval::JacobianEvalInputs { y, p, t, seed },
+                        tables,
+                        out,
+                    )
+                    .unwrap_or(false)
+            })
+        };
+        evaluator
+            .eval_through(
+                rumoca_eval_solve::TangentPoint {
+                    y,
+                    p,
+                    t,
+                    context: self.row_eval_context(),
+                },
+                &mut call,
+            )
+            .map(Some)
+            .map_err(Into::into)
+    }
+
     pub fn row_eval_context(&self) -> RowEvalContext<'_> {
         RowEvalContext {
             external_tables: Some(self.model.external_tables.as_slice()),
             pure_calls: Some(&self.model.pure_calls),
+            pure_call_execution: self
+                .execution_backend
+                .as_deref()
+                .and_then(|backend| backend.pure_call_execution()),
             runtime_state: Some(&self.runtime_state),
             ..Default::default()
         }
@@ -1185,7 +1556,7 @@ impl SolveRuntime {
                 params,
                 tol,
                 max_iters,
-                certify_coordinates: false,
+                certify_coordinates: true,
             },
         )?;
         self.eval_root_conditions_from_refreshed_solver_y(
@@ -1267,7 +1638,7 @@ impl SolveRuntime {
                     params,
                     tol,
                     max_iters,
-                    certify_coordinates: false,
+                    certify_coordinates: true,
                 },
             )?;
         }
@@ -1341,7 +1712,7 @@ impl SolveRuntime {
                     params,
                     tol,
                     max_iters,
-                    certify_coordinates: false,
+                    certify_coordinates: true,
                 },
             )?;
         }
@@ -1412,7 +1783,6 @@ impl SolveRuntime {
         self.validate_root_plan_output_len(plan, out)?;
         for (slot, entry) in out.iter_mut().zip(plan.entries.iter().copied()) {
             *slot = match entry {
-                RootConditionPlanEntry::ConstantNonZero(value) => value,
                 RootConditionPlanEntry::DirectTime(root) => {
                     direct_time_root_value(root, params, t)?
                 }
@@ -1445,9 +1815,7 @@ impl SolveRuntime {
         self.validate_root_plan_output_len(plan, out)?;
         for (slot, entry) in out.iter_mut().zip(plan.entries.iter().copied()) {
             *slot = match entry {
-                RootConditionPlanEntry::ConstantNonZero(_)
-                | RootConditionPlanEntry::ContinuousStatic
-                | RootConditionPlanEntry::Dynamic => 1.0,
+                RootConditionPlanEntry::ContinuousStatic | RootConditionPlanEntry::Dynamic => 1.0,
                 RootConditionPlanEntry::DirectTime(root) => {
                     direct_time_root_search_default(root, params, t)?
                 }
@@ -1547,9 +1915,6 @@ struct StateDerivativeScratch {
     /// the algebraic slots completed by the projection forward-sensitivity, for
     /// the AD Jacobian-vector product.
     seed_buf: Vec<f64>,
-    /// Scratch unit seed used to read a single residual row's diagonal
-    /// sensitivity `∂g_row/∂y_target`; kept all-zero between uses.
-    unit_seed: Vec<f64>,
 }
 
 /// Tolerances for the algebraic projection's fixed-point settle (shared by the

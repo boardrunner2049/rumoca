@@ -91,23 +91,27 @@ end StaticAssertConditional;
         let work = tempdir().unwrap();
         for target in ["fmi2", "fmi3"] {
             let destination = work.path().join(target);
-            let error = rumoca::compile_packaged_target(
+            rumoca::compile_packaged_target(
                 &compiled,
                 "StaticAssertConditional",
                 target,
                 destination.clone(),
             )
-            .expect_err(
-                "the state-dependent branch requires event support with or without assertions",
-            );
-            let diagnostic = format!("{error:#}");
+            .unwrap_or_else(|error| panic!("{target}: {error:#}"));
+            let description = fs::read_to_string(
+                destination
+                    .join("StaticAssertConditional")
+                    .join("modelDescription.xml"),
+            )
+            .expect("the packaged component describes itself");
+            let advertised = if target == "fmi2" {
+                description.contains("numberOfEventIndicators=\"1\"")
+            } else {
+                description.matches("<EventIndicator ").count() == 1
+            };
             assert!(
-                diagnostic.contains("continuous event indicators require general event support"),
-                "{target}: {diagnostic}"
-            );
-            assert!(
-                !destination.exists() || destination.read_dir().unwrap().next().is_none(),
-                "a refused event-bearing model must not leave a successful-looking package"
+                advertised,
+                "{target} advertises its one state event: {description}"
             );
         }
     }

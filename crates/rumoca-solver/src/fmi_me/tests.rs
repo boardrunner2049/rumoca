@@ -5,14 +5,17 @@
 //! directional-derivative tests run a real component, because the operation's
 //! whole point is that the *component* owns the derivative.
 
+mod committed_seed;
 mod failure_atomicity;
+mod manifold;
+mod on_demand_derivatives;
 mod publication;
 
 use indexmap::IndexMap;
 use rumoca_ir_solve as solve;
 
 use super::kernel::{
-    continuous_state_values_changed, event_right_limit_state_derivatives,
+    StateTimeCoincidence, continuous_state_values_changed, event_right_limit_state_derivatives,
     event_update_application_time,
 };
 use super::{
@@ -35,8 +38,15 @@ fn zero_state_event_continuation_is_independent_of_value_tolerance() {
             None,
         )
         .expect("zero-state component should instantiate");
-        let options = live_session_options(0.0, atol, atol, 1.0e-10, None)
-            .expect("zero-state session options should construct");
+        let options = live_session_options(
+            &rumoca_ir_solve::fmi::RootLocationPlan::STANDARD,
+            0.0,
+            atol,
+            atol,
+            1.0e-10,
+            None,
+        )
+        .expect("zero-state session options should construct");
         let host = retained
             .into_lease(options)
             .expect("zero-state component should initialize");
@@ -68,14 +78,28 @@ fn state_event_application_time_preserves_clock_and_numerical_owners() {
     let snapped_horizon = 0.215;
 
     assert_eq!(
-        event_update_application_time(semantic_root, snapped_horizon, false).to_bits(),
+        event_update_application_time(semantic_root, snapped_horizon, StateTimeCoincidence::None)
+            .to_bits(),
         snapped_horizon.to_bits(),
         "ordinary root rows execute at the host's numerical application point"
     );
     assert_eq!(
-        event_update_application_time(semantic_root, snapped_horizon, true).to_bits(),
+        event_update_application_time(
+            semantic_root,
+            snapped_horizon,
+            StateTimeCoincidence::Unconsumed
+        )
+        .to_bits(),
         semantic_root.to_bits(),
         "a coincident clock pass retains the semantic tick"
+    );
+    let consumed_tick = 1.0_f64;
+    let later_root = consumed_tick.next_up();
+    assert_eq!(
+        event_update_application_time(consumed_tick, later_root, StateTimeCoincidence::Consumed)
+            .to_bits(),
+        later_root.to_bits(),
+        "a consumed clock cannot backdate a later state event"
     );
 }
 
@@ -216,6 +240,7 @@ fn harmonic_oscillator() -> solve::SolveModel {
             ..Default::default()
         },
         artifacts: solve::SolveArtifacts {
+            discrete: Default::default(),
             continuous: solve::ContinuousSolveArtifacts {
                 full_jacobian_v: jacobian_v,
                 ..Default::default()
@@ -312,6 +337,7 @@ fn nonlinear_right_limit_seed_model() -> solve::SolveModel {
                         rows: vec![1],
                         y_indices: vec![1],
                         tearing: None,
+                        alternate_charts: Vec::new(),
                     }],
                 },
                 ..Default::default()
@@ -328,6 +354,7 @@ fn nonlinear_right_limit_seed_model() -> solve::SolveModel {
             ..Default::default()
         },
         artifacts: solve::SolveArtifacts {
+            discrete: Default::default(),
             continuous: solve::ContinuousSolveArtifacts {
                 implicit_jacobian_v: solve::ComputeBlock::from_scalar_program_block(
                     implicit_jvp.clone(),
@@ -360,16 +387,15 @@ fn event_right_limit_derivative_retains_the_full_algebraic_seed() {
             .expect("the retained positive algebraic branch should remain solvable");
     assert_eq!(derivative, vec![2.0]);
 
-    let error =
+    // A zeroed algebraic seed leaves `a` resting on the singular point of
+    // `a² - x` (its Jacobian `2*a` vanishes at `a = 0`). Rather than stall,
+    // the projection advances off the critical seed toward the positive branch,
+    // matching OpenModelica's default-seed convention, so `a` recovers `+2` and
+    // the derivative matches the branch-carrying seed above.
+    let recovered =
         event_right_limit_state_derivatives(&runtime, &[4.0, 0.0], 0.0, &[4.0], &[], settle)
-            .expect_err("a zeroed algebraic seed is singular for a² - x at a = 0");
-    assert!(
-        error
-            .to_string()
-            .contains("algebraic projection did not converge"),
-        "{error}"
-    );
-    assert!(error.to_string().contains("target=a"), "{error}");
+            .expect("a zeroed algebraic seed advances off the singular point");
+    assert_eq!(recovered, vec![2.0]);
 }
 
 fn strict_root_relation_memory() -> solve::SolveModel {
@@ -1057,6 +1083,7 @@ fn the_component_retains_the_typed_post_side_of_a_strict_root() {
         super::MeCompletedIntegratorStep {
             enter_event_mode: true,
             terminate_simulation: false,
+            basis_change: false,
         },
         "the standard callback reports the component-observed domain change"
     );
@@ -1541,7 +1568,8 @@ fn refresh_owned(mut model: solve::SolveModel) -> solve::SolveModel {
 /// checked against the code that actually runs.
 const COMPONENT_SOURCE: &str = include_str!("kernel/component.rs");
 const KERNEL_SOURCE: &str = include_str!("kernel.rs");
-const INDICATOR_PLAN_SOURCE: &str = include_str!("kernel/indicator_plan.rs");
+const INDICATOR_PLAN_SOURCE: &str =
+    include_str!("../../../rumoca-ir-solve/src/fmi/indicator_plan.rs");
 const SOLVE_OPS_SOURCE: &str = include_str!("../runtime/solve_ops.rs");
 const SOLVE_RUNTIME_SOURCE: &str = include_str!("../runtime/solve_runtime.rs");
 const SOLVE_RUNTIME_PLANS_SOURCE: &str = include_str!("../runtime/solve_runtime/plans.rs");
@@ -1558,44 +1586,15 @@ fn method_body<'source>(source: &'source str, signature: &str) -> &'source str {
     &body[..end]
 }
 
-/// The name of the method one occurrence sits in.
-fn enclosing_method<'source>(source: &'source str, needle: &str) -> &'source str {
-    let position = source
-        .find(needle)
-        .unwrap_or_else(|| panic!("{needle} must exist"));
-    let header = source[..position]
-        .rfind("\n    fn ")
-        .into_iter()
-        .chain(source[..position].rfind("\n    pub(super) fn "))
-        .chain(source[..position].rfind("\n    pub(crate) fn "))
-        .max()
-        .expect("an occurrence sits inside a method");
-    let name = source[header..position]
-        .split("fn ")
-        .nth(1)
-        .expect("a method header names its function");
-    name.split(['(', '<', ' ']).next().unwrap_or_default()
-}
-
 #[test]
-fn the_indicator_inventory_has_one_constructor_the_step_path_cannot_reach() {
-    assert_eq!(
-        COMPONENT_SOURCE
-            .matches("FmiIndicatorPlan::derive(")
-            .count(),
-        1,
-        "the resolved indicator table is constructed exactly once"
-    );
-    assert_eq!(
-        KERNEL_SOURCE.matches("FmiIndicatorPlan::derive").count(),
-        0,
-        "no operation outside the constructor may build an indicator table"
-    );
-    assert_eq!(
-        enclosing_method(COMPONENT_SOURCE, "FmiIndicatorPlan::derive("),
-        "instantiate_inner",
-        "the only indicator table is the instantiated component's own"
-    );
+fn the_indicator_table_comes_from_solve_ir_and_is_never_rebuilt() {
+    for source in [COMPONENT_SOURCE, KERNEL_SOURCE] {
+        assert_eq!(
+            source.matches("FmiIndicatorPlan::derive").count(),
+            0,
+            "the component reads the Solve IR indicator table and never builds one"
+        );
+    }
     for source in [COMPONENT_SOURCE, KERNEL_SOURCE] {
         assert_eq!(
             source.matches(".indicator_plan =").count(),
@@ -1633,15 +1632,17 @@ fn the_step_path_neither_masks_nor_reprojects_the_root_vector() {
     }
     let evaluation = method_body(COMPONENT_SOURCE, "fn evaluate_inventory_indicators(");
     assert_eq!(
-        evaluation.matches("full_solver_y").count(),
+        evaluation.matches("solver_y_at_parameters").count(),
         1,
         "an indicator read settles the full algebraic coordinate at most once"
     );
     assert!(
-        evaluation
-            .contains("if self.indicator_plan.reads_deadlines() && settled_guess.is_none() {"),
-        "only a dynamic-time deadline needs a settled algebraic coordinate of its own; \
-         a root-only inventory keeps the root search's own restricted refresh"
+        evaluation.contains(
+            "let needs_settled = self.indicator_plan.reads_deadlines() || self.seed_active();"
+        ),
+        "only a dynamic-time deadline or the committed seed (SPEC_0044 ME-PROJ-005) needs a \
+         settled algebraic coordinate; a root-only inventory without a seed keeps the root \
+         search's own restricted refresh"
     );
     for signature in [
         "fn evaluate_inventory_indicators(",

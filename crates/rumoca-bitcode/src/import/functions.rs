@@ -74,6 +74,7 @@ pub(super) fn rebuild_arena<'dae>(
             ends[index],
         )?;
     }
+    rebuild_derivatives(construction, ctx, &stream.functions)?;
     while stream.built.len() < model.expressions.len() {
         let index = stream.built.len();
         if let Some(function) = body_scope(&model.expressions[index].node) {
@@ -352,6 +353,7 @@ fn rebuild_function<'dae>(
         RbcInline::Unstated => rumoca_core::InlineAnnotation::Unstated,
         RbcInline::Requested => rumoca_core::InlineAnnotation::Requested,
         RbcInline::Never => rumoca_core::InlineAnnotation::Never,
+        RbcInline::AfterIndexReduction => rumoca_core::InlineAnnotation::AfterIndexReduction,
     });
     construction.function(signature, |c, reservation| {
         let mut parameters = Vec::with_capacity(function.parameters.len());
@@ -440,6 +442,7 @@ enum Operation<'m> {
     Assert {
         condition: ExprId,
         message: ExprId,
+        level: RbcAssertionLevel,
         provenance: RbcProvenance,
     },
     Open {
@@ -483,10 +486,12 @@ fn push_operations<'m>(statements: &'m [RbcFunctionStatement], out: &mut Vec<Ope
             RbcFunctionStatement::Assertion {
                 condition,
                 message,
+                level,
                 provenance,
             } => out.push(Operation::Assert {
                 condition: *condition,
                 message: *message,
+                level: *level,
                 provenance: *provenance,
             }),
             RbcFunctionStatement::For {
@@ -735,6 +740,7 @@ impl<'dae> Replay<'_, 'dae> {
             Operation::Assert {
                 condition,
                 message,
+                level,
                 provenance,
             } => {
                 if !ready(&condition) || !ready(&message) {
@@ -744,9 +750,17 @@ impl<'dae> Replay<'_, 'dae> {
                 let message = expression(message)?;
                 let at = ctx.provenance(provenance)?;
                 let capability = self.capability_mut(ctx)?;
+                let level = match level {
+                    RbcAssertionLevel::Error => dae::AssertionLevel::Error,
+                    RbcAssertionLevel::Warning => dae::AssertionLevel::Warning,
+                };
                 construction.functions(|f| match capability {
-                    Capability::Body(body) => f.assertion(body, condition, message, at),
-                    Capability::Loop(body) => f.assertion_loop(body, condition, message, at),
+                    Capability::Body(body) => {
+                        f.assertion_with_level(body, condition, message, level, at)
+                    }
+                    Capability::Loop(body) => {
+                        f.assertion_loop_with_level(body, condition, message, level, at)
+                    }
                 })?;
             }
             // A loop with carried values issues nodes of its own, so it opens
@@ -1150,9 +1164,73 @@ pub(super) fn function_node<'dae>(
                 let head = resolve(built, call_owner.0, "expression", ctx)?;
                 owner
                     .at(at)
-                    .replay_call_projection(head, callee, *output as usize)?
+                    .replay_call_projection(head, callee, *output as usize, None)?
             }
         }
         _ => return Err(ctx.unsupported("function_node called on a node naming no function")),
     })
+}
+
+/// Replay derivative chains through the checked API once their functions exist.
+fn rebuild_derivatives<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    ctx: &Rebuild<'_>,
+    functions: &FunctionTable<'dae>,
+) -> Result<(), dae::DaeConstructionError> {
+    let mut links = std::collections::BTreeMap::new();
+    let mut pending: Vec<_> = ctx
+        .model
+        .functions
+        .iter()
+        .flat_map(|function| {
+            function
+                .derivatives
+                .iter()
+                .enumerate()
+                .map(move |(ordinal, link)| (function.id, ordinal as u32, link))
+        })
+        .collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut deferred = Vec::new();
+        for (function, ordinal, link) in pending {
+            let key = (function.0, ordinal);
+            if (ordinal > 0 && !links.contains_key(&(function.0, ordinal - 1)))
+                || link
+                    .previous
+                    .is_some_and(|(id, n)| !links.contains_key(&(id.0, n)))
+            {
+                deferred.push((function, ordinal, link));
+                continue;
+            }
+            let source = resolve(&functions.ids, function.0, "derivative source", ctx)?
+                .ok_or_else(|| ctx.unsupported("derivative source has no carried body"))?;
+            let target = resolve(&functions.ids, link.target.0, "derivative target", ctx)?
+                .ok_or_else(|| ctx.unsupported("derivative target has no carried body"))?;
+            let at = ctx.provenance(link.provenance)?;
+            let id = construction.functions(|owner| match link.previous {
+                Some((source_id, n)) => owner.next_derivative(
+                    source,
+                    links[&(source_id.0, n)],
+                    target,
+                    link.inputs.iter().copied(),
+                    link.priority,
+                    at,
+                ),
+                None => owner.first_derivative(
+                    source,
+                    target,
+                    link.inputs.iter().copied(),
+                    link.priority,
+                    at,
+                ),
+            })?;
+            links.insert(key, id);
+        }
+        if deferred.len() == before {
+            return Err(ctx.unsupported("derivative predecessor links are cyclic or undefined"));
+        }
+        pending = deferred;
+    }
+    Ok(())
 }

@@ -22,13 +22,11 @@
 //!   reading — but they are folded into the rows that read them instead of
 //!   standing as extra rows over extra unknowns. `initial equation der(x) = 0`
 //!   is therefore a row over `x`, not over `der(x)`.
-//! * **A `fixed = true` start is an equation, not an unknown.** MLS 3.6 §8.6:
-//!   "For every Real variable `vc` with `fixed = true`, the equation
-//!   `vc = startExpression` is added to the initialization equations." The
-//!   runtime seeds that coordinate from its own declaration, which *is* that
-//!   equation, so the coordinate is determined and must never also be offered
-//!   to the projection — one storage slot with two owners is the seed and the
-//!   projection fighting over one number.
+//! * **A `fixed = true` start determines its state.** A source start proved
+//!   independent of initialization unknowns supplies a given coordinate that
+//!   projection cannot write. A start that depends on an unknown parameter is
+//!   only a seed until its `state = startExpression` residual joins the same
+//!   projection as the initial equations and retained manifold.
 //! * **A start with `fixed = false`, or with no `fixed` at all, is a guess.**
 //!   MLS 3.6 §4.8.1 gives `fixed` the default `false` for everything that is
 //!   not a parameter or constant, and §8.6 says of such a start only that "the
@@ -40,11 +38,12 @@
 //!   them"). `initial_parameters` owns that half and its binding-substitution
 //!   ordering; this module only reads the coordinates it published.
 //!
-//! What is left is therefore square by the same count MLS states: the unknowns
-//! are the coordinates whose value nothing else fixes — unpinned states and
-//! unbound `fixed = false` parameters — and the equations are the initialization
-//! rows (initial equations, initial-algorithm residuals, and the transferred
-//! §8.6 values `initial_pins` could only place beside another stated one).
+//! The resulting unknowns are states without given values and unbound
+//! `fixed = false` parameters. Dependent fixed starts and transferred pins
+//! remain explicit equations, alongside initial equations and every retained
+//! manifold row.
+//! A rectangular system keeps its surplus equations as consistency checks;
+//! a free state without a determining equation retains its start guess.
 //!
 //! ## What is deliberately not an unknown, and what that costs
 //!
@@ -54,25 +53,13 @@
 //! [`solve::InitializationRowRole`] carries the difference to the runtime so a
 //! failure names the right defect instead of the friendliest one.
 //!
-//! **Algebraic and output reads join the solve through algebraic refresh.**
-//! The runtime re-settles every algebraic/output coordinate from the current
-//! unknowns on each residual evaluation (`refreshes_algebraic_reads`), and
-//! takes the Jacobian-vector product through that refresh, so a row that
-//! reads one is a function of the projection unknowns. Its exact incidence
-//! through the continuous system is implicit, so such a row conservatively
-//! joins every unknown -- the rule `ImplicitAlgebraic` checks already use --
-//! and is recorded as `SolvedThroughAlgebraicRefresh` (or
-//! `SurplusAlgebraicCheck`). A zero sensitivity can make a block fail; it can
-//! never certify a wrong value, because the certificate itself evaluates the
-//! refreshed residual. This closes the two historical failure modes:
-//!
-//! * `a = 2*time + 5; der(x) = a - x;` with `initial equation der(x) = 0` once
-//!   *silently simulated* `x(0) = 0` (the seeds cancelled) and later failed
-//!   closed; it now initializes to OpenModelica's `5`.
-//! * `initial equation x = a + 7` on the same model now gives `12`.
-//!
-//! A row is admitted this way only when algebraic reads are its *only*
-//! obstacle; a discrete, unreadable or other coordinate still excludes it.
+//! **Algebraic and output reads follow the continuous matching.** Each read
+//! expands its matched source row, including the exact tensor component and
+//! structured domain point. A visited-coordinate set closes algebraic cycles;
+//! their external state and parameter dependencies determine the reduced
+//! projection incidence. The runtime reconstructs algebraics at each residual
+//! evaluation and differentiates that complete map. Stored algebraic seeds
+//! cannot certify initialization, and a missing defining row remains unowned.
 //!
 //! **Discrete reads: the check is honest, and the refusal is an over-refusal.** A
 //! discrete coordinate *is* at its §8.6 value when the residual runs — the runtime
@@ -84,11 +71,11 @@
 //! unplanned row, and admitting it needs discretes in the unknown space's
 //! *determined* half — task #44's event-machinery territory.
 //!
-//! **Shapes this walk cannot read per scalar** — an array state, a multi-scalar
-//! initialization row, a derivative whose defining row is a structured family
-//! point — disqualify the row rather than claiming a coordinate the walk cannot
-//! prove the row reads. `Real x[2]; initial equation x[1] = 3; x[2] = 4;` is
-//! therefore unplanned where OpenModelica initializes it.
+//! **Array coordinates retain their exact scalar identity.** Initial equations,
+//! structured family points, substituted parameter bindings, and matched
+//! derivative rows use the same checked scalar dependency projection as
+//! structural incidence. A projection failure remains unowned. A fixed state
+//! declaration or transferred pin contributes only its actual scalar equations.
 //!
 //! ## Two choices this phase makes that the model does not
 //!
@@ -113,10 +100,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
-use rumoca_phase_structural::{InitialValuePin, InitialValueRole};
 
 use super::initial_parameters::InitializationParameterOwnership;
-use super::{DerivativeRowIndex, scalar_count, variable_scalar_slot};
+use super::{ContinuousRowIndex, ScalarRowSource, scalar_count, variable_scalar_slot};
 use crate::LowerError;
 use crate::layout::LoweredLayout;
 
@@ -149,27 +135,16 @@ impl InitialUnknown {
     }
 }
 
-/// What determines one state coordinate at the initialization instant.
-#[derive(Clone, Copy)]
-enum StateInitialOwner {
-    /// The projection: the declaration states only a guess, so the
-    /// initialization rows are what determine it. Carries its Y-slot index.
-    Projection(usize),
-    /// The declaration itself: MLS §8.6 turns a `fixed = true` start into the
-    /// equation `vc = startExpression`, and the structural phase may also have
-    /// proved another declaration's stated value *defines* this coordinate
-    /// (`InitialValueRole::Definition`), which lowers to an update row. Either
-    /// way the coordinate holds a determined value a row may read, and offering
-    /// it to the projection as well would give one slot two owners.
-    Stated,
-}
-
 /// The coordinate space one model's initialization system solves over.
 pub(super) struct InitializationUnknownSpace<'a, 'dae> {
     view: dae::DaeView<'dae>,
     ownership: &'a InitializationParameterOwnership<'dae>,
-    derivatives: &'a DerivativeRowIndex<'dae>,
-    states: HashMap<u32, StateInitialOwner>,
+    derivatives: &'a ContinuousRowIndex<'dae>,
+    states: HashMap<(u32, usize), usize>,
+    given_state_indices: BTreeSet<usize>,
+    /// The declared `nominal` of each `fixed = false` parameter scalar the
+    /// projection solves, keyed by P-slot index (MLS §4.8.1).
+    parameter_nominals: HashMap<usize, f64>,
 }
 
 /// Everything the initialization unknown space is assembled from.
@@ -177,8 +152,8 @@ pub(super) struct InitializationUnknownInputs<'a, 'dae> {
     pub(super) view: dae::DaeView<'dae>,
     pub(super) layout: &'a LoweredLayout<'dae>,
     pub(super) ownership: &'a InitializationParameterOwnership<'dae>,
-    pub(super) derivatives: &'a DerivativeRowIndex<'dae>,
-    pub(super) pins: &'a [InitialValuePin],
+    pub(super) derivatives: &'a ContinuousRowIndex<'dae>,
+    pub(super) given_state_indices: &'a [usize],
 }
 
 /// Decide, once per model, who owns every coordinate the §8.6 system touches.
@@ -190,112 +165,111 @@ pub(super) fn initialization_unknown_space<'a, 'dae>(
         layout,
         ownership,
         derivatives,
-        pins,
+        given_state_indices,
     } = inputs;
     Ok(InitializationUnknownSpace {
         view,
         ownership,
         derivatives,
-        states: state_initial_owners(view, layout, pins)?,
+        states: state_initial_slots(view, layout)?,
+        given_state_indices: given_state_indices.iter().copied().collect(),
+        parameter_nominals: parameter_nominals(view, ownership)?,
     })
 }
 
-impl<'dae> InitializationUnknownSpace<'_, 'dae> {
-    /// The declaration one coordinate identity names.
-    ///
-    /// Absent when the identity has no declaration, which the walk treats as a
-    /// coordinate it cannot own rather than assuming a shape for it.
-    fn variable(&self, variable: dae::VariableId<'dae>) -> Option<dae::VariableView<'dae>> {
-        self.view.variable(variable)
+/// The declared `nominal` of every projection-owned `fixed = false` parameter
+/// scalar, evaluated once from parameters and constants. A parameter without
+/// `nominal` is absent, and the projection scales it by its start guess.
+fn parameter_nominals(
+    view: dae::DaeView<'_>,
+    ownership: &InitializationParameterOwnership<'_>,
+) -> Result<HashMap<usize, f64>, LowerError> {
+    let mut nominals = HashMap::new();
+    let mut evaluator = rumoca_eval_dae::NumericEvaluator::new(view);
+    for (id, variable) in view.variables() {
+        let (Some(slots), Some(nominal)) = (
+            ownership.projection_unknown_slots(id.index()),
+            variable.nominal(),
+        ) else {
+            continue;
+        };
+        let span = variable.declaration().span();
+        let mut values = evaluator.expression(nominal).map_err(|error| {
+            LowerError::contract(
+                format!(
+                    "nominal of `{}` does not evaluate: {error}",
+                    variable.name()
+                ),
+                span,
+            )
+        })?;
+        dae::broadcast_scalar_values(&mut values, slots.len());
+        if values.len() != slots.len()
+            || values
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(LowerError::contract(
+                format!(
+                    "nominal of `{}` must be {} finite positive values",
+                    variable.name(),
+                    slots.len()
+                ),
+                span,
+            ));
+        }
+        nominals.extend(slots.iter().copied().zip(values));
     }
-
-    fn all_projection_unknowns(&self) -> BTreeSet<InitialUnknown> {
-        self.ownership
-            .all_projection_unknown_slots()
-            .map(InitialUnknown::Parameter)
-            .chain(self.states.values().filter_map(|owner| match owner {
-                StateInitialOwner::Projection(index) => Some(InitialUnknown::State(*index)),
-                StateInitialOwner::Stated => None,
-            }))
-            .collect()
-    }
+    Ok(nominals)
 }
 
-/// Who determines each state coordinate, keyed by variable index.
-///
-/// A state absent from the map is one this phase can neither own nor read: an
-/// array whose scalars a whole-expression walk cannot separate, with nothing
-/// stated about it. A row that reaches such a coordinate is left unplanned.
-fn state_initial_owners(
+/// Exact state coordinates of the simultaneous initialization system.
+fn state_initial_slots(
     view: dae::DaeView<'_>,
     layout: &LoweredLayout<'_>,
-    pins: &[InitialValuePin],
-) -> Result<HashMap<u32, StateInitialOwner>, LowerError> {
-    let defined: BTreeSet<u32> = pins
-        .iter()
-        .filter(|pin| matches!(pin.role, InitialValueRole::Definition))
-        .map(|pin| pin.coordinate)
-        .collect();
-    let mut owners = HashMap::new();
+) -> Result<HashMap<(u32, usize), usize>, LowerError> {
+    let mut slots = HashMap::new();
     for (id, variable) in view.variables() {
         if variable.role() != dae::VariableRole::State {
             continue;
         }
         let span = variable.declaration().span();
-        if variable.fixed() == Some(true) || defined.contains(&id.index()) {
-            owners.insert(id.index(), StateInitialOwner::Stated);
-            continue;
+        for scalar in 0..variable.scalar_count() {
+            let solve::ScalarSlot::Y { index, .. } =
+                variable_scalar_slot(layout, id.index(), scalar, span)?
+            else {
+                return Err(LowerError::contract(
+                    "a state does not occupy solver storage",
+                    span,
+                ));
+            };
+            slots.insert((id.index(), scalar), index);
         }
-        if variable.scalar_count() != 1 {
-            continue;
-        }
-        let solve::ScalarSlot::Y { index, .. } = variable_scalar_slot(layout, id.index(), 0, span)?
-        else {
-            return Err(LowerError::contract(
-                format!("state `{}` does not occupy solver storage", variable.name()),
-                span,
-            ));
-        };
-        owners.insert(id.index(), StateInitialOwner::Projection(index));
     }
-    Ok(owners)
+    Ok(slots)
 }
 
 /// Where one initialization row's coordinate incidence is read from.
 ///
 /// The three forms differ in what the walk may start from, not in what it proves.
 pub(super) enum InitialRowIncidence<'dae> {
-    /// Nothing this planner can read: a multi-scalar equation, whose per-scalar
-    /// unknowns a whole-expression walk cannot separate.
-    Opaque,
-    /// One whole-model residual expression. Every coordinate it reaches is an
-    /// unknown of the row, so a coordinate the projection cannot own disqualifies
-    /// the row.
-    Residual(dae::ExprId<'dae>),
-    /// A stated initial value carried onto a coordinate that already holds one
-    /// (`initial_pins`). The row is `coordinate - Σ terms`, and the coordinate is
-    /// a state the initialization instant has already seeded, so only the terms
-    /// carry unknowns — which is exactly what lets such a row determine a
-    /// `fixed = false` parameter its displacement reads.
-    ///
-    /// The coordinate itself is never one of those unknowns, and that is a fact
-    /// rather than a restriction: `initial_pins::class_pins` emits a `Check` only
-    /// for a *second* stated value about a class whose state already carries the
-    /// first — either as its own `fixed = true` start or as a `Definition` pin —
-    /// so the coordinate is always one [`StateInitialOwner::Stated`] covers. A
-    /// `Check` that failed to converge is therefore two declarations contradicting
-    /// each other, not a coordinate nothing solved.
-    CarriedValue(Vec<dae::ExprId<'dae>>),
-    /// A fixed algebraic/output checked after solving the simultaneous
-    /// continuous algebraic system. Its exact total incidence is implicit in
-    /// that solve, so it conservatively joins every initialization unknown;
-    /// zero numerical sensitivity can make the block fail, never certify a
-    /// wrong value.
-    ImplicitAlgebraic,
+    /// The same scalar and structured domain point the emitted residual reads.
+    Residual(ScalarRowSource<'dae>),
+    /// An explicit fixed-value equation about one exact state scalar.
+    StateValue {
+        index: usize,
+        terms: Vec<(dae::ExprId<'dae>, usize)>,
+    },
+    /// A fixed algebraic/output follows its matched continuous definition and
+    /// its start expression, just like an authored initial residual.
+    AlgebraicValue {
+        variable: dae::AlgebraicId<'dae>,
+        scalar: usize,
+        terms: Vec<(dae::ExprId<'dae>, usize)>,
+    },
 }
 
 pub(super) struct InitialProjection {
-    pub(super) unknowns: Vec<solve::ScalarSlot>,
     pub(super) plan: solve::InitializationProjectionPlan,
     /// What the projection does with each row, positionally by equation index.
     pub(super) row_roles: Vec<solve::InitializationRowRole>,
@@ -322,65 +296,51 @@ pub(super) struct InitialProjection {
 /// silently shipping the parameter's guess as its value.
 ///
 /// The matching is structural, so it is rank-blind: it takes the first augmenting
-/// assignment, which can pick a block whose Jacobian is numerically singular while
-/// a different assignment of the same rows would not be. The runtime reports that
-/// as a failed solve rather than a wrong answer, and a minimum-degree ordering
-/// would choose better; until then the risk is accepted and named here rather than
-/// left implied.
+/// assignment after preferring rows with fewer unknowns. A chosen block can still
+/// have a numerically singular Jacobian while another assignment would not.
+/// Runtime numerical checks remain required; structural degree is not a rank proof.
 pub(super) fn plan_initialization_projection<'dae>(
     space: &InitializationUnknownSpace<'_, 'dae>,
     rows: &[InitialRowIncidence<'dae>],
-) -> InitialProjection {
+) -> Result<InitialProjection, LowerError> {
     // Every row starts as a check between values the rest of the system fixed,
     // and is downgraded or promoted below by what the walk and the matching find.
     let mut row_roles = vec![solve::InitializationRowRole::SurplusCheck; rows.len()];
     let mut incidence: Vec<(usize, BTreeSet<InitialUnknown>)> = Vec::new();
-    // Rows admitted through algebraic refresh; promoted with the implicit
-    // algebraic checks below.
-    let mut refreshed = vec![false; rows.len()];
+    let mut algebraic_rows = BTreeSet::new();
+    let mut projection_cache = rumoca_eval_dae::ScalarCoordinateProjectionCache::default();
     for (row, source) in rows.iter().enumerate() {
-        match row_unknowns(space, source) {
-            RowIncidence::ThroughAlgebraicRefresh(unknowns) => {
-                refreshed[row] = true;
+        match row_unknowns(space, source, &mut projection_cache) {
+            RowIncidence::Owned {
+                unknowns,
+                algebraic_reads,
+            } => {
+                if algebraic_reads {
+                    algebraic_rows.insert(row);
+                }
                 if !unknowns.is_empty() {
                     incidence.push((row, unknowns));
                 }
             }
-            RowIncidence::Owned(unknowns) if !unknowns.is_empty() => {
-                incidence.push((row, unknowns));
-            }
-            // Nothing this row reads is an unknown: it is exactly the §8.6
-            // consistency check the default role already names.
-            RowIncidence::Owned(_) => {}
             RowIncidence::Unowned(kind) => {
                 row_roles[row] = solve::InitializationRowRole::UnownedCoordinate(kind);
             }
         }
     }
     let mut blocks = Vec::new();
-    let mut unknowns = Vec::new();
     for component in connected_components(&incidence) {
         let matched = match_component(&component).unwrap_or_default();
         record_component_roles(&component, &matched, &mut row_roles);
         if matched.is_empty() {
             continue;
         }
-        let mut block_rows = Vec::with_capacity(matched.len());
-        let mut block_unknowns = Vec::with_capacity(matched.len());
-        for (row, unknown) in matched {
-            block_rows.push(row);
-            block_unknowns.push(unknown.slot());
-        }
-        unknowns.extend(block_unknowns.iter().copied());
-        blocks.push(solve::InitializationProjectionBlock {
-            rows: block_rows,
-            unknowns: block_unknowns,
-        });
+        blocks.extend(ordered_projection_blocks(
+            &component,
+            &matched,
+            &space.parameter_nominals,
+        )?);
     }
-    for (row, source) in rows.iter().enumerate() {
-        if !matches!(source, InitialRowIncidence::ImplicitAlgebraic) && !refreshed[row] {
-            continue;
-        }
+    for row in algebraic_rows {
         row_roles[row] = match row_roles[row] {
             solve::InitializationRowRole::Solved => {
                 solve::InitializationRowRole::SolvedThroughAlgebraicRefresh
@@ -388,14 +348,88 @@ pub(super) fn plan_initialization_projection<'dae>(
             solve::InitializationRowRole::SurplusCheck => {
                 solve::InitializationRowRole::SurplusAlgebraicCheck
             }
+            // Even an unmatched row must observe reconstructed values. Do not
+            // turn its unsolved algebraic dependency into a declaration seed.
+            solve::InitializationRowRole::UnownedCoordinate(_) => {
+                solve::InitializationRowRole::UnownedCoordinate(
+                    solve::InitializationCoordinateKind::Algebraic,
+                )
+            }
             role => role,
         };
     }
-    InitialProjection {
-        unknowns,
+    Ok(InitialProjection {
         plan: solve::InitializationProjectionPlan { blocks },
         row_roles,
-    }
+    })
+}
+
+/// Triangularize the selected matching before numerical projection.
+///
+/// Sharing an unknown does not imply mutual dependence. A row defining `q`
+/// must run before a row defining `y` from `q`, particularly when the latter
+/// changes a Boolean branch between the start guess and the solved value.
+fn ordered_projection_blocks(
+    component: &ProjectionComponent,
+    matched: &[(usize, InitialUnknown)],
+    nominals: &HashMap<usize, f64>,
+) -> Result<Vec<solve::InitializationProjectionBlock>, LowerError> {
+    let producer: BTreeMap<_, _> = matched
+        .iter()
+        .enumerate()
+        .map(|(position, (_, unknown))| (*unknown, position))
+        .collect();
+    let reads: BTreeMap<_, _> = component
+        .rows
+        .iter()
+        .copied()
+        .zip(&component.row_unknowns)
+        .collect();
+    let dependencies = matched
+        .iter()
+        .enumerate()
+        .map(|(position, (row, _))| {
+            reads[row]
+                .iter()
+                .filter_map(|unknown| producer.get(unknown).copied())
+                .filter(|dependency| *dependency != position)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let components =
+        rumoca_core::dependency_graph::dependency_first_sccs(&dependencies).map_err(|error| {
+            LowerError::UnspannedContractViolation {
+                reason: format!("initialization matching has invalid dependency indices: {error}"),
+            }
+        })?;
+    Ok(components
+        .into_iter()
+        .map(|component| {
+            let (rows, unknowns): (Vec<usize>, Vec<solve::ScalarSlot>) = component
+                .members
+                .iter()
+                .map(|position| {
+                    let (row, unknown) = matched[*position];
+                    (row, unknown.slot())
+                })
+                .unzip();
+            let scales = unknowns
+                .iter()
+                .map(|unknown| match unknown {
+                    solve::ScalarSlot::P { index, .. } => nominals.get(index).map_or(
+                        solve::InitializationUnknownScale::GuessMagnitude,
+                        |nominal| solve::InitializationUnknownScale::Nominal(*nominal),
+                    ),
+                    _ => solve::InitializationUnknownScale::Solver,
+                })
+                .collect();
+            solve::InitializationProjectionBlock {
+                rows,
+                unknowns,
+                scales,
+            }
+        })
+        .collect())
 }
 
 /// Say, per row of one component, what the projection ended up doing with it.
@@ -439,50 +473,114 @@ fn record_component_roles(
 fn row_unknowns<'dae>(
     space: &InitializationUnknownSpace<'_, 'dae>,
     row: &InitialRowIncidence<'dae>,
+    projection_cache: &mut rumoca_eval_dae::ScalarCoordinateProjectionCache<'dae>,
 ) -> RowIncidence {
     let pending = match row {
-        InitialRowIncidence::Opaque => {
-            return RowIncidence::Unowned(solve::InitializationCoordinateKind::Unreadable);
-        }
-        InitialRowIncidence::Residual(residual) => vec![*residual],
-        InitialRowIncidence::CarriedValue(terms) => terms.clone(),
-        InitialRowIncidence::ImplicitAlgebraic => {
-            return RowIncidence::Owned(space.all_projection_unknowns());
-        }
+        InitialRowIncidence::Residual(residual) => vec![residual.clone()],
+        InitialRowIncidence::StateValue { terms, .. }
+        | InitialRowIncidence::AlgebraicValue { terms, .. } => terms
+            .iter()
+            .map(|(expression, scalar)| ScalarRowSource {
+                expression: *expression,
+                scalar: *scalar,
+                domain_point: None,
+            })
+            .collect(),
     };
     let mut incidence = InitialIncidence {
-        unknowns: BTreeSet::new(),
+        unknowns: match row {
+            InitialRowIncidence::StateValue { index, .. }
+                if !space.given_state_indices.contains(index) =>
+            {
+                BTreeSet::from([InitialUnknown::State(*index)])
+            }
+            _ => BTreeSet::new(),
+        },
         excluded: None,
-        other_than_algebraic: false,
         substituted: BTreeSet::new(),
         expanded: BTreeSet::new(),
+        algebraics: BTreeSet::new(),
         pending,
     };
-    // Walked to the end: whether an algebraic is the row's *only* obstacle
-    // decides whether it can join the solve through algebraic refresh.
-    while let Some(expression) = incidence.pending.pop() {
-        dae::for_each_expression(space.view, expression, |_, node| {
-            let dae::ExpressionOperation::Coordinate(coordinate) = node.operation() else {
-                return;
-            };
-            incidence.visit(space, coordinate);
-        });
+    if let InitialRowIncidence::AlgebraicValue {
+        variable, scalar, ..
+    } = row
+    {
+        incidence.visit_algebraic(space, *variable, *scalar);
+    }
+    // One coordinate the projection cannot own already disqualifies the row, but
+    // *which* one decides what the runtime is told, and the algebraic reading is
+    // the one worth reporting (see the module header). So the walk keeps going
+    // until it has found an algebraic or run out of expressions to expand.
+    while !matches!(
+        incidence.excluded,
+        Some(solve::InitializationCoordinateKind::Algebraic)
+    ) && let Some(row) = incidence.pending.pop()
+    {
+        let projected = rumoca_eval_dae::for_each_scalar_coordinate_cached(
+            space.view,
+            row.expression,
+            row.scalar,
+            row.domain_point
+                .as_ref()
+                .map(|(domain, point)| (*domain, point.as_slice())),
+            projection_cache,
+            |coordinate, scalar| incidence.visit(space, coordinate, scalar),
+        );
+        if projected.is_err() {
+            incidence.exclude(solve::InitializationCoordinateKind::Unreadable);
+        }
     }
     match incidence.excluded {
-        None => RowIncidence::Owned(incidence.unknowns),
-        // An algebraic/output read is re-settled from the current unknowns on
-        // every residual evaluation (`refreshes_algebraic_reads`), and the
-        // Jacobian-vector product is taken through that refresh, so the row is
-        // a function of the projection unknowns after all. Its exact incidence
-        // through the continuous system is implicit, so -- exactly as for
-        // `ImplicitAlgebraic` -- it conservatively joins every unknown: a zero
-        // sensitivity can make the block fail, never certify a wrong value.
-        Some(solve::InitializationCoordinateKind::Algebraic) if !incidence.other_than_algebraic => {
-            let mut unknowns = space.all_projection_unknowns();
-            unknowns.extend(incidence.unknowns);
-            RowIncidence::ThroughAlgebraicRefresh(unknowns)
-        }
-        Some(kind) => RowIncidence::Unowned(kind),
+        None => RowIncidence::Owned {
+            unknowns: incidence.unknowns,
+            algebraic_reads: !incidence.algebraics.is_empty(),
+        },
+        Some(kind) => RowIncidence::Unowned(if incidence.algebraics.is_empty() {
+            kind
+        } else {
+            solve::InitializationCoordinateKind::Algebraic
+        }),
+    }
+}
+
+/// Prove that one MLS §8.6 discrete initial definition reads only coordinates
+/// the projection settles independently of every discrete value.
+///
+/// The definition is applied as an update after the projection. Its reads are
+/// expanded exactly as an initialization row's are: an algebraic through its
+/// matched continuous definition, `der(x)` through its defining row, a bound
+/// parameter through its substituted binding. What remains is parameters,
+/// inputs, `time`, states, and `fixed = false` parameters. The projection
+/// determines those from rows that read no discrete coordinate (a row that
+/// does is never planned), and the algebraic expansion reached none either, so
+/// the value cannot depend on the coordinate it defines: one application after
+/// the projection is the simultaneous solution, and the next pass of
+/// `settle_initialization_system` changes nothing. A read that reaches a
+/// discrete or `pre` value, an algebraic without a matched definition, or any
+/// other unplanned coordinate has no such proof and is rejected here.
+pub(super) fn prove_initial_definition_reads<'dae>(
+    space: &InitializationUnknownSpace<'_, 'dae>,
+    value: dae::ExprId<'dae>,
+    scalar: usize,
+    span: rumoca_core::Span,
+) -> Result<(), LowerError> {
+    let mut cache = rumoca_eval_dae::ScalarCoordinateProjectionCache::default();
+    let source = InitialRowIncidence::Residual(ScalarRowSource {
+        expression: value,
+        scalar,
+        domain_point: None,
+    });
+    match row_unknowns(space, &source, &mut cache) {
+        RowIncidence::Owned { .. } => Ok(()),
+        RowIncidence::Unowned(kind) => Err(LowerError::unsupported(
+            format!(
+                "a discrete initial value reads a coordinate ({kind:?}) whose initialization \
+                 value is not proven independent of discrete values, so applying it after the \
+                 initialization projection has no proven evaluation order"
+            ),
+            span,
+        )),
     }
 }
 
@@ -490,21 +588,19 @@ fn row_unknowns<'dae>(
 enum RowIncidence {
     /// The projection coordinates the row reads. May be empty: the row is then a
     /// check over coordinates the initialization instant has already determined.
-    Owned(BTreeSet<InitialUnknown>),
+    Owned {
+        unknowns: BTreeSet<InitialUnknown>,
+        algebraic_reads: bool,
+    },
     /// The row reads a coordinate outside the planned unknown space, of this kind.
     Unowned(solve::InitializationCoordinateKind),
-    /// The row reads algebraic/output coordinates and nothing else outside the
-    /// unknown space; it joins the solve through algebraic refresh over these
-    /// unknowns.
-    ThroughAlgebraicRefresh(BTreeSet<InitialUnknown>),
 }
 
 /// How loudly one exclusion kind deserves to be reported, largest first.
 ///
-/// An algebraic read outranks the rest because it is the only kind whose residual
-/// says nothing either way — the others leave a row the runtime still checks
-/// against a determined value. Ranking also keeps the reported kind deterministic
-/// when a row reaches several, since the expression walk order is.
+/// An unavailable algebraic dependency still requires reconstruction before
+/// checking the residual, even if another read is also unowned. Keep that
+/// requirement visible independently of expression traversal order.
 const fn exclusion_rank(kind: solve::InitializationCoordinateKind) -> u8 {
     match kind {
         solve::InitializationCoordinateKind::Algebraic => 4,
@@ -519,14 +615,14 @@ const fn exclusion_rank(kind: solve::InitializationCoordinateKind) -> u8 {
 struct InitialIncidence<'dae> {
     unknowns: BTreeSet<InitialUnknown>,
     excluded: Option<solve::InitializationCoordinateKind>,
-    /// Whether any exclusion other than an algebraic/output read was found.
-    other_than_algebraic: bool,
     /// Parameter bindings already followed, so a diamond is walked once.
-    substituted: BTreeSet<u32>,
+    substituted: BTreeSet<(u32, usize)>,
     /// State derivatives already followed, so a derivative that reads itself
     /// through its own defining row terminates.
-    expanded: BTreeSet<u32>,
-    pending: Vec<dae::ExprId<'dae>>,
+    expanded: BTreeSet<(u32, usize)>,
+    /// Algebraic coordinates already expanded, including coupled-loop members.
+    algebraics: BTreeSet<(u32, usize)>,
+    pending: Vec<ScalarRowSource<'dae>>,
 }
 
 impl<'dae> InitialIncidence<'dae> {
@@ -534,22 +630,19 @@ impl<'dae> InitialIncidence<'dae> {
         &mut self,
         space: &InitializationUnknownSpace<'_, 'dae>,
         coordinate: dae::CoordinateView<'dae>,
+        scalar: usize,
     ) {
         match coordinate {
-            dae::CoordinateView::Parameter(parameter) => self.visit_parameter(space, parameter),
-            dae::CoordinateView::State(state) => self.visit_state(space, state),
-            dae::CoordinateView::Derivative(state) => self.visit_derivative(space, state),
+            dae::CoordinateView::Parameter(parameter) => self.visit_parameter(space, parameter, scalar),
+            dae::CoordinateView::State(state) => self.visit_state(space, state, scalar),
+            dae::CoordinateView::Derivative(state) => self.visit_derivative(space, state, scalar),
             // MLS §8.6.1: the environment supplies inputs as known values.
             // Complete Solve-model construction requires a checked binding or
             // an explicit host value for every scalar before initialization.
             // They are coefficients of this solve, never projection unknowns.
             dae::CoordinateView::Input(_) => {}
-            // The runtime reconstructs an algebraic before it certifies the
-            // complete residual (module header), but this planner cannot yet
-            // differentiate through or solve the simultaneous continuous
-            // system, so the row remains outside the admitted reduced solve.
-            dae::CoordinateView::Algebraic(_) => {
-                self.exclude(solve::InitializationCoordinateKind::Algebraic);
+            dae::CoordinateView::Algebraic(variable) => {
+                self.visit_algebraic(space, variable, scalar);
             }
             dae::CoordinateView::DiscreteReal(_)
             | dae::CoordinateView::DiscreteValue(_)
@@ -574,11 +667,23 @@ impl<'dae> InitialIncidence<'dae> {
         }
     }
 
+    fn visit_algebraic(
+        &mut self,
+        space: &InitializationUnknownSpace<'_, 'dae>,
+        variable: dae::AlgebraicId<'dae>,
+        scalar: usize,
+    ) {
+        if !self.algebraics.insert((variable.index(), scalar)) {
+            return;
+        }
+        match space.derivatives.algebraic_definition(variable, scalar) {
+            Some(definition) => self.pending.push(definition.clone()),
+            None => self.exclude(solve::InitializationCoordinateKind::Algebraic),
+        }
+    }
+
     /// Record why the row cannot be planned, keeping the loudest reason found.
     fn exclude(&mut self, kind: solve::InitializationCoordinateKind) {
-        if kind != solve::InitializationCoordinateKind::Algebraic {
-            self.other_than_algebraic = true;
-        }
         if self
             .excluded
             .is_none_or(|held| exclusion_rank(kind) > exclusion_rank(held))
@@ -591,16 +696,29 @@ impl<'dae> InitialIncidence<'dae> {
         &mut self,
         space: &InitializationUnknownSpace<'_, 'dae>,
         parameter: dae::ParameterId<'dae>,
+        scalar: usize,
     ) {
         if let Some(indices) = space.ownership.projection_unknown_slots(parameter.index()) {
-            self.unknowns
-                .extend(indices.iter().copied().map(InitialUnknown::Parameter));
+            match indices.get(scalar) {
+                Some(index) => {
+                    self.unknowns.insert(InitialUnknown::Parameter(*index));
+                }
+                None => self.exclude(solve::InitializationCoordinateKind::Unreadable),
+            }
             return;
         }
         if let Some(binding) = space.ownership.substitution(parameter.index())
-            && self.substituted.insert(parameter.index())
+            && self.substituted.insert((parameter.index(), scalar))
         {
-            self.pending.push(binding);
+            self.pending.push(ScalarRowSource {
+                expression: binding,
+                scalar: if scalar_count(space.view, binding) == 1 {
+                    0
+                } else {
+                    scalar
+                },
+                domain_point: None,
+            });
         }
     }
 
@@ -608,13 +726,13 @@ impl<'dae> InitialIncidence<'dae> {
         &mut self,
         space: &InitializationUnknownSpace<'_, 'dae>,
         state: dae::StateId<'dae>,
+        scalar: usize,
     ) {
-        match space.states.get(&state.index()) {
-            Some(StateInitialOwner::Projection(index)) => {
+        match space.states.get(&(state.index(), scalar)) {
+            Some(index) if !space.given_state_indices.contains(index) => {
                 self.unknowns.insert(InitialUnknown::State(*index));
             }
-            // A stated value is a number the row may read, not an unknown.
-            Some(StateInitialOwner::Stated) => {}
+            Some(_) => {}
             None => self.exclude(solve::InitializationCoordinateKind::Unreadable),
         }
     }
@@ -629,28 +747,14 @@ impl<'dae> InitialIncidence<'dae> {
         &mut self,
         space: &InitializationUnknownSpace<'_, 'dae>,
         state: dae::StateId<'dae>,
+        scalar: usize,
     ) {
-        let scalar = space
-            .variable(state.into())
-            .map(dae::VariableView::scalar_count);
-        if scalar != Some(1) {
-            self.exclude(solve::InitializationCoordinateKind::Unreadable);
-            return;
-        }
-        let Some(definition) = space.derivatives.definition(state, 0) else {
+        let Some(definition) = space.derivatives.definition(state, scalar) else {
             self.exclude(solve::InitializationCoordinateKind::Other);
             return;
         };
-        // A family point carries binder values this walk does not substitute, and
-        // a multi-scalar residual mixes the coordinates of every scalar into one
-        // expression, so neither can be read per scalar.
-        if definition.domain_point.is_some() || scalar_count(space.view, definition.expression) != 1
-        {
-            self.exclude(solve::InitializationCoordinateKind::Unreadable);
-            return;
-        }
-        if self.expanded.insert(state.index()) {
-            self.pending.push(definition.expression);
+        if self.expanded.insert((state.index(), scalar)) {
+            self.pending.push(definition.clone());
         }
     }
 }
@@ -658,10 +762,19 @@ impl<'dae> InitialIncidence<'dae> {
 /// Assign each unknown of a component a distinct row that reads it.
 ///
 /// Returns the matched `(row, unknown)` pairs, or `None` when a `fixed = false`
-/// parameter of the component is left without one. This is the Hungarian
-/// augmenting-path search over the row/unknown bipartite graph: each round either
-/// matches the next unknown to a free row or reroutes an already-matched row to
-/// make one free, and an unknown that neither reaches is one no row can determine.
+/// parameter of the component is left without one. This is an augmenting-path
+/// search for a maximum matching over the row/unknown bipartite graph: each round
+/// either matches the next unknown to a free row or reroutes an already-matched
+/// row to make one free, and an unknown that neither reaches is one no row can
+/// determine. The augmenting-path characterization is C. Berge, PNAS
+/// 43(9):842-844, 1957; the alternating-tree search per vertex is the
+/// unweighted case of H. W. Kuhn's Hungarian method, "The Hungarian method for
+/// the assignment problem", Naval Research Logistics Quarterly 2(1-2):83-97,
+/// 1955, doi:10.1002/nav.3800020109, refined in matrix form by J. Munkres,
+/// "Algorithms for the assignment and transportation problems", Journal of the
+/// SIAM 5(1):32-38, 1957. This code solves the unweighted matching problem, not
+/// the weighted assignment problem the Hungarian method is named for, so no
+/// cost matrix or dual potentials appear.
 /// Augmenting never un-matches an unknown, so running the parameters first (their
 /// `InitialUnknown` ordering) guarantees the maximum number of them is covered.
 fn match_component(component: &ProjectionComponent) -> Option<Vec<(usize, InitialUnknown)>> {
@@ -680,6 +793,9 @@ fn match_component(component: &ProjectionComponent) -> Option<Vec<(usize, Initia
                 adjacency[*unknown].push(row);
             }
         }
+    }
+    for rows in &mut adjacency {
+        rows.sort_by_key(|&row| (component.row_unknowns[row].len(), component.rows[row]));
     }
     let mut matching = RowUnknownMatching {
         row_of_unknown: vec![None; unknown_count],
@@ -796,9 +912,8 @@ struct ProjectionComponent {
 
 /// Group rows that share an initialization unknown into one solvable component.
 ///
-/// Two rows that read the same unknown must be solved together, so the components
-/// of the row/unknown bipartite graph are the coarsest blocks that stay
-/// independent.
+/// These components bound the matching problem. The selected matching later
+/// determines which rows are mutually dependent and need a simultaneous solve.
 fn connected_components(
     incidence: &[(usize, BTreeSet<InitialUnknown>)],
 ) -> Vec<ProjectionComponent> {

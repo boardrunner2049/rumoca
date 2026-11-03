@@ -130,6 +130,8 @@ pub struct RbcModel {
     /// Values discrete-valued variables take at the initialization instant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_discrete_values: Vec<RbcInitialDiscreteValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_parameter_values: Vec<RbcInitialDiscreteValue>,
     /// Function declarations named by `RbcExprNode::Call`, with their
     /// bodies when this artifact carries them (`RbcFunctionBody`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -483,6 +485,14 @@ pub enum RbcScalar {
 
 // ── Variables ────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RbcDeclaredCausality {
+    None,
+    Input,
+    Output,
+}
+
 /// What a declaration promises about a symbol.
 ///
 /// Carried per symbol and preserved through flattening, so a consumer need not
@@ -568,6 +578,17 @@ pub enum RbcCausality {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RbcStateSelect {
+    Never,
+    Avoid,
+    #[default]
+    Default,
+    Prefer,
+    Always,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RbcVariable {
     pub id: VariableId,
@@ -575,6 +596,10 @@ pub struct RbcVariable {
     pub name: String,
     pub role: RbcRole,
     pub causality: RbcCausality,
+    /// The written prefix, independently of the exported storage role.
+    /// Absent in older artifacts, where input/output causality implied it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_causality: Option<RbcDeclaredCausality>,
     pub value_type: TypeId,
     /// Number of scalars this variable expands to (1 for a scalar).
     pub scalar_count: u32,
@@ -638,6 +663,15 @@ pub struct RbcVariable {
     pub nominal: Option<ExprId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed: Option<bool>,
+    /// Per-element fixed attributes when they are not uniform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_elements: Option<Vec<bool>>,
+    #[serde(default)]
+    pub evaluable: bool,
+    #[serde(default)]
+    pub held: bool,
+    #[serde(default)]
+    pub state_select: RbcStateSelect,
     #[serde(default)]
     pub tunable: bool,
     /// True when the variable was written in the source rather than generated.
@@ -999,6 +1033,8 @@ pub struct RbcBranch {
 /// defined together, and the branches that give them values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RbcDiscreteDefinition {
+    #[serde(default)]
+    pub observed: bool,
     /// The discrete-valued variables this owner defines, in the order the
     /// branches' `values` follow.
     pub targets: Vec<VariableId>,
@@ -1244,6 +1280,16 @@ pub struct RbcDomain {
 /// table and folds its statements address; `ElidedModelica` records a body
 /// that exists and is not here (a recursive function), so an absent body is
 /// never mistaken for an empty one.
+/// Checked derivative links attached to a function in priority order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RbcFunctionDerivative {
+    pub target: FunctionId,
+    pub inputs: Vec<rumoca_core::FunctionDerivativeInput>,
+    pub priority: u32,
+    pub previous: Option<(FunctionId, u32)>,
+    pub provenance: RbcProvenance,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RbcFunction {
     pub id: FunctionId,
@@ -1254,6 +1300,8 @@ pub struct RbcFunction {
     pub results: Vec<TypeId>,
     /// The MLS §18.3 `Inline`/`LateInline` request the declaration wrote.
     pub inline: RbcInline,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivatives: Vec<RbcFunctionDerivative>,
     pub body: RbcFunctionBody,
     /// Output and local values, in owner-local ordinal order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1360,6 +1408,7 @@ pub enum RbcInline {
     Unstated,
     Requested,
     Never,
+    AfterIndexReduction,
 }
 
 /// What kind of body the declaration has, and whether this artifact carries it.
@@ -1408,6 +1457,15 @@ pub enum RbcFunctionBody {
     },
 }
 
+/// MLS assertion severity, independent of compiler-private enum ordinals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RbcAssertionLevel {
+    #[default]
+    Error,
+    Warning,
+}
+
 /// One statement of a lowered function body.
 ///
 /// The four forms `rumoca_ir_dae::FunctionStatementView` distinguishes. A
@@ -1427,6 +1485,8 @@ pub enum RbcFunctionStatement {
     Assertion {
         condition: ExprId,
         message: ExprId,
+        #[serde(default)]
+        level: RbcAssertionLevel,
         provenance: RbcProvenance,
     },
     /// Several values defined together, optionally under a shared branch.
@@ -1758,6 +1818,11 @@ pub enum RbcClockAnchor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RbcClockNode {
+    Shifted {
+        base: ClockId,
+        counter: u32,
+        condition: ConditionId,
+    },
     Periodic {
         period: RbcClockRational,
         phase: RbcClockRational,
@@ -1805,6 +1870,11 @@ pub struct RbcEventAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RbcAction {
+    /// Report when the condition is false, without introducing a state event.
+    Warning {
+        condition: ExprId,
+        message: ExprId,
+    },
     /// `reinit(state, value)`.
     Reinitialize {
         state: VariableId,

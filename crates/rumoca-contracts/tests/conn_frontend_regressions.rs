@@ -154,7 +154,7 @@ fn two_outputs_on_one_bus_member_are_rejected() {
         ),
         "P.M",
         FailedPhase::Flatten,
-        "EF033",
+        "EF037",
     );
 }
 

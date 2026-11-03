@@ -12,6 +12,10 @@ indexmap = { workspace = true }
 rumoca-core = { workspace = true }
 rumoca-ir-solve = { workspace = true }
 tracing = { workspace = true }
+nalgebra = "0.34"
+
+[target.'cfg(not(kani))'.dependencies]
+faer = { workspace = true }
 
 serde_json = { workspace = true }
 sha1 = { workspace = true }

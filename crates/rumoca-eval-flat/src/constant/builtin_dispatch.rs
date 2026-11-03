@@ -82,6 +82,7 @@ pub(super) fn eval_builtin_function(
         | BuiltinFunction::Hold
         | BuiltinFunction::Previous
         | BuiltinFunction::Interval
+        | BuiltinFunction::FirstTick
         | BuiltinFunction::SubSample
         | BuiltinFunction::SuperSample
         | BuiltinFunction::ShiftSample

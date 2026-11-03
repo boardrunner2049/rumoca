@@ -80,13 +80,13 @@ pub(super) fn resolve_field_shape(
     values: &ShapeEnvironment,
 ) -> Result<ValueShape, ToDaeError> {
     if siblings.is_empty() || !has_expression_axis(field) {
-        return resolve_declared_shape(field, actual, values);
+        return resolve_declared_shape(field, actual, None, values);
     }
     let mut scoped = values.clone();
     for (name, sibling_shape) in siblings {
         scoped.insert(name.clone(), sibling_shape.clone());
     }
-    resolve_declared_shape(field, actual, &scoped)
+    resolve_declared_shape(field, actual, None, &scoped)
 }
 
 /// The positional arguments of a record-constructor default, in declared

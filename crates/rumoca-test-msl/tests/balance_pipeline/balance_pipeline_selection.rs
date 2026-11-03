@@ -684,12 +684,19 @@ pub(super) fn simulation_parallelism() -> usize {
         sim_worker_cap_from_budget(total_mb, per_worker_memory_mb)
     });
 
-    let effective_threads = requested_threads.min(capped_by_memory).max(1);
+    // OMC's reference pool pins one session per physical core, so the
+    // simulation stage takes the same cap and both tools run at one count.
+    let capped_by_cores = detected_physical_parallelism().unwrap_or(requested_threads);
+    let effective_threads = requested_threads
+        .min(capped_by_memory)
+        .min(capped_by_cores)
+        .max(1);
     if effective_threads < requested_threads {
         println!(
-            "Simulation parallelism capped by memory budget: {} workers (requested {}, per-worker estimate {} MB, total budget {} MB)",
+            "Simulation parallelism capped: {} workers (requested {}, physical cores {}, per-worker estimate {} MB, total budget {} MB)",
             effective_threads,
             requested_threads,
+            capped_by_cores,
             per_worker_memory_mb,
             total_budget_mb.unwrap_or(0)
         );

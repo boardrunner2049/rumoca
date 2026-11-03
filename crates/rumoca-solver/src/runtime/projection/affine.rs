@@ -1,0 +1,306 @@
+//! Evaluate a certified affine block independently of its incoming guess.
+
+use super::*;
+
+pub(super) fn project_affine_block<M: ImplicitProjectionModel>(
+    model: &M,
+    y: &mut [f64],
+    p: &[f64],
+    t: f64,
+    block: &solve::AlgebraicProjectionBlock,
+    block_index: usize,
+    tol: f64,
+) -> Result<ProjectionBlockUpdate, RuntimeSolveError> {
+    // The solve runs in `y` itself, which it changes only in the block
+    // unknowns; they are restored when the block does not settle.
+    let incoming = super::block_values(y, &block.y_indices);
+    let settled = settle_affine_block(model, y, (p, t), block, block_index, tol);
+    if !matches!(settled, Ok(true)) {
+        super::restore_block_values(y, &block.y_indices, &incoming);
+    }
+    let settled = settled?;
+    let changed = settled && super::block_values_changed(y, &block.y_indices, &incoming);
+    Ok(ProjectionBlockUpdate { changed, settled })
+}
+
+/// Solve the block's unknowns in `candidate` from the arithmetic origin.
+/// Construction proves F(x) = A*x + b for this block. Evaluating b at x=0 and
+/// solving A*x=-b computes the coordinate itself. Accepting an incoming Newton
+/// iterate merely because its correction is below tol can retain the wrong
+/// side of a relation after a discrete branch change.
+fn settle_affine_block<M: ImplicitProjectionModel>(
+    model: &M,
+    candidate: &mut [f64],
+    (p, t): (&[f64], f64),
+    block: &solve::AlgebraicProjectionBlock,
+    block_index: usize,
+    tol: f64,
+) -> Result<bool, RuntimeSolveError> {
+    for &index in &block.y_indices {
+        candidate[index] = 0.0;
+    }
+    let structure = model.algebraic_projection_block_structure(block_index);
+    let jacobian = affine_block_jacobian(model, candidate, (p, t), block, block_index, structure)?;
+    let (row_scales, variable_scales) = algebraic_block_scales(
+        model,
+        candidate,
+        block,
+        &jacobian,
+        structure.map(solve::JacobianStructure::pattern),
+    );
+    let row_magnitudes =
+        jacobian_row_magnitudes(&jacobian, structure.map(solve::JacobianStructure::pattern));
+    let row_derived = jacobian_row_derived(
+        &jacobian,
+        &variable_scales,
+        structure.map(solve::JacobianStructure::pattern),
+    );
+    // The certificate's scales at the origin: every block unknown is zero
+    // there, so its origin scale is its declared scale, and a fallback
+    // coordinate outside the block keeps its value for the whole call, so its
+    // origin scale serves every pass.
+    let mut certificate_scales = CertificateScales {
+        unknowns: Vec::with_capacity(block.y_indices.len()),
+        fallbacks: Vec::with_capacity(block.rows.len()),
+    };
+    for (&index, &scale) in block.y_indices.iter().zip(&variable_scales) {
+        certificate_scales.unknowns.push((index, scale));
+    }
+    for target in fallback_targets(model, block) {
+        let mut fallback = None;
+        if let Some(index) = target {
+            fallback = Some((index, model_variable_scale(model, index, candidate[index])));
+        }
+        certificate_scales.fallbacks.push(fallback);
+    }
+    let mut system = AffineBlockSystem {
+        model,
+        parameters: p,
+        time: t,
+        block,
+        block_index,
+        jacobian,
+        row_magnitudes,
+        row_derived,
+        certificate_scales,
+        row_scales,
+        variable_scales,
+        structure,
+        tolerance: tol,
+        prefer_torn: true,
+        used_torn: std::cell::Cell::new(false),
+    };
+    let mut settled = system.project(candidate)?;
+    if !settled && system.used_torn.get() {
+        system.prefer_torn = false;
+        for &index in &block.y_indices {
+            candidate[index] = 0.0;
+        }
+        settled = system.project(candidate)?;
+    }
+    if let (Some(_), Some(cache)) = (structure, model.affine_jacobian_cache(block_index)) {
+        cache.borrow_mut().retain_affine_jacobian(system.jacobian);
+    }
+    Ok(settled)
+}
+
+/// The block Jacobian at `candidate`, refilled into the matrix the previous
+/// solve of this block retained when it has a structural pattern. Every
+/// structured writer writes only pattern entries, so the retained matrix is
+/// zero outside the pattern and clearing its pattern entries makes it the
+/// fresh zero matrix the fill expects, without clearing the whole block.
+fn affine_block_jacobian<M: ImplicitProjectionModel>(
+    model: &M,
+    candidate: &[f64],
+    (p, t): (&[f64], f64),
+    block: &solve::AlgebraicProjectionBlock,
+    block_index: usize,
+    structure: Option<&solve::JacobianStructure>,
+) -> Result<DMatrix<f64>, RuntimeSolveError> {
+    let shape = (block.rows.len(), block.y_indices.len());
+    let retained = match structure {
+        Some(_) => match model.affine_jacobian_cache(block_index) {
+            Some(cache) => cache.borrow_mut().take_affine_jacobian(),
+            None => None,
+        },
+        None => None,
+    };
+    let storage = match (retained, structure) {
+        (Some(mut retained), Some(structure)) => {
+            debug_assert_eq!(retained.shape(), shape);
+            clear_pattern_entries(&mut retained, structure.pattern());
+            retained
+        }
+        _ => DMatrix::zeros(shape.0, shape.1),
+    };
+    algebraic_block_jacobian_in(
+        model,
+        candidate,
+        p,
+        t,
+        (&block.rows, &block.y_indices),
+        structure,
+        storage,
+    )
+}
+
+struct AffineBlockSystem<'a, M> {
+    model: &'a M,
+    parameters: &'a [f64],
+    time: f64,
+    block: &'a solve::AlgebraicProjectionBlock,
+    block_index: usize,
+    jacobian: DMatrix<f64>,
+    /// [`jacobian_row_magnitudes`] of `jacobian`.
+    row_magnitudes: Vec<f64>,
+    /// [`jacobian_row_derived`] at the origin variable scales.
+    row_derived: Vec<bool>,
+    /// The model scales the refinement's certificate reads.
+    certificate_scales: CertificateScales,
+    row_scales: Vec<f64>,
+    variable_scales: Vec<f64>,
+    structure: Option<&'a solve::JacobianStructure>,
+    tolerance: f64,
+    prefer_torn: bool,
+    used_torn: std::cell::Cell<bool>,
+}
+
+impl<M: ImplicitProjectionModel> AffineBlockSystem<'_, M> {
+    fn project(&self, y: &mut [f64]) -> Result<bool, RuntimeSolveError> {
+        let residual = self.residual(y)?;
+        let Some(solution) = self.solve(&residual) else {
+            return Ok(false);
+        };
+        for (&index, &value) in self.block.y_indices.iter().zip(solution.iter()) {
+            y[index] = value;
+        }
+        self.refine(y)
+    }
+
+    fn residual(&self, y: &[f64]) -> Result<Vec<f64>, RuntimeSolveError> {
+        if let Some(selection) = self
+            .structure
+            .and_then(solve::JacobianStructure::residual_output_evaluation)
+        {
+            let mut residual = vec![0.0; self.block.rows.len()];
+            if self.model.eval_implicit_residual_outputs(
+                selection,
+                y,
+                self.parameters,
+                self.time,
+                &mut residual,
+            )? {
+                return Ok(residual);
+            }
+        }
+        implicit_selected_residuals(
+            self.model,
+            y,
+            self.parameters,
+            self.time,
+            &self.block.rows,
+            "affine block residual",
+        )
+    }
+
+    fn solve(&self, residual: &[f64]) -> Option<DVector<f64>> {
+        // Conditioning belongs to this fixed matrix. Candidate-dependent
+        // scales still certify the fresh source residual in `refine`.
+        let system = ScaledNewtonSystem {
+            jacobian: &self.jacobian,
+            residual,
+            row_scales: &self.row_scales,
+            variable_scales: &self.variable_scales,
+            structure: self.structure.map(solve::JacobianStructure::pattern),
+            tolerance: self.tolerance,
+        };
+        let finite = |v: &DVector<f64>| {
+            v.len() == self.block.y_indices.len() && v.iter().all(|x| x.is_finite())
+        };
+        if self.prefer_torn
+            && let Some(delta) = self
+                .model
+                .solve_affine_torn_delta(self.block_index, system)
+                .filter(finite)
+        {
+            self.used_torn.set(true);
+            return Some(delta);
+        }
+        let delta = self
+            .model
+            .solve_algebraic_newton_delta(self.block_index, system)
+            .filter(finite);
+        if delta.is_none() {
+            super::note_block_fallback(
+                self.model.projection_site(self.block_index),
+                ProjectionFallback::JacobianDeclined,
+            );
+        }
+        delta
+    }
+
+    fn refine(&self, y: &mut [f64]) -> Result<bool, RuntimeSolveError> {
+        for iteration in 0..ALGEBRAIC_PROJECTION_MAX_ITERS {
+            let residual = self.residual(y)?;
+            // Zero was only the arithmetic origin used to extract b. The
+            // residual certificate uses this candidate's coordinate scales.
+            let origin = OriginRowScales {
+                jacobian: &self.jacobian,
+                structure: self.structure.map(solve::JacobianStructure::pattern),
+                scales: &self.row_scales,
+                magnitudes: &self.row_magnitudes,
+                derived: &self.row_derived,
+            };
+            let converged = origin_bounded_residual_converged(
+                y,
+                &self.certificate_scales,
+                &origin,
+                &residual,
+                self.tolerance,
+            );
+            // One correction recovers small coordinates lost while solving
+            // beside large offsets, even when the residual already fits tol.
+            // Exact zero needs no correction; subsequent passes certify the
+            // corrected coordinate under the unchanged convergence policy.
+            if converged && (iteration > 0 || residual.iter().all(|&value| value == 0.0)) {
+                return Ok(true);
+            }
+            // Factorization roundoff can leave small coordinates inaccurate
+            // in a block containing much larger currents or forces. Refine
+            // against the original residual with the same certified matrix.
+            let Some(delta) = self.solve(&residual) else {
+                return Ok(false);
+            };
+            let Some(changed) = self.apply_correction(y, delta.as_slice()) else {
+                return Ok(false);
+            };
+            if !changed {
+                return Ok(converged);
+            }
+        }
+        Ok(false)
+    }
+
+    fn apply_correction(&self, y: &mut [f64], delta: &[f64]) -> Option<bool> {
+        let mut changed = false;
+        for (&index, &correction) in self.block.y_indices.iter().zip(delta) {
+            let value = y[index] + correction;
+            if !value.is_finite() {
+                return None;
+            }
+            changed |= value != y[index];
+            y[index] = value;
+        }
+        Some(changed)
+    }
+}
+
+/// Zero exactly the pattern entries of a retained block Jacobian.
+///
+/// One non-generic copy serves every projection model, so the row visitor is
+/// compiled once.
+fn clear_pattern_entries(matrix: &mut DMatrix<f64>, pattern: &solve::StructuralPattern) {
+    for row in 0..matrix.nrows() {
+        pattern.visit_row_columns(row, &mut |column| matrix[(row, column)] = 0.0);
+    }
+}

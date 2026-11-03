@@ -9,8 +9,25 @@ use std::sync::Arc;
 
 use crate::{SolvePureCallDirectionalSite, SolvePureCallSite, SolveValueType};
 
+mod block_split;
+mod dead_constants;
+mod seed_invariance;
+mod shared_values;
+
+pub use block_split::{BlockResidualSplit, BlockResidualSplitError};
+pub use dead_constants::prune_dead_constants;
+pub use shared_values::{
+    AssignmentProgram, CappedValue, SHARED_VALUE_REGISTER_CAP, SharedValueError,
+    SharedValueSegment, SharedValueSegments, share_program_values, shared_value_proof_failures,
+};
+
 /// Register index in a lowered op sequence.
 pub type Reg = u32;
+
+/// Largest interleaved lane count of a tensor operation in a tangent-lane
+/// program: one primal lane and up to 32 tangent lanes. Ordinary scalar
+/// programs use one (primal) or two (dual) lanes.
+pub const MAX_TENSOR_LANES: usize = 33;
 
 /// A strided run of registers read as one tensor operand.
 ///
@@ -62,8 +79,12 @@ pub struct MatrixProductShape {
 /// The Solve phase issues this certificate with its continuous refresh owner;
 /// evaluators execute it directly and never search the residual program for a
 /// target assignment.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TargetAssignmentShape {
+    Zero {
+        target_y_index: usize,
+        expr_eval_len: usize,
+    },
     Direct {
         target_y_index: usize,
         expr_reg: Reg,
@@ -78,31 +99,85 @@ pub enum TargetAssignmentShape {
         coefficient_scale: f64,
         expr_eval_len: usize,
     },
-    AffineResidual {
+    Additive {
         target_y_index: usize,
-        target_reg: Reg,
-        residual_reg: Reg,
+        offset_terms: std::sync::Arc<[(Reg, f64)]>,
         coefficient: f64,
+        expr_eval_len: usize,
+    },
+    TensorAffine {
+        target_y_index: usize,
+        projection: crate::refresh::AffineTensorProjection,
         expr_eval_len: usize,
     },
 }
 
 impl TargetAssignmentShape {
+    /// Whether the isolation divides by a construction constant (a nonzero
+    /// scale), never by a value of the solve, so its coefficient cannot vanish
+    /// at a point.
     #[must_use]
-    pub const fn target_y_index(self) -> usize {
+    pub fn constant_coefficient(&self) -> bool {
         match self {
-            Self::Direct { target_y_index, .. }
+            Self::Zero { .. } | Self::Direct { .. } | Self::Additive { .. } => true,
+            Self::Affine {
+                coefficient_reg, ..
+            } => coefficient_reg.is_none(),
+            Self::TensorAffine { projection, .. } => projection.constant_coefficient(),
+        }
+    }
+
+    /// Source registers determining the isolated value, excluding its old target.
+    pub fn value_registers(&self) -> impl Iterator<Item = Reg> + '_ {
+        let (fixed, terms): ([Option<Reg>; 2], &[(Reg, f64)]) = match self {
+            Self::Zero { .. } => ([None, None], &[]),
+            Self::Direct { expr_reg, .. } => ([Some(*expr_reg), None], &[]),
+            Self::Affine {
+                offset_reg,
+                coefficient_reg,
+                ..
+            } => ([Some(*offset_reg), *coefficient_reg], &[]),
+            Self::Additive { offset_terms, .. } => ([None, None], offset_terms),
+            Self::TensorAffine { .. } => ([None, None], &[]),
+        };
+        fixed
+            .into_iter()
+            .flatten()
+            .chain(terms.iter().map(|(register, _)| *register))
+            .chain(
+                match self {
+                    Self::TensorAffine { projection, .. } => Some(projection),
+                    _ => None,
+                }
+                .into_iter()
+                .flat_map(|projection| projection.value_registers()),
+            )
+    }
+
+    #[must_use]
+    pub const fn is_direct(&self) -> bool {
+        matches!(self, Self::Zero { .. } | Self::Direct { .. })
+    }
+
+    #[must_use]
+    pub const fn target_y_index(&self) -> usize {
+        match self {
+            Self::Zero { target_y_index, .. }
+            | Self::Direct { target_y_index, .. }
             | Self::Affine { target_y_index, .. }
-            | Self::AffineResidual { target_y_index, .. } => target_y_index,
+            | Self::Additive { target_y_index, .. }
+            | Self::TensorAffine { target_y_index, .. } => *target_y_index,
         }
     }
 
     #[must_use]
-    pub const fn expr_eval_len(self) -> usize {
+    pub const fn expr_eval_len(&self) -> usize {
         match self {
-            Self::Direct { expr_eval_len, .. }
+            Self::Zero { expr_eval_len, .. }
+            | Self::Direct { expr_eval_len, .. }
             | Self::Affine { expr_eval_len, .. }
-            | Self::AffineResidual { expr_eval_len, .. } => expr_eval_len,
+            | Self::Additive { expr_eval_len, .. }
+            | Self::TensorAffine { expr_eval_len, .. } => *expr_eval_len,
         }
     }
 }
@@ -1264,6 +1339,9 @@ pub struct ScalarProgramRegisterFlow {
 pub(crate) struct ScalarProgramValidationCache {
     conditional_programs: HashSet<ConditionalValidationKey>,
     use_owner_ids: bool,
+    /// Admit tensor operations of up to [`MAX_TENSOR_LANES`] interleaved lanes
+    /// (a tangent-lane program) rather than one primal or two dual lanes.
+    tangent_lanes: bool,
 }
 
 impl ScalarProgramValidationCache {
@@ -1271,6 +1349,15 @@ impl ScalarProgramValidationCache {
         Self {
             conditional_programs: HashSet::new(),
             use_owner_ids: true,
+            tangent_lanes: false,
+        }
+    }
+
+    const fn max_tensor_lanes(&self) -> usize {
+        if self.tangent_lanes {
+            MAX_TENSOR_LANES
+        } else {
+            2
         }
     }
 
@@ -1313,6 +1400,22 @@ impl ScalarProgramRegisterFlow {
             fold_context,
             conditional_capture_count,
             &mut ScalarProgramValidationCache::default(),
+        )
+    }
+
+    /// Register flow of a tangent-lane program, whose tensor operations may
+    /// carry up to [`MAX_TENSOR_LANES`] interleaved lanes.
+    pub(crate) fn derive_tangent_lanes(
+        program: &[LinearOp],
+    ) -> Result<Self, ScalarProgramRegisterError> {
+        Self::derive_inner_with_cache(
+            program,
+            None,
+            None,
+            &mut ScalarProgramValidationCache {
+                tangent_lanes: true,
+                ..ScalarProgramValidationCache::default()
+            },
         )
     }
 
@@ -1482,6 +1585,7 @@ struct OpSources<'a> {
     initialized: &'a [bool],
     fold_context: Option<(usize, usize, usize)>,
     conditional_capture_count: Option<usize>,
+    max_lanes: usize,
 }
 
 impl OpSources<'_> {
@@ -1595,7 +1699,8 @@ fn validate_op_sources(
     conditional_capture_count: Option<usize>,
     validation: &mut ScalarProgramValidationCache,
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
-    let cx = OpSources { op, op_index, initialized, fold_context, conditional_capture_count };
+    let max_lanes = validation.max_tensor_lanes();
+    let cx = OpSources { op, op_index, initialized, fold_context, conditional_capture_count, max_lanes };
     match *op {
         LinearOp::Const { .. } | LinearOp::LoadTime { .. } | LinearOp::LoadY { .. }
         | LinearOp::LoadP { .. } | LinearOp::LoadSeed { .. } => Ok(None),
@@ -2201,7 +2306,7 @@ fn matrix_multiply(
     columns: usize,
     lanes: usize,
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
-    if rows == 0 || inner == 0 || columns == 0 || lanes == 0 || lanes > 2 {
+    if rows == 0 || inner == 0 || columns == 0 || lanes == 0 || lanes > cx.max_lanes {
         return Err(cx.tensor_error("matrix multiply has an invalid shape or lane count"));
     }
     let lhs_count = rows
@@ -2234,7 +2339,7 @@ fn tensor_binary(
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
     if count == 0
         || lanes == 0
-        || lanes > 2
+        || lanes > cx.max_lanes
         || !matches!(
             op,
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
@@ -2270,7 +2375,7 @@ fn tensor_cross(
     rhs_start: Reg,
     lanes: usize,
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
-    if lanes == 0 || lanes > 2 {
+    if lanes == 0 || lanes > cx.max_lanes {
         return Err(cx.tensor_error("tensor cross product has an invalid lane count"));
     }
     let count = 3usize
@@ -2298,7 +2403,7 @@ fn tensor_transpose(
         .and_then(|count| count.checked_mul(element_width))
         .and_then(|count| count.checked_mul(lanes))
         .ok_or_else(|| cx.tensor_error("tensor transpose range overflows"))?;
-    if rows == 0 || columns == 0 || element_width == 0 || lanes == 0 || lanes > 2 {
+    if rows == 0 || columns == 0 || element_width == 0 || lanes == 0 || lanes > cx.max_lanes {
         return Err(
             cx.tensor_error("tensor transpose has an invalid shape, element width, or lane count")
         );
@@ -2319,7 +2424,7 @@ fn tensor_concatenate(
         || dimensions.is_empty()
         || axis >= dimensions.len()
         || lanes == 0
-        || lanes > 2
+        || lanes > cx.max_lanes
     {
         return Err(cx.tensor_error("tensor concatenate has an invalid shape, axis, or lane count"));
     }
@@ -2365,7 +2470,7 @@ fn tensor_update(
     if dimensions.is_empty()
         || dimensions.len() != subscripts.len()
         || lanes == 0
-        || lanes > 2
+        || lanes > cx.max_lanes
         || dimensions.contains(&0)
     {
         return Err(
@@ -2434,7 +2539,7 @@ fn tensor_fill(
     count: usize,
     lanes: usize,
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
-    if count == 0 || lanes == 0 || lanes > 2 {
+    if count == 0 || lanes == 0 || lanes > cx.max_lanes {
         return Err(cx.tensor_error("tensor fill has an invalid extent or lane count"));
     }
     cx.require_range(value_start, lanes)?;
@@ -2447,7 +2552,7 @@ fn tensor_identity(
     size: usize,
     lanes: usize,
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
-    if size == 0 || lanes == 0 || lanes > 2 || size.checked_mul(size).is_none() {
+    if size == 0 || lanes == 0 || lanes > cx.max_lanes || size.checked_mul(size).is_none() {
         return Err(cx.tensor_error("tensor identity has an invalid extent or lane count"));
     }
     Ok(None)
@@ -2460,7 +2565,7 @@ fn tensor_load(
     seed_start: Option<usize>,
     lanes: usize,
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
-    if count == 0 || lanes == 0 || lanes > 2 || (lanes == 1 && seed_start.is_some()) {
+    if count == 0 || lanes == 0 || lanes > cx.max_lanes || (lanes == 1 && seed_start.is_some()) {
         return Err(cx.tensor_error("tensor load has an invalid extent, seed, or lane count"));
     }
     Ok(None)

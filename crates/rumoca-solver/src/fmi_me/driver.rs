@@ -10,36 +10,22 @@ use super::session::{
 };
 use crate::timeline::try_build_output_times;
 
-/// How the host derives a root-scan resolution when a caller supplies only an
-/// output cadence.
-///
-/// SPEC_0044 §6 keeps event fidelity independent of trace density, so the
-/// default is a fixed fraction of the experiment's own scale rather than the
-/// output interval: refining the trace must not refine the event search, and
-/// coarsening it must not coarsen the event search.
-const DEFAULT_SCAN_FRACTION: f64 = 1.0 / 8.0;
-
-/// The default adjacent-sample bound for an experiment of the given width.
-#[must_use]
-pub fn default_root_scan_resolution(experiment_width: f64) -> f64 {
-    let width = experiment_width.abs();
-    if width.is_finite() && width > 0.0 {
-        (width * DEFAULT_SCAN_FRACTION).max(f64::MIN_POSITIVE)
-    } else {
-        1.0e-3
-    }
-}
-
-/// The default bracket width a located root is refined to.
-#[must_use]
-pub fn default_root_location_tolerance(scan_resolution: f64, absolute_tolerance: f64) -> f64 {
-    absolute_tolerance
-        .max(f64::MIN_POSITIVE)
-        .min(scan_resolution)
+/// The root-location tolerance of `plan` at `start_time`: the host's
+/// time-coordinate roundoff over one scan interval, per the plan's rule.
+fn root_location_tolerance(
+    plan: &rumoca_ir_solve::fmi::RootLocationPlan,
+    start_time: f64,
+    scan_resolution: f64,
+) -> f64 {
+    plan.location_tolerance(
+        plan.interval_roundoff(start_time, scan_resolution),
+        scan_resolution,
+    )
 }
 
 /// The checked session options a defined experiment implies.
 pub fn batch_session_options(
+    plan: &rumoca_ir_solve::fmi::RootLocationPlan,
     start_time: f64,
     stop_time: f64,
     relative_tolerance: f64,
@@ -47,7 +33,7 @@ pub fn batch_session_options(
     output_interval: f64,
     max_wall_seconds: Option<f64>,
 ) -> Result<MeSessionOptions, MeSessionError> {
-    let scan_resolution = default_root_scan_resolution(stop_time - start_time);
+    let scan_resolution = plan.scan_resolution(stop_time - start_time);
     MeSessionOptions::new(MeSessionOptionsInput {
         start_time,
         stop_time: Some(stop_time),
@@ -55,10 +41,7 @@ pub fn batch_session_options(
         absolute_tolerance,
         output_interval,
         root_scan_resolution: scan_resolution,
-        root_location_tolerance: default_root_location_tolerance(
-            scan_resolution,
-            absolute_tolerance,
-        ),
+        root_location_tolerance: root_location_tolerance(plan, start_time, scan_resolution),
         max_wall_seconds,
         records_trace: true,
     })
@@ -72,13 +55,14 @@ pub fn batch_session_options(
 /// horizon. `scan_scale` is the coordinate span the
 /// default scan resolution is derived from; it is not an experiment end.
 pub fn live_session_options(
+    plan: &rumoca_ir_solve::fmi::RootLocationPlan,
     start_time: f64,
     relative_tolerance: f64,
     absolute_tolerance: f64,
     scan_scale: f64,
     max_wall_seconds: Option<f64>,
 ) -> Result<MeSessionOptions, MeSessionError> {
-    let scan_resolution = default_root_scan_resolution(scan_scale);
+    let scan_resolution = plan.scan_resolution(scan_scale);
     MeSessionOptions::new(MeSessionOptionsInput {
         start_time,
         stop_time: None,
@@ -89,10 +73,7 @@ pub fn live_session_options(
         // fidelity.
         output_interval: scan_resolution,
         root_scan_resolution: scan_resolution,
-        root_location_tolerance: default_root_location_tolerance(
-            scan_resolution,
-            absolute_tolerance,
-        ),
+        root_location_tolerance: root_location_tolerance(plan, start_time, scan_resolution),
         max_wall_seconds,
         records_trace: false,
     })
@@ -125,20 +106,23 @@ pub fn advance_live_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rumoca_ir_solve::fmi::RootLocationPlan;
+
+    const STANDARD: RootLocationPlan = RootLocationPlan::STANDARD;
 
     #[test]
     fn a_live_session_never_carries_defined_stop_metadata() {
-        let options =
-            live_session_options(0.0, 1.0e-6, 1.0e-6, 1.0, None).expect("live options are checked");
+        let options = live_session_options(&STANDARD, 0.0, 1.0e-6, 1.0e-6, 1.0, None)
+            .expect("live options are checked");
         assert_eq!(options.stop_time(), None);
         assert!(!options.records_trace());
     }
 
     #[test]
     fn the_scan_resolution_does_not_follow_the_output_cadence() {
-        let coarse = batch_session_options(0.0, 1.0, 1.0e-6, 1.0e-6, 0.5, None)
+        let coarse = batch_session_options(&STANDARD, 0.0, 1.0, 1.0e-6, 1.0e-6, 0.5, None)
             .expect("coarse cadence is legal");
-        let fine = batch_session_options(0.0, 1.0, 1.0e-6, 1.0e-6, 1.0e-3, None)
+        let fine = batch_session_options(&STANDARD, 0.0, 1.0, 1.0e-6, 1.0e-6, 1.0e-3, None)
             .expect("fine cadence is legal");
 
         // The two experiments differ only in trace density.
@@ -161,11 +145,50 @@ mod tests {
     }
 
     #[test]
+    fn default_root_time_accuracy_does_not_follow_state_units() {
+        let baseline = batch_session_options(&STANDARD, 0.0, 1.0, 1e-6, 1e-9, 0.1, None).unwrap();
+        let rescaled = batch_session_options(&STANDARD, 0.0, 1.0, 1e-6, 1e-3, 0.1, None).unwrap();
+        assert_eq!(
+            baseline.root_location_tolerance(),
+            rescaled.root_location_tolerance(),
+            "changing the state unit cannot change a root's time accuracy"
+        );
+        let live = live_session_options(&STANDARD, 0.0, 1e-6, 1e-9, 1.0, None).unwrap();
+        let rescaled_live = live_session_options(&STANDARD, 0.0, 1e-6, 1e-3, 1.0, None).unwrap();
+        assert_eq!(
+            live.root_location_tolerance(),
+            rescaled_live.root_location_tolerance()
+        );
+    }
+
+    #[test]
+    fn default_root_time_accuracy_scales_with_time_units() {
+        let baseline = batch_session_options(&STANDARD, 2.0, 3.0, 1e-6, 1e-6, 0.1, None).unwrap();
+        let scale = 1024.0;
+        let rescaled = batch_session_options(
+            &STANDARD,
+            2.0 * scale,
+            3.0 * scale,
+            1e-6,
+            1e-6,
+            0.1 * scale,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            scale * baseline.root_location_tolerance(),
+            rescaled.root_location_tolerance(),
+            "a root-location duration must transform with the time coordinate"
+        );
+    }
+
+    #[test]
     fn an_unbuildable_output_grid_is_typed_host_option_data() {
-        let options =
-            batch_session_options(0.0, 1.0, 1.0e-6, 1.0e-6, 0.1, None).expect("checked options");
+        let options = batch_session_options(&STANDARD, 0.0, 1.0, 1.0e-6, 1.0e-6, 0.1, None)
+            .expect("checked options");
         assert!(batch_output_cursor(&options).is_ok());
-        let live = live_session_options(0.0, 1.0e-6, 1.0e-6, 1.0, None).expect("live options");
+        let live =
+            live_session_options(&STANDARD, 0.0, 1.0e-6, 1.0e-6, 1.0, None).expect("live options");
         assert!(matches!(
             batch_output_cursor(&live),
             Err(MeSessionError::Options { .. })
@@ -174,6 +197,6 @@ mod tests {
 
     #[test]
     fn a_backward_experiment_is_rejected_before_a_session_exists() {
-        assert!(batch_session_options(1.0, 0.0, 1.0e-6, 1.0e-6, 0.1, None).is_err());
+        assert!(batch_session_options(&STANDARD, 1.0, 0.0, 1.0e-6, 1.0e-6, 0.1, None).is_err());
     }
 }

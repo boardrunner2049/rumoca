@@ -7,10 +7,12 @@ resolver = "2"
 # carrying its own copy of every crate. Without this, a build run from the
 # workspace root can resolve a package to a worktree copy instead of the
 # checkout, producing a binary that does not match the source under review.
-exclude = ["infra/fuzz", ".claude/worktrees"]
+# Third-party source stays outside first-party workspace test/lint policy.
+exclude = ["infra/fuzz", ".claude/worktrees", "vendor/diffsol"]
 members = [
     "crates/rumoca",
     "crates/rumoca-worker",
+    "crates/rumoca-allocator",
     "crates/rumoca-test-msl",
     "crates/rumoca-core",
     "crates/rumoca-contracts",
@@ -73,7 +75,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/CogniPilot/rumoca"
@@ -92,6 +94,7 @@ name = "rumoca"
 # crates that depend on `rumoca`.
 rumoca = { path = "crates/rumoca", default-features = false }
 rumoca-worker = { path = "crates/rumoca-worker" }
+rumoca-allocator = { path = "crates/rumoca-allocator" }
 rumoca-core = { path = "crates/rumoca-core" }
 rumoca-contracts = { path = "crates/rumoca-contracts" }
 rumoca-reference = { path = "crates/rumoca-reference" }
@@ -147,6 +150,7 @@ rumoca-test-msl = { path = "crates/rumoca-test-msl" }
 # External dependencies
 anyhow = "1.0"
 mimalloc = "0.1"
+libmimalloc-sys = "0.1"
 num_cpus = "1.17"
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }
@@ -169,7 +173,7 @@ sha1 = "0.10"
 scnr2 = "0.3.3"
 sigpipe = "0.1"
 serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 self_cell = "1.2.2"
 bincode = "1.3"
 ciborium = "0.2"
@@ -207,8 +211,9 @@ pyo3 = { version = "0.22", features = ["extension-module"] }
 # `cfg(kani)` is set only by the Kani verifier in the dedicated `.#kani` shell
 # (see CONTRIBUTING.md). Declaring it here keeps the bounded-verification
 # harnesses warning-free without a blanket `allow`, so a *typo* in any other
-# cfg name still warns.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+# cfg name still warns. `cfg(coverage_nightly)` is set by `cargo llvm-cov` on
+# a nightly toolchain and gates the one coverage exemption (SPEC_0025 §4).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(coverage_nightly)'] }
 unsafe_code = "deny"
 unreachable_pub = "deny"
 unnameable_types = "deny"
@@ -288,3 +293,8 @@ opt-level = 2
 opt-level = 3
 [profile.dev.package.scnr2]
 opt-level = 3
+
+[patch.crates-io]
+# Correct the accepted BDF state at its owner; see the provenance and patch
+# inventory in vendor/diffsol/RUMOCA_PATCH.md.
+diffsol = { path = "vendor/diffsol" }

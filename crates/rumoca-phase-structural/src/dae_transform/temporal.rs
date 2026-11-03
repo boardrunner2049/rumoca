@@ -60,6 +60,21 @@ pub(super) fn rebuild_clocks<'target>(
             dae::ClockOperation::Triggered(condition) => target
                 .triggered(conditions[condition.index() as usize], clock.provenance())
                 .map(RebuiltClock::Triggered),
+            dae::ClockOperation::Shifted {
+                base,
+                counter,
+                condition,
+            } => target
+                .shifted(
+                    clocks
+                        .get(base.index() as usize)
+                        .map(|clock: &RebuiltClock<'_>| clock.clock_id())
+                        .expect("an event clock precedes the clocks shifted from it"),
+                    counter,
+                    conditions[condition.index() as usize],
+                    clock.provenance(),
+                )
+                .map(RebuiltClock::Triggered),
         })?;
         clocks.push(rebuilt);
     }

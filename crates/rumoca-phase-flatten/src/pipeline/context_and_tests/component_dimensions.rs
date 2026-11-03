@@ -17,10 +17,14 @@ impl Context {
                 continue;
             }
             let var_name = qualified_to_var_name(&instance_data.qualified_name);
+            if !flat.variables.contains_key(&var_name) {
+                continue;
+            }
+            let span = instance_source_span(instance_data, tree)?;
+            record_structural_dimension_parameters(self, flat, instance_data, span)?;
             let Some(flat_var) = flat.variables.get(&var_name) else {
                 continue;
             };
-            let span = instance_source_span(instance_data, tree)?;
             let resolved_dims = self.resolve_component_dims_expr(
                 var_name.as_str(),
                 instance_data,
@@ -192,6 +196,63 @@ impl Context {
         }
         Ok(dim)
     }
+}
+
+/// Record the ordinary parameters a declared dimension reads.
+///
+/// MLS 3.7 §10.1 fixes every array extent at translation, so a parameter a
+/// dimension reads is structural: DAE construction marks it evaluable, like a
+/// DAE-C22 selection guard, and warns at the declaration. A `size`/`ndims`
+/// operand contributes only its fixed shape and is not recorded.
+fn record_structural_dimension_parameters(
+    ctx: &Context,
+    flat: &mut Model,
+    instance_data: &ast::InstanceData,
+    span: rumoca_core::Span,
+) -> Result<(), FlattenError> {
+    let dimensions = instance_data
+        .dims_expr
+        .iter()
+        .filter_map(|subscript| match subscript {
+            ast::Subscript::Expression(expression) => Some(expression),
+            ast::Subscript::Range { .. } | ast::Subscript::Empty => None,
+        })
+        .collect::<Vec<_>>();
+    let parts = &instance_data.qualified_name.parts;
+    let scope = ast::QualifiedName {
+        parts: parts[..parts.len().saturating_sub(1)].to_vec(),
+    };
+    // MLS 3.7 sections 4.5 and 18.6: a `fixed = false` or `Evaluate = false`
+    // parameter is not evaluable, so a dimension reading one has no
+    // translation value (section 10.1).
+    if let Some(parameter) = dimensions.iter().find_map(|dimension| {
+        crate::boolean_eval::non_evaluable_parameter_read(ctx, dimension, &scope)
+    }) {
+        return Err(FlattenError::unresolved_component_dimension(
+            instance_data.qualified_name.to_string(),
+            format!(
+                "the dimension reads non-evaluable parameter `{parameter}` (fixed = false or \
+                 Evaluate = false); MLS 3.7 section 10.1 fixes every dimension at translation"
+            ),
+            span,
+        ));
+    }
+    if !dimensions
+        .iter()
+        .any(|dimension| crate::boolean_eval::reads_parameter(ctx, dimension, &scope))
+    {
+        return Ok(());
+    }
+    let selection = crate::equations::parameter_branch_selection(
+        flat::StructuralParameterUse::ArrayDimension,
+        dimensions.iter().copied(),
+        &scope,
+        span,
+    );
+    if !selection.references.is_empty() && !flat.parameter_branch_selections.contains(&selection) {
+        flat.parameter_branch_selections.push(selection);
+    }
+    Ok(())
 }
 
 fn unexpanded_structured_parent_dims(

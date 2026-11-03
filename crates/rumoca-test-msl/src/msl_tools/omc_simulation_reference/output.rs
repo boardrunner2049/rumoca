@@ -430,6 +430,9 @@ fn build_timing_payload(
         "workers_requested": args.workers,
         "workers_used": context.workers,
         "omc_threads": args.omc_threads,
+        "rumoca_sim_workers": args.rumoca_sim_workers,
+        "rumoca_stage_workers": args.rumoca_stage_workers,
+        "host": host_description(),
         "batches_total": context.n_batches,
         "batches_ran": metrics.ran_batches,
         "batches_skipped": metrics.skipped_batches,
@@ -754,4 +757,15 @@ fn print_omc_assertion_snapshot(state: &SimRunState) {
         }
         println!("    - {model_name}: {}", assertions.join(" | "));
     }
+}
+
+/// The host these references were timed on: its CPU counts and, on a CI
+/// runner, the runner image and environment.
+pub(super) fn host_description() -> Value {
+    json!({
+        "logical_cpus": std::thread::available_parallelism().map(usize::from).ok(),
+        "physical_cores": rumoca_worker::physical_cpu_core_count(),
+        "image": std::env::var("ImageOS").ok(),
+        "runner_environment": std::env::var("RUNNER_ENVIRONMENT").ok(),
+    })
 }

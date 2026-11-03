@@ -14,6 +14,25 @@ use crate::equations::build_qualified_name;
 struct FlattenScalarAdapter<'a> {
     ctx: Option<&'a Context>,
     structural_only: bool,
+    /// Read only `final` and `Evaluate = true` parameters, so a value folded
+    /// under it holds for every value any other parameter may take.
+    evaluable_only: bool,
+}
+
+impl FlattenScalarAdapter<'_> {
+    /// Whether this fold must not read the parameter `name`.
+    fn refuses(&self, ctx: &Context, name: &str, prefix: &ast::QualifiedName) -> bool {
+        (self.structural_only && scoped_set_contains(&ctx.non_structural_params, name, prefix))
+            || (self.evaluable_only && !evaluable_parameter(ctx, name, prefix))
+    }
+}
+
+/// Whether `name` is a constant or a `final`/`Evaluate = true` parameter: a
+/// classified value that is not an ordinary (tunable) parameter. An
+/// unclassified name is not one.
+fn evaluable_parameter(ctx: &Context, name: &str, prefix: &ast::QualifiedName) -> bool {
+    scoped_set_contains(&ctx.structural_params, name, prefix)
+        && !scoped_set_contains(&ctx.tunable_params, name, prefix)
 }
 
 impl FlattenScalarAdapter<'_> {
@@ -27,9 +46,8 @@ impl FlattenScalarAdapter<'_> {
             return false;
         };
         operands.into_iter().any(|operand| {
-            ast::expression_component_path(operand).is_some_and(|path| {
-                scoped_set_contains(&ctx.non_structural_params, &path.to_flat_string(), prefix)
-            })
+            ast::expression_component_path(operand)
+                .is_some_and(|path| self.refuses(ctx, &path.to_flat_string(), prefix))
         })
     }
 }
@@ -39,7 +57,7 @@ impl rumoca_eval_ast::ast_scalar::AstScalarContext for FlattenScalarAdapter<'_> 
         let ctx = self.ctx?;
         let name = ast::expression_component_path(expr)?.to_flat_string();
         let prefix = ast::QualifiedName::from_dotted(scope);
-        if self.structural_only && scoped_set_contains(&ctx.non_structural_params, &name, &prefix) {
+        if self.refuses(ctx, &name, &prefix) {
             return None;
         }
         scoped_lookup_integer_param(ctx, &name, &prefix)
@@ -49,7 +67,7 @@ impl rumoca_eval_ast::ast_scalar::AstScalarContext for FlattenScalarAdapter<'_> 
         let ctx = self.ctx?;
         let name = ast::expression_component_path(expr)?.to_flat_string();
         let prefix = ast::QualifiedName::from_dotted(scope);
-        if self.structural_only && scoped_set_contains(&ctx.non_structural_params, &name, &prefix) {
+        if self.refuses(ctx, &name, &prefix) {
             return None;
         }
         scoped_lookup_real_param(ctx, &name, &prefix)
@@ -60,7 +78,7 @@ impl rumoca_eval_ast::ast_scalar::AstScalarContext for FlattenScalarAdapter<'_> 
         let ctx = self.ctx?;
         let name = ast::expression_component_path(expr)?.to_flat_string();
         let prefix = ast::QualifiedName::from_dotted(scope);
-        if self.structural_only && scoped_set_contains(&ctx.non_structural_params, &name, &prefix) {
+        if self.refuses(ctx, &name, &prefix) {
             return None;
         }
         scoped_lookup_map(&ctx.boolean_parameter_values, &name, &prefix)
@@ -125,7 +143,7 @@ impl rumoca_eval_ast::ast_scalar::AstScalarContext for FlattenScalarAdapter<'_> 
         // Same refusal as the scalar lookups: under `structural_only` a
         // non-structural parameter must not decide a structural fold, or a
         // conditional that has to survive to runtime is eliminated here.
-        if self.structural_only && self.refuses_non_structural([lhs, rhs], &prefix) {
+        if self.refuses_non_structural([lhs, rhs], &prefix) {
             return None;
         }
         let lhs = try_resolve_enum_value(self.ctx, lhs, &prefix)?;
@@ -158,6 +176,7 @@ pub(crate) fn try_eval_integer_with_scope(
         &FlattenScalarAdapter {
             ctx: Some(ctx),
             structural_only: false,
+            evaluable_only: false,
         },
         scope,
         0,
@@ -174,6 +193,7 @@ pub(crate) fn try_eval_real_with_scope(
         &FlattenScalarAdapter {
             ctx: Some(ctx),
             structural_only: false,
+            evaluable_only: false,
         },
         scope,
         0,
@@ -190,6 +210,7 @@ pub(crate) fn try_eval_boolean_with_scope(
         &FlattenScalarAdapter {
             ctx: Some(ctx),
             structural_only: false,
+            evaluable_only: false,
         },
         scope,
         0,
@@ -202,6 +223,60 @@ pub(crate) fn try_eval_boolean_with_scope(
 /// quantities (e.g., parameters marked `Evaluate=true`, `final` parameters, and
 /// constants). Non-structural parameters must not be folded here.
 ///
+/// Whether `expr` reads an ordinary parameter (fixed, without `Evaluate=true`
+/// or `final`): a branch selection over it fixes that parameter, so it is
+/// left to DAE construction (SPEC_0040 DAE-C22).
+pub(crate) fn reads_tunable_parameter(
+    ctx: &Context,
+    expr: &ast::Expression,
+    prefix: &ast::QualifiedName,
+) -> bool {
+    ast::collect_component_refs(expr)
+        .iter()
+        .any(|reference| scoped_set_contains(&ctx.tunable_params, &reference.to_string(), prefix))
+}
+
+/// The first non-evaluable parameter (MLS 3.7 section 4.5: `fixed = false`
+/// or `Evaluate = false`) `expr` reads; a condition reading one is not
+/// evaluable, so no branch is selected on it at translation.
+pub(crate) fn non_evaluable_parameter_read(
+    ctx: &Context,
+    expr: &ast::Expression,
+    prefix: &ast::QualifiedName,
+) -> Option<String> {
+    ast::collect_component_refs(expr)
+        .iter()
+        .map(ToString::to_string)
+        .find(|name| scoped_set_contains(&ctx.non_evaluable_params, name, prefix))
+}
+
+/// Whether `expr` reads any parameter, `final` and `Evaluate = true` ones
+/// included: a `final` parameter bound to an ordinary one still carries that
+/// parameter's value into a structural use (SPEC_0022 DECL-037), and DAE
+/// construction closes the recorded reads over their bindings.
+pub(crate) fn reads_parameter(
+    ctx: &Context,
+    expr: &ast::Expression,
+    prefix: &ast::QualifiedName,
+) -> bool {
+    ast::collect_component_refs(expr).iter().any(|reference| {
+        let name = reference.to_string();
+        scoped_set_contains(&ctx.structural_params, &name, prefix)
+            || scoped_set_contains(&ctx.non_structural_params, &name, prefix)
+    })
+}
+
+/// Whether `name` denotes a parameter or a constant from `prefix`.
+pub(crate) fn names_parameter_or_constant(
+    ctx: &Context,
+    name: &str,
+    prefix: &ast::QualifiedName,
+) -> bool {
+    scoped_set_contains(&ctx.structural_params, name, prefix)
+        || scoped_set_contains(&ctx.non_structural_params, name, prefix)
+        || scoped_lookup_map(&ctx.constant_values, name, prefix).is_some()
+}
+
 /// Check if an expression only references structural parameters (Evaluate=true or final).
 ///
 /// Returns true if:
@@ -287,6 +362,28 @@ pub(crate) fn is_structural_expression(
     }
 }
 
+/// [`try_eval_structural_boolean`] that reads only `final` and
+/// `Evaluate = true` parameters: a value it returns holds for every value any
+/// other parameter may take at run time, so folding it fixes none of them
+/// (`x > -p or b` with an `Evaluate = true` parameter `b = true` is `true` for
+/// every `p`).
+pub(crate) fn try_eval_evaluable_boolean(
+    ctx: &Context,
+    expr: &ast::Expression,
+    prefix: &ast::QualifiedName,
+) -> Option<bool> {
+    rumoca_eval_ast::ast_scalar::eval_boolean(
+        expr,
+        &FlattenScalarAdapter {
+            ctx: Some(ctx),
+            structural_only: true,
+            evaluable_only: true,
+        },
+        &prefix.to_flat_string(),
+        0,
+    )
+}
+
 /// Try to evaluate a boolean expression, but only if it uses structural parameters.
 ///
 /// This is the safe version that respects the Evaluate=true annotation (MLS §18.3).
@@ -311,6 +408,7 @@ pub(crate) fn try_eval_structural_boolean(
         &FlattenScalarAdapter {
             ctx: Some(ctx),
             structural_only: true,
+            evaluable_only: false,
         },
         &prefix.to_flat_string(),
         0,
@@ -328,6 +426,7 @@ pub(crate) fn try_eval_boolean_with_ctx_inner(
         &FlattenScalarAdapter {
             ctx,
             structural_only: false,
+            evaluable_only: false,
         },
         &prefix.to_flat_string(),
         0,
@@ -432,6 +531,7 @@ pub(crate) fn try_eval_integer_for_comparison(
         &FlattenScalarAdapter {
             ctx,
             structural_only: false,
+            evaluable_only: false,
         },
         &prefix.to_flat_string(),
         0,

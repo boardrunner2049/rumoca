@@ -304,9 +304,9 @@ and then discards parameters, inputs and `pre()` reads because matching does not
 need them — which means the obvious entry point for "what does this equation
 depend on" gives an incomplete answer for any purpose other than matching.
 
-## 9. Open item: SPEC_0052
+## 9. Open item: SPEC_0054
 
-`spec/SPEC_0052_MODEL_ANALYSIS_PASSES.md` was written during the earlier
+`spec/SPEC_0054_MODEL_ANALYSIS_PASSES.md` was written during the earlier
 plugin-ABI iteration and is registered as `PROPOSED`. Its §5 describes a
 WASM/WIT drop-in boundary that this design supersedes. Its other sections — pass
 categories, owned results, determinism, the analysis manager — remain

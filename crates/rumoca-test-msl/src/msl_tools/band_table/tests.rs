@@ -106,6 +106,7 @@ fn meta(tag: &str) -> BandTableMeta {
             results_digest: format!("results-digest-{tag}"),
             exclusions_file: "msl_trace_compare_exclusions.json".to_string(),
             exclusions_digest: "exclusions-digest".to_string(),
+            exclusions_sha256: "exclusions-sha256".to_string(),
         },
     }
 }
@@ -1424,6 +1425,8 @@ fn the_table_records_the_exclusion_list_that_attributed_it() {
         !table.source.exclusions_digest.is_empty(),
         "the list's digest must travel with the table"
     );
+    // The SHA-256 a reviewed baseline boundary pins travels too.
+    assert_eq!(table.source.exclusions_sha256.len(), 64);
 }
 
 /// An unreadable exclusion list used to yield an empty map, which silently
@@ -1527,4 +1530,97 @@ fn write_run(dir: &Path, artifacts: &RunArtifacts) {
     fs::create_dir_all(dir).expect("create results dir");
     write_pretty_json(&dir.join(TRACE_COMPARISON_FILE), &artifacts.trace).expect("write trace");
     write_pretty_json(&dir.join(MSL_RESULTS_FILE), &artifacts.results).expect("write results");
+}
+
+#[test]
+fn a_compared_model_whose_run_fell_back_is_banded_fallback_not_high() {
+    let trace = trace_payload(
+        json!({ "Alpha": metric("Alpha", 9, 0, 0, 1e-4), "Beta": metric("Beta", 9, 0, 0, 1e-4) }),
+        json!({}),
+        json!({}),
+    );
+    let mut results = results_payload(&[("Alpha", Some("sim_ok")), ("Beta", Some("sim_ok"))]);
+    results["model_results"][0]["projection_fallback_rate"] = json!(1.0);
+    results["model_results"][0]["projection_fallback_detail"] = json!(
+        "projection block 897 (45 rows) fell back on 100.0% of 3055 calls (torn_to_dense 3055)"
+    );
+    let table = derive(&trace, &results);
+    ensure_comparable(&table).expect("a v3 table with a fallback row is comparable");
+    let alpha = table.row("Alpha").expect("Alpha row");
+    assert_eq!(alpha.band, BandLabel::Fallback);
+    assert_eq!(alpha.fallback_rate, Some(1.0));
+    assert_eq!(alpha.fallback_of, Some(BandLabel::High));
+    assert_eq!(table.agreement_models(BandLabel::High), 2);
+    assert!(
+        alpha
+            .describe()
+            .starts_with("fallback (rate 100.0%: projection block 897")
+    );
+    assert_eq!(table.row("Beta").expect("Beta row").band, BandLabel::High);
+    assert_eq!((table.counts.high, table.counts.fallback), (1, 1));
+    assert_eq!(table.counts.compared_models, 2);
+    assert_eq!(table.strict_high_models(), 1);
+}
+
+#[test]
+fn a_schema_v2_table_reads_as_fallback_free() {
+    let trace = trace_payload(
+        json!({ "Alpha": metric("Alpha", 9, 0, 0, 1e-4) }),
+        json!({}),
+        json!({}),
+    );
+    let table = derive(&trace, &results_payload(&[("Alpha", Some("sim_ok"))]));
+    // A v2 table: its rows and counts carry no fallback fields at all.
+    let mut wire = serde_json::to_value(&table).expect("serialize");
+    wire["schema_version"] = json!(BAND_TABLE_PREVIOUS_SCHEMA_VERSION);
+    wire["counts"]
+        .as_object_mut()
+        .expect("counts")
+        .remove("fallback");
+    let v2: BandTable = serde_json::from_value(wire).expect("a v2 table decodes");
+    ensure_comparable(&v2).expect("a v2 table's digest and counts still verify");
+    assert_eq!(v2.counts.fallback, 0);
+    assert!(v2.rows.iter().all(|row| row.fallback_rate.is_none()));
+}
+
+#[test]
+fn a_fallback_rate_on_a_row_of_another_band_is_refused() {
+    let trace = trace_payload(
+        json!({ "Alpha": metric("Alpha", 9, 0, 0, 1e-4) }),
+        json!({}),
+        json!({}),
+    );
+    let mut table = derive(&trace, &results_payload(&[("Alpha", Some("sim_ok"))]));
+    table.rows[0].fallback_rate = Some(0.5);
+    table.rows_digest = rows_digest(&table.rows);
+    assert!(ensure_comparable(&table).is_err());
+}
+
+/// Run A simulates all three models: strict-high `Alpha` and excluded `Gamma`
+/// are accounted for, and deviating `Beta` is the one completion the gate
+/// cannot certify.
+#[test]
+fn only_uncertified_completions_without_a_typed_exception_join_the_roster() {
+    let table = run_a();
+    let roster = table
+        .unexcepted_non_high_rows()
+        .map(|row| row.model_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(roster, ["Beta"]);
+
+    let failed = run_b();
+    let alpha = failed.row("Alpha").expect("row");
+    assert!(
+        !alpha.is_unexcepted_non_high(),
+        "a failed simulation is not a completion"
+    );
+}
+
+#[test]
+fn triage_packages_are_the_first_three_name_segments() {
+    assert_eq!(
+        triage_package("Modelica.Electrical.Analog.Examples.ChuaCircuit"),
+        "Modelica.Electrical.Analog"
+    );
+    assert_eq!(triage_package("Modelica.Blocks"), "Modelica.Blocks");
 }

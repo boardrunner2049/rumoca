@@ -83,9 +83,12 @@ fn state_input() -> solve::fmi::FmiVariableInput {
         unit: None,
         description: None,
         causality: solve::fmi::FmiCausality::Local,
+        declared_causality: None,
         variability: solve::fmi::FmiVariability::Continuous,
         tunable: false,
+        evaluable: false,
         declaration: fixture_span(),
+        text_start: None,
     }
 }
 
@@ -99,11 +102,14 @@ fn component(delay_bearing: bool) -> solve::fmi::FmiComponent {
 
 fn component_with_initialization() -> solve::fmi::FmiComponent {
     let mut model = model_with_one_state_run(false);
-    model.problem.initialization.update_rhs = one_row_block();
-    model.problem.initialization.update_targets = vec![solve::ScalarSlot::Y {
+    let mut initialization = model.problem.initialization.clone().into_input();
+    initialization.update_rhs = one_row_block();
+    initialization.update_targets = vec![solve::ScalarSlot::Y {
         index: 0,
         byte_offset: 0,
     }];
+    model.problem.initialization = solve::InitializationSolveSystem::construct(initialization)
+        .expect("fixture initialization ownership is disjoint");
     solve::fmi::FmiComponent::construct(model, vec![state_input()])
         .expect("the initialization-bearing fixture is a checked component")
 }
@@ -149,18 +155,18 @@ fn a_delay_bearing_component_reaches_no_renderer() {
     );
 }
 
-/// ME-PARAM-001: parameter initialization support does not admit state writes.
+/// ME-PARAM-001: a state start assignment renders; the state is published
+/// `initial="calculated"` without a start, since its value is assigned at
+/// initialization rather than set by the environment.
 #[test]
-fn a_state_initialization_bearing_component_reaches_no_renderer() {
+fn a_state_start_assignment_renders_as_a_calculated_state() {
     let view = event_free_view(component_with_initialization());
-    let error = SolveTemplateRenderer::new_owned_with_fmi(view)
-        .expect_err("state initialization cannot be rendered by the parameter-only C profile");
-    assert!(
-        error
-            .to_string()
-            .contains("C initialization can only assign parameter storage"),
-        "the rejected capability stays explicit: {error}"
-    );
+    let renderer = SolveTemplateRenderer::new_owned_with_fmi(view)
+        .expect("a state start assignment is admitted by the C profile");
+    let rendered = renderer
+        .render("{{ fmi.variables[0].initial }}|{{ fmi.variables[0].start is defined }}")
+        .expect("the narrowed view renders");
+    assert_eq!(rendered, "calculated|false");
 }
 
 /// The positive control for the case above: an event-free component narrows,
@@ -210,6 +216,101 @@ fn the_fmi2_scalar_walk_reads_the_projected_storage_run() {
     assert!(rendered.contains("name=\"der(x[1])\""), "{rendered}");
 }
 
+fn render_description(component: solve::fmi::FmiComponent, target: &str) -> String {
+    let rendered = SolveTemplateRenderer::new_owned_with_fmi(event_free_view(component))
+        .expect("an event-free component renders")
+        .render_with_name_and_artifact(
+            builtin_template(target, "modelDescription.xml.jinja"),
+            "FmiProjectionFixture",
+            &artifact_identities(),
+        );
+    match rendered {
+        Ok(description) => description,
+        Err(error) => panic!("{target} description renders: {error}"),
+    }
+}
+
+fn component_declaring(
+    causality: solve::fmi::FmiCausality,
+    declared: Option<solve::fmi::FmiDeclaredCausality>,
+) -> solve::fmi::FmiComponent {
+    let input = solve::fmi::FmiVariableInput {
+        causality,
+        declared_causality: declared,
+        ..state_input()
+    };
+    solve::fmi::FmiComponent::construct(model_with_one_state_run(false), vec![input])
+        .expect("one state run is a complete inventory")
+}
+
+/// A nested `output` exported `local` carries its declared prefix as a
+/// namespaced annotation: FMI 2 after the type element of every scalar, FMI 3
+/// as the first child of the tensor variable, ahead of its dimensions.
+#[test]
+fn a_nested_output_renders_its_declared_causality_annotation() {
+    let declared = || {
+        component_declaring(
+            solve::fmi::FmiCausality::Local,
+            Some(solve::fmi::FmiDeclaredCausality::Output),
+        )
+    };
+
+    let fmi2 = render_description(declared(), "fmi2");
+    let annotation = "<Annotations>\n        <Tool name=\"rumoca\">\n          \
+                      <DeclaredCausality value=\"output\"/>\n        </Tool>\n      \
+                      </Annotations>";
+    for scalar in ["x[1]", "x[2]"] {
+        let Some(start) = fmi2.find(&format!("<ScalarVariable name=\"{scalar}\"")) else {
+            panic!("{scalar} is published: {fmi2}");
+        };
+        let variable = &fmi2[start..start + fmi2[start..].find("</ScalarVariable>").unwrap()];
+        assert!(variable.contains("causality=\"local\""), "{variable}");
+        let real = variable.find("<Real").expect("the type element");
+        let annotated = variable.find(annotation).expect("the annotation");
+        assert!(real < annotated, "{variable}");
+    }
+    assert_eq!(fmi2.matches(annotation).count(), 2, "{fmi2}");
+
+    let fmi3 = render_description(declared(), "fmi3");
+    assert!(
+        fmi3.contains(
+            "causality=\"local\" variability=\"continuous\" initial=\"exact\" \
+             start=\"1.0 2.0\">\n      <Annotations>\n        \
+             <Annotation type=\"rumoca.declaredCausality\">output</Annotation>\n      \
+             </Annotations>\n      <Dimension start=\"2\"/>"
+        ),
+        "{fmi3}"
+    );
+    assert_eq!(fmi3.matches("<Annotations>").count(), 1, "{fmi3}");
+}
+
+/// A declaration whose exported causality states its prefix, and one with no
+/// prefix, publish no annotation.
+#[test]
+fn an_exported_or_undeclared_causality_renders_no_annotation() {
+    for (causality, declared) in [
+        (solve::fmi::FmiCausality::Output, None),
+        (solve::fmi::FmiCausality::Local, None),
+    ] {
+        for target in ["fmi2", "fmi3"] {
+            let rendered = render_description(component_declaring(causality, declared), target);
+            assert!(!rendered.contains("Annotation"), "{target}: {rendered}");
+        }
+    }
+    let redundant = solve::fmi::FmiComponent::construct(
+        model_with_one_state_run(false),
+        vec![solve::fmi::FmiVariableInput {
+            causality: solve::fmi::FmiCausality::Output,
+            declared_causality: Some(solve::fmi::FmiDeclaredCausality::Output),
+            ..state_input()
+        }],
+    );
+    assert!(matches!(
+        redundant,
+        Err(solve::fmi::FmiComponentError::RedundantDeclaredCausality { .. })
+    ));
+}
+
 /// The correlated component is the FMI path's only semantic input.
 ///
 /// The compile-time half of this is on `new_owned_with_fmi` itself, which no
@@ -225,5 +326,170 @@ fn the_fmi_render_context_exposes_no_dae() {
             .render("{{ dae is undefined }}|{{ fmi.variables | length }}")
             .expect("the probe template renders"),
         "true|1"
+    );
+}
+
+/// A retained state-manifold projection is a runtime shape the shared ME
+/// projection does not execute. The Solve admissibility gate refuses it, and
+/// a checked component cannot even reach the renderer: the retained manifold
+/// rows are initialization residuals, which the C profile narrowing refuses
+/// first. The renderer's own refusal of the same shape is therefore a second,
+/// independent guard behind a typed input it can no longer receive.
+#[test]
+fn a_state_manifold_projection_is_refused_before_any_byte() {
+    let plain = model_with_one_state_run(false);
+    assert!(super::me_projection::me_refresh_admissible(&plain.problem));
+
+    let mut model = plain;
+    let manifold = solve::ComputeBlock::from_scalar_program_block(
+        solve::ScalarProgramBlock::with_source_span(
+            vec![vec![
+                solve::LinearOp::LoadY { dst: 0, index: 0 },
+                solve::LinearOp::StoreOutput { src: 0 },
+            ]],
+            fixture_span()
+                .require_provenance("FMI manifold fixture")
+                .expect("fixture span is source-backed"),
+        )
+        .expect("fixture manifold residual is computable"),
+    );
+    let mut initialization = model.problem.initialization.clone().into_input();
+    initialization.residual = manifold.clone();
+    initialization.row_roles = vec![solve::InitializationRowRole::SurplusCheck];
+    initialization.manifold_row_count = 1;
+    model.problem.initialization = solve::InitializationSolveSystem::construct(initialization)
+        .expect("the retained manifold row closes the initialization residual");
+    model.problem.continuous.manifold_residual = manifold;
+    model.problem.continuous.manifold_projection_plan = solve::AlgebraicProjectionPlan {
+        blocks: vec![solve::AlgebraicProjectionBlock {
+            rows: vec![0],
+            y_indices: vec![0],
+            tearing: None,
+            alternate_charts: Vec::new(),
+        }],
+    };
+    model
+        .problem
+        .validate()
+        .expect("the manifold-bearing fixture is a valid Solve problem");
+    assert!(!super::me_projection::me_refresh_admissible(&model.problem));
+
+    let component = solve::fmi::FmiComponent::construct(model, vec![state_input()])
+        .expect("the manifold-bearing fixture is a checked component");
+    let error = component
+        .into_codegen_view()
+        .try_c()
+        .expect_err("the C profile refuses the retained manifold initialization rows");
+    assert!(
+        error
+            .to_string()
+            .contains("C initialization cannot certify retained state-manifold rows"),
+        "{error}"
+    );
+}
+
+/// A chain of `depth` parameter bindings `p[k] = p[k-1] + 1` over one run of
+/// `depth + 1` parameters, beside the state run.
+fn component_with_binding_chain(depth: usize) -> solve::fmi::FmiComponent {
+    let mut model = model_with_one_state_run(false);
+    let count = depth + 1;
+    model.problem.layout = solve::VarLayout::from_parts(IndexMap::new(), 2, count);
+    model
+        .problem
+        .solve_layout
+        .variable_storage_runs
+        .push(solve::SolveVariableStorageRun {
+            base: solve::ScalarSlot::P {
+                index: 0,
+                byte_offset: 0,
+            },
+            scalar_count: count,
+            role: solve::SolveVariableStorageRole::Parameter,
+            value_kind: solve::SolveVariableValueKind::Real,
+        });
+    model
+        .problem
+        .solve_layout
+        .variable_declarations
+        .push(solve::SolveVariableDeclaration::new(
+            solve::SolveVariableStorageRole::Parameter,
+            solve::SolveVariableValueKind::Real,
+        ));
+    model.problem.solve_layout.parameter_count = count;
+    let programs = (1..count)
+        .map(|k| {
+            vec![
+                solve::LinearOp::LoadP {
+                    dst: 0,
+                    index: k - 1,
+                },
+                solve::LinearOp::Const { dst: 1, value: 1.0 },
+                solve::LinearOp::Binary {
+                    dst: 2,
+                    op: solve::BinaryOp::Add,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                solve::LinearOp::StoreOutput { src: 2 },
+            ]
+        })
+        .collect();
+    let mut initialization = model.problem.initialization.clone().into_input();
+    initialization.update_rhs = solve::ScalarProgramBlock::with_source_span(
+        programs,
+        fixture_span()
+            .require_provenance("binding chain fixture")
+            .expect("fixture span is source-backed"),
+    )
+    .expect("the chain is computable");
+    initialization.update_targets = (1..count)
+        .map(|index| solve::ScalarSlot::P {
+            index,
+            byte_offset: 8 * index,
+        })
+        .collect();
+    model.problem.initialization = solve::InitializationSolveSystem::construct(initialization)
+        .expect("each binding owns its own target");
+    let parameter = solve::fmi::FmiVariableInput {
+        name: "p".to_string(),
+        scalar_names: (1..=count).map(|k| format!("p[{k}]")).collect(),
+        role: solve::SolveVariableStorageRole::Parameter,
+        dimensions: vec![count as u32],
+        start: vec![0.0; count],
+        causality: solve::fmi::FmiCausality::Parameter,
+        variability: solve::fmi::FmiVariability::Fixed,
+        ..state_input()
+    };
+    solve::fmi::FmiComponent::construct(model, vec![state_input(), parameter])
+        .expect("the binding chain is a checked component")
+}
+
+/// The runtime settles parameter bindings with at most
+/// `ALGEBRAIC_REFRESH_MAX_ITERS` simultaneous sweeps; a chain deep enough to
+/// exhaust them is refused rather than exported to settle where the linked
+/// kernel fails (SPEC_0044 ME-PARAM-001).
+#[test]
+fn a_binding_chain_the_runtime_cannot_settle_is_refused() {
+    let limit = rumoca_eval_solve::projection_policy::ALGEBRAIC_REFRESH_MAX_ITERS;
+    let render = |depth| {
+        let view = component_with_binding_chain(depth)
+            .into_codegen_view()
+            .try_c()
+            .expect("an acyclic parameter chain is admitted");
+        assert_eq!(view.parameter_binding_levels(), depth);
+        SolveTemplateRenderer::new_owned_with_fmi(view)
+    };
+    assert!(
+        render(limit - 1).is_ok(),
+        "a chain within the sweep limit renders"
+    );
+    let error = render(limit)
+        .map(|_| ())
+        .expect_err("the runtime cannot settle it");
+    assert!(
+        error.to_string().contains(&format!(
+            "parameter bindings form a dependency chain {limit} levels deep"
+        )),
+        "{error}"
     );
 }

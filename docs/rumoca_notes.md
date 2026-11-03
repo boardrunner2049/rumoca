@@ -702,13 +702,13 @@ Adding a pass framework introduces a new architectural layer and new crates,
 which touches SPEC_0029 (crate boundaries and tiers) and its ownership catalog
 SPEC_0041. Upstream process expects a `PROPOSED` spec before the code, and that
 route was taken: see
-[SPEC_0052](../spec/SPEC_0052_MODEL_ANALYSIS_PASSES.md) (`PROPOSED`), with
-SPEC_0029 §3, SPEC_0041 §6, and the SPEC_0008 `EA0xx`/`WA0xx` ranges amended to
+[SPEC_0054](../spec/SPEC_0054_MODEL_ANALYSIS_PASSES.md) (`PROPOSED`), with
+SPEC_0029 §3, SPEC_0041 §7, and the SPEC_0008 `EA0xx`/`WA0xx` ranges amended to
 match. The spec stays `PROPOSED` until upstream maintainers vote, which cannot
 happen inside this fork; `ACCEPTED` would claim an implementation that does not
 exist yet.
 
-SPEC_0052 §5 makes **out-of-tree drop-in plugins a first-class requirement**:
+SPEC_0054 §5 makes **out-of-tree drop-in plugins a first-class requirement**:
 an installed Rumoca binary loads a pass artifact with no checkout, no rebuild,
 and no toolchain match, over a WASM Component Model / WIT interface that never
 exposes an internal Rust IR type. Two findings from these notes became

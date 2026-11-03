@@ -34,6 +34,7 @@ impl Pass for PruneFunctions {
                 function.body = RbcFunctionBody::ElidedModelica;
                 function.folds.clear();
                 function.calls.clear();
+                function.derivatives.clear();
             }
         }
         let live = live_expressions(model)?;
@@ -67,6 +68,12 @@ fn reachable_functions(model: &RbcModel) -> Result<Vec<bool>, PassError> {
         };
         if std::mem::replace(slot, true) {
             continue;
+        }
+        for derivative in &model.functions[function].derivatives {
+            pending.push(derivative.target.0 as usize);
+            if let Some((source, _)) = derivative.previous {
+                pending.push(source.0 as usize);
+            }
         }
         pending.extend(
             model.functions[function]

@@ -106,7 +106,7 @@ fn binding_extent(
     scope: &IndexMap<String, ast::Component>,
     depth: usize,
 ) -> Option<i64> {
-    if depth > super::MAX_CONDITION_DEPTH {
+    if depth > super::MAX_EXPR_EVAL_DEPTH {
         return None;
     }
     constructor_extent(binding, axis)
@@ -242,66 +242,19 @@ fn comprehension_extent(
     Some(span / step + 1)
 }
 
-/// Extent along `axis` of a nested `{...}` array constructor.
+/// Extent of a literal constructor, using the source's concatenation axis.
 fn constructor_extent(expression: &ast::Expression, axis: usize) -> Option<i64> {
-    match expression {
-        ast::Expression::Parenthesized { inner, .. } => constructor_extent(inner, axis),
-        ast::Expression::Array {
-            elements,
-            is_matrix: false,
-            ..
-        } => match axis {
-            0 => i64::try_from(elements.len()).ok(),
-            _ => constructor_extent(elements.first()?, axis - 1),
-        },
-        ast::Expression::Array {
-            elements,
-            is_matrix: true,
-            ..
-        } => matrix_extent(elements, axis),
-        _ => None,
-    }
-}
-
-/// Extent along `axis` of a `[a, b; c, d]` matrix constructor whose entries
-/// are scalars (MLS §10.4.2). A row that concatenates arrays has an extent
-/// that depends on its operands' shapes and is not answered here.
-fn matrix_extent(elements: &[ast::Expression], axis: usize) -> Option<i64> {
-    let is_row = |element: &ast::Expression| {
-        matches!(
-            element,
-            ast::Expression::Array {
-                is_matrix: true,
-                ..
+    fn shape(expression: &ast::Expression) -> Option<Vec<usize>> {
+        match expression {
+            ast::Expression::Parenthesized { inner, .. } => shape(inner),
+            ast::Expression::Array { elements, kind, .. } => {
+                let operands = elements.iter().map(shape).collect::<Option<Vec<_>>>()?;
+                kind.checked_dimensions(&operands)
             }
-        )
-    };
-    let scalar_row = |row: &[ast::Expression]| {
-        row.iter()
-            .all(|entry| !matches!(entry, ast::Expression::Array { .. }))
-    };
-    let (rows, columns) = if elements.iter().all(is_row) {
-        let mut columns = None;
-        for row in elements {
-            let ast::Expression::Array { elements: row, .. } = row else {
-                return None;
-            };
-            if !scalar_row(row) || columns.is_some_and(|width| width != row.len()) {
-                return None;
-            }
-            columns = Some(row.len());
+            _ => Some(Vec::new()),
         }
-        (elements.len(), columns?)
-    } else if scalar_row(elements) {
-        (1, elements.len())
-    } else {
-        return None;
-    };
-    match axis {
-        0 => i64::try_from(rows).ok(),
-        1 => i64::try_from(columns).ok(),
-        _ => None,
     }
+    i64::try_from(*shape(expression)?.get(axis)?).ok()
 }
 
 /// Extent of `rec.field` where `rec` is a record component of this scope: a

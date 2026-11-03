@@ -20,7 +20,7 @@ pub(super) fn validate(version: &str, fmu_root: &Path, standard: &Path, xml: &st
     let output = Command::new("cc")
         .args(["-std=c99", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
         .arg(format!("-I{}", standard.join("headers").display()))
-        .arg(fmu_root.join("sources/model.c"))
+        .args(source_units(fmu_root))
         .arg(&source)
         .args(["-lm", "-o"])
         .arg(&executable)
@@ -81,8 +81,14 @@ int main(void) {{
     CHECK(fmi2Reset(me) == fmi2OK);
     CHECK(fmi2SetupExperiment(me, fmi2False, 0.0, 0.0, fmi2True, 1.0) == fmi2OK);
     CHECK(fmi2EnterInitializationMode(me) == fmi2OK);
+    fmi2ValueReference initial_vr[2] = {{ 1, 2 }};
+    fmi2Real initial_state[2] = {{ 2.0, 3.0 }};
+    CHECK(fmi2SetReal(me, initial_vr, 2, initial_state) == fmi2OK);
     CHECK(fmi2ExitInitializationMode(me) == fmi2OK);
     CHECK(fmi2EnterContinuousTimeMode(me) == fmi2OK);
+    fmi2Real settled[2];
+    CHECK(fmi2GetContinuousStates(me, settled, 2) == fmi2OK);
+    CHECK(settled[0] == 2.0 && settled[1] == 3.0);
     CHECK(fmi2SetTime(me, 0.1) == fmi2OK);
     fmi2Real state[2] = {{ 0.95, 0.90 }};
     CHECK(fmi2SetContinuousStates(me, state, 2) == fmi2OK);
@@ -161,8 +167,14 @@ int main(void) {{
         &early_return, &last_time) == fmi3Error);
     CHECK(fmi3Reset(me) == fmi3OK);
     CHECK(fmi3EnterInitializationMode(me, fmi3False, 0.0, 0.0, fmi3True, 1.0) == fmi3OK);
+    fmi3ValueReference initial_vr = 1;
+    fmi3Float64 initial_state[2] = {{ 2.0, 3.0 }};
+    CHECK(fmi3SetFloat64(me, &initial_vr, 1, initial_state, 2) == fmi3OK);
     CHECK(fmi3ExitInitializationMode(me) == fmi3OK);
     CHECK(fmi3EnterContinuousTimeMode(me) == fmi3OK);
+    fmi3Float64 settled[2];
+    CHECK(fmi3GetContinuousStates(me, settled, 2) == fmi3OK);
+    CHECK(settled[0] == 2.0 && settled[1] == 3.0);
     CHECK(fmi3SetTime(me, 0.1) == fmi3OK);
     fmi3Float64 state[2] = {{ 0.95, 0.90 }};
     CHECK(fmi3SetContinuousStates(me, state, 2) == fmi3OK);
@@ -210,3 +222,14 @@ int main(void) {{
     return 0;
 }}
 "#;
+
+/// Every C translation unit the package declares, in name order.
+fn source_units(fmu_root: &Path) -> Vec<std::path::PathBuf> {
+    let mut units = fs::read_dir(fmu_root.join("sources"))
+        .expect("read FMU sources")
+        .map(|entry| entry.expect("read FMU source entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "c"))
+        .collect::<Vec<_>>();
+    units.sort();
+    units
+}

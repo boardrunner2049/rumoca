@@ -81,7 +81,11 @@ pub(super) fn dae_uses_random(model: &dae::Dae) -> bool {
 }
 
 pub(super) fn dae_has_initialization(model: &dae::Dae) -> bool {
-    model.inspect(|view| view.initialization_owner_count() != 0)
+    model.inspect(|view| {
+        view.initialization_owner_count() != 0
+            || view.initial_discrete_value_count() != 0
+            || view.initial_parameter_value_count() != 0
+    })
 }
 
 pub(super) fn dae_has_events(model: &dae::Dae) -> bool {
@@ -149,30 +153,61 @@ pub(super) fn dae_has_dynamic_derivative_subscripts(model: &dae::Dae) -> bool {
 // capabilities and `rumoca-phase-codegen`, which makes it admissibility rather
 // than an IR query.
 
+/// Whether rendering `problem` needs residual-equation export from a target
+/// declaring these algebraic capabilities.
+///
+/// A target that executes exact assignments renders a model whose algebraic
+/// refresh is fully explicit. A target that executes algebraic projection
+/// stages with the shared ME projection kernel also renders a staged refresh
+/// with coupled blocks; its renderer re-checks the artifact-level stage
+/// certificate before producing any byte.
 pub(super) fn solve_requires_residual_equations(
     problem: &solve::SolveProblem,
     exact_algebraic_assignments: Option<bool>,
+    algebraic_projection: Option<bool>,
 ) -> bool {
     let continuous = &problem.continuous;
     let algebraic_count = problem.solve_layout.algebraic_scalar_count();
     let has_algebraic_system = !continuous.implicit_rhs.is_empty()
         || !continuous.algebraic_projection_plan.is_empty()
         || algebraic_count != 0;
-    has_algebraic_system
-        && (exact_algebraic_assignments != Some(true)
-            || !rumoca_phase_codegen::explicit_algebraic_assignment_complete(problem))
+    let explicit = exact_algebraic_assignments == Some(true)
+        && rumoca_phase_codegen::explicit_algebraic_assignment_complete(problem);
+    let projected =
+        algebraic_projection == Some(true) && rumoca_phase_codegen::me_refresh_admissible(problem);
+    has_algebraic_system && !explicit && !projected
 }
 
 fn dynamic_subscript<'dae>(view: dae::DaeView<'dae>, subscript: dae::SubscriptView<'dae>) -> bool {
     let dae::SubscriptView::Index { expression, .. } = subscript else {
         return true;
     };
-    view.expression(expression).is_none_or(|expression| {
-        !matches!(
-            expression.operation(),
+    !static_index(view, expression)
+}
+
+/// Whether an integer subscript is fixed at every point it is evaluated: a
+/// literal, a binder of a structured equation family (whose checked domain is
+/// finite and compact, so each scalar row of the family has a literal index),
+/// or integer arithmetic of those.
+fn static_index<'dae>(view: dae::DaeView<'dae>, expression: dae::ExprId<'dae>) -> bool {
+    view.expression(expression)
+        .is_some_and(|expression| match expression.operation() {
             dae::ExpressionOperation::Literal(dae::DaeLiteral::Integer(_))
-        )
-    })
+            | dae::ExpressionOperation::Coordinate(dae::CoordinateView::Binder(_)) => true,
+            dae::ExpressionOperation::Unary {
+                operator: dae::UnaryOperator::Negate | dae::UnaryOperator::Plus,
+                operand,
+            } => static_index(view, operand),
+            dae::ExpressionOperation::Binary {
+                operator:
+                    dae::BinaryOperator::Add
+                    | dae::BinaryOperator::Subtract
+                    | dae::BinaryOperator::Multiply,
+                lhs,
+                rhs,
+            } => static_index(view, lhs) && static_index(view, rhs),
+            _ => false,
+        })
 }
 
 fn calls_named(view: dae::DaeView<'_>, predicate: impl Fn(&str) -> bool) -> bool {

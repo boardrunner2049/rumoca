@@ -1,5 +1,7 @@
 mod arena_walks;
 mod quotient_owners;
+#[cfg(test)]
+mod scalar_owner_tests;
 pub use quotient_owners::{RuntimeQuotientOwnerKind, RuntimeQuotientOwnerView};
 
 use super::*;
@@ -166,6 +168,7 @@ impl<'dae> DaeView<'dae> {
         initialization_equation_count => initialization_equations,
         initialization_owner_count => initialization_equation_owners,
         initial_discrete_value_count => initial_discrete_values,
+        initial_parameter_value_count => initial_parameter_values,
         discrete_real_equation_count => discrete_real_equations,
         discrete_value_owner_count => discrete_value_owners,
         model_event_transaction_count => model_event_transactions,
@@ -391,6 +394,7 @@ impl<'dae> DaeView<'dae> {
         })
     }
 
+    #[inline]
     pub fn expression(self, id: ExprId<'dae>) -> Option<ExpressionView<'dae>> {
         let index = id.index() as usize;
         Some(ExpressionView {
@@ -418,13 +422,15 @@ impl<'dae> DaeView<'dae> {
     }
 
     pub fn continuous_owner(self, index: usize) -> Option<ContinuousOwnerView<'dae>> {
+        #[cfg(test)]
+        scalar_owner_tests::OWNER_VIEWS.with(|count| count.set(count.get() + 1));
         Some(
-            match *self.dae.storage.continuous_equation_owners.get(index)? {
-                EquationOwnerEntry::Residual(raw) => ContinuousOwnerView::Residual {
+            match self.dae.storage.continuous_equation_owners.get(index)?.kind {
+                EquationOwnerKind::Residual(raw) => ContinuousOwnerView::Residual {
                     id: ContinuousEquationId::from_raw(raw),
                     equation: self.continuous_equation(raw as usize)?,
                 },
-                EquationOwnerEntry::Structured(raw) => ContinuousOwnerView::Structured {
+                EquationOwnerKind::Structured(raw) => ContinuousOwnerView::Structured {
                     id: ContinuousFamilyId::from_raw(raw),
                     family: self.continuous_family(raw as usize)?,
                 },
@@ -439,24 +445,17 @@ impl<'dae> DaeView<'dae> {
         })
     }
 
-    /// Resolve the semantic owner of one row in the derived scalar view.
+    /// Resolve a scalar row in O(log owners), without expanding structured domains.
     pub fn continuous_owner_for_scalar_row(
         self,
         scalar_row: usize,
     ) -> Option<ContinuousOwnerView<'dae>> {
-        let mut first_row = 0usize;
-        for owner in self.continuous_owners() {
-            let row_count = match owner {
-                ContinuousOwnerView::Residual { .. } => 1,
-                ContinuousOwnerView::Structured { family, .. } => family.scalar_rows() as usize,
-            };
-            let end = first_row.checked_add(row_count)?;
-            if scalar_row < end {
-                return Some(owner);
-            }
-            first_row = end;
-        }
-        None
+        let index = self
+            .dae
+            .storage
+            .continuous_equation_owners
+            .partition_point(|owner| owner.scalar_row_end <= scalar_row);
+        self.continuous_owner(index)
     }
 
     pub fn continuous_family(self, index: usize) -> Option<StructuredFamilyView<'dae>> {
@@ -475,12 +474,18 @@ impl<'dae> DaeView<'dae> {
 
     pub fn initialization_owner(self, index: usize) -> Option<InitializationOwnerView<'dae>> {
         Some(
-            match *self.dae.storage.initialization_equation_owners.get(index)? {
-                EquationOwnerEntry::Residual(raw) => InitializationOwnerView::Residual {
+            match self
+                .dae
+                .storage
+                .initialization_equation_owners
+                .get(index)?
+                .kind
+            {
+                EquationOwnerKind::Residual(raw) => InitializationOwnerView::Residual {
                     id: InitializationEquationId::from_raw(raw),
                     equation: self.initialization_equation(raw as usize)?,
                 },
-                EquationOwnerEntry::Structured(raw) => InitializationOwnerView::Structured {
+                EquationOwnerKind::Structured(raw) => InitializationOwnerView::Structured {
                     id: InitializationFamilyId::from_raw(raw),
                     family: self.initialization_family(raw as usize)?,
                 },
@@ -532,6 +537,7 @@ impl<'dae> DaeView<'dae> {
                     scalar_view: structure.scalar_view,
                     scalar_rows: structure.scalar_rows,
                 }),
+            observed: entry.observed,
             provenance: entry.provenance,
         })
     }
@@ -630,7 +636,7 @@ impl<'dae> VariableView<'dae> {
             |view| view.attributes().binding.map(ExprId::from_raw);
         fn start -> Option<ExprId<'dae>> =
             |view| view.attributes().start.map(ExprId::from_raw);
-        fn fixed -> Option<bool> = |view| view.attributes().fixed;
+        fn fixed -> Option<&'dae [bool]> = |view| view.attributes().fixed.as_deref();
         fn minimum -> Option<ExprId<'dae>> =
             |view| view.attributes().min.map(ExprId::from_raw);
         fn maximum -> Option<ExprId<'dae>> =
@@ -642,9 +648,42 @@ impl<'dae> VariableView<'dae> {
         fn description -> Option<&'dae str> =
             |view| view.attributes().description.as_deref();
         fn causality -> VariableCausality = |view| view.attributes().causality;
+        fn declared_causality -> DeclaredCausality =
+            |view| view.attributes().declared_causality;
         fn is_tunable -> bool = |view| view.attributes().is_tunable;
         fn is_held -> bool = |view| view.attributes().is_held;
+        fn is_evaluable -> bool = |view| view.attributes().evaluable;
         fn origin -> VariableOrigin = |view| view.attributes().origin;
+    }
+
+    /// The `fixed` attribute reduced to a single Boolean when every element
+    /// agrees (MLS §4.8): `None` when the attribute is absent or the element
+    /// values differ.
+    pub fn fixed_uniform(self) -> Option<bool> {
+        crate::model::uniform_fixed(self.fixed())
+    }
+
+    /// The `fixed` value that governs one scalar element (MLS §4.8, §4.8.6): a
+    /// single stored value broadcasts over every element; an array indexes by
+    /// element position.
+    pub fn fixed_scalar(self, scalar: usize) -> Option<bool> {
+        crate::model::scalar_fixed(self.fixed(), scalar)
+    }
+
+    /// Whether any element is declared `fixed = true` (MLS §4.8.6): the
+    /// declaration then contributes at least one stated initial value even when
+    /// its elements disagree.
+    pub fn fixed_any_true(self) -> bool {
+        self.fixed()
+            .is_some_and(|values| values.iter().any(|&value| value))
+    }
+
+    /// The `stateSelect` request of a continuous Real declaration, the only
+    /// kind state selection ranks (MLS 3.7 §4.9.7.1); `None` for any other.
+    pub fn continuous_state_select(self) -> Option<StateSelect> {
+        (self.entry.variability == ExpressionVariability::Continuous
+            && self.value_type.scalar_type() == ScalarType::Real)
+            .then(|| self.state_select())
     }
 
     pub fn identity(self) -> VariableIdentity<'dae> {
@@ -670,6 +709,17 @@ impl<'dae> VariableView<'dae> {
         self.value_type
             .scalar_count()
             .expect("final DAE value type has a checked scalar capacity")
+    }
+
+    /// Spread a single evaluated attribute or binding value over this
+    /// variable's scalars; see [`broadcast_scalar_values`].
+    pub fn broadcast_values<T: Clone>(self, values: &mut Vec<T>) {
+        broadcast_scalar_values(values, self.scalar_count());
+    }
+
+    /// Every scalar name of this declaration, in flat order.
+    pub fn scalar_names(self) -> impl Iterator<Item = String> + 'dae {
+        (0..self.scalar_count()).filter_map(move |scalar| self.scalar_name(scalar))
     }
 
     pub fn scalar_name(self, flat_index: usize) -> Option<String> {
@@ -711,6 +761,21 @@ pub struct FunctionView<'dae> {
 }
 
 impl<'dae> FunctionView<'dae> {
+    pub fn derivatives(self) -> impl ExactSizeIterator<Item = FunctionDerivativeView<'dae>> {
+        self.entry
+            .derivatives
+            .iter()
+            .enumerate()
+            .map(move |(ordinal, entry)| FunctionDerivativeView {
+                source: self.id,
+                ordinal: ordinal as u32,
+                types: &self.dae.storage.value_types,
+                parameters: &self.entry.parameters,
+                results: &self.entry.results,
+                entry,
+            })
+    }
+
     view_getters! {
         const fn id -> FunctionId<'dae> = |view| view.id;
         const fn declaration -> DaeProvenance = |view| view.entry.declaration;
@@ -979,6 +1044,7 @@ pub enum FunctionStatementView<'dae> {
     Assertion {
         condition: ExprId<'dae>,
         message: ExprId<'dae>,
+        level: AssertionLevel,
         provenance: DaeProvenance,
     },
     For {
@@ -1044,10 +1110,12 @@ impl<'dae> FunctionStatementView<'dae> {
             FunctionStatementWire::Assertion {
                 condition,
                 message,
+                level,
                 provenance,
             } => Self::Assertion {
                 condition: ExprId::from_raw(*condition),
                 message: ExprId::from_raw(*message),
+                level: *level,
                 provenance: *provenance,
             },
             FunctionStatementWire::For {
@@ -1190,6 +1258,25 @@ pub struct ExpressionView<'dae> {
 }
 
 impl<'dae> ExpressionView<'dae> {
+    /// The source call and selected link that constructed a supplied derivative.
+    pub fn call_derivative(self) -> Option<(ExprId<'dae>, FunctionDerivativeId<'dae>)> {
+        let ExprNode::Call {
+            derivative: Some((source, ordinal)),
+            ..
+        } = self.node
+        else {
+            return None;
+        };
+        let ExprNode::Call { function, .. } = self.dae.storage.expressions.nodes[*source as usize]
+        else {
+            unreachable!("a differentiated call has a checked earlier source")
+        };
+        Some((
+            ExprId::from_raw(*source),
+            FunctionDerivativeId::from_raw(function, *ordinal),
+        ))
+    }
+
     view_getters! {
         const fn provenance -> DaeProvenance = |view| view.provenance;
         const fn value_type -> &'dae ValueType = |view| view.value_type;
@@ -1225,6 +1312,7 @@ impl<'dae> ExpressionView<'dae> {
         }
     }
 
+    #[inline]
     pub fn operation(self) -> ExpressionOperation<'dae> {
         match self.node {
             ExprNode::Literal(_)
@@ -1325,6 +1413,7 @@ impl<'dae> ExpressionView<'dae> {
                 function,
                 output,
                 operands,
+                ..
             } => ExpressionOperation::Call {
                 owner: ExprId::from_raw(*owner),
                 function: FunctionId::from_raw(*function),
@@ -1809,5 +1898,19 @@ fn positive_parameter_view(entry: &PositiveParameterEntry) -> PositiveParameterV
         expression: ExprId::from_raw(entry.expression),
         value: entry.value,
         provenance: entry.provenance,
+    }
+}
+
+/// Spread one evaluated value over `scalar_count` scalars.
+///
+/// A scalar attribute of a type applies to every element of an array of that
+/// type (MLS §4.9, §10.1), so one value covers the whole array, including the
+/// empty element set of a zero-size array (MLS §10.3.1). Any other length is
+/// left for the caller's shape check.
+pub fn broadcast_scalar_values<T: Clone>(values: &mut Vec<T>, scalar_count: usize) {
+    if values.len() == 1 && scalar_count != 1 {
+        let value = values[0].clone();
+        values.clear();
+        values.resize(scalar_count, value);
     }
 }

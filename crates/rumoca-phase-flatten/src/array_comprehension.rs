@@ -98,7 +98,9 @@ pub(crate) fn expand_array_comprehension_bindings(
         }
 
         let var_name = rumoca_core::VarName::new(instance_data.qualified_name.to_flat_string());
-        let prefix = if instance_data.binding_from_modification {
+        let modification_scope =
+            variables::binding_uses_modification_scope(instance_data, class_index);
+        let prefix = if modification_scope {
             variables::modification_binding_prefix_pub(instance_data, tree)?
         } else {
             variables::parent_prefix_pub(&instance_data.qualified_name)
@@ -111,7 +113,7 @@ pub(crate) fn expand_array_comprehension_bindings(
             &scope_index,
             component_override_map,
         )?;
-        let binding_imports = if instance_data.binding_from_modification {
+        let binding_imports = if modification_scope {
             &imports.binding
         } else {
             &imports.declaration
@@ -146,10 +148,9 @@ pub(crate) fn expand_array_comprehension_bindings(
             continue;
         }
 
-        let is_matrix = matches!(&**expr, ast::Expression::Array { .. });
         let expanded_array = ast::Expression::Array {
             elements: expanded_elements,
-            is_matrix,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: *span,
         };
 
@@ -275,6 +276,9 @@ fn lower_expanded_comprehension_binding(
 }
 
 #[cfg(test)]
+mod constructor_default_scope_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rumoca_core::{Location, Token};
@@ -338,7 +342,7 @@ mod tests {
     fn test_expand_comprehension_multiple_indices_cartesian_product() {
         let expr = ast::Expression::Array {
             elements: vec![cref("i"), cref("j")],
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         };
         let expanded = expand_comprehension(&expr, &[("i", vec![1, 2]), ("j", vec![10, 20])]);
@@ -356,7 +360,7 @@ mod tests {
     fn test_lower_expanded_comprehension_preserves_imported_constant_aliases() {
         let expanded_array = ast::Expression::Array {
             elements: vec![cref("pi")],
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             span: test_span(),
         };
         let prefix = ast::QualifiedName::from_dotted("machine.spacePhasorS");

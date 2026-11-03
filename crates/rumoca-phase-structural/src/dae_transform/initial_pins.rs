@@ -1,64 +1,26 @@
-//! Carry a stated initial value onto the coordinate the runtime seeds.
+//! Transfer fixed initial equations through exact signed-displacement equalities.
 //!
-//! MLS 3.6 §8.6: "For every Real variable vc with fixed = true, the equation
-//! vc = startExpression is added to the initialization equations." A runtime
-//! that seeds one value per *state* from that state's own `start` and then
-//! projects the algebraic unknowns onto the residuals answers that equation
-//! only when the pinned variable is itself a state. A pin declared on an
-//! aliased coordinate — `s_rel(start = 1, fixed = true)` on a translational
-//! spring, whose position is `flange_b.s - flange_a.s` — has no equation of its
-//! own left: the state the alias determines keeps whatever guess its `start`
-//! carries, and the pinned coordinate lands wherever that guess puts it.
+//! A class with one state can express an initial equation on that state. Other
+//! scalar pins remain direct checks, and contradictions proved from literal
+//! values retain both declarations in their diagnostic. Parameter-dependent
+//! agreement remains an equation for the joint initialization solve.
 //!
-//! The equalities the source system already asserts decide the transfer. Every
-//! accepted residual is an unconditional continuous equation, so
-//! `su·u + sv·v + K = 0` proves `u ≡ -su·sv·v - su·K` for all time whenever `K`
-//! is time-invariant, and `s·v + K = 0` proves `v` equal to that constant. Both
-//! facts are exact at the initialization instant too, so a pin on `u` states
-//! exactly one value for `v`, displacement included. That value is a
-//! *definition* of the state, not one more residual to solve: the closure has
-//! already done the solving.
-//!
-//! A residual that names a third coordinate proves nothing on its own, but a
-//! coordinate this closure has already proved constant is not an unknown —
-//! substituting it turns `s_rel - (flange_b.s - flange_a.s)` into a two-term
-//! equality the moment `flange_a.s` is known to sit at a fixed support. The
-//! reading is therefore repeated while it keeps learning constants.
-//!
-//! Two members of one class whose stated values differ by a *proved nonzero
-//! constant* state an initialization with no solution, and are rejected with
-//! both declarations rather than resolved by picking one. A difference that
-//! still reads a parameter proves nothing here — `a(start = 3)` and
-//! `b(start = 1)` under `a = b + L` agree exactly when `L = 2` — so it is left
-//! to the initialization instant as a residual the runtime checks with numbers.
-//!
-//! A class holding exactly one state transfers its value onto that state. A
-//! class with no unique state instead retains each pinned algebraic/output as a
-//! check about that coordinate itself. Solve may lower such a check only through
-//! an exact causal definition; if no such definition exists, it rejects the
-//! model as unsupported instead of omitting the §8.6 equation. A class holding
-//! several states is a redundancy the reduction has to resolve first, so its
-//! state declarations remain owned by their seeds while its non-state pins are
-//! retained as the same checked equations.
-//!
-//! The reduction and this transfer answer the same MLS 3.6 §8.6 obligation from
-//! two sides, so they are checked against each other rather than trusted to
-//! agree: `constraints.rs` accepts a reduction that drops a pinned coordinate
-//! only after [`represented_initial_values`] proves the system it produces still
-//! states that value, which is exactly the reading `transfers` acts on.
-//!
-//! A `fixed = true` start this closure cannot use for an invariant transfer is
-//! still retained directly when the DAE names its start expression. An absent
-//! start has no expression ordinal to carry and is therefore left for Solve's
-//! completeness audit, which fails closed with source provenance rather than
-//! returning a successful model missing an initialization equation.
+//! The transfer is an equivalent representation, not the inventory of initial
+//! obligations. Solve also lowers every fixed coordinate not covered by a
+//! transfer, including algebraic coordinates and default starts. Structural
+//! reconstruction preserves that complete declaration inventory independently
+//! of which coordinates remain states.
+
+mod coordinates;
 
 use rumoca_ir_dae as dae;
 
+use coordinates::Coordinates;
+
 use super::constraints::{numeric_literal, states_the_same_expression};
 use super::equalities::{
-    AdditiveOperands, EqualityAnchor, EqualitySign, SystemEqualities, flatten_additive,
-    is_scalar_real, is_time_invariant,
+    AdditiveOperands, EqualityAnchor, EqualitySign, SystemEqualities,
+    flatten_additive_with_projection, is_scalar_real, is_time_invariant,
 };
 use crate::StructuralError;
 
@@ -79,8 +41,8 @@ pub struct PinTerm {
 /// How the runtime has to enforce one MLS 3.6 §8.6 initial equation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitialValueRole {
-    /// A definition: the asserted equalities prove this value for a coordinate
-    /// the runtime seeds, so nothing is left to solve.
+    /// A definition: the asserted equalities express one state's initial value.
+    /// It remains an equation in the joint initialization solve.
     Definition,
     /// A check: the equation stays a residual so the initialization instant
     /// answers it with numbers instead of this phase guessing. This includes a
@@ -103,63 +65,31 @@ pub struct InitialValuePin {
     pub role: InitialValueRole,
     /// The variable whose `fixed = true` start the value was read from.
     pub source: u32,
+    /// Component of that declaration's initial equation, before transfer.
+    pub source_scalar: u32,
     /// That variable's declaration.
     pub provenance: dae::DaeProvenance,
 }
 
-/// Every stated initial value the runtime would otherwise drop, rewritten onto
-/// the state that carries it.
+/// Initial equations transferred through proved equality classes.
 pub(super) fn transferred_initial_values(
     view: dae::DaeView<'_>,
 ) -> Result<Vec<InitialValuePin>, StructuralError> {
     ValueClosure::collect(view).transfers(view)
 }
 
-/// Every stated initial value this system still enforces at the initialization
-/// instant, by variable ordinal.
+/// Source-fixed declarations whose initial equations must survive reconstruction.
 ///
-/// MLS 3.6 §8.6 states one equation per `fixed = true` declaration, and it
-/// states it about the *quantity* the declaration names — not about whichever
-/// coordinate a runtime happens to integrate. An index reduction may therefore
-/// move a stated value onto another coordinate of the same quantity, and may
-/// not drop it. This reports which values a given system still states, so the
-/// demotion in [`super::demote_direct_state_with_observer`] can read the set before a rebuild
-/// and again after it and refuse any rebuild that lost one: a checked
-/// postcondition rather than an assumption about what a demotion preserves.
-///
-/// Exactly four proofs answer the §8.6 equation for one declaration, and
-/// nothing else does:
-///
-///   * the declaration is a state, so the runtime seeds that coordinate from
-///     this very start;
-///   * its class holds exactly one state, so [`ValueClosure::transfers`] writes
-///     the value onto that state — as a definition, or as a residual the
-///     initialization instant checks;
-///   * its class holds several states and one of them is pinned too, so that
-///     state's own seeding answers this equation as far as anything here can;
-///   * its class holds no state at all, and the asserted equalities prove the
-///     class holds a value the stated one is not proved to differ from.
-///
-/// A declaration whose stated value this closure cannot write down — an absent
-/// `start`, which is the MLS 3.6 §4.8 default with no expression in the system
-/// to name, or a start that is not time-invariant — is reported under the first
-/// proof only. Nothing here can carry a value it cannot name, so a demotion
-/// that turns such a declaration into an algebraic drops it, and the check
-/// above refuses that demotion instead of accepting it on a value nobody
-/// proved.
-///
-/// Cost: one whole closure per call, and the caller makes one call per rebuilt
-/// system it is willing to take. That is deliberate — the answer is a property
-/// of the *rebuilt* system, so nothing cheaper is an answer — but two things
-/// keep it bounded. A system that states no initial value at all skips the
-/// comparison outright ([`super::constraints::discarded_stated_initial_value`]
-/// returns on an empty set), and a candidate that does not reduce is dropped
-/// before the closure is built at all. Note that [`flatten_additive`] reads
-/// every residual to its leaves with no early bail on arity — that is what makes
-/// a four-terminal balance readable however it is spelled, and it makes one
-/// closure linear in the whole system rather than in its two-term residuals.
-pub(super) fn represented_initial_values(view: dae::DaeView<'_>) -> Vec<u32> {
-    ValueClosure::collect(view).represented(view)
+/// Solve lowers each declaration's complete initial equation, whether its
+/// coordinate remains a state or becomes algebraic. Transferred pins supply
+/// equivalent rows; its remaining-coordinate inventory emits every other row,
+/// including default starts. State selection therefore cannot decide whether
+/// an initial equation exists.
+pub(super) fn stated_initial_variables(view: dae::DaeView<'_>) -> Vec<u32> {
+    view.variables()
+        .filter(|(_, variable)| carries_a_stated_initial_value(*variable))
+        .map(|(id, _)| id.index())
+        .collect()
 }
 
 /// Where one variable sits relative to the root of its class.
@@ -186,7 +116,8 @@ enum Reading {
 /// Coordinate classes closed over the exact equalities a system asserts, with
 /// the time-invariant displacement between each member and its class root.
 struct ValueClosure {
-    /// Union-find parent per variable ordinal.
+    coordinates: Coordinates,
+    /// Union-find parent per whole variable or authored component identity.
     parent: Vec<u32>,
     /// Whether each variable is the negation of its parent's value.
     parity: Vec<bool>,
@@ -201,9 +132,11 @@ struct ValueClosure {
 
 impl ValueClosure {
     fn collect(view: dae::DaeView<'_>) -> Self {
-        let count = view.variable_count();
+        let coordinates = Coordinates::collect(view);
+        let count = coordinates.len();
         let mut closure = Self {
-            parent: (0..count as u32).collect(),
+            coordinates,
+            parent: (0..count).map(|key| key as u32).collect(),
             parity: vec![false; count],
             offset: vec![Vec::new(); count],
             invariant: vec![None; count],
@@ -252,7 +185,9 @@ impl ValueClosure {
             return Reading::Unusable;
         };
         let mut operands = AdditiveOperands::default();
-        if !flatten_additive(view, expression, false, &mut operands) {
+        if !flatten_additive_with_projection(view, expression, false, &mut operands, &|e| {
+            self.coordinates.projection(e)
+        }) {
             return Reading::Unusable;
         }
         let mut constants = invariant_terms(&operands);
@@ -419,7 +354,9 @@ fn reduced(terms: Vec<PinTerm>) -> Vec<PinTerm> {
     let mut kept: Vec<PinTerm> = Vec::with_capacity(terms.len());
     for term in terms {
         match kept.iter().position(|candidate| {
-            candidate.expression == term.expression && candidate.negated != term.negated
+            candidate.expression == term.expression
+                && candidate.scalar == term.scalar
+                && candidate.negated != term.negated
         }) {
             Some(index) => {
                 kept.remove(index);
@@ -489,6 +426,7 @@ fn cancel_symbolic_terms(view: dae::DaeView<'_>, terms: &[PinTerm]) -> bool {
     for term in terms.iter().copied() {
         let matched = open.iter().position(|candidate| {
             candidate.negated != term.negated
+                && candidate.scalar == term.scalar
                 && same_expression(view, candidate.expression, term.expression)
         });
         match matched {
@@ -521,6 +459,7 @@ fn same_expression(view: dae::DaeView<'_>, left: u32, right: u32) -> bool {
 
 /// One `fixed = true` declaration, resolved against its class root.
 struct PinnedMember {
+    /// Closure identity, including a component when the source is projected.
     variable: u32,
     /// The value the pin states for the class root.
     at_root: Vec<PinTerm>,
@@ -556,18 +495,24 @@ fn aggregate_pins(view: dae::DaeView<'_>) -> Vec<InitialValuePin> {
         if target.scalar_count() != variable.scalar_count() {
             continue;
         }
-        let role = if target.fixed() == Some(true) || definitions.contains(&state) {
-            InitialValueRole::Check
-        } else {
-            definitions.push(state);
-            InitialValueRole::Definition
-        };
         let start = variable.start();
         let start_count = start.and_then(|start| {
             view.expression(start)
                 .and_then(|expression| expression.value_type().scalar_count())
         });
         for scalar in 0..variable.scalar_count() {
+            // MLS §4.8.6: each state element owns its `fixed` independently. An
+            // element the state already pins through its own fixed start takes
+            // the transferred value as a consistency check; a free element takes
+            // it as its definition, and only the first transfer defines it.
+            let role = if target.fixed_scalar(scalar) == Some(true)
+                || definitions.contains(&(state, scalar as u32))
+            {
+                InitialValueRole::Check
+            } else {
+                definitions.push((state, scalar as u32));
+                InitialValueRole::Definition
+            };
             let value = start
                 .map(|start| {
                     vec![PinTerm {
@@ -583,6 +528,7 @@ fn aggregate_pins(view: dae::DaeView<'_>) -> Vec<InitialValuePin> {
                 value,
                 role,
                 source: id.index(),
+                source_scalar: scalar as u32,
                 provenance: variable.declaration(),
             });
         }
@@ -599,7 +545,7 @@ fn aggregate_start_scalar(start_count: Option<usize>, scalar: usize) -> u32 {
 }
 
 impl ValueClosure {
-    /// Rewrite every stated initial value the runtime would otherwise drop.
+    /// Express scalar initial equations through the proved equality classes.
     ///
     /// The contradiction check runs first and over every class, whatever shape
     /// it has: two declarations that state different values for one quantity are
@@ -619,7 +565,11 @@ impl ValueClosure {
             self.reject_contradicted_pins(view, &members)?;
             match class_states(&states, root) {
                 [state] => {
-                    represented_sources.extend(members.iter().map(|member| member.variable));
+                    represented_sources.extend(
+                        members
+                            .iter()
+                            .map(|member| self.coordinates.get(member.variable).variable),
+                    );
                     pins.extend(self.class_pins(view, *state, &members));
                 }
                 _ => self.append_direct_class_pins(
@@ -633,9 +583,9 @@ impl ValueClosure {
         pins.extend(aggregate_pins(view));
         // A varying start cannot participate in the invariant equality closure,
         // but its §8.6 equation is still exact at the initialization instant.
-        // Retain it directly so Solve either proves a causal residual for it or
-        // rejects the model. An absent start has no DAE expression to carry and
-        // is deliberately caught by Solve's completeness audit.
+        // Retain it directly in the joint initialization solve. An absent start
+        // has no expression to transfer; Solve's remaining-coordinate inventory
+        // supplies the exact Real default instead.
         for (id, variable) in view.variables() {
             if !carries_a_stated_initial_value(variable)
                 || !is_scalar_real(variable)
@@ -657,6 +607,7 @@ impl ValueClosure {
                 }],
                 role: InitialValueRole::Check,
                 source: id.index(),
+                source_scalar: 0,
                 provenance: variable.declaration(),
             });
         }
@@ -671,8 +622,9 @@ impl ValueClosure {
         represented_sources: &mut Vec<u32>,
     ) {
         for member in members {
+            let source = self.coordinates.get(member.variable);
             let Some(variable) = view
-                .variable_id(member.variable as usize)
+                .variable_id(source.variable as usize)
                 .and_then(|id| view.variable(id))
             else {
                 continue;
@@ -680,19 +632,22 @@ impl ValueClosure {
             if variable.role() != dae::VariableRole::State {
                 pins.push(self.direct_pin(view, member));
             }
-            represented_sources.push(member.variable);
+            represented_sources.push(source.variable);
         }
     }
 
     /// Retain one non-state declaration as its literal §8.6 equation.
     fn direct_pin(&self, view: dae::DaeView<'_>, member: &PinnedMember) -> InitialValuePin {
+        let source = self.coordinates.get(member.variable);
         InitialValuePin {
-            coordinate: member.variable,
-            scalar: 0,
-            value: stated_value(view, member.variable)
+            coordinate: source.variable,
+            scalar: source.scalar,
+            value: self
+                .stated_value(view, member.variable)
                 .expect("a pinned closure member has a named invariant start"),
             role: InitialValueRole::Check,
-            source: member.variable,
+            source: source.variable,
+            source_scalar: source.scalar,
             provenance: member.provenance,
         }
     }
@@ -744,142 +699,49 @@ impl ValueClosure {
     /// What one pinned declaration states about `state`.
     fn pin(&self, state: u32, member: &PinnedMember, role: InitialValueRole) -> InitialValuePin {
         let resolved = self.find(state);
+        let target = self.coordinates.get(state);
         InitialValuePin {
-            coordinate: state,
-            scalar: 0,
+            coordinate: target.variable,
+            scalar: target.scalar,
             value: reduced([signed(&member.at_root, resolved.negated), resolved.offset].concat()),
             role,
-            source: member.variable,
+            source: self.coordinates.get(member.variable).variable,
+            source_scalar: self.coordinates.get(member.variable).scalar,
             provenance: member.provenance,
-        }
-    }
-
-    /// Every stated initial value this system still enforces. See
-    /// [`represented_initial_values`].
-    fn represented(&self, view: dae::DaeView<'_>) -> Vec<u32> {
-        let states = self.states_by_root(view);
-        let members = self.pinned_members(view);
-        let equalities = SystemEqualities::collect(view);
-        view.variables()
-            .filter(|(_, variable)| carries_a_stated_initial_value(*variable))
-            .filter(|(id, variable)| {
-                variable.role() == dae::VariableRole::State
-                    || if is_scalar_real(*variable) {
-                        self.class_states_the_value(view, &states, &members, id.index())
-                    } else {
-                        matches!(
-                            equalities.value_anchor_of(id.index()),
-                            Some((EqualityAnchor::State(_), _))
-                        )
-                    }
-            })
-            .map(|(id, _)| id.index())
-            .collect()
-    }
-
-    /// Whether the asserted equalities still state `variable`'s pinned value
-    /// about a coordinate the runtime answers, for a declaration that is not
-    /// itself a state.
-    ///
-    /// The three class-shaped proofs of [`represented_initial_values`], read off
-    /// the same closure [`ValueClosure::transfers`] acts on, so the two agree by
-    /// construction: a value reported here is one `transfers` writes down, one
-    /// another seeded state already carries, or one the system asserts outright.
-    ///
-    /// Three-valued, exactly like [`stated_agreement`] and for the reason stated
-    /// at the top of this module: a difference that still reads a parameter
-    /// proves nothing. `x(start = 1, fixed = true)` in a class the system pins
-    /// to a parameter `c` states one value exactly when `c = 1`, which is a
-    /// question about a number this phase never has, so it is left to the
-    /// initialization instant — as the checked residual `class_pins` writes
-    /// where the class has a state to write it about, and otherwise as the
-    /// numeric solve of the very equation that asserts the value. Only a
-    /// *proved* mismatch means the equation MLS 3.6 §8.6 adds was discarded;
-    /// refusing an undecided one would refuse consistent models over the way
-    /// their starts happen to be spelled, and §8.6 states the
-    /// balanced-initialization rule as a "should". `Rotational.Components.Fixed`
-    /// alone — `flange.phi = phi0` with `phi0` a parameter — puts every rigidly
-    /// held mechanism in that undecided case.
-    ///
-    /// What the caller does with this is a *superset* test across one rebuild,
-    /// so the question each arm answers is whether the demotion changed the
-    /// answer: a class that asserts a value asserts the same one afterwards, and
-    /// a class another declaration seeds is seeded by that same declaration
-    /// afterwards.
-    fn class_states_the_value(
-        &self,
-        view: dae::DaeView<'_>,
-        states: &[(u32, Vec<u32>)],
-        members: &[(u32, PinnedMember)],
-        variable: u32,
-    ) -> bool {
-        let Some((root, member)) = members
-            .iter()
-            .find(|(_, member)| member.variable == variable)
-        else {
-            return false;
-        };
-        match class_states(states, *root) {
-            [_] => true,
-            [] => self.value_of(variable).is_some_and(|proved| {
-                stated_value(view, variable).is_some_and(|stated| {
-                    stated_agreement(view, &proved, &stated) != StatedAgreement::Contradicted
-                })
-            }),
-            // A pinned member of the class that the runtime seeds answers this
-            // declaration's equation as far as anything here can: exactly when
-            // the two agree, and undecidably when their difference reads a
-            // parameter. A *proved* difference is the one case where it does not
-            // — the surviving seed states a different value for the same
-            // quantity — so it counts as no answer at all, and a demotion that
-            // leaves only that behind is refused by name.
-            _ => members.iter().any(|(other_root, other)| {
-                other_root == root
-                    && other.variable != variable
-                    && is_seeded_state(view, other.variable)
-                    && stated_agreement(view, &member.at_root, &other.at_root)
-                        != StatedAgreement::Contradicted
-            }),
         }
     }
 
     /// Every `fixed = true` scalar Real coordinate, keyed by its class root.
     fn pinned_members(&self, view: dae::DaeView<'_>) -> Vec<(u32, PinnedMember)> {
         let mut members = Vec::new();
-        for (id, variable) in view.variables() {
-            if !carries_a_stated_initial_value(variable) || !is_scalar_real(variable) {
+        for (key, coordinate) in self.coordinates.iter() {
+            let variable = view
+                .variable(view.variable_id(coordinate.variable as usize).unwrap())
+                .unwrap();
+            if !carries_a_stated_initial_value(variable)
+                || (!coordinate.projected && !is_scalar_real(variable))
+            {
                 continue;
             }
             // A start that is not time-invariant is not a value this phase can
             // hand a runtime as a definition, so its class is left alone.
-            let Some(start) = variable
-                .start()
-                .filter(|start| is_time_invariant(view, *start))
-            else {
+            let Some(value) = self.stated_value(view, key) else {
                 continue;
             };
-            let resolved = self.find(id.index());
+            let resolved = self.find(key);
             if self.contradicted[resolved.root as usize] {
                 continue;
             }
             // value(variable) = negated·value(root) + offset, and the pin
             // states value(variable) = start.
             let at_root = reduced(signed(
-                &[
-                    vec![PinTerm {
-                        expression: start.index(),
-                        scalar: 0,
-                        negated: false,
-                    }],
-                    signed(&resolved.offset, true),
-                ]
-                .concat(),
+                &[value, signed(&resolved.offset, true)].concat(),
                 resolved.negated,
             ));
             members.push((
                 resolved.root,
                 PinnedMember {
-                    variable: id.index(),
+                    variable: key,
                     at_root,
                     provenance: variable.declaration(),
                 },
@@ -891,14 +753,17 @@ impl ValueClosure {
     /// The state coordinates of every class that has one, keyed by class root.
     fn states_by_root(&self, view: dae::DaeView<'_>) -> Vec<(u32, Vec<u32>)> {
         let mut classes: Vec<(u32, Vec<u32>)> = Vec::new();
-        for (id, variable) in view.variables() {
+        for (key, coordinate) in self.coordinates.iter() {
+            let variable = view
+                .variable(view.variable_id(coordinate.variable as usize).unwrap())
+                .unwrap();
             if variable.role() != dae::VariableRole::State {
                 continue;
             }
-            let root = self.find(id.index()).root;
+            let root = self.find(key).root;
             match classes.iter_mut().find(|(candidate, _)| *candidate == root) {
-                Some((_, states)) => states.push(id.index()),
-                None => classes.push((root, vec![id.index()])),
+                Some((_, states)) => states.push(key),
+                None => classes.push((root, vec![key])),
             }
         }
         classes
@@ -930,8 +795,8 @@ impl ValueClosure {
         match contradiction {
             None => Ok(()),
             Some((member, other)) => Err(StructuralError::ConflictingStatedInitialValues {
-                variable: variable_name(view, member.variable),
-                other: variable_name(view, other.variable),
+                variable: variable_name(view, self.coordinates.get(member.variable).variable),
+                other: variable_name(view, self.coordinates.get(other.variable).variable),
                 span: member.provenance.span(),
                 other_span: other.provenance.span(),
             }),
@@ -942,15 +807,14 @@ impl ValueClosure {
 /// Whether MLS 3.6 §8.6 turns this declaration into an initialization equation
 /// this phase is responsible for.
 ///
-/// This inventory includes Real aggregates even though the equality closure
-/// currently transfers only scalar coordinates. That distinction is
-/// deliberate: the state-preservation postcondition must reject a reduction
-/// that demotes an aggregate whose initial equations it cannot yet transfer.
+/// This inventory includes entire Real aggregates. A proof about an authored
+/// component alone cannot justify demoting the whole fixed declaration: every
+/// initial equation must remain represented.
 /// A discrete coordinate is initialized by its own §8.6 owner, and a parameter
 /// with `fixed = false` is an unknown of the initialization system rather than
 /// a stated value.
 fn carries_a_stated_initial_value(variable: dae::VariableView<'_>) -> bool {
-    variable.fixed() == Some(true)
+    variable.fixed_any_true()
         && variable.value_type().scalar_type() == dae::ScalarType::Real
         && matches!(
             variable.role(),
@@ -963,24 +827,23 @@ fn carries_a_stated_initial_value(variable: dae::VariableView<'_>) -> bool {
 /// Only a start this closure can name is reported: an absent one is the MLS 3.6
 /// §4.8 default, which no expression of the system spells, and a start that
 /// varies states nothing about the initialization instant on its own.
-fn stated_value(view: dae::DaeView<'_>, variable: u32) -> Option<Vec<PinTerm>> {
-    let start = view
-        .variable_id(variable as usize)
-        .and_then(|id| view.variable(id))
-        .and_then(|variable| variable.start())
-        .filter(|start| is_time_invariant(view, *start))?;
-    Some(vec![PinTerm {
-        expression: start.index(),
-        scalar: 0,
-        negated: false,
-    }])
-}
-
-/// Whether the runtime seeds `variable` from its own declaration.
-fn is_seeded_state(view: dae::DaeView<'_>, variable: u32) -> bool {
-    view.variable_id(variable as usize)
-        .and_then(|id| view.variable(id))
-        .is_some_and(|variable| variable.role() == dae::VariableRole::State)
+impl ValueClosure {
+    fn stated_value(&self, view: dae::DaeView<'_>, key: u32) -> Option<Vec<PinTerm>> {
+        let coordinate = self.coordinates.get(key);
+        let start = view
+            .variable_id(coordinate.variable as usize)
+            .and_then(|id| view.variable(id))
+            .and_then(|variable| variable.start())
+            .filter(|start| is_time_invariant(view, *start))?;
+        Some(vec![PinTerm {
+            expression: start.index(),
+            scalar: aggregate_start_scalar(
+                view.expression(start)?.value_type().scalar_count(),
+                coordinate.scalar as usize,
+            ),
+            negated: false,
+        }])
+    }
 }
 
 fn variable_name(view: dae::DaeView<'_>, variable: u32) -> String {

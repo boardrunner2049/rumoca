@@ -483,7 +483,7 @@ fn array_discrete_real_binding_keeps_one_target_shaped_b1b_owner() {
                 span: binding_span,
             })
             .collect(),
-        is_matrix: false,
+        kind: rumoca_core::ArrayConstructor::Array,
         span: binding_span,
     });
     variable.source_span = declaration_span;
@@ -692,7 +692,7 @@ fn assert_indexed_output_connection_value(output_first: bool) {
                 span: source.span("false", 0),
             },
         ],
-        is_matrix: false,
+        kind: rumoca_core::ArrayConstructor::Array,
         span: source.span("{true, false}", 0),
     });
 
@@ -861,6 +861,193 @@ fn b1c_element_assignments_reject_a_forward_array_recurrence() {
         Err(ToDaeError::DiscreteSolvedFormViolation { detail, .. })
             if detail.contains("identity 0 reads discrete-value identity 0")
     ));
+}
+
+/// A single leading index that selects the sole element of a size-one discrete
+/// array denotes the whole coordinate. The element equation is the only
+/// definition, so it must construct one array-shaped owner rather than being
+/// rejected for carrying a subscript.
+#[test]
+fn b1c_single_leading_index_element_assignment_owns_the_whole_coordinate() {
+    let source =
+        TestSource::new("model M discrete Boolean moving[1]; equation moving[1] = true; end M;");
+    let mut model = test_model();
+    add_primitive_variable(
+        &mut model,
+        &source,
+        "moving",
+        "discrete Boolean moving[1]",
+        8,
+        vec![1],
+        true,
+    );
+    let equation_span = source.span("moving[1] = true", 0);
+    model.add_equation(flat::Equation::new(
+        Expression::Binary {
+            op: OpBinary::Sub,
+            lhs: Box::new(Expression::VarRef {
+                name: test_reference("moving"),
+                subscripts: vec![Subscript::Index {
+                    value: 1,
+                    span: source.span("moving[1]", 0),
+                }],
+                span: source.span("moving[1]", 0),
+            }),
+            rhs: Box::new(Expression::Literal {
+                value: Literal::Boolean(true),
+                span: source.span("true", 0),
+            }),
+            span: equation_span,
+        },
+        equation_span,
+        flat::EquationOrigin::ComponentEquation {
+            component: String::new(),
+        },
+    ));
+
+    let dae = construct(&model, source.map)
+        .expect("a size-one array assigned through its sole element constructs one owner");
+    dae.inspect(|view| {
+        assert_eq!(view.discrete_value_owner_count(), 1);
+        let owner = view
+            .discrete_value_owner(view.discrete_value_owner_id(0).unwrap())
+            .unwrap();
+        let value = view
+            .expression(owner.branches().get(0).unwrap().values().get(0).unwrap().0)
+            .unwrap();
+        assert!(matches!(
+            value.operation(),
+            dae::ExpressionOperation::Array(elements) if elements.len() == 1
+        ));
+        assert_eq!(value.value_type().dimensions(), &[1]);
+    });
+}
+
+/// Two element equations that both write the sole coordinate of a size-one
+/// array overlap. The one-owner guarantee must still reject them even though a
+/// single well-formed singleton element assignment is now accepted.
+#[test]
+fn b1c_single_leading_index_rejects_overlapping_element_coverage() {
+    let source = TestSource::new(
+        "model M discrete Boolean moving[1]; equation moving[1] = true; moving[1] = false; end M;",
+    );
+    let mut model = test_model();
+    add_primitive_variable(
+        &mut model,
+        &source,
+        "moving",
+        "discrete Boolean moving[1]",
+        8,
+        vec![1],
+        true,
+    );
+    for (occurrence, value) in [(0usize, true), (1usize, false)] {
+        let equation_span = source.span("moving[1]", occurrence);
+        model.add_equation(flat::Equation::new(
+            Expression::Binary {
+                op: OpBinary::Sub,
+                lhs: Box::new(Expression::VarRef {
+                    name: test_reference("moving"),
+                    subscripts: vec![Subscript::Index {
+                        value: 1,
+                        span: source.span("moving[1]", occurrence),
+                    }],
+                    span: source.span("moving[1]", occurrence),
+                }),
+                rhs: Box::new(Expression::Literal {
+                    value: Literal::Boolean(value),
+                    span: source.span(if value { "true" } else { "false" }, 0),
+                }),
+                span: equation_span,
+            },
+            equation_span,
+            flat::EquationOrigin::ComponentEquation {
+                component: String::new(),
+            },
+        ));
+    }
+
+    assert!(matches!(
+        construct(&model, source.map),
+        Err(ToDaeError::DiscreteSolvedFormViolation { detail, .. })
+            if detail.contains("overlapping element assignments")
+    ));
+}
+
+/// An output discrete array defined outside the connection graph, by element
+/// equations, is a producer. A fan-out that flattening renders as a chain of
+/// same-causality input-to-input connections must orient outward from that
+/// producer so every consumer array has exactly one definition owner, instead
+/// of the first consumer being claimed by both its producer edge and the next
+/// consumer edge.
+#[test]
+fn b1c_element_assigned_output_orients_fanout_to_same_causality_inputs() {
+    let source = TestSource::new(
+        "model M output Boolean p[1]; input Boolean c1[1]; input Boolean c2[1]; equation \
+         p[1] = true; connect(p, c1); connect(c1, c2); end M;",
+    );
+    let mut model = test_model();
+    add_connection_endpoint(
+        &mut model,
+        &source,
+        "p",
+        "output Boolean p[1]",
+        8,
+        vec![1],
+        Causality::Output(Default::default()),
+    );
+    for (name, declaration, type_id) in [
+        ("c1", "input Boolean c1[1]", 9u32),
+        ("c2", "input Boolean c2[1]", 10u32),
+    ] {
+        add_connection_endpoint(
+            &mut model,
+            &source,
+            name,
+            declaration,
+            type_id,
+            vec![1],
+            Causality::Input(Default::default()),
+        );
+    }
+    let equation_span = source.span("p[1] = true", 0);
+    model.add_equation(flat::Equation::new(
+        Expression::Binary {
+            op: OpBinary::Sub,
+            lhs: Box::new(Expression::VarRef {
+                name: test_reference("p"),
+                subscripts: vec![Subscript::Index {
+                    value: 1,
+                    span: source.span("p[1]", 0),
+                }],
+                span: source.span("p[1]", 0),
+            }),
+            rhs: Box::new(Expression::Literal {
+                value: Literal::Boolean(true),
+                span: source.span("true", 0),
+            }),
+            span: equation_span,
+        },
+        equation_span,
+        flat::EquationOrigin::ComponentEquation {
+            component: String::new(),
+        },
+    ));
+    for (producer, consumer) in [("p", "c1"), ("c1", "c2")] {
+        let connection = format!("connect({producer}, {consumer})");
+        let span = source.span(&connection, 0);
+        model.add_equation(connection_equation(
+            scalar_connection_reference(&source, producer, if producer == "c1" { 1 } else { 0 }),
+            scalar_connection_reference(&source, consumer, 0),
+            span,
+        ));
+    }
+
+    let dae = construct(&model, source.map)
+        .expect("the element-assigned output orients the fan-out to one owner per consumer");
+    dae.inspect(|view| {
+        assert_eq!(view.discrete_value_owner_count(), 3);
+    });
 }
 
 fn ordered_array_assignment_model(source: &TestSource, forward: bool) -> flat::Model {
@@ -1886,13 +2073,13 @@ fn nested_duplicate_diagnostic_follows_source_insertion_order() {
 }
 
 #[test]
-fn when_assert_level_reaches_checked_event_action_with_exact_provenance() {
+fn when_assert_settled_warning_level_reaches_checked_event_action() {
     let source = TestSource::new(
-        "model M equation when true then assert(false, \"failed\", 2); end when; end M;",
+        "model M equation when true then assert(false, \"failed\", 1); end when; end M;",
     );
     let condition_span = source.span("true", 0);
-    let assertion_span = source.span("assert(false, \"failed\", 2)", 0);
-    let level_span = source.span("2", 0);
+    let assertion_span = source.span("assert(false, \"failed\", 1)", 0);
+    let level_span = source.span("1", 0);
     let mut branch = flat::WhenBranch::new(
         Expression::Literal {
             value: Literal::Boolean(true),
@@ -1910,7 +2097,7 @@ fn when_assert_level_reaches_checked_event_action_with_exact_provenance() {
             span: source.span("\"failed\"", 0),
         },
         Some(Expression::Literal {
-            value: Literal::Integer(2),
+            value: Literal::Integer(1),
             span: level_span,
         }),
         assertion_span,
@@ -1918,7 +2105,7 @@ fn when_assert_level_reaches_checked_event_action_with_exact_provenance() {
     ));
     let chain = flat::WhenChain::new(
         branch,
-        source.span("when true then assert(false, \"failed\", 2); end when", 0),
+        source.span("when true then assert(false, \"failed\", 1); end when", 0),
     );
     let mut model = test_model();
     model.when_chains.push(chain);
@@ -1930,25 +2117,21 @@ fn when_assert_level_reaches_checked_event_action_with_exact_provenance() {
         assert_eq!(action.provenance().span(), assertion_span);
         assert_eq!(
             view.source_text(action.provenance()),
-            Some("assert(false, \"failed\", 2)")
+            Some("assert(false, \"failed\", 1)")
         );
-        let dae::EventActionOperation::Assert {
-            message,
-            level: Some(level),
-        } = action.operation()
-        else {
-            panic!("checked event assertion must own its optional level");
+        let dae::EventActionOperation::Warning { message, condition } = action.operation() else {
+            panic!("a settled warning-level assertion is a warning action");
         };
+        assert_eq!(
+            view.source_text(view.expression(condition).unwrap().provenance()),
+            Some("false")
+        );
         assert_eq!(
             view.source_text(view.expression(message).unwrap().provenance()),
             Some("\"failed\"")
         );
-        let level = view.expression(level).unwrap();
-        assert_eq!(level.provenance().span(), level_span);
-        assert_eq!(view.source_text(level.provenance()), Some("2"));
-        assert!(matches!(
-            level.operation(),
-            dae::ExpressionOperation::Literal(dae::DaeLiteral::Integer(2))
-        ));
     });
 }
+
+// SPEC_0021 file-size exception: this file is 2141 lines, over the 2000-line
+// action threshold; split plan: partition the discrete DAE construction cases by feature (when-equations, clocked, sampled) into sibling test modules.

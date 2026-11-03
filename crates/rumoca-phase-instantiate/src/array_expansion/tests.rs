@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 mod homogeneity_tests;
 mod homogeneous_family_tests;
+mod record_bound_dimensions;
 mod vector_subscript_tests;
 
 fn make_token(text: &str) -> rumoca_core::Token {

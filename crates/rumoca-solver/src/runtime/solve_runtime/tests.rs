@@ -1,5 +1,10 @@
 //! Runtime projection and event regression tests.
 
+mod native_manifold;
+mod native_projection_residual;
+mod seed_linearization;
+mod state_jacobian_pattern;
+
 use super::*;
 use rumoca_eval_solve::refresh_plan::{
     build_algebraic_refresh_plan, build_derivative_refresh_plan,
@@ -48,6 +53,14 @@ fn set_test_implicit_jvp(
     mirror_scalar_implicit_jvp(model);
 }
 
+fn derive_test_structural_artifacts(model: &mut solve::SolveModel) {
+    let (continuous, initialization) =
+        solve_eval::derive_solve_structural_artifacts(&model.problem, &model.artifacts)
+            .expect("fixture programs derive their structural artifacts");
+    model.artifacts.continuous.structural = continuous;
+    model.artifacts.initialization.structural = initialization;
+}
+
 fn set_complete_test_projection_plan(model: &mut solve::SolveModel) {
     let state_count = model.state_scalar_count();
     let solver_count = model.solver_scalar_count();
@@ -60,6 +73,7 @@ fn set_complete_test_projection_plan(model: &mut solve::SolveModel) {
                 y_indices: rows.clone(),
                 rows,
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         }
     };
@@ -74,6 +88,7 @@ fn set_causal_test_projection_plan(model: &mut solve::SolveModel) {
                 rows: vec![index],
                 y_indices: vec![index],
                 tearing: None,
+                alternate_charts: Vec::new(),
             })
             .collect(),
     };
@@ -227,6 +242,7 @@ fn runtime_new_reports_invalid_native_stride_metadata() {
     assert_eq!(error.source_span(), Some(span));
 }
 
+mod coupled_event_newton;
 mod event_iteration;
 #[test]
 fn derivative_refresh_keeps_coupled_dependency_block_but_drops_unrelated_output() {
@@ -266,11 +282,13 @@ fn derivative_refresh_keeps_coupled_dependency_block_but_drops_unrelated_output(
                             rows: vec![1, 2],
                             y_indices: vec![1, 2],
                             tearing: None,
+                            alternate_charts: Vec::new(),
                         },
                         solve::AlgebraicProjectionBlock {
                             rows: vec![3],
                             y_indices: vec![3],
                             tearing: None,
+                            alternate_charts: Vec::new(),
                         },
                     ],
                 },
@@ -334,6 +352,7 @@ fn derivative_refresh_rejects_missing_owner_without_exact_isolation() {
                         rows: vec![1],
                         y_indices: vec![1],
                         tearing: None,
+                        alternate_charts: Vec::new(),
                     }],
                 },
                 ..Default::default()
@@ -441,6 +460,7 @@ fn causal_certificate_keeps_equation_rows_distinct_from_solver_y_indices() {
                         rows: vec![0],
                         y_indices: vec![1],
                         tearing: None,
+                        alternate_charts: Vec::new(),
                     }],
                 },
                 ..Default::default()
@@ -580,11 +600,13 @@ fn causal_certificate_rejects_swapped_blt_equation_target_pairs() {
                             rows: vec![0],
                             y_indices: vec![1],
                             tearing: None,
+                            alternate_charts: Vec::new(),
                         },
                         solve::AlgebraicProjectionBlock {
                             rows: vec![1],
                             y_indices: vec![0],
                             tearing: None,
+                            alternate_charts: Vec::new(),
                         },
                     ],
                 },
@@ -661,11 +683,13 @@ fn uncertified_seed_keeps_its_projection_block_after_dependency_projection() {
                             rows: vec![0],
                             y_indices: vec![0],
                             tearing: None,
+                            alternate_charts: Vec::new(),
                         },
                         solve::AlgebraicProjectionBlock {
                             rows: vec![1],
                             y_indices: vec![1],
                             tearing: None,
+                            alternate_charts: Vec::new(),
                         },
                     ],
                 },
@@ -784,6 +808,7 @@ fn refresh_residual_fallback_solves_positive_unit_coefficient() {
                         rows: vec![0],
                         y_indices: vec![0],
                         tearing: None,
+                        alternate_charts: Vec::new(),
                     }],
                 },
                 ..Default::default()
@@ -917,6 +942,7 @@ fn mode_dependent_repivot_model() -> solve::SolveModel {
                         rows: vec![0, 1],
                         y_indices: vec![0, 1],
                         tearing: None,
+                        alternate_charts: Vec::new(),
                     }],
                 },
                 ..Default::default()
@@ -938,18 +964,29 @@ fn mode_dependent_repivot_model() -> solve::SolveModel {
 fn refresh_newton_repivots_mode_dependent_coupled_residuals() {
     // At k=0, row 0 is structurally incident on x but numerically independent
     // of it. The complete Jacobian remains nonsingular.
-    let model = mode_dependent_repivot_model();
+    let mut model = mode_dependent_repivot_model();
+    derive_test_structural_artifacts(&mut model);
     let runtime = SolveRuntime::new_fixture(&model).expect("valid runtime should prepare");
-    assert!(runtime.algebraic_refresh.rows.is_empty());
+    // The second row now exposes y = 3 - x, but x still has no causal seed.
+    // The stage owns both residuals and unknowns, so its Newton solve does
+    // not need an isolatable assignment for every initial guess.
+    assert_eq!(runtime.algebraic_refresh.rows.len(), 1);
+    assert_eq!(runtime.algebraic_refresh.rows[0].target_index(), 1);
+    assert!(matches!(
+        runtime.algebraic_refresh.rows[0].assignment_shape(),
+        Some(solve::TargetAssignmentShape::Additive { .. })
+    ));
+    assert!(runtime.value_stage_schedule_is_certified(&runtime.algebraic_refresh));
     assert_eq!(runtime.algebraic_refresh.simultaneous_plan.blocks.len(), 1);
 
     let mut solver_y = model.initial_y.clone();
-    runtime
-        .refresh_algebraic_and_output_slots(0.0, &mut solver_y, &[0.0], 1.0e-10, 4)
-        .expect("coupled Newton solve should dynamically repivot the residuals");
-
-    assert!((solver_y[0] - 2.0).abs() <= 1.0e-9);
-    assert!((solver_y[1] - 1.0).abs() <= 1.0e-9);
+    for k in [0.0, 1.0, 3.0, 0.0] {
+        runtime
+            .refresh_algebraic_and_output_slots_certified(0.0, &mut solver_y, &[k], 1.0e-10, 4)
+            .expect("the prepared coupled stage should repivot at the current parameters");
+        assert!((solver_y[0] - 2.0 / (1.0 + k)).abs() <= 1.0e-9);
+        assert!((solver_y[1] - (3.0 - solver_y[0])).abs() <= 1.0e-9);
+    }
 }
 
 fn refresh_with_value_stages(
@@ -1079,6 +1116,7 @@ fn refresh_newton_keeps_finite_causal_values_from_first_sweep() {
     assert!((solver_y[2] + 3.0).abs() <= 1.0e-9);
 }
 
+mod affine_stage_seeds;
 mod condition_memory_seed;
 mod refresh_projection_cases;
 mod visibility;
@@ -1580,6 +1618,11 @@ fn direct_assignment_residual_row() -> Vec<solve::LinearOp> {
 // Jacobian is d(der)/dx = d(a)/dx = k, which a states-only seed would miss
 // (it would yield 0) — so this pins the projection forward-sensitivity.
 
+mod chart_sharing;
+mod grouped_projection_jvp;
+mod native_projection_assignments;
+mod native_projection_jvp;
+mod prepared_projection_jacobian;
 mod projection_output_mapping;
 mod projection_sensitivity;
 mod slot_updates;

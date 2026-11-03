@@ -1,3 +1,18 @@
+//! Derive the sparsity pattern of a compute block's Jacobian.
+//!
+//! Propagating index sets forward through the operation list to obtain, for
+//! each output, the inputs it can depend on is the standard sparsity-pattern
+//! derivation of A. Griewank and A. Walther, "Evaluating Derivatives:
+//! Principles and Techniques of Algorithmic Differentiation", 2nd ed., SIAM
+//! 2008, doi:10.1137/1.9780898717761, chapter 7. The pattern this produces is
+//! structural, therefore conservative: an entry can be structurally present and
+//! numerically zero, never the reverse, which is exactly the guarantee the
+//! column coloring in `rumoca_ir_solve::StructuralPattern::column_coloring`
+//! needs. The bit-vector propagation form is C. H. Bischof, A. Carle, P.
+//! Khademi and A. Mauer, "ADIFOR 2.0: automatic differentiation of Fortran 77
+//! programs", IEEE Computational Science and Engineering 3(3):18-32, 1996,
+//! doi:10.1109/99.537089.
+
 use std::collections::BTreeSet;
 
 use rumoca_core::Span;
@@ -174,7 +189,23 @@ pub fn derive_solve_structural_artifacts(
             problem.continuous.derivative_rhs.len()?,
             full_columns,
         )?,
-    );
+    )
+    .with_algebraic_output_evaluations(
+        &problem.continuous.algebraic_projection_plan,
+        &to_scalar_program_block(&problem.continuous.implicit_rhs)?,
+        &to_scalar_program_block(&artifacts.continuous.implicit_jacobian_v)?,
+        &artifacts.continuous.implicit_jacobian_v_scalar,
+    )
+    .with_manifold_output_evaluations(
+        &problem.continuous.manifold_projection_plan,
+        &to_scalar_program_block(&artifacts.continuous.manifold_jacobian_v)?,
+    )
+    .with_state_jacobian(
+        &problem.continuous.algebraic_projection_plan,
+        problem.solve_layout.state_scalar_count,
+        solver_columns,
+    )
+    .map_err(|error| from_pattern_error(error, None))?;
     let initialization_columns = solver_columns
         .checked_add(problem.layout.p_scalars())
         .ok_or_else(|| {
@@ -185,12 +216,12 @@ pub fn derive_solve_structural_artifacts(
         })?;
     let initialization_residual = derive_optional_compute_pattern(
         &artifacts.initialization.residual_jacobian_v,
-        problem.initialization.residual.len()?,
+        problem.initialization.residual().len()?,
         initialization_columns,
     )?;
     let initialization_projection = derive_initial_projection_patterns(
         initialization_residual.as_ref(),
-        &problem.initialization.projection_plan,
+        problem.initialization.projection_plan(),
         solver_columns,
     )?;
     let initialization = rumoca_ir_solve::InitializationStructuralArtifacts::derived(

@@ -1,0 +1,177 @@
+{
+  "baseline_commit": "4b4a31c0ea5eab5ef948a2616969768a2204b5f0",
+  "source_sha256": {
+    "crates/rumoca-phase-flatten/src/pipeline/flatten_pipeline.rs": "2dfb8fcf3818eff8bcee1b0806ac2cae7943cda7a966f8a7b0cd04d439657594",
+    "crates/rumoca-phase-flatten/src/postprocess/index_collapse.rs": "ae1c870b7aa42a76a16fdd9220d894ffb8fb33839012f82e807c2bd05b141746",
+    "crates/rumoca-phase-flatten/src/postprocess/index_collapse/equation_shapes.rs": "c19681b01967205e5144659e90f88b839ba495d35cb0da3a761b5aaf00db37ba",
+    "crates/rumoca-phase-flatten/src/postprocess/substitute_constant_tests.rs": "2b722449e8764011289f7e5c3ab8da7dda756113ffe424189b59e1fe84e58d9f",
+    "crates/rumoca/tests/suite_core/array_constructor_equation_shape.rs": "bd785e9f23e7d6b1fc0fac9a731c1f89d7c65ed62644bac73ea49b995d3d77e7"
+  },
+  "governing_rules": [
+    "MLS 10.6.1 equality is element-wise",
+    "MLS 10.6.9 component-array member projection",
+    "SPEC_0007 Flat stage contract",
+    "SPEC_0032 structured equation domain ownership",
+    "SPEC_0033 sections 2, 3, 6a"
+  ],
+  "model": "ConfiguredQuadP2",
+  "source_equation": "reactions.aerodynamicMoment_r = rotors.moment_r;",
+  "failure": {
+    "phase": "ToDae",
+    "code": "ED001",
+    "equations": 1283,
+    "unknowns": 1291,
+    "balance": -8
+  },
+  "first_divergence": "Flat array-member projection materialized all 4 vector-valued occurrences but retained only the parent dimension in scalar_count and the row-major family domain.",
+  "owner_rationale": "Index collapse resolves the member references through the occurrence graph and is the producer of the expanded array expression. It now updates cardinality and its structured domain using exact InstanceId dimensions at that point; DAE balance validation remains unchanged.",
+  "rejected_hypotheses": [
+    "Scalar ESC/motor pair compiles to DAE.",
+    "Four-element ESC/motor array compiles to DAE.",
+    "A library-free vector member projection reproduces exactly -8 (16 equations versus 24 unknowns).",
+    "Before/after Flat comparison has identical variables and residual expressions. Only equation 571 scalar_count changes from 4 to 12; its domain changes from [4] to [4,3]."
+  ],
+  "before_after": {
+    "equation_index": 571,
+    "scalar_count_before": 4,
+    "scalar_count_after": 12,
+    "domain_before": [
+      4
+    ],
+    "domain_after": [
+      4,
+      3
+    ],
+    "variables_unchanged": true,
+    "all_residuals_unchanged": true,
+    "after_equations": 1291,
+    "after_unknowns": 1291,
+    "dae_emission": "passed"
+  },
+  "verification": {
+    "focused": {
+      "command": "cargo test -p rumoca --test suite_core array_constructor_equation_shape",
+      "passed": 4,
+      "failed": 0
+    },
+    "core": {
+      "command": "cargo test -p rumoca --test suite_core",
+      "passed": 1115,
+      "failed": 0
+    },
+    "flatten": {
+      "command": "cargo test -p rumoca-phase-flatten --lib",
+      "passed": 643,
+      "failed": 1,
+      "pre_existing_failure": "functions::tests::test_convert_component_to_param_preserves_constant_shape_identity",
+      "baseline_reproduction": "The same test fails at HEAD with dimensions [2] versus expected [0]; source changes were restored after the check."
+    },
+    "clippy": {
+      "command": "cargo clippy -p rumoca-phase-flatten --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    "format": "cargo fmt --all; git diff --check passed",
+    "concurrency": {
+      "CARGO_BUILD_JOBS": 4,
+      "RUST_TEST_THREADS": 4,
+      "RAYON_NUM_THREADS": 4
+    },
+    "fastdyn_build": {
+      "command": "python3 utils/build_fmi3_fmu.py --config configs/copter462_fire_p2.toml --skip-submodules",
+      "result": "passed including native C compilation and binary packaging"
+    },
+    "fmu_smoke": {
+      "fmu": "/home/mhcho/ws/courbet_project/FastDyn/out/fmi3/ConfiguredQuadP2/ConfiguredQuadP2.fmu",
+      "binary": "binaries/x86_64-linux/Rumoca_29de8836_522c_4219_8645_3d4aafe7021a.so",
+      "required_ports": {
+        "lat0": 22,
+        "lon0": 23,
+        "ground_alt_wgs84": 24,
+        "earth_radius_m": 25,
+        "pwm": 26,
+        "accel": 27,
+        "gyro": 28,
+        "mag": 29,
+        "gps": 30,
+        "vel_ned": 31,
+        "yaw_deg": 32,
+        "baro_altitude_m": 33,
+        "baro_pressure_pa": 34,
+        "baro_temperature_c": 35,
+        "baro_climb_rate_mps": 36
+      },
+      "steps": 40,
+      "samples": [
+        {
+          "time": 0.002,
+          "current": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "speed": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "time": 0.004,
+          "current": [
+            13.169668946763297,
+            13.169668946763297,
+            13.169668946763297,
+            13.169668946763297
+          ],
+          "speed": [
+            1.4054886988881687,
+            1.4054886988881687,
+            1.4054886988881687,
+            1.4054886988881687
+          ]
+        }
+      ]
+    },
+    "not_run": [
+      "Full 566-model Tier 2 MSL sweep: this is a focused bug fix with Tier 1 evidence.",
+      "QEMU/firmware mission and long-duration P2 simulation."
+    ]
+  },
+  "canary": {
+    "scope": "fixed 20-model Tier 1 canary; partial, not cohort parity",
+    "command": "cargo xtask verify msl-parity --sim-targets-file infra/verification/msl-canary-20.json --results-dir <before-or-after>",
+    "target_list_sha256": "536004933ce502f7a8a4317e5dd6de2b700a6b176e84d2d6e7bbe0dcdf61eafa",
+    "before": {
+      "cohort_models": 20,
+      "compared_models": 12,
+      "high": 12,
+      "near": 0,
+      "deviation": 0,
+      "fallback": 0,
+      "absent": 8,
+      "absent_by_reason": {
+        "not_attempted": 6,
+        "sim_failed": 2
+      }
+    },
+    "after": {
+      "cohort_models": 20,
+      "compared_models": 12,
+      "high": 12,
+      "near": 0,
+      "deviation": 0,
+      "fallback": 0,
+      "absent": 8,
+      "absent_by_reason": {
+        "not_attempted": 6,
+        "sim_failed": 2
+      }
+    },
+    "all_rows_identical": true,
+    "new_failures": []
+  },
+  "local_artifacts": "/home/mhcho/ws/courbet_project/FastDyn/out/rumoca-p2-debug",
+  "spec_reference": "https://specification.modelica.org/maint/3.6/arrays.html#slice-operation"
+}

@@ -42,7 +42,7 @@ required-features = ["tensor-scaling-bin"]
 anyhow = { workspace = true }
 clap = { workspace = true }
 indexmap = { workspace = true }
-mimalloc = { workspace = true }
+rumoca-allocator = { workspace = true }
 rumoca-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["unbounded_depth"] }
@@ -54,6 +54,7 @@ rumoca-worker = { workspace = true }
 # Used by the MSL tooling moved from xtask (zmq: OMC worker pool; nix: process
 # signals; blake3/regex/walkdir/tempfile: caching, parsing, fs scans).
 blake3 = { workspace = true }
+sha2 = "0.10"
 nix = { version = "0.29", features = ["signal"] }
 regex = "1"
 tempfile = { workspace = true }

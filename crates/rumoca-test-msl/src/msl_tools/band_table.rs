@@ -78,17 +78,14 @@
 //! this module only records what that classifier decided, per model, alongside
 //! the reason every other cohort model was not classified at all.
 
-use super::common::{
-    TRACE_EXCLUSIONS_FILE_REL, git_worktree_content_digest, load_trace_exclusions_file,
-    unix_timestamp_seconds, write_pretty_json,
-};
+use super::common::{git_worktree_content_digest, unix_timestamp_seconds, write_pretty_json};
 use crate::repo_root;
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use rumoca_sim::sim_trace_compare::{
     AgreementBand, MODEL_HIGH_MAX_DEVIATION_CHANNEL_SHARE, MODEL_HIGH_MIN_HIGH_CHANNEL_SHARE,
     MODEL_MINOR_MAX_DEVIATION_CHANNEL_SHARE, MODEL_MINOR_MIN_HIGH_PLUS_MINOR_CHANNEL_SHARE,
-    ModelDeviationMetric, TraceCertificationProfile, classify_trace_metric_channel_distribution,
+    ModelDeviationMetric, classify_trace_metric_channel_distribution,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -107,7 +104,11 @@ const BAND_TABLE_TEMP_FILE: &str = "msl_band_table.json.tmp";
 /// instead of deserializing it into a table with zero rows.
 pub const BAND_TABLE_SCHEMA: &str = "msl_band_table";
 /// Schema version this build writes and accepts.
-pub const BAND_TABLE_SCHEMA_VERSION: u32 = 2;
+pub const BAND_TABLE_SCHEMA_VERSION: u32 = 3;
+
+/// The predecessor schema this build still reads. A v2 table predates
+/// projection fallback reporting, so its rows read as fallback-free.
+pub const BAND_TABLE_PREVIOUS_SCHEMA_VERSION: u32 = 2;
 
 const TRACE_COMPARISON_FILE: &str = "sim_trace_comparison.json";
 const MSL_RESULTS_FILE: &str = "msl_results.json";
@@ -126,6 +127,10 @@ pub enum BandLabel {
     Near,
     /// Measured deviation.
     Deviation,
+    /// Compared, but a projection block of the run fell back above the policy
+    /// rate (SPEC_0044 ME-PROJ-003); never quoted as strict-high parity,
+    /// whatever its channels.
+    Fallback,
     /// Not compared in this run; the row carries an [`ExitReason`].
     Absent,
 }
@@ -137,6 +142,7 @@ impl BandLabel {
             Self::High => "high",
             Self::Near => "near",
             Self::Deviation => "deviation",
+            Self::Fallback => "fallback",
             Self::Absent => "absent",
         }
     }
@@ -151,79 +157,6 @@ impl BandLabel {
             AgreementBand::HighAgreement => Self::High,
             AgreementBand::MinorAgreement => Self::Near,
             AgreementBand::Deviation => Self::Deviation,
-        }
-    }
-}
-
-/// How the comparator classified a candidate it did not compare.
-///
-/// The comparator writes this into `sim_trace_comparison.json` beside the
-/// human-readable detail. It exists because attribution has to be decided where
-/// the knowledge is: only the comparator knows whether a missing trace was
-/// rumoca's gap or OMC's, and whether a `skipped` model was skipped by policy or
-/// because the comparison itself blew up. Reading either back off a free-text
-/// reason string is how a solver regression got filed as a policy exclusion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TraceExitKind {
-    /// Excluded by the tracked policy list before any trace was loaded.
-    PolicyExcluded,
-    /// The comparator ran on this model and failed.
-    ComparatorFailed,
-    /// The comparator ran and found nothing to compare: the two traces share no
-    /// variable with comparable samples. Distinct from a comparator failure
-    /// because it is a property of the traces, not a defect in the comparator.
-    NoComparableSamples,
-    /// Pointwise comparison is non-identifying for this trace. This is an
-    /// uncertified proof obligation, not an agreement band or policy skip.
-    TraceNonidentifiable,
-    /// Rumoca produced no usable trace for a model it reported as simulated.
-    RumocaTraceMissing,
-    /// The OMC reference trace is missing or unusable.
-    OmcTraceMissing,
-}
-
-impl TraceExitKind {
-    fn exit_reason(self) -> ExitReason {
-        match self {
-            Self::PolicyExcluded => ExitReason::Excluded,
-            Self::ComparatorFailed => ExitReason::ComparatorFailed,
-            Self::NoComparableSamples => ExitReason::NoComparableSamples,
-            Self::TraceNonidentifiable => ExitReason::TraceNonidentifiable,
-            Self::RumocaTraceMissing => ExitReason::RumocaTraceMissing,
-            Self::OmcTraceMissing => ExitReason::ReferenceMissing,
-        }
-    }
-}
-
-/// One comparator-recorded non-comparison, as it appears on the wire.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceExitRecord {
-    pub kind: TraceExitKind,
-    pub detail: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub certification_profile: Option<TraceCertificationProfile>,
-}
-
-impl TraceExitRecord {
-    /// Record a candidate the comparator did not compare.
-    pub fn new(kind: TraceExitKind, detail: impl Into<String>) -> Self {
-        Self {
-            kind,
-            detail: detail.into(),
-            certification_profile: None,
-        }
-    }
-
-    /// Record an explicitly uncertified pointwise proof boundary.
-    pub fn trace_nonidentifiable(profile: TraceCertificationProfile) -> Self {
-        Self {
-            kind: TraceExitKind::TraceNonidentifiable,
-            detail: format!(
-                "pointwise trace certification is non-identifying ({:?}); replacement proof obligations remain outstanding",
-                profile.reason()
-            ),
-            certification_profile: Some(profile),
         }
     }
 }
@@ -315,6 +248,17 @@ pub struct BandRow {
     /// Model-level bounded normalized L1 score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounded_normalized_l1_score: Option<f64>,
+    /// Worst fallback rate of the run's projection blocks, present exactly when
+    /// `band == BandLabel::Fallback`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_rate: Option<f64>,
+    /// The run's fallback warnings behind `fallback_rate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_detail: Option<String>,
+    /// The band the comparator gave a `fallback` row's channels, which the
+    /// reference's agreement counts still include.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_of: Option<BandLabel>,
 }
 
 impl BandRow {
@@ -339,6 +283,9 @@ impl BandRow {
             max_channel_bounded_normalized_l1: Some(metric.max_channel_bounded_normalized_l1),
             mean_channel_bounded_normalized_l1: Some(metric.mean_channel_bounded_normalized_l1),
             bounded_normalized_l1_score: Some(metric.bounded_normalized_l1_score),
+            fallback_rate: None,
+            fallback_detail: None,
+            fallback_of: None,
         }
     }
 
@@ -356,6 +303,9 @@ impl BandRow {
             max_channel_bounded_normalized_l1: None,
             mean_channel_bounded_normalized_l1: None,
             bounded_normalized_l1_score: None,
+            fallback_rate: None,
+            fallback_detail: None,
+            fallback_of: None,
         }
     }
 
@@ -366,8 +316,23 @@ impl BandRow {
         fn metric(value: Option<f64>) -> String {
             value.map_or_else(|| "-".to_string(), |value| format!("{value:.12e}"))
         }
+        // A fallback-free row renders exactly as schema v2 did, so a v2 table's
+        // digest still verifies.
+        let fallback = match (
+            self.fallback_rate,
+            self.fallback_detail.as_deref(),
+            self.fallback_of,
+        ) {
+            (None, None, None) => String::new(),
+            (rate, detail, of) => format!(
+                "|{}|{}|{}",
+                metric(rate),
+                detail.unwrap_or("-"),
+                of.map_or("-", BandLabel::as_str)
+            ),
+        };
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}{fallback}\n",
             self.model_name,
             self.band.as_str(),
             self.exit_reason.map_or("-", ExitReason::as_str),
@@ -391,6 +356,14 @@ impl BandRow {
                 None => format!("absent ({})", reason.as_str()),
             },
             (BandLabel::Absent, None) => "absent (no reason recorded)".to_string(),
+            (BandLabel::Fallback, _) => format!(
+                "fallback (rate {:.1}%: {}; channels {}/{}/{})",
+                100.0 * self.fallback_rate.unwrap_or(f64::NAN),
+                self.fallback_detail.as_deref().unwrap_or("-"),
+                self.channel_high_count,
+                self.channel_minor_count,
+                self.channel_deviation_count
+            ),
             (band, _) => format!(
                 "{} (channels {}/{}/{}, max_dev={:.3e})",
                 band.as_str(),
@@ -411,6 +384,9 @@ pub struct BandTableCounts {
     pub high: usize,
     pub near: usize,
     pub deviation: usize,
+    /// Compared models banded `fallback`; zero for a schema v2 table.
+    #[serde(default)]
+    pub fallback: usize,
     pub absent: usize,
     #[serde(default)]
     pub absent_by_reason: BTreeMap<String, usize>,
@@ -444,6 +420,10 @@ pub struct BandTableSource {
     pub exclusions_file: String,
     #[serde(default)]
     pub exclusions_digest: String,
+    /// SHA-256 of the same list: the digest a reviewed baseline boundary pins,
+    /// so the quality gate can prove the list it read is the reviewed one.
+    #[serde(default)]
+    pub exclusions_sha256: String,
 }
 
 /// Which run wrote a table.
@@ -536,6 +516,16 @@ impl BandTable {
             .count()
     }
 
+    /// Models whose channels the comparator placed in `band`, including the
+    /// `fallback` rows it would otherwise have banded there; the reference's
+    /// agreement counts read the same way.
+    pub fn agreement_models(&self, band: BandLabel) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| row.band == band || row.fallback_of == Some(band))
+            .count()
+    }
+
     /// Models in the compared set.
     pub fn models_compared(&self) -> usize {
         self.compared_rows().count()
@@ -623,6 +613,7 @@ fn count_rows(rows: &[BandRow]) -> BandTableCounts {
             BandLabel::High => counts.high += 1,
             BandLabel::Near => counts.near += 1,
             BandLabel::Deviation => counts.deviation += 1,
+            BandLabel::Fallback => counts.fallback += 1,
             BandLabel::Absent => {
                 counts.absent += 1;
                 let key = row
@@ -633,7 +624,7 @@ fn count_rows(rows: &[BandRow]) -> BandTableCounts {
             }
         }
     }
-    counts.compared_models = counts.high + counts.near + counts.deviation;
+    counts.compared_models = counts.high + counts.near + counts.deviation + counts.fallback;
     counts
 }
 
@@ -651,9 +642,11 @@ pub fn ensure_comparable(table: &BandTable) -> Result<()> {
             table.schema
         );
     }
-    if table.schema_version != BAND_TABLE_SCHEMA_VERSION {
+    if table.schema_version != BAND_TABLE_SCHEMA_VERSION
+        && table.schema_version != BAND_TABLE_PREVIOUS_SCHEMA_VERSION
+    {
         bail!(
-            "band table schema_version is {}, this build reads {BAND_TABLE_SCHEMA_VERSION}",
+            "band table schema_version is {}, this build reads {BAND_TABLE_SCHEMA_VERSION} and {BAND_TABLE_PREVIOUS_SCHEMA_VERSION}",
             table.schema_version
         );
     }
@@ -769,6 +762,12 @@ fn ensure_rows_well_formed(table: &BandTable) -> Result<()> {
                         row.model_name
                     );
                 }
+                if row.fallback_rate.is_some() {
+                    bail!(
+                        "band table row '{}' is absent but carries a fallback rate",
+                        row.model_name
+                    );
+                }
             }
             band => ensure_banded_row_well_formed(row, band)?,
         }
@@ -777,6 +776,20 @@ fn ensure_rows_well_formed(table: &BandTable) -> Result<()> {
 }
 
 fn ensure_banded_row_well_formed(row: &BandRow, band: BandLabel) -> Result<()> {
+    let fallback_of_compared = matches!(
+        row.fallback_of,
+        Some(BandLabel::High | BandLabel::Near | BandLabel::Deviation)
+    );
+    if (band == BandLabel::Fallback) != row.fallback_rate.is_some()
+        || (band == BandLabel::Fallback) != fallback_of_compared
+        || (band != BandLabel::Fallback && row.fallback_of.is_some())
+    {
+        bail!(
+            "band table row '{}' is banded '{}' but its fallback rate does not match its band",
+            row.model_name,
+            band.as_str()
+        );
+    }
     if row.exit_reason.is_some() {
         bail!(
             "band table row '{}' is banded '{}' but carries an exit reason",
@@ -803,6 +816,9 @@ struct SimAttempt {
     failure_detail: Option<String>,
     /// Why the run never simulated it (the phase it stopped at).
     unattempted_detail: String,
+    /// The run's worst projection fallback rate and its warnings, recorded only
+    /// when a block exceeded the policy rate.
+    fallback: Option<(f64, String)>,
 }
 
 /// Build a table from the comparator's trace-comparison payload plus the run's
@@ -868,6 +884,7 @@ pub fn derive_band_table(
         add_policy_absences(&mut rows, exclusions, roster, &attempts);
     }
     add_sim_absences(&mut rows, &attempts, roster.as_ref());
+    mark_fallbacks(&mut rows, &attempts);
     if let Some(roster) = roster.as_ref() {
         add_unrecorded_targets(&mut rows, roster);
     }
@@ -876,6 +893,25 @@ pub fn derive_band_table(
     rows.sort_by(|left, right| left.model_name.cmp(&right.model_name));
     let cohort_roster_models = roster.as_ref().map_or(0, BTreeSet::len);
     Ok(BandTable::with_rows(rows, cohort_roster_models, meta))
+}
+
+/// Band every compared model whose run reported a projection block over the
+/// fallback rate as `fallback`, never strict-high (SPEC_0044 ME-PROJ-003).
+fn mark_fallbacks(rows: &mut IndexMap<String, BandRow>, attempts: &BTreeMap<String, SimAttempt>) {
+    for (model_name, row) in rows.iter_mut() {
+        let Some((rate, detail)) = attempts
+            .get(model_name)
+            .and_then(|attempt| attempt.fallback.clone())
+        else {
+            continue;
+        };
+        if row.band.is_compared() {
+            row.fallback_of = Some(row.band);
+            row.band = BandLabel::Fallback;
+            row.fallback_rate = Some(rate);
+            row.fallback_detail = Some(detail);
+        }
+    }
 }
 
 fn in_cohort(roster: Option<&BTreeSet<String>>, model_name: &str) -> bool {
@@ -1002,6 +1038,16 @@ fn collect_sim_attempts(results: &Value) -> Result<BTreeMap<String, SimAttempt>>
                     .map(str::to_string),
                 failure_detail: sim_failure_detail(model),
                 unattempted_detail: compile_failure_detail(model),
+                fallback: model
+                    .get("projection_fallback_rate")
+                    .and_then(Value::as_f64)
+                    .map(|rate| {
+                        let detail = model
+                            .get("projection_fallback_detail")
+                            .and_then(Value::as_str)
+                            .unwrap_or("-");
+                        (rate, detail.to_string())
+                    }),
             },
         );
     }
@@ -1337,46 +1383,10 @@ pub fn derive_band_table_from_dir(
             results_digest: optional_file_digest(&results_file)?,
             exclusions_file: exclusions.file,
             exclusions_digest: exclusions.digest,
+            exclusions_sha256: exclusions.sha256,
         },
     };
     derive_band_table(&trace, results.as_ref(), &exclusions.entries, meta)
-}
-
-/// The tracked policy exclusions, keyed by model name, with the digest of the
-/// list they came from.
-///
-/// The list *decides* attribution: an untyped `skipped` entry is a policy
-/// exclusion when the model is on this list and a comparator defect when it is
-/// not. Reading it must therefore never fall back to "no exclusions" — that
-/// default silently reclassifies every policy skip as a defect, and it would do
-/// so as a function of the working directory, since the path is resolved from
-/// the workspace root found by walking up from the CWD. A list that cannot be
-/// read is a hard error, and the digest travels into the table so the reading is
-/// attributable after the fact.
-#[derive(Debug)]
-struct TrackedExclusions {
-    entries: BTreeMap<String, String>,
-    file: String,
-    digest: String,
-}
-
-fn tracked_exclusions() -> Result<TrackedExclusions> {
-    exclusions_from(&crate::repo_root().join(TRACE_EXCLUSIONS_FILE_REL))
-}
-
-fn exclusions_from(path: &Path) -> Result<TrackedExclusions> {
-    let entries = load_trace_exclusions_file(path).with_context(|| {
-        format!(
-            "cannot attribute policy exclusions without the tracked list '{}'; every `skipped` \
-             model would be recorded as a comparator defect instead",
-            path.display()
-        )
-    })?;
-    Ok(TrackedExclusions {
-        entries,
-        file: path.display().to_string(),
-        digest: file_digest(path)?,
-    })
 }
 
 /// The persisted table when one exists and belongs to this directory, else a
@@ -1930,6 +1940,15 @@ fn print_band_table_summary(results_dir: &Path, table: &BandTable, previous: Opt
         );
     }
 }
+
+mod exclusions;
+mod soundness;
+#[cfg(test)]
+use exclusions::exclusions_from;
+use exclusions::tracked_exclusions;
+mod trace_exit;
+pub use soundness::triage_package;
+pub use trace_exit::{TraceExitKind, TraceExitRecord};
 
 #[cfg(test)]
 mod tests;

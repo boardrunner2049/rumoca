@@ -1,6 +1,13 @@
 //! INST (Instantiation) contract tests - MLS §5, §7
 //!
-//! Tests for the 53 instantiation contracts defined in SPEC_0022.
+//! Tests for the instantiation contracts defined in SPEC_0022; lookup,
+//! inner/outer, final, `break`, `each`, and class-selection contracts are in
+//! `inst_lookup_contracts.rs`, extends-clause contracts in
+//! `inst_extends_contracts.rs`.
+
+// SPEC_0021 file-size exception: over the 2000-line action threshold. split plan:
+// move the `redeclare_dimension*` cases and their `redeclared_*` helpers into
+// `inst_redeclare_contracts.rs`, as lookup and extends contracts already are.
 
 use rumoca_compile::compile::FailedPhase;
 use rumoca_contracts::test_support::{
@@ -218,7 +225,7 @@ fn inst_006_conflicting_inherited_components_fail() {
 // =============================================================================
 
 // A non-final binding is a default that a modification replaces, so the cycle
-// is judged on the instance (DAE construction, ED023); a final cyclic binding
+// is judged on the instance (DAE construction, ED025); a final cyclic binding
 // can never be broken and is rejected by Resolve (ER007).
 #[test]
 fn inst_008_no_cyclic_binding() {
@@ -234,7 +241,7 @@ fn inst_008_no_cyclic_binding() {
     "#,
         "Test",
         FailedPhase::ToDae,
-        "ED023",
+        "ED025",
     );
     expect_resolve_failure_with_code(
         r#"
@@ -287,6 +294,23 @@ fn inst_010_final_cannot_modify() {
         end Base;
         model Test
             Base b(p = 2);
+        end Test;
+    "#,
+        "Test",
+        FailedPhase::Instantiate,
+        "EI028",
+    );
+}
+
+#[test]
+fn inst_010_declaration_cannot_modify_final_type_attribute() {
+    expect_failure_in_phase_with_code(
+        r#"
+        type Voltage = Real(final unit = "V");
+        model Test
+            Voltage v(unit = "kV");
+        equation
+            v = 1;
         end Test;
     "#,
         "Test",
@@ -1075,6 +1099,46 @@ fn inst_053_conditional_true_kept() {
         end Test;
     "#,
         "Test",
+    );
+}
+
+// =============================================================================
+// INST-054: Automatic inner creation
+// "An inner declaration of a unique non-partial class is automatically added
+// for outer declarations lacking a matching inner, with a diagnostic"
+// =============================================================================
+
+#[test]
+fn inst_054_outer_without_inner_synthesizes_default() {
+    expect_compile_warning(
+        r#"
+        model World
+            parameter Boolean enableAnimation = true;
+            parameter Real nominalLength = 1;
+            parameter Real defaultBodyDiameter = nominalLength/9;
+            annotation(
+                defaultComponentName="world",
+                defaultComponentPrefixes="inner",
+                missingInnerMessage="A default world component with the default
+gravity field will be used.");
+        end World;
+        model Shape
+            Real s;
+        equation
+            s = 1.0;
+        end Shape;
+        model Body
+            outer World world;
+            parameter Boolean animation = true;
+            parameter Real sphereDiameter = world.defaultBodyDiameter;
+            Shape sphere if world.enableAnimation and animation and sphereDiameter > 0;
+        end Body;
+        model Standalone
+            Body body;
+        end Standalone;
+    "#,
+        "Standalone",
+        "WI013",
     );
 }
 
@@ -1927,7 +1991,9 @@ fn inst_038_inner_outer_modification_accepted() {
 /// ThermoPower `FanCharacteristics.Models.SplineFlow`: the redeclared class
 /// extends the inherited `flowCharacteristic`, not itself. Constant collection
 /// looked the base up by spelling, found the redeclaring class and recursed
-/// until the stack overflowed.
+/// until the stack overflowed. `dummyFlow` has no algorithm of its own: the
+/// redeclared class inherits every section of it, and MLS 3.7 §12.2 allows a
+/// function one algorithm section in all (EF035).
 #[test]
 fn redeclare_function_extends_short_alias_does_not_recurse() {
     expect_success(
@@ -1939,8 +2005,6 @@ fn redeclare_function_extends_short_alias_does_not_recurse() {
             end baseFlow;
             function dummyFlow
                 extends baseFlow;
-            algorithm
-                H := q;
             end dummyFlow;
             model BaseFlow
                 replaceable function flowCharacteristic = P.dummyFlow

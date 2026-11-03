@@ -362,6 +362,15 @@ struct MslModelResult {
     flatten_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dae_seconds: Option<f64>,
+    /// Whether the compile started from the worker's prepared resolution plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict_plan_warm: Option<bool>,
+    /// The compiling worker's one-time source-root load and plan cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_prepare_seconds: Option<f64>,
+    /// Why the compiling worker could not build its resolution plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict_plan_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compile_perf_profile_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -410,6 +419,15 @@ struct MslModelResult {
     sim_run_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sim_wall_seconds: Option<f64>,
+    /// The simulation's solver, tolerances, output points, steps, and events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sim_settings: Option<rumoca_worker::WorkerSimSettings>,
+    /// Failed single-program shared-value proofs while simulating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_value_proof_failures: Option<u64>,
+    /// Relation settles kept on a coordinate surface (ME-EVENT-008).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relation_surface_settles: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sim_trace_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

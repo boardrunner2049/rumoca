@@ -250,19 +250,13 @@ fn shaping() -> Vec<Row> {
 /// derivative around it stays right.
 fn constant() -> Vec<Row> {
     let admitted: &[(&'static str, Shape, &str, Carrier, Verdict)] = &[
-        ("zeros", Scalar, "({a}) .+ zeros(3)", VECTOR_OUT, ELSEWHERE),
+        ("zeros", Scalar, "({a}) .+ zeros(3)", VECTOR_OUT, HERE),
         ("zeros", Vector, "({a}) .+ zeros(3)", VECTOR_OUT, HERE),
         ("zeros", Matrix, "({a}) .+ zeros(3, 3)", MATRIX_OUT, HERE),
         ("ones", Scalar, "({a}) .* ones(3)", VECTOR_OUT, HERE),
         ("ones", Vector, "({a}) .* ones(3)", VECTOR_OUT, HERE),
         ("ones", Matrix, "({a}) .* ones(3, 3)", MATRIX_OUT, HERE),
-        (
-            "identity",
-            Scalar,
-            "({a}) .+ identity(3)",
-            MATRIX_OUT,
-            ELSEWHERE,
-        ),
+        ("identity", Scalar, "({a}) .+ identity(3)", MATRIX_OUT, HERE),
         ("identity", Matrix, "({a}) .+ identity(3)", MATRIX_OUT, HERE),
         (
             "size",
@@ -348,23 +342,11 @@ fn arithmetic() -> Vec<Row> {
     for shape in Shape::ALL {
         rows.push(binary("/", *shape, Scalar, carrier_of(*shape)));
     }
-    // `.*` and `./` spread a rank-0 operand here; `.+` and `.-` do not, so
-    // their spreading rows are checked in OpenModelica.
-    for operator in [".*", "./"] {
+    // Every elementwise operator spreads a rank-0 operand over the other here,
+    // so each pairs the shapes `PAIRED` lists in-process (MLS 10.6.5).
+    for operator in [".*", "./", ".+", ".-"] {
         for (left, right, carrier) in PAIRED {
             rows.push(binary(operator, *left, *right, *carrier));
-        }
-    }
-    for operator in [".+", ".-"] {
-        for (left, right, carrier) in PAIRED {
-            rows.push(row(
-                Family::Arithmetic,
-                operator,
-                &[*left, *right],
-                &format!("({{a}}) {operator} ({{b}})"),
-                *carrier,
-                checked_where(*left, *right),
-            ));
         }
     }
     let stated = rows.clone();
@@ -648,13 +630,10 @@ fn composite() -> Vec<Row> {
 /// its formal is not one call but one call per element (MLS 12.4.6), so its
 /// result is not the shape JAC-S3 has the wrapper state.
 ///
-/// Every admitted row here is checked in OpenModelica. JAC-G1 makes a tangent
-/// body call both the callee's tangent and the callee itself, and a function
-/// that calls two others, is called from a third and returns an array is a
-/// program this compiler's Solve IR declines (`EL005`, "pure-call owner was
-/// not issued by this table"). The primal of each probe runs here; its
-/// expansion does not, so there is no in-process program to compare against
-/// and the gate takes the row where one exists.
+/// Every admitted row here is checked in process. JAC-G1 makes a tangent body
+/// call both the callee's tangent and the callee itself; the callee call the
+/// tangent result does not read still owns a registered pure-call owner, so the
+/// expansion runs and is compared against central differences here.
 fn calls() -> Vec<Row> {
     let admitted: &[(Shape, &'static str, Carrier)] = &[
         (Scalar, CALL_SCALAR, SCALAR_OUT),
@@ -670,7 +649,7 @@ fn calls() -> Vec<Row> {
             form: String::new(),
             carrier: *carrier,
             body: Some(body),
-            verdict: ELSEWHERE,
+            verdict: HERE,
         })
         .collect();
     rows.push(Row {

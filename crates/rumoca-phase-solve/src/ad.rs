@@ -1,9 +1,27 @@
 //! AD lowering from primal linear ops to forward-mode J·v ops.
 //!
+//! Where an operation is not differentiable, the emitted tangent follows the
+//! kink rules stated once in `rumoca_eval_solve::reverse`, so a forward product
+//! certifies a matrix assembled from reverse rows; `kink_rule_tests` pins the
+//! two together with the typed directional owners.
+//!
 //! SPEC_0021 file-size exception: AD lowering still keeps scalar row AD,
 //! tensor-node JVP lowering, and regression tests together while Solve IR
 //! multi-output programs are being stabilized. split plan: move tensor-node JVP
 //! lowering and indexed-load AD helpers into sibling modules behind this facade.
+
+#[cfg(test)]
+mod inactive_tangent_tests;
+mod inactive_tangents;
+#[cfg(test)]
+mod kink_rule_tests;
+mod seed_domain;
+#[cfg(test)]
+mod seed_domain_tests;
+mod tensor_packing;
+#[cfg(test)]
+mod variability_tests;
+pub(crate) use seed_domain::lower_projection_domain;
 
 use crate::LowerError;
 use rumoca_ir_solve::{
@@ -52,7 +70,7 @@ pub fn lower_compute_block_full_jvp(
 
 fn lower_compute_block_jvp_with_seed_mode(
     block: &ComputeBlock,
-    seed_mode: SeedMode,
+    seed_mode: SeedMode<'_>,
 ) -> Result<ComputeBlock, LowerError> {
     let span = compute_block_context_span(block);
     let mut nodes = ad_vec_with_capacity(block.nodes.len(), "compute block JVP node count", span)?;
@@ -64,7 +82,7 @@ fn lower_compute_block_jvp_with_seed_mode(
 
 fn lower_compute_node_jvp(
     node: &ComputeNode,
-    seed_mode: SeedMode,
+    seed_mode: SeedMode<'_>,
 ) -> Result<ComputeNode, LowerError> {
     match node {
         ComputeNode::ScalarPrograms(rows) => {
@@ -158,7 +176,7 @@ fn lower_affine_jvp_ops(
     load_strides: &[AffineStencilLoadStride],
     const_strides: &[AffineStencilConstStride],
     span: rumoca_core::Span,
-    seed_mode: SeedMode,
+    seed_mode: SeedMode<'_>,
 ) -> Result<AffineJvpOps, LowerError> {
     validate_affine_jvp_stride_targets(base_ops, load_strides, const_strides, span)?;
     let mut builder = AdBuilder::new_with_span(seed_mode, span);
@@ -264,7 +282,7 @@ fn validate_affine_jvp_stride_targets(
 
 fn lower_matmul_jvp_node(
     node: &ComputeNode,
-    seed_mode: SeedMode,
+    seed_mode: SeedMode<'_>,
 ) -> Result<ComputeNode, LowerError> {
     let ComputeNode::MatMul {
         lhs_ops,
@@ -361,14 +379,14 @@ fn full_tensor_pattern(
         .map_err(|error| ad_contract_violation(error.to_string(), span))
 }
 
-fn lower_tensor_operand(
+fn lower_tensor_operand<'seed>(
     ops: &[LinearOp],
     value_start: Reg,
     value_count: usize,
     next_reg: Reg,
     span: rumoca_core::Span,
-    seed_mode: SeedMode,
-) -> Result<(AdBuilder, Vec<DualReg>), LowerError> {
+    seed_mode: SeedMode<'seed>,
+) -> Result<(AdBuilder<'seed>, Vec<DualReg>), LowerError> {
     let mut builder = AdBuilder::new_with_span(seed_mode, span);
     builder.next_reg = next_reg;
     for op in ops {
@@ -479,7 +497,7 @@ fn compute_node_context_span(node: &ComputeNode) -> Option<rumoca_core::Span> {
     }
 }
 
-fn ops_reference_seeded_inputs(ops: &[LinearOp], seed_mode: SeedMode) -> bool {
+fn ops_reference_seeded_inputs(ops: &[LinearOp], seed_mode: SeedMode<'_>) -> bool {
     ops.iter().any(|op| {
         matches!(op, LinearOp::LoadY { .. })
             || matches!(seed_mode, SeedMode::SolverYAndP { .. })
@@ -487,6 +505,13 @@ fn ops_reference_seeded_inputs(ops: &[LinearOp], seed_mode: SeedMode) -> bool {
             || matches!(op, LinearOp::FunctionFold { program, .. }
                 | LinearOp::GuardedFunctionFold { program, .. }
                 if ops_reference_seeded_inputs(&program.update, seed_mode))
+            || matches!(op, LinearOp::FunctionConditional { program, .. }
+                if program
+                    .arms
+                    .iter()
+                    .flat_map(|arm| [&arm.condition, &arm.result])
+                    .chain(std::iter::once(&program.fallback))
+                    .any(|region| ops_reference_seeded_inputs(region, seed_mode)))
     })
 }
 
@@ -498,7 +523,7 @@ struct LinSolveJvpInput<'ops> {
     matrix_pattern: rumoca_ir_solve::StructuralPattern,
     metadata: rumoca_ir_solve::TensorNodeMetadata,
     span: rumoca_core::Span,
-    seed_mode: SeedMode,
+    seed_mode: SeedMode<'ops>,
 }
 
 fn lower_linsolve_jvp_node(input: LinSolveJvpInput<'_>) -> Result<ComputeNode, LowerError> {
@@ -593,6 +618,26 @@ pub fn lower_scalar_program_block_ad(
     )
 }
 
+/// The forward-mode JVP of `block` over `[solver-y | parameter]` seeds whose
+/// parameter seeds start at `p_seed_offset`, row-aligned with `block`.
+pub fn lower_scalar_program_block_full_jvp(
+    block: &rumoca_ir_solve::ScalarProgramBlock,
+    p_seed_offset: usize,
+) -> Result<rumoca_ir_solve::ScalarProgramBlock, LowerError> {
+    let rows = lower_scalar_program_rows_ad(
+        block.programs(),
+        block.program_spans(),
+        SeedMode::SolverYAndP { p_seed_offset },
+        "full scalar program JVP row count",
+    )?;
+    rumoca_ir_solve::ScalarProgramBlock::with_output_indices(
+        rows,
+        block.program_spans().to_vec(),
+        block.output_indices().to_vec(),
+    )
+    .map_err(LowerError::from)
+}
+
 pub fn lower_scalar_program_block_full_ad_with_spans(
     primal_rows: &[Vec<LinearOp>],
     row_spans: &[rumoca_core::Span],
@@ -611,7 +656,7 @@ pub fn lower_scalar_program_block_full_ad_with_spans(
 fn lower_scalar_program_rows_ad(
     primal_rows: &[Vec<LinearOp>],
     row_spans: &[rumoca_core::Span],
-    seed_mode: SeedMode,
+    seed_mode: SeedMode<'_>,
     context: &'static str,
 ) -> Result<Vec<Vec<LinearOp>>, LowerError> {
     let span = first_non_dummy_span(row_spans);
@@ -674,7 +719,7 @@ fn first_non_dummy_span(spans: &[rumoca_core::Span]) -> Option<rumoca_core::Span
 
 fn lower_row_ad_with_span(
     primal_ops: &[LinearOp],
-    seed_mode: SeedMode,
+    seed_mode: SeedMode<'_>,
     span: Option<rumoca_core::Span>,
     fold_program_cache: FoldAdCache,
 ) -> Result<Vec<LinearOp>, LowerError> {
@@ -687,9 +732,12 @@ fn lower_row_ad_with_span(
 }
 
 #[derive(Clone, Copy, Default)]
-enum SeedMode {
+enum SeedMode<'a> {
     #[default]
     SolverYOnly,
+    SolverYSubset {
+        active: &'a [usize],
+    },
     SolverYAndP {
         p_seed_offset: usize,
     },
@@ -703,31 +751,35 @@ enum StoreOutputMode {
     Dual,
 }
 
-struct AdBuilder {
+struct AdBuilder<'a> {
     ops: Vec<LinearOp>,
     next_reg: Reg,
     map: HashMap<Reg, DualReg>,
+    unary_values: HashMap<(UnaryOp, Reg), Reg>,
+    tangent_planes: HashMap<(Reg, usize), Reg>,
     cached_zero: Option<Reg>,
     cached_one: Option<Reg>,
     cached_ln10: Option<Reg>,
-    cached_two: Option<Reg>,
-    seed_mode: SeedMode,
+    cached_half: Option<Reg>,
+    seed_mode: SeedMode<'a>,
     span: Option<rumoca_core::Span>,
     store_output_mode: StoreOutputMode,
     fold_program_cache: FoldAdCache,
     conditional_program_cache: ConditionalAdCache,
 }
 
-impl Default for AdBuilder {
+impl Default for AdBuilder<'_> {
     fn default() -> Self {
         Self {
             ops: Vec::new(),
             next_reg: 0,
             map: HashMap::new(),
+            unary_values: HashMap::new(),
+            tangent_planes: HashMap::new(),
             cached_zero: None,
             cached_one: None,
             cached_ln10: None,
-            cached_two: None,
+            cached_half: None,
             seed_mode: SeedMode::default(),
             span: None,
             store_output_mode: StoreOutputMode::Derivative,
@@ -737,12 +789,12 @@ impl Default for AdBuilder {
     }
 }
 
-impl AdBuilder {
-    fn new_with_span(seed_mode: SeedMode, span: rumoca_core::Span) -> Self {
+impl<'a> AdBuilder<'a> {
+    fn new_with_span(seed_mode: SeedMode<'a>, span: rumoca_core::Span) -> Self {
         Self::new_with_optional_span(seed_mode, Some(span))
     }
 
-    fn new_with_optional_span(seed_mode: SeedMode, span: Option<rumoca_core::Span>) -> Self {
+    fn new_with_optional_span(seed_mode: SeedMode<'a>, span: Option<rumoca_core::Span>) -> Self {
         Self {
             seed_mode,
             span,
@@ -751,7 +803,7 @@ impl AdBuilder {
     }
 
     fn new_with_optional_span_and_fold_cache(
-        seed_mode: SeedMode,
+        seed_mode: SeedMode<'a>,
         span: Option<rumoca_core::Span>,
         fold_program_cache: FoldAdCache,
     ) -> Self {
@@ -1100,6 +1152,9 @@ impl AdBuilder {
         if input_starts.len() != site.inputs().len() {
             return Err(unsupported("typed pure-call AD input interface mismatch"));
         }
+        if self.lower_zero_tangent_call(dst_start, input_starts, &site)? {
+            return Ok(());
+        }
         let mut directional_inputs = Vec::with_capacity(directional.inputs().len());
         for (&start, value_type) in input_starts.iter().zip(site.inputs()) {
             let count = value_type.scalar_count() as usize;
@@ -1142,11 +1197,7 @@ impl AdBuilder {
         let mut directional_offset = 0usize;
         for output in site.outputs() {
             let count = output.value_type().scalar_count() as usize;
-            let has_tangent = output.kind() == rumoca_ir_solve::SolvePureCallOutputKind::Result
-                && matches!(
-                    output.value_type().element_type(),
-                    rumoca_ir_solve::SolveScalarType::Real { .. }
-                );
+            let has_tangent = output.carries_tangent();
             let primal_start = checked_ad_reg_offset(
                 directional_start,
                 directional_offset,
@@ -1747,14 +1798,18 @@ impl AdBuilder {
 
     fn lower_load_y(&mut self, dst: Reg, index: usize) -> Result<(), LowerError> {
         let re = self.emit_load_y(index)?;
-        let du = self.emit_load_seed(index)?;
+        let du = if self.seed_mode.y_is_active(index) {
+            self.emit_load_seed(index)?
+        } else {
+            self.zero_reg()?
+        };
         self.bind(dst, DualReg { re, du })
     }
 
     fn lower_load_p(&mut self, dst: Reg, index: usize) -> Result<(), LowerError> {
         let re = self.emit_load_p(index)?;
         let du = match self.seed_mode {
-            SeedMode::SolverYOnly => self.zero_reg()?,
+            SeedMode::SolverYOnly | SeedMode::SolverYSubset { .. } => self.zero_reg()?,
             SeedMode::SolverYAndP { .. } => self.emit_load_seed(self.p_seed_index(index)?)?,
         };
         self.bind(dst, DualReg { re, du })
@@ -1775,7 +1830,7 @@ impl AdBuilder {
         let idx = self.lookup(index)?;
         let re = self.emit_load_indexed_p(base, count, idx.re)?;
         let du = match self.seed_mode {
-            SeedMode::SolverYOnly => self.zero_reg()?,
+            SeedMode::SolverYOnly | SeedMode::SolverYSubset { .. } => self.zero_reg()?,
             SeedMode::SolverYAndP { .. } => {
                 self.emit_load_indexed_seed(self.p_seed_index(base)?, count, idx.re)?
             }
@@ -2163,6 +2218,10 @@ impl AdBuilder {
 
     fn lower_unary(&mut self, dst: Reg, op: UnaryOp, arg: Reg) -> Result<(), LowerError> {
         let x = self.lookup(arg)?;
+        if self.tangent_is_zero(x) {
+            let re = self.emit_unary(op, x.re)?;
+            return self.bind(dst, DualReg { re, du: x.du });
+        }
         let out = self.unary_dual(op, x)?;
         self.bind(dst, out)
     }
@@ -2191,16 +2250,10 @@ impl AdBuilder {
         for term in 0..count {
             let lhs = self.lookup(lhs_operand.start + (term * lhs_operand.stride) as Reg)?;
             let rhs = self.lookup(rhs_operand.start + (term * rhs_operand.stride) as Reg)?;
-            let re = self.emit_binary(BinaryOp::Mul, lhs.re, rhs.re)?;
-            let lhs_du = self.emit_binary(BinaryOp::Mul, lhs.du, rhs.re)?;
-            let rhs_du = self.emit_binary(BinaryOp::Mul, lhs.re, rhs.du)?;
-            let du = self.emit_binary(BinaryOp::Add, lhs_du, rhs_du)?;
+            let product = self.binary_dual(BinaryOp::Mul, lhs, rhs)?;
             sum = Some(match sum {
-                Some(sum) => DualReg {
-                    re: self.emit_binary(BinaryOp::Add, sum.re, re)?,
-                    du: self.emit_binary(BinaryOp::Add, sum.du, du)?,
-                },
-                None => DualReg { re, du },
+                Some(sum) => self.binary_dual(BinaryOp::Add, sum, product)?,
+                None => product,
             });
         }
         let sum = match sum {
@@ -2234,6 +2287,22 @@ impl AdBuilder {
         let lhs_count = checked_ad_product(rows, inner, self.span, "matrix multiply lhs")?;
         let rhs_count = checked_ad_product(inner, columns, self.span, "matrix multiply rhs")?;
         let output_count = checked_ad_product(rows, columns, self.span, "matrix multiply output")?;
+        if self.lower_inactive_bilinear_factors(
+            dst_start,
+            [(lhs_start, lhs_count), (rhs_start, rhs_count)],
+            output_count,
+            |dst_start, lhs_start, rhs_start| LinearOp::MatrixMultiply {
+                dst_start,
+                lhs_start,
+                rhs_start,
+                rows,
+                inner,
+                columns,
+                lanes: 1,
+            },
+        )? {
+            return Ok(());
+        }
         let lhs_start = self.pack_dual_register_range(lhs_start, lhs_count)?;
         let rhs_start = self.pack_dual_register_range(rhs_start, rhs_count)?;
         let dual_start = self.next_reg;
@@ -2294,6 +2363,43 @@ impl AdBuilder {
         }
         let lhs_count = if lhs_stride == 0 { 1 } else { count };
         let rhs_count = if rhs_stride == 0 { 1 } else { count };
+        if op == BinaryOp::Mul
+            && self.lower_inactive_bilinear_factors(
+                dst_start,
+                [(lhs_start, lhs_count), (rhs_start, rhs_count)],
+                count,
+                |dst_start, lhs_start, rhs_start| LinearOp::TensorBinary {
+                    dst_start,
+                    op,
+                    lhs_start,
+                    rhs_start,
+                    count,
+                    lhs_stride,
+                    rhs_stride,
+                    lanes: 1,
+                },
+            )?
+        {
+            return Ok(());
+        }
+        if self.range_tangent_is_zero(lhs_start, lhs_count)?
+            && self.range_tangent_is_zero(rhs_start, rhs_count)?
+        {
+            let lhs_start = self.pack_primal_range(lhs_start, lhs_count)?;
+            let rhs_start = self.pack_primal_range(rhs_start, rhs_count)?;
+            return self.emit_zero_tangent_result(dst_start, count, |dst_start| {
+                LinearOp::TensorBinary {
+                    dst_start,
+                    op,
+                    lhs_start,
+                    rhs_start,
+                    count,
+                    lhs_stride,
+                    rhs_stride,
+                    lanes: 1,
+                }
+            });
+        }
         let lhs_start = self.pack_dual_register_range(lhs_start, lhs_count)?;
         let rhs_start = self.pack_dual_register_range(rhs_start, rhs_count)?;
         let dual_start = self.next_reg;
@@ -2341,6 +2447,19 @@ impl AdBuilder {
             return Err(unsupported(
                 "forward AD expects a primal tensor cross product with one lane",
             ));
+        }
+        if self.lower_inactive_bilinear_factors(
+            dst_start,
+            [(lhs_start, 3), (rhs_start, 3)],
+            3,
+            |dst_start, lhs_start, rhs_start| LinearOp::TensorCross {
+                dst_start,
+                lhs_start,
+                rhs_start,
+                lanes: 1,
+            },
+        )? {
+            return Ok(());
         }
         let lhs_start = self.pack_dual_register_range(lhs_start, 3)?;
         let rhs_start = self.pack_dual_register_range(rhs_start, 3)?;
@@ -2395,6 +2514,19 @@ impl AdBuilder {
             self.span,
             "tensor transpose element width",
         )?;
+        if self.range_tangent_is_zero(src_start, count)? {
+            let src_start = self.pack_primal_range(src_start, count)?;
+            return self.emit_zero_tangent_result(dst_start, count, |dst_start| {
+                LinearOp::TensorTranspose {
+                    dst_start,
+                    src_start,
+                    rows,
+                    columns,
+                    element_width,
+                    lanes: 1,
+                }
+            });
+        }
         let src_start = self.pack_dual_register_range(src_start, count)?;
         let dual_start = self.next_reg;
         for _ in 0..checked_ad_product(count, 2, self.span, "tensor transpose dual output")? {
@@ -2616,6 +2748,16 @@ impl AdBuilder {
             ));
         }
         let value = self.lookup(value_start)?;
+        if self.tangent_is_zero(value) {
+            return self.emit_zero_tangent_result(dst_start, count, |dst_start| {
+                LinearOp::TensorFill {
+                    dst_start,
+                    value_start: value.re,
+                    count,
+                    lanes: 1,
+                }
+            });
+        }
         let value_start = self.pack_registers(&[value.re, value.du])?;
         let dual_start = self.next_reg;
         for _ in 0..checked_ad_product(count, 2, self.span, "tensor fill dual output")? {
@@ -2658,33 +2800,11 @@ impl AdBuilder {
             ));
         }
         let count = checked_ad_product(size, size, self.span, "tensor identity")?;
-        let dual_start = self.next_reg;
-        for _ in 0..checked_ad_product(count, 2, self.span, "tensor identity dual output")? {
-            self.alloc_reg()?;
-        }
-        self.ops.push(LinearOp::TensorIdentity {
-            dst_start: dual_start,
+        self.emit_zero_tangent_result(dst_start, count, |dst_start| LinearOp::TensorIdentity {
+            dst_start,
             size,
-            lanes: 2,
-        });
-        for offset in 0..count {
-            let primal =
-                checked_ad_reg_offset(dst_start, offset, self.span, "tensor identity output")?;
-            let dual = checked_ad_reg_offset(
-                dual_start,
-                checked_ad_product(offset, 2, self.span, "tensor identity dual lane")?,
-                self.span,
-                "tensor identity dual output",
-            )?;
-            self.bind(
-                primal,
-                DualReg {
-                    re: dual,
-                    du: dual + 1,
-                },
-            )?;
-        }
-        Ok(())
+            lanes: 1,
+        })
     }
 
     fn lower_tensor_load(
@@ -2701,42 +2821,34 @@ impl AdBuilder {
                 "forward AD expects a primal tensor load with one lane and no seed",
             ));
         }
+        if input == rumoca_ir_solve::TensorInputKind::Y
+            && let SeedMode::SolverYSubset { active } = self.seed_mode
+        {
+            return self.lower_domain_tensor_load(dst_start, input_start, count, active);
+        }
         let seed_start = match (input, self.seed_mode) {
             (rumoca_ir_solve::TensorInputKind::Y, _) => Some(input_start),
-            (rumoca_ir_solve::TensorInputKind::P, SeedMode::SolverYOnly) => None,
+            (
+                rumoca_ir_solve::TensorInputKind::P,
+                SeedMode::SolverYOnly | SeedMode::SolverYSubset { .. },
+            ) => None,
             (rumoca_ir_solve::TensorInputKind::P, SeedMode::SolverYAndP { .. }) => {
                 Some(self.p_seed_index(input_start)?)
             }
         };
-        let dual_start = self.next_reg;
-        for _ in 0..checked_ad_product(count, 2, self.span, "tensor load dual output")? {
-            self.alloc_reg()?;
+        if seed_start.is_none() {
+            return self.emit_zero_tangent_result(dst_start, count, |dst_start| {
+                LinearOp::TensorLoad {
+                    dst_start,
+                    input,
+                    input_start,
+                    count,
+                    seed_start: None,
+                    lanes: 1,
+                }
+            });
         }
-        self.ops.push(LinearOp::TensorLoad {
-            dst_start: dual_start,
-            input,
-            input_start,
-            count,
-            seed_start,
-            lanes: 2,
-        });
-        for offset in 0..count {
-            let primal = checked_ad_reg_offset(dst_start, offset, self.span, "tensor load output")?;
-            let dual = checked_ad_reg_offset(
-                dual_start,
-                checked_ad_product(offset, 2, self.span, "tensor load dual lane")?,
-                self.span,
-                "tensor load dual output",
-            )?;
-            self.bind(
-                primal,
-                DualReg {
-                    re: dual,
-                    du: dual + 1,
-                },
-            )?;
-        }
-        Ok(())
+        self.lower_active_tensor_load(dst_start, input, input_start, count, seed_start)
     }
 
     fn lower_compare(
@@ -2829,14 +2941,7 @@ impl AdBuilder {
                         != usize::try_from(register).ok()
                 })
         {
-            let packed_start = self.next_reg;
-            for source in &sources {
-                let destination = self.alloc_reg()?;
-                self.ops.push(LinearOp::Move {
-                    dst: destination,
-                    src: *source,
-                });
-            }
+            let packed_start = self.pack_registers(&sources)?;
             self.ops.push(LinearOp::StoreOutputRange {
                 start: packed_start,
                 count: sources.len(),
@@ -2946,15 +3051,13 @@ impl AdBuilder {
         let x_sq = self.emit_binary(BinaryOp::Mul, x.re, x.re)?;
         let denom_sq = self.emit_binary(BinaryOp::Sub, one, x_sq)?;
         let denom = self.emit_unary(UnaryOp::Sqrt, denom_sq)?;
-        let safe = self.emit_binary(BinaryOp::Div, x.du, denom)?;
-        let signed = if is_acos {
-            self.emit_unary(UnaryOp::Neg, safe)?
+        let reciprocal = self.emit_binary(BinaryOp::Div, one, denom)?;
+        let partial = if is_acos {
+            self.emit_unary(UnaryOp::Neg, reciprocal)?
         } else {
-            safe
+            reciprocal
         };
-        let zero = self.zero_reg()?;
-        let du_zero = self.emit_compare(CompareOp::Eq, x.du, zero)?;
-        let du = self.emit_select(du_zero, zero, signed)?;
+        let du = self.scale_by_finite_partial(x.du, partial)?;
         Ok(DualReg { re, du })
     }
 
@@ -2965,28 +3068,39 @@ impl AdBuilder {
             UnaryOp::Log
         };
         let re = self.emit_unary(op, x.re)?;
-        let zero = self.zero_reg()?;
-        let nonzero = self.emit_compare(CompareOp::Ne, x.re, zero)?;
         let denom = if is_log10 {
             let ln10 = self.ln10_reg()?;
             self.emit_binary(BinaryOp::Mul, x.re, ln10)?
         } else {
             x.re
         };
-        let safe = self.emit_binary(BinaryOp::Div, x.du, denom)?;
-        let du = self.emit_select(nonzero, safe, zero)?;
+        let one = self.one_reg()?;
+        let partial = self.emit_binary(BinaryOp::Div, one, denom)?;
+        let du = self.scale_by_finite_partial(x.du, partial)?;
         Ok(DualReg { re, du })
     }
 
     fn lower_sqrt(&mut self, x: DualReg) -> Result<DualReg, LowerError> {
         let re = self.emit_unary(UnaryOp::Sqrt, x.re)?;
-        let zero = self.zero_reg()?;
-        let nonzero = self.emit_compare(CompareOp::Ne, x.re, zero)?;
-        let two = self.two_reg()?;
-        let denom = self.emit_binary(BinaryOp::Mul, two, re)?;
-        let safe = self.emit_binary(BinaryOp::Div, x.du, denom)?;
-        let du = self.emit_select(nonzero, safe, zero)?;
+        let half = self.half_reg()?;
+        let partial = self.emit_binary(BinaryOp::Div, half, re)?;
+        let du = self.scale_by_finite_partial(x.du, partial)?;
         Ok(DualReg { re, du })
+    }
+
+    /// `tangent · partial` when the local partial is finite, and zero where it
+    /// does not exist (the `rumoca_eval_solve::reverse` kink rules). `p - p` is
+    /// `0` exactly for every finite `p` and NaN for an infinite or NaN one.
+    fn scale_by_finite_partial(&mut self, tangent: Reg, partial: Reg) -> Result<Reg, LowerError> {
+        let guarded = self.finite_or_zero(partial)?;
+        self.emit_binary(BinaryOp::Mul, tangent, guarded)
+    }
+
+    fn finite_or_zero(&mut self, value: Reg) -> Result<Reg, LowerError> {
+        let zero = self.zero_reg()?;
+        let difference = self.emit_binary(BinaryOp::Sub, value, value)?;
+        let finite = self.emit_compare(CompareOp::Eq, difference, zero)?;
+        self.emit_select(finite, value, zero)
     }
 
     fn binary_dual(
@@ -2995,6 +3109,10 @@ impl AdBuilder {
         lhs: DualReg,
         rhs: DualReg,
     ) -> Result<DualReg, LowerError> {
+        if op != BinaryOp::Div && self.tangent_is_zero(lhs) && self.tangent_is_zero(rhs) {
+            let re = self.emit_binary(op, lhs.re, rhs.re)?;
+            return Ok(DualReg { re, du: lhs.du });
+        }
         let out = match op {
             BinaryOp::Add => self.binary_add(lhs, rhs)?,
             BinaryOp::Sub => self.binary_sub(lhs, rhs)?,
@@ -3038,13 +3156,29 @@ impl AdBuilder {
         let denom_zero_re = self.emit_select(numer_zero, zero, safe_re)?;
         let re = self.emit_select(denom_zero, denom_zero_re, safe_re)?;
 
-        let term1 = self.emit_binary(BinaryOp::Mul, lhs.du, rhs.re)?;
-        let term2 = self.emit_binary(BinaryOp::Mul, lhs.re, rhs.du)?;
-        let numer_du = self.emit_binary(BinaryOp::Sub, term1, term2)?;
-        let rhs_sq = self.emit_binary(BinaryOp::Mul, rhs.re, rhs.re)?;
-        let safe_du = self.emit_binary(BinaryOp::Div, numer_du, rhs_sq)?;
-        let du = self.emit_select(denom_zero, zero, safe_du)?;
+        if self.tangent_is_zero(lhs) && self.tangent_is_zero(rhs) {
+            return Ok(DualReg { re, du: zero });
+        }
 
+        // Each local partial when finite (the `rumoca_eval_solve::reverse`
+        // kink rules): a zero, subnormal, or huge denominator zeroes the
+        // partial that does not exist.
+        let lhs_term = if self.tangent_is_zero(lhs) {
+            None
+        } else {
+            let one = self.one_reg()?;
+            let partial = self.emit_binary(BinaryOp::Div, one, rhs.re)?;
+            Some(self.scale_by_finite_partial(lhs.du, partial)?)
+        };
+        let rhs_term = if self.tangent_is_zero(rhs) {
+            None
+        } else {
+            let negated = self.emit_unary(UnaryOp::Neg, lhs.re)?;
+            let rhs_sq = self.emit_binary(BinaryOp::Mul, rhs.re, rhs.re)?;
+            let partial = self.emit_binary(BinaryOp::Div, negated, rhs_sq)?;
+            Some(self.scale_by_finite_partial(rhs.du, partial)?)
+        };
+        let du = self.sum_terms(lhs_term, rhs_term)?;
         Ok(DualReg { re, du })
     }
 
@@ -3054,30 +3188,42 @@ impl AdBuilder {
         Ok(DualReg { re, du })
     }
 
+    /// The `pow` kink rule of `rumoca_eval_solve::reverse`: the base partial
+    /// `r·l^(r-1)` when finite, the exponent partial `l^r·ln(l)` only for
+    /// `l > 0` and when finite. Each partial depends on the primal operands
+    /// alone, so a seeded exponent never changes the base term.
     fn lower_pow_du(&mut self, lhs: DualReg, rhs: DualReg, re: Reg) -> Result<Reg, LowerError> {
-        let zero = self.zero_reg()?;
-        let one = self.one_reg()?;
-        let rhs_du_zero = self.emit_compare(CompareOp::Eq, rhs.du, zero)?;
+        let base_term = if self.tangent_is_zero(lhs) {
+            None
+        } else {
+            let one = self.one_reg()?;
+            let rhs_minus_one = self.emit_binary(BinaryOp::Sub, rhs.re, one)?;
+            let x_pow_n_minus_1 = self.emit_binary(BinaryOp::Pow, lhs.re, rhs_minus_one)?;
+            let partial = self.emit_binary(BinaryOp::Mul, rhs.re, x_pow_n_minus_1)?;
+            Some(self.scale_by_finite_partial(lhs.du, partial)?)
+        };
+        let exponent_term = if self.tangent_is_zero(rhs) {
+            None
+        } else {
+            let zero = self.zero_reg()?;
+            let ln_x = self.emit_unary(UnaryOp::Log, lhs.re)?;
+            let partial = self.emit_binary(BinaryOp::Mul, re, ln_x)?;
+            let finite = self.finite_or_zero(partial)?;
+            let lhs_positive = self.emit_compare(CompareOp::Gt, lhs.re, zero)?;
+            let guarded = self.emit_select(lhs_positive, finite, zero)?;
+            Some(self.emit_binary(BinaryOp::Mul, rhs.du, guarded)?)
+        };
+        self.sum_terms(base_term, exponent_term)
+    }
 
-        let lhs_re_zero = self.emit_compare(CompareOp::Eq, lhs.re, zero)?;
-        let rhs_re_one = self.emit_compare(CompareOp::Eq, rhs.re, one)?;
-        let rhs_minus_one = self.emit_binary(BinaryOp::Sub, rhs.re, one)?;
-        let x_pow_n_minus_1 = self.emit_binary(BinaryOp::Pow, lhs.re, rhs_minus_one)?;
-        let n_times = self.emit_binary(BinaryOp::Mul, rhs.re, x_pow_n_minus_1)?;
-        let const_exp_safe = self.emit_binary(BinaryOp::Mul, n_times, lhs.du)?;
-        let lhs_zero_branch = self.emit_select(rhs_re_one, lhs.du, zero)?;
-        let const_exp_du = self.emit_select(lhs_re_zero, lhs_zero_branch, const_exp_safe)?;
-
-        let lhs_positive = self.emit_compare(CompareOp::Gt, lhs.re, zero)?;
-        let ln_x = self.emit_unary(UnaryOp::Log, lhs.re)?;
-        let term1 = self.emit_binary(BinaryOp::Mul, rhs.du, ln_x)?;
-        let xprime_over_x = self.emit_binary(BinaryOp::Div, lhs.du, lhs.re)?;
-        let term2 = self.emit_binary(BinaryOp::Mul, rhs.re, xprime_over_x)?;
-        let sum = self.emit_binary(BinaryOp::Add, term1, term2)?;
-        let var_exp_safe = self.emit_binary(BinaryOp::Mul, re, sum)?;
-        let var_exp_du = self.emit_select(lhs_positive, var_exp_safe, zero)?;
-
-        self.emit_select(rhs_du_zero, const_exp_du, var_exp_du)
+    /// The sum of the operand terms of a binary tangent, omitting a term whose
+    /// operand carries no tangent.
+    fn sum_terms(&mut self, lhs: Option<Reg>, rhs: Option<Reg>) -> Result<Reg, LowerError> {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) => self.emit_binary(BinaryOp::Add, lhs, rhs),
+            (Some(term), None) | (None, Some(term)) => Ok(term),
+            (None, None) => self.zero_reg(),
+        }
     }
 
     fn binary_bool(
@@ -3093,13 +3239,26 @@ impl AdBuilder {
 
     fn binary_atan2(&mut self, lhs: DualReg, rhs: DualReg) -> Result<DualReg, LowerError> {
         let re = self.emit_binary(BinaryOp::Atan2, lhs.re, rhs.re)?;
-        let term1 = self.emit_binary(BinaryOp::Mul, lhs.du, rhs.re)?;
-        let term2 = self.emit_binary(BinaryOp::Mul, lhs.re, rhs.du)?;
-        let numer = self.emit_binary(BinaryOp::Sub, term1, term2)?;
         let lhs_sq = self.emit_binary(BinaryOp::Mul, lhs.re, lhs.re)?;
         let rhs_sq = self.emit_binary(BinaryOp::Mul, rhs.re, rhs.re)?;
         let denom = self.emit_binary(BinaryOp::Add, lhs_sq, rhs_sq)?;
-        let du = self.emit_binary(BinaryOp::Div, numer, denom)?;
+        // Each local partial when finite (the `rumoca_eval_solve::reverse`
+        // kink rules), so the origin, where both are `0 / 0`, contributes
+        // nothing.
+        let lhs_term = if self.tangent_is_zero(lhs) {
+            None
+        } else {
+            let partial = self.emit_binary(BinaryOp::Div, rhs.re, denom)?;
+            Some(self.scale_by_finite_partial(lhs.du, partial)?)
+        };
+        let rhs_term = if self.tangent_is_zero(rhs) {
+            None
+        } else {
+            let negated = self.emit_unary(UnaryOp::Neg, lhs.re)?;
+            let partial = self.emit_binary(BinaryOp::Div, negated, denom)?;
+            Some(self.scale_by_finite_partial(rhs.du, partial)?)
+        };
+        let du = self.sum_terms(lhs_term, rhs_term)?;
         Ok(DualReg { re, du })
     }
 
@@ -3158,6 +3317,9 @@ impl AdBuilder {
         {
             return Ok(start);
         }
+        if let Some(start) = self.pack_compact_registers(regs)? {
+            return Ok(start);
+        }
         let start = self.next_reg;
         for &src in regs {
             let dst = self.alloc_reg()?;
@@ -3174,25 +3336,8 @@ impl AdBuilder {
         if count == 0 {
             return Ok(self.next_reg);
         }
-        let first = self.lookup(primal_start)?;
-        let already_interleaved = first.du == first.re.saturating_add(1)
-            && (0..count).all(|offset| {
-                let Ok(primal) =
-                    checked_ad_reg_offset(primal_start, offset, self.span, "dual register range")
-                else {
-                    return false;
-                };
-                let Ok(value) = self.lookup(primal) else {
-                    return false;
-                };
-                let Ok(lane) = u32::try_from(offset.saturating_mul(2)) else {
-                    return false;
-                };
-                value.re == first.re.saturating_add(lane)
-                    && value.du == first.re.saturating_add(lane).saturating_add(1)
-            });
-        if already_interleaved {
-            return Ok(first.re);
+        if let Some(start) = self.interleaved_dual_range(primal_start, count)? {
+            return Ok(start);
         }
         let capacity = checked_ad_product(count, 2, self.span, "dual register range")?;
         let mut registers = ad_vec_with_capacity(capacity, "dual register range", self.span)?;
@@ -3263,7 +3408,7 @@ impl AdBuilder {
 
     fn p_seed_index(&self, index: usize) -> Result<usize, LowerError> {
         match self.seed_mode {
-            SeedMode::SolverYOnly => Ok(index),
+            SeedMode::SolverYOnly | SeedMode::SolverYSubset { .. } => Ok(index),
             SeedMode::SolverYAndP { p_seed_offset } => {
                 p_seed_offset.checked_add(index).ok_or_else(|| {
                     ad_optional_contract_violation(
@@ -3326,8 +3471,12 @@ impl AdBuilder {
     }
 
     fn emit_unary(&mut self, op: UnaryOp, arg: Reg) -> Result<Reg, LowerError> {
+        if let Some(&value) = self.unary_values.get(&(op, arg)) {
+            return Ok(value);
+        }
         let dst = self.alloc_reg()?;
         self.ops.push(LinearOp::Unary { dst, op, arg });
+        self.unary_values.insert((op, arg), dst);
         Ok(dst)
     }
 
@@ -3381,12 +3530,12 @@ impl AdBuilder {
         Ok(reg)
     }
 
-    fn two_reg(&mut self) -> Result<Reg, LowerError> {
-        if let Some(reg) = self.cached_two {
+    fn half_reg(&mut self) -> Result<Reg, LowerError> {
+        if let Some(reg) = self.cached_half {
             return Ok(reg);
         }
-        let reg = self.emit_const(2.0)?;
-        self.cached_two = Some(reg);
+        let reg = self.emit_const(0.5)?;
+        self.cached_half = Some(reg);
         Ok(reg)
     }
 }
@@ -3446,7 +3595,7 @@ fn ad_vec_with_capacity<T>(
 }
 
 fn collect_dual_range(
-    builder: &AdBuilder,
+    builder: &AdBuilder<'_>,
     start: Reg,
     len: usize,
     span: impl Into<Option<rumoca_core::Span>>,

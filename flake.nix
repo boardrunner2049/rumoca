@@ -158,6 +158,10 @@
               && !(pkgs.lib.hasInfix "node_modules" rel)
             )
             || pkgs.lib.hasPrefix ".cargo" rel
+            # vendor/diffsol is a patched path dependency the workspace builds
+            # from source; keep its tree (and the vendor dir so it is walked).
+            || rel == "vendor"
+            || pkgs.lib.hasPrefix "vendor/diffsol" rel
             || rel == "Cargo.toml"
             || rel == "Cargo.lock"
             || rel == "rust-toolchain.toml";
@@ -239,7 +243,7 @@
             inherit src;
             cargoRoot = ".";
             name = "rumoca-${rumocaVersion}-cargo-vendor";
-            hash = "sha256-OzV54twIb0dZ94mDUK5UEPaWAZXafgJTSQ99qa5P/vY=";
+            hash = "sha256-SpoMApRQ/q34H5dbyW3bV2b5S/UxUBU48OrJZmXP9NY=";
           };
           nativeBuildInputs = [
             rustToolchain
@@ -450,6 +454,10 @@
         devShells.ci-python-wheel = mkDevShell [
           pkgs.maturin
           pkgs.python312
+          # `zig` lets `maturin build --zig` cross-link the Linux wheels
+          # against an older glibc, so they carry a real manylinux platform
+          # tag that PyPI accepts instead of a bare `linux_*` tag.
+          pkgs.zig
         ];
         # WASM packaging needs the workspace build inputs plus the JavaScript
         # and optimization tools. Keep the interactive shell's Rumoca, OMC,
@@ -474,7 +482,23 @@
         );
         devShells.ci-template-fmi = fmiShell;
         devShells.ci-template-modelica = modelicaShell;
-        devShells.ci-template-wasm = templateRuntimeShell [ pkgs.wasm-tools ];
+        devShells.ci-template-wasm =
+          let
+            wasiCc = pkgs.pkgsCross.wasi32.stdenv.cc;
+          in
+          (templateRuntimeShell [
+            pkgs.wasm-tools
+            wasiCc
+          ]).overrideAttrs
+            (old: {
+              # The fmi-ls-wasm target compiles the shared FMI 3 C kernel for
+              # wasm32-wasip2 through the cc crate, which reads these variables.
+              shellHook = (old.shellHook or "") + ''
+                export CC_wasm32_wasip2="${wasiCc}/bin/wasm32-unknown-wasi-clang"
+                export AR_wasm32_wasip2="${wasiCc}/bin/wasm32-unknown-wasi-ar"
+                export NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING=1
+              '';
+            });
         devShells.ci-template-python = templateRuntimeShell [ ciPython ];
         devShells.ci-template-julia = juliaShell;
       }

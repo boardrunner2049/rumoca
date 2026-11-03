@@ -1,4 +1,8 @@
+// SPEC_0021 file-size exception: this suite root is just over the 2000-line
+// action threshold; split plan: move the inline crate-boundary and facade
+// tests into topic modules beside `size_and_validation` and `totality_debt`.
 mod acceptance_surface;
+mod ad_only_jacobians;
 mod architecture_hardening_support;
 mod build_resource_budget;
 mod commit_messages;
@@ -13,6 +17,7 @@ mod instantiate_value_fabrication;
 mod parser_contract;
 mod parser_ownership;
 mod phase_diagnostics;
+mod process_allocator;
 mod public_api_surface;
 mod size_and_validation;
 mod solver_backend_boundary;
@@ -1491,9 +1496,11 @@ The Devices runtime factory belongs in rumoca-sim."
 
     // Adapter crates must depend on rumoca-input (not a separate types crate).
     for adapter in ["rumoca-input-gamepad", "rumoca-input-keyboard"] {
-        let adapter_toml =
-            fs::read_to_string(workspace_root().join(format!("crates/{adapter}/Cargo.toml")))
-                .unwrap_or_else(|error| panic!("read {adapter} Cargo.toml: {error}"));
+        let manifest = workspace_root().join(format!("crates/{adapter}/Cargo.toml"));
+        let adapter_toml = match fs::read_to_string(manifest) {
+            Ok(text) => text,
+            Err(error) => panic!("read {adapter} Cargo.toml: {error}"),
+        };
         assert!(
             section_contains_dependency(&adapter_toml, "dependencies", "rumoca-input"),
             "{adapter} must depend on rumoca-input for shared vocabulary"

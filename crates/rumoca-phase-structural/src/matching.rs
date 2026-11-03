@@ -1,5 +1,18 @@
 //! Maximum matching via augmenting paths (Kuhn's algorithm).
 //!
+//! The augmenting-path characterization of a maximum matching is C. Berge,
+//! "Two theorems in graph theory", PNAS 43(9):842-844, 1957; the name "Kuhn's
+//! algorithm" for the one-augmentation-per-vertex form traces to H. W. Kuhn,
+//! "The Hungarian method for the assignment problem", Naval Research Logistics
+//! Quarterly 2(1-2):83-97, 1955, doi:10.1002/nav.3800020109, whose assignment
+//! problem is the weighted case. The asymptotically faster phased variant is
+//! J. E. Hopcroft and R. M. Karp, "An n^(5/2) algorithm for maximum matchings
+//! in bipartite graphs", SIAM Journal on Computing 2(4):225-231, 1973,
+//! doi:10.1137/0202019. For the sparse-matrix setting this matching serves,
+//! including the ordering heuristics: I. S. Duff, "On algorithms for obtaining
+//! a maximum transversal", ACM Transactions on Mathematical Software
+//! 7(3):315-330, 1981, doi:10.1145/355958.355963.
+//!
 //! The compatibility graph arrives as [`IncidenceRows`]: compressed sparse rows
 //! whose runs are already ascending. That is what makes the traversal both
 //! allocation-free and deterministic -- the old code re-collected and re-sorted
@@ -12,6 +25,127 @@
 //! on long alternating chains, which array-shaped models produce routinely.
 
 use crate::incidence::rows::IncidenceRows;
+
+/// A maximum matching of `eq_vars` (equation to variable) and its size, grown
+/// from `seed`, a matching valid in these rows.
+///
+/// Hopcroft-Karp phases: a breadth-first layering from every unmatched
+/// equation, then depth-first augmentation along strictly increasing layers,
+/// retiring an equation once it has no path. A layering that reaches no free
+/// variable proves no augmenting path exists, so the matching is maximum, and
+/// the phase count grows only with the square root of the matching size.
+pub(crate) fn grow_maximum_matching(
+    n_var: usize,
+    eq_vars: &IncidenceRows,
+    seed: Vec<Option<usize>>,
+) -> (Vec<Option<usize>>, usize) {
+    let mut match_eq = seed;
+    let mut match_var: Vec<Option<usize>> = vec![None; n_var];
+    for (eq, var) in match_eq.iter().enumerate() {
+        if let Some(var) = *var {
+            debug_assert!(eq_vars.row(eq).binary_search(&var).is_ok());
+            match_var[var] = Some(eq);
+        }
+    }
+    let mut matched = match_eq.iter().filter(|var| var.is_some()).count();
+    let mut layer = vec![usize::MAX; match_eq.len()];
+    let mut queue = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    while layer_equations(eq_vars, &match_eq, &match_var, &mut layer, &mut queue) {
+        for start in 0..match_eq.len() {
+            if match_eq[start].is_some() {
+                continue;
+            }
+            stack.clear();
+            stack.push((start, 0));
+            if augment_layered(
+                eq_vars,
+                &mut match_eq,
+                &mut match_var,
+                &mut layer,
+                &mut stack,
+            ) {
+                matched += 1;
+            }
+        }
+    }
+    (match_eq, matched)
+}
+
+/// One depth-first search from the equation on `stack` along strictly
+/// increasing layers; an exhausted equation is retired from the phase. On
+/// reaching a free variable the path on the stack is flipped into the
+/// matching.
+fn augment_layered(
+    eq_vars: &IncidenceRows,
+    match_eq: &mut [Option<usize>],
+    match_var: &mut [Option<usize>],
+    layer: &mut [usize],
+    stack: &mut Vec<(usize, usize)>,
+) -> bool {
+    while let Some(&(eq, cursor)) = stack.last() {
+        let Some(&var) = eq_vars.row(eq).get(cursor) else {
+            layer[eq] = usize::MAX;
+            stack.pop();
+            continue;
+        };
+        if let Some(top) = stack.last_mut() {
+            top.1 += 1;
+        }
+        match match_var[var] {
+            None => {
+                // Each frame's last visited variable is the path edge.
+                for &(eq, cursor) in stack.iter() {
+                    let var = eq_vars.row(eq)[cursor - 1];
+                    match_eq[eq] = Some(var);
+                    match_var[var] = Some(eq);
+                }
+                return true;
+            }
+            Some(next) if layer[next] == layer[eq].saturating_add(1) => {
+                stack.push((next, 0));
+            }
+            Some(_) => {}
+        }
+    }
+    false
+}
+
+/// Layer the equations by alternating distance from the unmatched ones and
+/// report whether any free variable is reachable.
+fn layer_equations(
+    eq_vars: &IncidenceRows,
+    match_eq: &[Option<usize>],
+    match_var: &[Option<usize>],
+    layer: &mut [usize],
+    queue: &mut Vec<usize>,
+) -> bool {
+    queue.clear();
+    for (eq, var) in match_eq.iter().enumerate() {
+        layer[eq] = if var.is_none() {
+            queue.push(eq);
+            0
+        } else {
+            usize::MAX
+        };
+    }
+    let mut reachable = false;
+    let mut head = 0;
+    while let Some(&eq) = queue.get(head) {
+        head += 1;
+        for &var in eq_vars.row(eq) {
+            match match_var[var] {
+                None => reachable = true,
+                Some(next) if layer[next] == usize::MAX => {
+                    layer[next] = layer[eq] + 1;
+                    queue.push(next);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    reachable
+}
 
 pub(crate) fn maximum_matching_with_structured(
     n_eq: usize,
@@ -636,5 +770,57 @@ fn commit_augment(stack: &[AugmentFrame], matching: &mut Matching<'_>) {
         };
         matching.match_eq[frame.eq] = Some(variable);
         matching.match_var[variable] = Some(frame.eq);
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Every bipartite graph on four equations and four variables, grown
+    /// from an empty seed and from a greedy seed, reaches the size Kuhn's
+    /// search finds, with a matching that uses only row edges.
+    #[test]
+    fn grown_matchings_are_maximum_on_every_small_graph() {
+        for encoded in 0..1_u32 << 16 {
+            let sets: Vec<HashSet<usize>> = (0..4)
+                .map(|eq| {
+                    (0..4)
+                        .filter(|var| encoded >> (eq * 4 + var) & 1 == 1)
+                        .collect()
+                })
+                .collect();
+            let rows = IncidenceRows::from_sets(sets);
+            let (reference, _) = maximum_matching_with_structured(4, 4, &rows, &[], &[]);
+            let expected = reference.iter().flatten().count();
+            let mut taken = [false; 4];
+            let greedy = (0..4)
+                .map(|eq| {
+                    let var = rows.row(eq).iter().copied().find(|var| !taken[*var])?;
+                    taken[var] = true;
+                    Some(var)
+                })
+                .collect();
+            for seed in [vec![None; 4], greedy] {
+                let (matching, size) = grow_maximum_matching(4, &rows, seed);
+                assert_eq!(size, expected, "graph {encoded}");
+                assert_eq!(valid_matching_size(&rows, &matching), size);
+            }
+        }
+    }
+
+    /// The size of `matching`, asserting it pairs distinct variables through
+    /// row edges only.
+    fn valid_matching_size(rows: &IncidenceRows, matching: &[Option<usize>]) -> usize {
+        let mut used = HashSet::new();
+        for (eq, var) in matching
+            .iter()
+            .enumerate()
+            .filter_map(|(eq, var)| Some((eq, (*var)?)))
+        {
+            assert!(rows.row(eq).contains(&var) && used.insert(var));
+        }
+        used.len()
     }
 }

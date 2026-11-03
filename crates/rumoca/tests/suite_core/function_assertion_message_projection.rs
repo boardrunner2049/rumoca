@@ -10,7 +10,8 @@
 
 use rumoca::Compiler;
 use rumoca_ir_solve as solve;
-use rumoca_sim::{SimOptions, SimResult, simulate_dae_with_diagnostics};
+use rumoca_sim::{SimError, SimOptions, SimResult, simulate_dae, simulate_dae_with_diagnostics};
+use rumoca_solver::fmi_me::{MeError, session::MeSessionError};
 
 const CONCATENATED_MESSAGE: &str = r#"
 model ConcatenatedMessage
@@ -264,19 +265,25 @@ fn a_converted_argument_reads_the_value_the_owner_was_already_given() {
         .model("ArgCallMessage")
         .compile_str(ARGUMENT_FROM_A_CALL, "ArgCallMessage.mo")
         .expect("ArgCallMessage compiles");
-    let error = simulate_dae_with_diagnostics(
-        &compiled.dae,
-        &SimOptions {
-            t_end: 0.5,
-            ..SimOptions::default()
-        },
-    )
-    .expect_err("`y < 6` is violated once x reaches 1.5");
+    let options = SimOptions {
+        t_end: 0.5,
+        ..SimOptions::default()
+    };
+    let error =
+        simulate_dae(&compiled.dae, &options).expect_err("`y < 6` is violated once x reaches 1.5");
     // x = 1.5*exp(3t) - 0.5 reaches 1.5 at t = ln(4/3)/3, where the owner was
     // called with gate(1.5) = 2 and returned 3*2 = 6.
-    assert_eq!(
-        error.to_string(),
-        "Modelica assert failed at t=0.095894271: f rejects: u=2 y=6"
+    let SimError::ModelExchangeSession(MeSessionError::Component(component)) = error.kind() else {
+        panic!("expected a component assertion, got {error:?}");
+    };
+    let MeError::Assertion { time, message } = component.kind() else {
+        panic!("expected the function's assertion, got {component:?}");
+    };
+    assert_eq!(message, "f rejects: u=2 y=6");
+    let exact_state = 1.5 * (3.0 * time).exp() - 0.5;
+    assert!(
+        (exact_state - 1.5).abs() <= options.atol.max(options.rtol * 1.5),
+        "assertion at t={time} must locate x=1.5 within the integration accuracy"
     );
 }
 
@@ -350,4 +357,76 @@ fn a_refused_message_never_fires_the_nested_assertion_it_would_have_called() {
         reported.contains("call-specialized assertion message"),
         "the run stops at the refusal, not at a spurious abort: {reported}"
     );
+}
+
+/// The `Modelica.Fluid.Utilities.regFun3` shape: a nested function's
+/// assertion message converts its own arguments and locals, and its caller
+/// reaches it only in one branch, with arguments computed from its own locals.
+const NESTED_FRAME_MESSAGE: &str = r#"
+model NestedFrameMessage
+  function interp
+    input Real x;
+    input Real x0;
+    input Real x1;
+    output Real y;
+  protected
+    Real h;
+  algorithm
+    h := x1 - x0;
+    assert(h > 0, "interp: x0 = " + String(x0) + " x1 = " + String(x1) + " h = " + String(h));
+    y := x0 + h*x;
+  end interp;
+  function outerFn
+    input Real x;
+    input Real k;
+    output Real y;
+  protected
+    Real upper;
+  algorithm
+    upper := 2*k - 1;
+    if x > 0 then
+      y := interp(x, 1, upper);
+    else
+      y := x;
+    end if;
+  end outerFn;
+  Real x(start = 1.0, fixed = true);
+equation
+  der(x) = -outerFn(x, x);
+end NestedFrameMessage;
+"#;
+
+#[test]
+fn a_nested_assertion_renders_the_values_of_its_own_call_frame() {
+    let package = lower(
+        NESTED_FRAME_MESSAGE,
+        "NestedFrameMessage",
+        "NestedFrameMessage.mo",
+    );
+    // x = 0.75 calls interp(0.75, 1, 0.5), whose h = -0.5 violates `h > 0`;
+    // every converted value is the nested frame's argument or local.
+    assert_eq!(
+        assertion_message(&package, &[0.75]),
+        "interp: x0 = 1 x1 = 0.5 h = -0.5"
+    );
+}
+
+#[test]
+fn an_unselected_nested_assertion_never_fires() {
+    // For x <= 0 the caller never reaches `interp`, so its slots hold the
+    // unselected values and a run started at x = -1 follows x(t) = -exp(-t).
+    let result = simulate(
+        &NESTED_FRAME_MESSAGE.replace("start = 1.0", "start = -1.0"),
+        "NestedFrameMessage",
+        "NestedFrameMessage.mo",
+        0.5,
+    );
+    let xs = series(&result, "x");
+    for (t, x) in result.times.iter().zip(xs) {
+        let expected = -(-t).exp();
+        assert!(
+            (x - expected).abs() < 1e-5,
+            "der(x) = -x at t={t}: simulated {x}, closed form {expected}"
+        );
+    }
 }

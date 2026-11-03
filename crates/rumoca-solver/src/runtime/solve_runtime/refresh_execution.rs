@@ -68,7 +68,7 @@ impl SolveRuntime {
                 params,
                 tol,
                 max_iters,
-                certify_coordinates: false,
+                certify_coordinates: true,
             },
         )
     }
@@ -326,6 +326,8 @@ impl SolveRuntime {
         };
         let projection_model = RefreshProjectionModel {
             runtime: self,
+            seed_linearizations: None,
+            #[cfg(test)]
             plan: projection_plan,
             block_indices: &plan.simultaneous_block_indices,
             plan_validated: false,
@@ -375,6 +377,23 @@ impl SolveRuntime {
             params,
             t,
             self.state_count,
+            tol,
+        )
+    }
+
+    /// Check an initialization point; this API cannot alter a state coordinate.
+    pub fn certify_state_manifold(
+        &self,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        tol: f64,
+    ) -> Result<(), RuntimeSolveError> {
+        crate::runtime::projection::certify_state_manifold(
+            &RuntimeManifoldProjection { runtime: self },
+            y,
+            p,
+            t,
             tol,
         )
     }
@@ -567,7 +586,9 @@ impl SolveRuntime {
         solver_y: &mut [f64],
         params: &[f64],
     ) -> Result<(), RuntimeSolveError> {
-        if self.try_native_assignment_refresh(sequence, t, solver_y, params)? {
+        if self.try_native_assignment_refresh(sequence, t, solver_y, params)?
+            || self.try_interpreted_assignment_refresh(sequence, t, solver_y, params)?
+        {
             self.validate_refresh_values(plan, solver_y, params)?;
             return Ok(());
         }
@@ -627,16 +648,10 @@ impl SolveRuntime {
         let Some(compiled) = self.compiled_assignment_schedule(backend.as_ref(), sequence) else {
             return Ok(false);
         };
-        if compiled
+        compiled
             .call(solver_y, params, t, self.model.external_tables.as_slice())
-            .is_ok()
-        {
-            return Ok(true);
-        }
-        self.compiled_assignment_schedules
-            .borrow_mut()
-            .insert(sequence, None);
-        Ok(false)
+            .map_err(RuntimeSolveError::solve_ir)?;
+        Ok(true)
     }
 
     fn compiled_assignment_schedule(

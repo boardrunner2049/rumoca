@@ -17,10 +17,9 @@ This stays `DRAFT` until AST proofs, `flat::Model`, `Dae`, `SolveProblem`, and
 `SolveAlgorithmBlock` hide invariant fields/root validators. Solve sparsity follows
 [SPEC_0039](SPEC_0039_PROOF_CARRYING_SPARSITY.md).
 
-Milestone acceptance rows, reservation owners, canonical arenas, equation
-contracts, and enforcement evidence are catalogued in
-[SPEC_0043](SPEC_0043_CONSTRUCTION_CATALOG.md). Every row there is normative by
-reference from the section that links it.
+[SPEC_0043](SPEC_0043_CONSTRUCTION_CATALOG.md) catalogues acceptance, reservation,
+storage, equation, and evidence requirements. Each linking section makes its
+catalogue rows normative.
 
 ### DAE Milestone Acceptance
 
@@ -37,15 +36,32 @@ Acceptance rows and the `rumoca-ir-dae` LOC review triggers are
 | Success returns immutable `Dae`; failure exposes none | `Dae::construct` | No partial root |
 | Finalization is O(1), excluding freezing | `Dae::construct` | No rescan |
 
-Data-owning builders, partial roots, unchecked insertion, and
-finalized mutation are prohibited. Producers own analysis; insertion checks
-supplied proofs and local integrity.
+Prohibit data-owning builders, partial roots, unchecked insertion, and finalized
+mutation. Producers analyze; insertion checks supplied proofs and local integrity.
 
 ### Solve Aggregate and Discrete Definitions
 
 `SolveProblem::construct` is the one Solve construction authority; its per-owner
 rules are
 [SPEC_0043 §6](SPEC_0043_CONSTRUCTION_CATALOG.md#6-solve-aggregate-and-discrete-definition-catalog-spec_0036-solve-aggregate).
+
+Continuous refresh optimizations MUST consume constructor-issued facts and
+preserve source evaluation and checked wire replay under
+[SPEC_0043 §6a](SPEC_0043_CONSTRUCTION_CATALOG.md#6a-continuous-refresh-construction).
+Within one projection-Jacobian call, construction may certify reuse of complete
+operation results across colors from invariant input register versions and
+repeatable operations. Such facts derive once per immutable source, are shared
+across its block applications, and are rederived on specialization. The first
+execution remains ordered and complete; coordinate changes, failure, or a new
+call invalidate every retained result. Native constant facts belong to register
+versions: a complete source write invalidates prior destination facts after
+reading its inputs.
+An affine elimination layout derives its permutations and triangular
+dependencies from the exact block's tearing and sparsity owners; later
+dependencies issue guards, checked against fresh coefficients on every solve.
+A nonzero guard or a weak pivot promotes the step it names to a tear in place,
+up to the `projection_policy` capacity; beyond it the reduction declines, per
+the SPEC_0043 affine elimination row.
 
 For target `x`, the first true `(a_k, v_k)` gives `x' = v_k`; otherwise
 `x' = x`. Activations are shared per iteration; inactive values are skipped.
@@ -56,22 +72,19 @@ evidence constructs `Restart` instead.
 
 ### Solve Algorithm Block Construction
 
-`SolveAlgorithmBlock::construct` is the sole construction authority for the
-GALEC-derived executable root. Its typed program, storage, lifecycle, aggregate,
-call, effect, provenance, and serialization rules are
+`SolveAlgorithmBlock::construct` alone constructs the GALEC-derived root under
 [SPEC_0043 §9](SPEC_0043_CONSTRUCTION_CATALOG.md#9-solve-algorithm-block-construction-catalog).
 Construction consumes one checked `AlgorithmCodePackage` and one explicit
 arithmetic profile; failure exposes no partial root. A template view may borrow
-the completed root but cannot select an operation, storage class, local scope,
+the completed root but selects nothing: no operation, storage class, scope,
 shape, alias rule, call ABI, or failure behavior.
 
-The shared causal-discrete structural result derives target identity,
-current-value dependencies, and deterministic orientation from one branded DAE
-view. Solve and GALEC may restrict it but cannot reinterpret an unresolved row.
-The same causal-definition owner derives whether a complete algebraic/output
-declaration is event-held. Solve stores that fact as one typed declaration
-domain; scalar trace metadata is only a final presentation projection of the
-declaration proof.
+Shared causal-discrete analysis derives target identity, current-value
+dependencies, and deterministic orientation from one branded DAE view; Solve
+and GALEC may restrict it, never reinterpret unresolved rows. The same owner
+derives whether a complete algebraic/output declaration is event-held; Solve
+stores that as one typed declaration domain, and scalar trace metadata is only
+a presentation projection of that proof.
 
 ### Flat Aggregate Construction
 
@@ -79,10 +92,9 @@ declaration proof.
 rules are
 [SPEC_0043 §7](SPEC_0043_CONSTRUCTION_CATALOG.md#7-flat-aggregate-construction-catalog-spec_0036-flat-aggregate).
 
-Declarations retain exact spans. Per SPEC_0032 §1, Instance IR keeps no record
-of array compaction at all; per-element instance entries own Instance
-semantics. `flat::Model` owns only
-the flattened structured families, whose scalar views/counts derive.
+Declarations retain exact spans. Under SPEC_0032 §1, per-element Instance
+entries own Instance semantics without compaction records. Flat owns only flattened structured
+families and derives their scalar views/counts.
 Drafts, public invariant fields, repair, compatibility, unchecked insertion,
 finalized mutation, and alternate constructors are prohibited.
 
@@ -98,15 +110,14 @@ maps, persistent seals, root validation/repair, and unchecked paths are
 prohibited. Brands affect no finalized equality/order/display/wire data.
 Acyclic functions construct in dependency order.
 
-Construction is O(nodes + operands + total rank); insertion is amortized O(1)
-plus operand/rank work. Views borrow, derived indexes build once, proof
-transitions do not deep-clone IR.
+Construction is O(nodes + operands + total rank); insertion costs amortized
+O(1) plus operands/rank. Views borrow, derived indexes build once, and proof
+transitions never deep-clone IR.
 
 ### Canonical Arenas, Systems, and Environments
 
-The aggregate owns exactly the arenas, systems, and environments listed in
-[SPEC_0043 §3](SPEC_0043_CONSTRUCTION_CATALOG.md#3-canonical-arenas-systems-and-environments),
-each with its required storage.
+The aggregate owns exactly the storage specified by
+[SPEC_0043 §3](SPEC_0043_CONSTRUCTION_CATALOG.md#3-canonical-arenas-systems-and-environments).
 
 ### Type and Variable Identity
 
@@ -121,7 +132,7 @@ each with its required storage.
 | Proven parameter-variable families become calculated parameters atomically | ToDAE analysis/construction | One computable owner |
 | Calculated-parameter bindings require finite shape and acyclic dependency proofs | ToDAE analysis | Reject unsafe promotion |
 | Element type includes shape; shape products use checked multiplication | All constructors | Overflow fails |
-| Attributes are checked on attachment | Variable construction | No drift |
+| Attributes are checked on attachment; evaluability at completion ([SPEC_0043 §4](SPEC_0043_CONSTRUCTION_CATALOG.md#4-equation-contract-catalog-spec_0036-expressions-and-equations)) | Variable construction | No drift |
 
 Coordinates are primitive/enumeration rectangular values; function values may
 include checked aggregates/external objects. Finite, inspectable proofs
@@ -152,13 +163,9 @@ Partition ordinals are layout, never semantic identity.
 Per-system equation contracts are
 [SPEC_0043 §4](SPEC_0043_CONSTRUCTION_CATALOG.md#4-equation-contract-catalog-spec_0036-expressions-and-equations).
 
-A scalar discrete coordinate determined by an initial algorithm assignment or
-by an explicit initial equation `m = value` / `pre(m) = value` has one typed
-initial-value owner. Recognition only selects this owner; construction derives
-the target role and scalar type, proves that the value reads only
-initialization-settled coordinates, and rejects a second owner for the same
-target. The claimed Flat row therefore cannot also enter the numeric
-initialization residual system.
+Relation truth, homotopy iteration, and scalar discrete initialization MUST
+preserve their distinct checked owners, evaluation contexts, and rollback
+semantics under [SPEC_0043 §6b](SPEC_0043_CONSTRUCTION_CATALOG.md#6b-relation-and-initialization-construction).
 
 Each non-input `m` has exactly one B.1c definition owner. A source
 `when`/`elsewhen` chain becomes one atomic, source-priority-ordered conditional
@@ -167,13 +174,12 @@ the same target, as required by SPEC_0022 EQN-020. Event-only updates of `m`
 are therefore B.1c definitions, not a second generic event-action assignment
 path.
 
-The B.1c topology includes every current-`m` dependency reachable through the
-value, branch guard, trigger condition, condition DAG, and relation
-expression. `pre(m)` is a dependency leaf. The producer supplies stable
-topological owner order, and the linear construction capability independently
-checks that every reachable current-`m` dependency has already been issued in
-that owner group before consuming the target. No exclusivity claim, event
-iteration, or final graph scan repairs an invalid order.
+B.1c topology includes every current-`m` dependency through values, branch
+guards, triggers, condition DAGs, and relations; `pre(m)` is a leaf. Producers
+supply stable topological owner order. Before consuming a target, linear
+construction independently checks that all current-`m` dependencies were issued in its
+owner group. Exclusivity claims, event iteration, and final graph scans cannot
+repair invalid order.
 
 Structured families own compact domains, checked bodies, typed scalar views,
 and constructor-derived row counts; `rumoca-eval-dae` owns evaluation/lazy projection.
@@ -228,11 +234,12 @@ change/receipt registries, generation tokens, and post-rewrite validation are pr
 
 Only the current wire identified by `rumoca_ir_dae::DAE_SCHEMA_VERSION` exists;
 older/pre-versioned payloads, adapters, migration readers, and dual writes are
-prohibited. The code constant is the single version authority.
+prohibited. The code constant is authoritative.
 
 | Rule | Owner/Where | Brief Justification |
 |---|---|---|
 | Current wire records are private and deny unknown fields | DAE serde | Wire is not IR |
+| Finite floating-point values retain their exact bits through current-wire serialization and decoding | IR numeric transport | Replay cannot change coefficients or literals |
 | Operands travel on the operation that consumes them, never in a positional side table | DAE serde | One reading order |
 | Facts a construction operation produces are absent and re-issued by replay | Private wire types | Results cannot be forged |
 | Required collections are explicit, including empty | Private wire types | Omission is not ambiguity |
@@ -243,9 +250,8 @@ prohibited. The code constant is the single version authority.
 | Derived counts and indexes are absent from wire | Private wire types | Caches cannot be forged |
 | Invariant-bearing children have no fieldwise `Deserialize` | IR serde | Bytes cannot bypass checks |
 
-Across `flat::Model`, `Dae`, and `SolveProblem`, a root may implement custom
-`Deserialize` only by decoding private current-version records through checked
-construction. Children cannot implement or derive fieldwise `Deserialize`.
+`flat::Model`, `Dae`, and `SolveProblem` deserialize only private current-version
+records through checked construction; children prohibit fieldwise `Deserialize`.
 
 ### Other IR Boundaries
 
@@ -286,9 +292,16 @@ Runtime proof capabilities are erased and add no serialized receipts or
 duplicate IR. Compile-fail tests cover proof forgery/cross-stage use; property,
 differential, and refinement tests exercise each relation.
 
+### Function Derivative Ownership Proposal
+
+MLS §12.7.1 implementation follows
+[SPEC_0043 §10](SPEC_0043_CONSTRUCTION_CATALOG.md#10-function-derivative-ownership-proposal).
+Differentiated calls retain checked source-call and derivative-link ownership
+across reconstruction.
+
 ### Enforcement
 
-The evidence each guarantee requires is
+Evidence:
 [SPEC_0043 §5](SPEC_0043_CONSTRUCTION_CATALOG.md#5-enforcement-evidence-catalog).
 Tests may privately audit the complete aggregate. Production audits, public
 validation, superseded fallbacks, and compatibility are prohibited.

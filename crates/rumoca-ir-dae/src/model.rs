@@ -1,12 +1,15 @@
 mod construction_checks;
 mod domains;
+mod evaluable;
 mod external_functions;
 mod function_checks;
 mod function_conditionals;
+mod function_derivatives;
 mod function_loop_capability;
 mod function_loops;
 mod function_reads;
 mod function_scopes;
+pub(crate) mod initial_parameters;
 mod runtime_quotients;
 mod storage;
 mod value_types;
@@ -14,11 +17,12 @@ mod variable_types;
 mod view;
 mod wire;
 
+use initial_parameters::InitialParameterValueEntry;
 use std::marker::PhantomData;
 
 use rumoca_core::{
-    ComponentReference, InlineAnnotation, SourceMap, Span, StateSelect, StructuredIndexDomain,
-    TypeId, VarName,
+    ComponentReference, ExternalTableData, InlineAnnotation, SourceMap, Span, StateSelect,
+    StructuredIndexDomain, TypeId, VarName,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,13 +39,13 @@ use crate::discrete_values::{
 };
 use crate::equations::{
     ContinuousEquations, DiscreteEquations, DiscreteRealActivation, DiscreteRealEquationEntry,
-    DiscreteRealEquationView, EquationOwnerEntry, InitialDiscreteValueEntry,
+    DiscreteRealEquationView, EquationOwnerEntry, EquationOwnerKind, InitialDiscreteValueEntry,
     InitialDiscreteValueView, InitializationEquations, ResidualEquationEntry, ResidualShape,
     StructuredFamilyEntry,
 };
 use crate::events::{
-    EventActionEntry, EventActionKind, EventActionOperation, EventActionView, Events,
-    TimeEventEntry, TimeEventKind, TimeEventOperation, TimeEventView,
+    AssertionLevel, EventActionEntry, EventActionKind, EventActionOperation, EventActionView,
+    Events, TimeEventEntry, TimeEventKind, TimeEventOperation, TimeEventView,
 };
 use crate::expression::{
     BinaryOperator, Coordinate, CoordinateInput, ExprNode, ExpressionArenaStorage,
@@ -55,10 +59,10 @@ use crate::{
     AlgebraicId, ClockId, ClockOwnershipId, ConditionId, ContinuousEquationId, ContinuousFamilyId,
     DaeConstructionError, DaeGeneration, DaeLiteral, DaeProvenance, DelayId, DiscreteRealId,
     DiscreteValueId, DiscreteValueOwnerId, DomainBinderId, DomainId, EventActionId, ExprId,
-    FunctionDefinitionId, FunctionFoldId, FunctionId, FunctionParameterId, FunctionValueId,
-    InitializationEquationId, InitializationFamilyId, InputId, ModelEventTransactionId,
-    ModelEventTransactions, ParameterId, PreviousId, RelationId, RootId, ScalarType, StateId,
-    StructuredRootId, TerminalId, TimeEventId, ValueTypeId, VariableId,
+    FunctionDefinitionId, FunctionDerivativeId, FunctionFoldId, FunctionId, FunctionParameterId,
+    FunctionValueId, InitializationEquationId, InitializationFamilyId, InputId,
+    ModelEventTransactionId, ModelEventTransactions, ParameterId, PreviousId, RelationId, RootId,
+    ScalarType, StateId, StructuredRootId, TerminalId, TimeEventId, ValueTypeId, VariableId,
 };
 
 pub(crate) use construction_checks::{
@@ -148,7 +152,19 @@ pub(crate) use construction_checks::{
 /// from its carried targets. Replay clears those locals on entry and restores
 /// the enclosing reaching definitions on exit, so a superseded payload cannot
 /// reinterpret nonescaping scratch as loop-carried state.
-pub const DAE_SCHEMA_VERSION: u16 = 33;
+/// 34 preserves checked first-derivative function links and their input roles.
+/// 35 binds higher-order derivatives to their checked predecessor link.
+/// 36 retains checked non-Real parameter definitions at initialization.
+/// 37 appends the checked aggregate auxiliary `LinearSolve` pure function.
+/// 38 preserves source-call ownership for supplied derivative invocations.
+/// 39 records checked evaluability of `final` and `Evaluate=true` parameters.
+/// 40 carries each function's MLS §18.3 inline request on the wire.
+/// 41 adds the MLS §16.5.2 shifted event clock kind.
+/// 42 records each variable's declared `input`/`output` prefix beside its
+/// exported causality.
+/// 43 marks a B.1c owner whose targets are unread observations of a
+/// continuous-time definition, evaluated at every output point.
+pub const DAE_SCHEMA_VERSION: u16 = 43;
 
 pub use domains::Domains;
 pub(crate) use domains::insert_domain;
@@ -158,6 +174,8 @@ pub use external_functions::{
 };
 pub(crate) use external_functions::{ExternalArgumentEntry, ExternalBodyEntry};
 use function_checks::*;
+use function_derivatives::FunctionDerivativeEntry;
+pub use function_derivatives::FunctionDerivativeView;
 pub(crate) use function_reads::{
     FunctionReadFact, FunctionReadMergeError, FunctionReadSet, FunctionReadSets,
 };
@@ -174,7 +192,7 @@ pub use view::{
     FunctionView, InitializationOwnerView, RangeBoundView, RangeView, RecordFieldLayout,
     ResidualEquationView, RuntimeQuotientOwnerKind, RuntimeQuotientOwnerView,
     StringConversionFormatView, StructuredFamilyView, SubscriptView, SubscriptsView,
-    ValueTypeOperands, VariableIdentity, VariableView,
+    ValueTypeOperands, VariableIdentity, VariableView, broadcast_scalar_values,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -194,7 +212,7 @@ pub(crate) struct VariableAttributesWire {
     component_ref: Option<ComponentReference>,
     binding: Option<u32>,
     start: Option<u32>,
-    fixed: Option<bool>,
+    fixed: Option<Vec<bool>>,
     min: Option<u32>,
     max: Option<u32>,
     nominal: Option<u32>,
@@ -202,8 +220,10 @@ pub(crate) struct VariableAttributesWire {
     state_select: StateSelect,
     description: Option<String>,
     pub(crate) causality: VariableCausality,
+    declared_causality: DeclaredCausality,
     is_tunable: bool,
     is_held: bool,
+    evaluable: bool,
     origin: VariableOrigin,
 }
 
@@ -271,6 +291,21 @@ pub enum VariableCausality {
     Local,
 }
 
+/// The `input`/`output` prefix of a declaration (MLS §4.4.2.2), independent
+/// of where the declaration sits in the instance hierarchy.
+///
+/// [`VariableCausality`] is the exported causality, which is `Input` or
+/// `Output` only for a top-level declaration; a nested `output` is exported
+/// `Local` and keeps its prefix here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredCausality {
+    #[default]
+    None,
+    Input,
+    Output,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VariableOrigin {
@@ -284,7 +319,7 @@ pub struct VariableAttributes<'dae> {
     pub component_ref: Option<ComponentReference>,
     pub binding: Option<ExprId<'dae>>,
     pub start: Option<ExprId<'dae>>,
-    pub fixed: Option<bool>,
+    pub fixed: Option<Vec<bool>>,
     pub min: Option<ExprId<'dae>>,
     pub max: Option<ExprId<'dae>>,
     pub nominal: Option<ExprId<'dae>>,
@@ -292,8 +327,14 @@ pub struct VariableAttributes<'dae> {
     pub state_select: StateSelect,
     pub description: Option<String>,
     pub causality: VariableCausality,
+    /// The source `input`/`output` prefix. An exported `Input` or `Output`
+    /// causality requires the same declared causality (SPEC_0040 DAE-C24).
+    pub declared_causality: DeclaredCausality,
     pub is_tunable: bool,
     pub is_held: bool,
+    /// A `final` or `Evaluate=true` parameter or constant whose declaration
+    /// binding is evaluable (MLS §4.5, §18.6; SPEC_0040 STRUCT-T10).
+    pub evaluable: bool,
     pub origin: VariableOrigin,
 }
 
@@ -324,6 +365,7 @@ pub(crate) struct FunctionEntry {
     pub(crate) folds: Vec<u32>,
     declaration: DaeProvenance,
     inline: InlineAnnotation,
+    derivatives: Vec<FunctionDerivativeEntry>,
     definition: Option<FunctionBodyEntry>,
     build: Option<FunctionBuildState>,
 }
@@ -418,6 +460,7 @@ enum FunctionStatementWire {
     Assertion {
         condition: u32,
         message: u32,
+        level: AssertionLevel,
         provenance: DaeProvenance,
     },
     For {
@@ -480,6 +523,9 @@ pub(crate) struct Storage {
     flat_type_lookup: rustc_hash::FxHashMap<TypeId, u32>,
     structural_type_lookup: rustc_hash::FxHashMap<ValueType, u32>,
     pub(crate) variables: Vec<VariableEntry>,
+    /// Arena index of each reserved variable by name, so the duplicate-name
+    /// check of a reservation is one lookup; internal only, never iterated.
+    variable_by_name: rustc_hash::FxHashMap<VarName, u32>,
     pub(crate) functions: Vec<FunctionEntry>,
     pub(crate) function_folds: Vec<FunctionFoldEntry>,
     domains: Vec<DomainEntry>,
@@ -488,6 +534,8 @@ pub(crate) struct Storage {
     pub(crate) initialization_equations: Vec<ResidualEquationEntry>,
     pub(crate) initial_discrete_values: Vec<InitialDiscreteValueEntry>,
     pub(crate) initial_discrete_value_by_variable: rustc_hash::FxHashMap<u32, u32>,
+    pub(crate) initial_parameter_values: Vec<InitialParameterValueEntry>,
+    pub(crate) initial_parameter_value_by_variable: rustc_hash::FxHashMap<u32, u32>,
     pub(crate) discrete_real_equations: Vec<DiscreteRealEquationEntry>,
     pub(crate) discrete_value_owners: Vec<DiscreteValueOwnerEntry>,
     pub(crate) discrete_value_targets: Vec<u32>,
@@ -543,6 +591,7 @@ struct FrozenStorage {
     continuous_equations: Box<[ResidualEquationEntry]>,
     initialization_equations: Box<[ResidualEquationEntry]>,
     initial_discrete_values: Box<[InitialDiscreteValueEntry]>,
+    initial_parameter_values: Box<[InitialParameterValueEntry]>,
     discrete_real_equations: Box<[DiscreteRealEquationEntry]>,
     discrete_value_owners: Box<[DiscreteValueOwnerEntry]>,
     discrete_value_targets: Box<[u32]>,
@@ -579,6 +628,12 @@ pub struct Dae {
     /// finalized checked expression graph.
     #[serde(skip)]
     active_discrete_scalar_count: usize,
+    /// Loaded native table descriptors (MLS §12.9.7 ExternalObject handles) that
+    /// the constructor fold produced, keyed by the opaque integer id each handle
+    /// parameter binds to. The solver interpolates these with its native table
+    /// operators instead of calling foreign C code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    external_tables: Vec<ExternalTableData>,
 }
 
 impl Dae {
@@ -607,7 +662,21 @@ impl Dae {
             source_map,
             storage,
             active_discrete_scalar_count,
+            external_tables: Vec::new(),
         })
+    }
+
+    /// Attach the loaded native table descriptors produced by the constructor
+    /// fold. Consumed once by the DAE construction phase after `construct`.
+    #[must_use]
+    pub fn with_external_tables(mut self, external_tables: Vec<ExternalTableData>) -> Self {
+        self.external_tables = external_tables;
+        self
+    }
+
+    /// The loaded native table descriptors carried by this DAE.
+    pub fn external_tables(&self) -> &[ExternalTableData] {
+        &self.external_tables
     }
 
     pub const fn schema_version(&self) -> u16 {
@@ -1006,12 +1075,7 @@ impl<'dae> Variables<'_, 'dae> {
         capability: VariableTypeCapability<'dae>,
         declaration: DaeProvenance,
     ) -> Result<VariableId<'dae>, DaeConstructionError> {
-        if self
-            .storage
-            .variables
-            .iter()
-            .any(|entry| entry.name == name)
-        {
+        if self.storage.variable_by_name.contains_key(&name) {
             return Err(DaeConstructionError::DuplicateKey {
                 kind: "variable",
                 key: name.to_string(),
@@ -1019,6 +1083,7 @@ impl<'dae> Variables<'_, 'dae> {
             });
         }
         let raw = checked_u32(self.storage.variables.len(), "variable arena", declaration)?;
+        self.storage.variable_by_name.insert(name.clone(), raw);
         self.storage.variables.push(VariableEntry {
             name,
             role: capability.role(),
@@ -1056,6 +1121,8 @@ impl<'dae> Variables<'_, 'dae> {
                 });
             }
         }
+        self.validate_evaluable(variable, attributes, provenance)?;
+        self.validate_declared_causality(variable, attributes, provenance)?;
         if let Some(binding) = attributes.binding {
             self.storage.expect_closed_expression(binding, provenance)?;
             let found = self
@@ -1091,6 +1158,49 @@ impl<'dae> Variables<'_, 'dae> {
         }
         Ok(())
     }
+
+    /// An exported `Input` or `Output` causality exists only for a declaration
+    /// carrying the same prefix (SPEC_0040 DAE-C24).
+    fn validate_declared_causality(
+        &self,
+        variable: VariableId<'dae>,
+        attributes: &VariableAttributes<'dae>,
+        provenance: DaeProvenance,
+    ) -> Result<(), DaeConstructionError> {
+        let required = match attributes.causality {
+            VariableCausality::Input => DeclaredCausality::Input,
+            VariableCausality::Output => DeclaredCausality::Output,
+            _ => return Ok(()),
+        };
+        if attributes.declared_causality == required {
+            return Ok(());
+        }
+        let entry = self.storage.variable(variable.index(), provenance)?;
+        Err(DaeConstructionError::InvalidDeclaredCausality {
+            name: entry.name.clone(),
+            span: provenance.span(),
+        })
+    }
+}
+
+/// Reduce a scalarized `fixed` attribute to a single value when every element
+/// agrees (MLS §4.8). Absent attributes and differing elements both yield
+/// `None`, which a whole-declaration decision cannot represent.
+pub(crate) fn uniform_fixed(values: Option<&[bool]>) -> Option<bool> {
+    let values = values?;
+    let first = *values.first()?;
+    values.iter().all(|&value| value == first).then_some(first)
+}
+
+/// Select the `fixed` value for one scalar element, broadcasting a single
+/// stored value over every element (MLS §4.8.6).
+pub(crate) fn scalar_fixed(values: Option<&[bool]>, scalar: usize) -> Option<bool> {
+    let values = values?;
+    if values.len() == 1 {
+        values.first().copied()
+    } else {
+        values.get(scalar).copied()
+    }
 }
 
 fn erase_variable_attributes(attributes: VariableAttributes<'_>) -> VariableAttributesWire {
@@ -1106,8 +1216,10 @@ fn erase_variable_attributes(attributes: VariableAttributes<'_>) -> VariableAttr
         state_select: attributes.state_select,
         description: attributes.description,
         causality: attributes.causality,
+        declared_causality: attributes.declared_causality,
         is_tunable: attributes.is_tunable,
         is_held: attributes.is_held,
+        evaluable: attributes.evaluable,
         origin: attributes.origin,
     }
 }
@@ -1236,6 +1348,7 @@ impl<'dae> Functions<'_, 'dae> {
             declaration,
             inline,
             definition: None,
+            derivatives: Vec::new(),
             build: None,
         });
         self.storage.unfilled_functions += 1;
@@ -1547,16 +1660,28 @@ impl<'dae> Functions<'_, 'dae> {
     }
 
     /// Append one default-level MLS §8.3.7 assertion to a Modelica function.
-    ///
-    /// The mutable top-level body capability makes the action call-scoped and
-    /// prevents it from being inserted into a loop without a loop-action owner.
-    /// Both expressions must belong to the exact current function-value state;
-    /// the constructor stores no untyped call or rendered-name surrogate.
     pub fn assertion(
         &mut self,
         body: &mut FunctionBody<'dae>,
         condition: ExprId<'dae>,
         message: ExprId<'dae>,
+        provenance: DaeProvenance,
+    ) -> Result<(), DaeConstructionError> {
+        self.assertion_with_level(body, condition, message, AssertionLevel::Error, provenance)
+    }
+
+    /// Append one MLS §8.3.7 assertion at its level to a Modelica function.
+    ///
+    /// The mutable top-level body capability makes the action call-scoped and
+    /// prevents it from being inserted into a loop without a loop-action owner.
+    /// Both expressions must belong to the exact current function-value state;
+    /// the constructor stores no untyped call or rendered-name surrogate.
+    pub fn assertion_with_level(
+        &mut self,
+        body: &mut FunctionBody<'dae>,
+        condition: ExprId<'dae>,
+        message: ExprId<'dae>,
+        level: AssertionLevel,
         provenance: DaeProvenance,
     ) -> Result<(), DaeConstructionError> {
         if body.domain.is_some() {
@@ -1566,7 +1691,7 @@ impl<'dae> Functions<'_, 'dae> {
                 span: provenance.span(),
             });
         }
-        self.append_assertion(body, condition, message, provenance)
+        self.append_assertion(body, condition, message, level, provenance)
     }
 
     /// Append one default-level MLS §8.3.7 assertion to every iteration of a
@@ -1578,6 +1703,25 @@ impl<'dae> Functions<'_, 'dae> {
         message: ExprId<'dae>,
         provenance: DaeProvenance,
     ) -> Result<(), DaeConstructionError> {
+        self.assertion_loop_with_level(
+            loop_body,
+            condition,
+            message,
+            AssertionLevel::Error,
+            provenance,
+        )
+    }
+
+    /// Append one MLS §8.3.7 assertion at its level to every iteration of a
+    /// checked compact function loop.
+    pub fn assertion_loop_with_level(
+        &mut self,
+        loop_body: &mut FunctionLoop<'dae>,
+        condition: ExprId<'dae>,
+        message: ExprId<'dae>,
+        level: AssertionLevel,
+        provenance: DaeProvenance,
+    ) -> Result<(), DaeConstructionError> {
         if loop_body.body.domain.is_none() {
             return Err(DaeConstructionError::IncompleteDefinition {
                 kind: "function loop domain",
@@ -1585,7 +1729,7 @@ impl<'dae> Functions<'_, 'dae> {
                 span: provenance.span(),
             });
         }
-        self.append_assertion(&mut loop_body.body, condition, message, provenance)
+        self.append_assertion(&mut loop_body.body, condition, message, level, provenance)
     }
 
     fn append_assertion(
@@ -1593,6 +1737,7 @@ impl<'dae> Functions<'_, 'dae> {
         body: &mut FunctionBody<'dae>,
         condition: ExprId<'dae>,
         message: ExprId<'dae>,
+        level: AssertionLevel,
         provenance: DaeProvenance,
     ) -> Result<(), DaeConstructionError> {
         check_provenance(self.source_map, provenance)?;
@@ -1631,6 +1776,7 @@ impl<'dae> Functions<'_, 'dae> {
             .push(FunctionStatementWire::Assertion {
                 condition: condition.index(),
                 message: message.index(),
+                level,
                 provenance,
             });
         Ok(())

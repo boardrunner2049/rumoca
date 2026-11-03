@@ -1,3 +1,4 @@
+mod derivatives;
 mod expression_rules;
 mod integer_bounds;
 mod record_field_shapes;
@@ -5,15 +6,18 @@ mod record_field_shapes;
 mod tests;
 mod value_relevance;
 
+use super::expression::conditional_guards::retains_flat_guard;
 use super::*;
+use derivatives::FunctionDerivativeCertificate;
 pub(in crate::construction) use expression_rules::{
     call_free_expression_shape, call_free_target_shape,
 };
 use expression_rules::{expression_shape, reject_shape_call};
 pub(in crate::construction) use integer_bounds::infer_function_integer_bounds;
 use rumoca_core::{DefId, FunctionInstanceId};
+use rumoca_eval_flat::constant::{DeferredParameterSource, EvalEnvironment};
 use value_relevance::ValueReadInputs;
-pub(super) use value_relevance::function_expressions;
+pub(super) use value_relevance::{function_expressions, statement_expression_roots};
 
 pub(super) type ValueShape = Vec<u32>;
 
@@ -112,6 +116,17 @@ pub(super) struct ShapeEnvironment {
     /// `integer(...)` floor conversion, `mod`/`div`, enumeration ordinals — instead of
     /// a second rule set written for shapes alone.
     values: EvalContext,
+    /// Statically-known array extents per flat name, in dimension order.
+    ///
+    /// This is the shape proof's `shapes` restated as the `Integer` extents MLS
+    /// §10.3.1 `size(x, d)`/`size(x)`/`ndims(x)` read, and it is consulted *only*
+    /// when folding a conditional guard (MLS §3.6.5) to a Boolean. It is kept
+    /// apart from [`Self::values`] on purpose: the compact-domain proofs
+    /// (`proven_integer_bounds`, `proven_range_bounds`) evaluate a loop bound like
+    /// `1:size(A, 1)` through `values` and must keep `size(A, 1)` symbolic so the
+    /// domain stays a compact loop, not a constant-extent one. Folding `size`
+    /// there would collapse those domains; folding it in a guard never does.
+    dimension_extents: HashMap<VarName, Vec<i64>>,
     /// Whether this scope is one function specialization rather than the model.
     ///
     /// MLS §12.2 makes a function body's translation-time constants a property
@@ -123,6 +138,24 @@ pub(super) struct ShapeEnvironment {
     /// §12.9 external argument is in specialization scope with no body — so the
     /// distinction is carried by the environment that actually differs.
     specialized: bool,
+    /// Whether this environment lowers a variable's attribute or binding value.
+    ///
+    /// Such a value keeps an MLS §3.6.5 conditional whose guard reads a tunable
+    /// parameter, so a change to that parameter re-selects the branch after the
+    /// code is generated (an eFMI `Recalibrate` recomputes the same statement).
+    /// Folding such a guard to the parameter's translation-time value silently
+    /// freezes the branch. A structural guard (`size`/`ndims`, a constant, an
+    /// enumeration extent) still folds, because its value cannot change after
+    /// translation; only a guard that reads a tunable parameter is preserved.
+    /// Equation and function-body lowering leave this `false` and fold as usual.
+    attribute_scope: bool,
+    /// The model's parameters fixed at translation, known in the model scopes
+    /// once analysis settles them; a guard reading any other parameter is a
+    /// run-time guard under SPEC_0040 DAE-C22. `None` in function scopes.
+    evaluable: Option<Arc<std::collections::HashSet<VarName>>>,
+    /// Equation conditionals whose run-time arms could not be certified, so
+    /// their parameter guard is a structural selection.
+    structural_selections: Arc<HashSet<Span>>,
 }
 
 impl ShapeEnvironment {
@@ -134,8 +167,37 @@ impl ShapeEnvironment {
             enumeration_type_declarations: Arc::default(),
             record_array_fields: None,
             values: EvalContext::with_capacity(capacity, 0, 0),
+            dimension_extents: HashMap::with_capacity(capacity),
             specialized: false,
+            attribute_scope: false,
+            evaluable: None,
+            structural_selections: Arc::default(),
         }
+    }
+
+    /// Whether the equation conditional at `span` is a structural selection
+    /// because an arm's calls could not be certified.
+    pub(super) fn is_structural_selection(&self, span: Span) -> bool {
+        self.structural_selections.contains(&span)
+    }
+
+    /// The model's evaluable parameters, when this is a model scope.
+    pub(super) fn evaluable(&self) -> Option<&std::collections::HashSet<VarName>> {
+        self.evaluable.as_deref()
+    }
+
+    /// A clone of this environment marked as lowering a variable's attribute or
+    /// binding value, where an MLS §3.6.5 guard that reads a tunable parameter is
+    /// preserved rather than folded.
+    pub(super) fn in_attribute_scope(&self) -> Self {
+        let mut environment = self.clone();
+        environment.attribute_scope = true;
+        environment
+    }
+
+    /// Whether this environment lowers a variable's attribute or binding value.
+    pub(super) fn is_attribute_scope(&self) -> bool {
+        self.attribute_scope
     }
 
     /// Mark this scope as one function specialization's proven environment.
@@ -183,9 +245,17 @@ impl ShapeEnvironment {
     /// value must not read the model coordinate's value through the shadowed
     /// name. Absence of a value here means "not proven at this scope", which is
     /// exactly what the shape proof must then reject on.
+    ///
+    /// The shape's extents are also recorded as the dimensions the MLS §10.3.1
+    /// `size(x, d)`/`size(x)`/`ndims(x)` operators read when a conditional guard
+    /// is folded (MLS §3.6.5). A `ValueShape` is a vector of concrete extents, so
+    /// every dimension recorded here is statically known; a coordinate whose
+    /// extent is not statically known never reaches this scope with a concrete
+    /// shape and so never folds.
     pub(super) fn insert(&mut self, name: VarName, shape: ValueShape) {
         self.values.remove_parameter(name.as_str());
         self.integer_bounds.remove(&name);
+        self.record_dimension_extents(&name, &shape);
         self.shapes.insert(name, shape);
     }
 
@@ -196,6 +266,7 @@ impl ShapeEnvironment {
     /// non-scalar shape would be unrepresentable rather than merely wrong.
     pub(super) fn bind_scalar_value(&mut self, name: VarName, value: EvalValue) {
         self.integer_bounds.remove(&name);
+        self.record_dimension_extents(&name, &[]);
         self.shapes.insert(name.clone(), Vec::new());
         self.values.add_parameter(name.to_string(), value);
     }
@@ -204,9 +275,31 @@ impl ShapeEnvironment {
     /// has one translation-time value.
     pub(super) fn bind_integer_bounds(&mut self, name: VarName, lower: i64, upper: i64) {
         self.values.remove_parameter(name.as_str());
+        self.record_dimension_extents(&name, &[]);
         self.shapes.insert(name.clone(), Vec::new());
         self.integer_bounds
             .insert(name, (lower.min(upper), lower.max(upper)));
+    }
+
+    /// Record `shape` as the dimensions a folded guard resolves `size`/`ndims`
+    /// over for `name`, overwriting any dimensions a shadowed enclosing
+    /// coordinate of the same flat name registered. A scalar binding passes the
+    /// empty shape, which shadows an outer array's dimensions with the zero-rank
+    /// fact so `size(name, d)` over the scalar no longer reads the outer extents.
+    fn record_dimension_extents(&mut self, name: &VarName, shape: &[u32]) {
+        self.dimension_extents.insert(
+            name.clone(),
+            shape.iter().map(|extent| i64::from(*extent)).collect(),
+        );
+    }
+
+    /// A read-only view of the proven values that also answers `size`/`ndims`
+    /// from the proven dimensions. Used only to fold a conditional guard.
+    fn shape_aware_values(&self) -> ShapeAwareValues<'_> {
+        ShapeAwareValues {
+            values: &self.values,
+            dimension_extents: &self.dimension_extents,
+        }
     }
 
     pub(super) fn merge_integer_bounds(&mut self, name: VarName, lower: i64, upper: i64) {
@@ -226,8 +319,16 @@ impl ShapeEnvironment {
     /// established by the initialization problem instead — so the caller
     /// decides whether the missing value is fatal for the dimension or the
     /// specialization it is proving.
+    ///
+    /// The value is folded through a view that also answers MLS §10.3.1
+    /// `size(x, d)`/`size(x)`/`ndims(x)` from the proven dimensions, so a
+    /// conditional guard that is a constant relation over a statically-known
+    /// dimension (`size(offset, 1) == 1`) proves the Boolean the MLS §3.6.5 fold
+    /// selects an arm by. The compact-domain proofs deliberately do *not* use
+    /// this view; they keep `size` symbolic so a loop bound stays a compact
+    /// domain.
     pub(super) fn proven_value(&self, expression: &Expression) -> Option<ProvenValue> {
-        if let Some(value) = eval_expr(expression, &self.values)
+        if let Some(value) = eval_expr(expression, &self.shape_aware_values())
             .ok()
             .as_ref()
             .and_then(ProvenValue::from_settled)
@@ -246,6 +347,64 @@ impl ShapeEnvironment {
     /// about which ranges are static.
     pub(in crate::construction) fn proven_extent(&self, expression: &Expression) -> Option<i64> {
         evaluate_shape_integer(expression, self).ok()
+    }
+
+    /// The full translation-time value this scope folds for `expression`.
+    ///
+    /// This is the general evaluator behind [`Self::proven_value`], returning a
+    /// non-scalar array or record where one is settled, so a colon-sized local
+    /// whose binding is an MLS §10.4.1 array-valued expression the structural
+    /// shape rules do not decompose (a Real range, most notably) can still be
+    /// sized from the shape of the value it folds to.
+    fn fold_value(&self, expression: &Expression) -> Option<EvalValue> {
+        eval_expr(expression, &self.values).ok()
+    }
+
+    /// Whether this scope folds `expression` to a settled array value.
+    ///
+    /// MLS §10.4.3 sizes a compact range `j:d:k` from bounds settled at
+    /// translation time. When the range type promotes to Real (`0 + d:d:1`) the
+    /// cardinality is a floating-point quotient the Integer extent rules do not
+    /// decompose, so the honest test that such a range may enter canonical DAE
+    /// is that the same translation-time evaluator the lowering uses folds it to
+    /// its array value. The colon-local shape proof sizes a Real-range binding
+    /// from this identical fold, so the range admitted here and the extent that
+    /// sizes the local can never disagree.
+    pub(in crate::construction) fn folds_to_settled_array(&self, expression: &Expression) -> bool {
+        matches!(self.fold_value(expression), Some(EvalValue::Array(_)))
+    }
+
+    /// The settled Real elements of a Real compact range this scope folds.
+    ///
+    /// MLS §10.4.3 gives a Real range `j:d:k` a floating-point cardinality that
+    /// the Integer DAE range node cannot carry, so a Real range is lowered as
+    /// the constant array of its elements rather than as a range node. The range
+    /// is Real exactly when one of its bounds folds to a Real scalar; when it is,
+    /// the whole range is folded through the same evaluator the shape proof used
+    /// to size the colon local it binds. An Integer range folds to Integer
+    /// elements and returns `None`, so it keeps the efficient range-node path.
+    pub(in crate::construction) fn folded_real_range(
+        &self,
+        range: &Expression,
+    ) -> Option<Vec<f64>> {
+        let Expression::Range {
+            start, step, end, ..
+        } = range
+        else {
+            return None;
+        };
+        let folds_to_real =
+            |bound: &Expression| matches!(self.fold_value(bound), Some(EvalValue::Real(_)));
+        let is_real_range = folds_to_real(start)
+            || step.as_deref().is_some_and(folds_to_real)
+            || folds_to_real(end);
+        if !is_real_range {
+            return None;
+        }
+        let EvalValue::Array(elements) = self.fold_value(range)? else {
+            return None;
+        };
+        elements.iter().map(EvalValue::to_real).collect()
     }
 }
 
@@ -328,6 +487,42 @@ pub(in crate::construction) fn proven_conditional_branch(
     Some(None)
 }
 
+/// A read-only value view that also resolves MLS §10.3.1 `size`/`ndims` from a
+/// scope's proven dimensions.
+///
+/// Every method but [`Self::get_array_dimensions`] delegates to the size-blind
+/// value context, so a `size` operator folds to a constant only where this view
+/// is used: folding a conditional guard. The compact-domain proofs evaluate loop
+/// bounds through the value context directly and keep `size` symbolic.
+struct ShapeAwareValues<'a> {
+    values: &'a EvalContext,
+    dimension_extents: &'a HashMap<VarName, Vec<i64>>,
+}
+
+impl EvalEnvironment for ShapeAwareValues<'_> {
+    fn get_value(&self, name: &str) -> Option<std::borrow::Cow<'_, EvalValue>> {
+        self.values.get_value(name)
+    }
+
+    fn get_enum(&self, name: &str) -> Option<&(String, String)> {
+        self.values.get_enum(name)
+    }
+
+    fn get_function(&self, name: &str) -> Option<&rumoca_core::Function> {
+        self.values.get_function(name)
+    }
+
+    fn get_array_dimensions(&self, name: &str) -> Option<&[i64]> {
+        self.dimension_extents
+            .get(&VarName::new(name))
+            .map(Vec::as_slice)
+    }
+
+    fn deferred_parameter(&self, name: &str) -> Option<DeferredParameterSource> {
+        self.values.deferred_parameter(name)
+    }
+}
+
 impl std::ops::Index<&VarName> for ShapeEnvironment {
     type Output = ValueShape;
 
@@ -384,6 +579,10 @@ struct CallInputProjection {
 
 pub(super) struct FunctionShapeAnalysis {
     model_values: ShapeEnvironment,
+    /// [`Self::model_values`] marked as attribute scope, used to lower a
+    /// variable's attribute and binding values so an MLS §3.6.5 guard over a
+    /// tunable parameter survives to the eFMI `Recalibrate` step.
+    attribute_values: ShapeEnvironment,
     certificates: Vec<FunctionShapeCertificate>,
     certificate_by_key: HashMap<FunctionSpecializationKey, usize>,
     call_certificates: HashMap<FunctionSpecializationKey, FunctionCallShapeCertificate>,
@@ -402,12 +601,30 @@ pub(super) struct FunctionShapeAnalysis {
     /// split certificates that are proven identical, which both duplicates DAE
     /// functions and denies a recursive call the repeated key it terminates on.
     value_read_inputs: ValueReadInputs,
+    derivatives: Vec<FunctionDerivativeCertificate>,
+    /// Equation conditionals (by source span) whose parameter guard would stay
+    /// a run-time branch but an arm's calls cannot be certified, so the guard
+    /// is a structural selection (SPEC_0040 DAE-C22).
+    structural_selections: HashSet<Span>,
 }
 
 impl FunctionShapeAnalysis {
+    #[cfg(test)]
     pub(super) fn analyze(flat: &flat::Model, constants: &EvalContext) -> Result<Self, ToDaeError> {
+        Self::analyze_model(flat, constants, None)
+    }
+
+    /// Analyze with the model's evaluable parameters known, so discovery keeps
+    /// every arm of an equation conditional whose parameter guard stays a
+    /// run-time branch (SPEC_0040 DAE-C22).
+    pub(super) fn analyze_model(
+        flat: &flat::Model,
+        constants: &EvalContext,
+        evaluable: Option<&std::collections::HashSet<VarName>>,
+    ) -> Result<Self, ToDaeError> {
         let record_array_fields = Arc::new(analysis::analyze_record_array_field_plans(flat)?);
         let mut model_values = concrete_model_shapes(flat, constants)?;
+        model_values.evaluable = evaluable.map(|evaluable| Arc::new(evaluable.clone()));
         model_values.record_array_fields = Some(record_array_fields);
         let constructor_instances = flat
             .functions
@@ -448,6 +665,7 @@ impl FunctionShapeAnalysis {
             flat,
             analysis: Self {
                 model_values,
+                attribute_values: ShapeEnvironment::default(),
                 certificates: Vec::new(),
                 certificate_by_key: HashMap::new(),
                 call_certificates: HashMap::new(),
@@ -456,11 +674,18 @@ impl FunctionShapeAnalysis {
                 constructor_fields_by_key: HashMap::new(),
                 declared_input_counts,
                 value_read_inputs,
+                derivatives: Vec::new(),
+                structural_selections: HashSet::new(),
             },
             active_specializations: Vec::new(),
         };
         analyzer.discover_model_calls()?;
-        Ok(analyzer.analysis)
+        analyzer.discover_derivative_calls()?;
+        let mut analysis = analyzer.analysis;
+        analysis.model_values.structural_selections =
+            Arc::new(analysis.structural_selections.clone());
+        analysis.attribute_values = analysis.model_values.in_attribute_scope();
+        Ok(analysis)
     }
 
     pub(super) fn record_array_fields(&self) -> &Arc<RecordArrayFieldPlans> {
@@ -501,8 +726,40 @@ impl FunctionShapeAnalysis {
         &self.model_values
     }
 
+    /// Record equation conditionals whose guard is not kept as a run-time
+    /// branch (SPEC_0040 DAE-C22), so every consumer folds them by the same
+    /// translation-time selection. The set only grows: a selection discovery
+    /// already recorded stays one.
+    pub(super) fn add_structural_selections(&mut self, spans: impl IntoIterator<Item = Span>) {
+        self.structural_selections.extend(spans);
+        let selections = Arc::new(self.structural_selections.clone());
+        self.model_values.structural_selections = Arc::clone(&selections);
+        self.attribute_values.structural_selections = selections;
+    }
+
+    /// Record the model's settled evaluable parameters in both model scopes.
+    pub(super) fn set_evaluable_parameters(
+        &mut self,
+        evaluable: &std::collections::HashSet<VarName>,
+    ) {
+        let evaluable = Arc::new(evaluable.clone());
+        self.model_values.evaluable = Some(Arc::clone(&evaluable));
+        self.attribute_values.evaluable = Some(evaluable);
+    }
+
+    /// The model environment for lowering a variable's attribute and binding
+    /// values, where an MLS §3.6.5 conditional guard is left unfolded so a guard
+    /// over a tunable parameter survives to the eFMI `Recalibrate` step.
+    pub(super) fn model_attribute_values(&self) -> &ShapeEnvironment {
+        &self.attribute_values
+    }
+
     pub(super) fn certificates(&self) -> &[FunctionShapeCertificate] {
         &self.certificates
+    }
+
+    pub(super) fn derivatives(&self) -> &[FunctionDerivativeCertificate] {
+        &self.derivatives
     }
 
     pub(super) fn construction_components(&self) -> Vec<rumoca_core::DependencyScc> {
@@ -675,6 +932,12 @@ impl FunctionShapeAnalysis {
     }
 }
 
+struct DiscoveryCheckpoint {
+    certificates: usize,
+    call_keys: HashSet<FunctionSpecializationKey>,
+    constructor_keys: HashSet<FunctionSpecializationKey>,
+}
+
 struct ShapeAnalyzer<'flat> {
     flat: &'flat flat::Model,
     analysis: FunctionShapeAnalysis,
@@ -684,8 +947,34 @@ struct ShapeAnalyzer<'flat> {
 impl ShapeAnalyzer<'_> {
     fn discover_model_calls(&mut self) -> Result<(), ToDaeError> {
         let values = self.analysis.model_values.clone();
-        for expression in all_model_expressions(self.flat) {
-            self.discover_calls(expression, &values)?;
+        // Only an equation keeps a parameter guard as a run-time branch; an
+        // attribute or a parameter binding prunes arms its guard proves dead.
+        let attribute_values = ShapeEnvironment {
+            evaluable: None,
+            ..values.clone()
+        };
+        for variable in self.flat.variables.values() {
+            let binding_is_equation = !matches!(
+                variable.variability,
+                Variability::Parameter(_) | Variability::Constant(_)
+            );
+            for expression in variable_attribute_expressions(variable) {
+                let equation = binding_is_equation
+                    && variable
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| std::ptr::eq(binding, expression));
+                let scopes = [&attribute_values, &values];
+                self.discover_calls(expression, scopes[usize::from(equation)])?;
+            }
+        }
+        for equation in self
+            .flat
+            .equations
+            .iter()
+            .chain(&self.flat.initial_equations)
+        {
+            self.discover_calls(&equation.residual, &values)?;
         }
         for algorithm in self
             .flat
@@ -725,28 +1014,20 @@ impl ShapeAnalyzer<'_> {
             self.discover_expression(expression, values)?;
             return Ok(());
         }
-        if let Expression::Array {
-            elements,
-            is_matrix: true,
-            ..
+        // MLS §11.5 evaluates only the selected arm of a conditional. When this
+        // specialization settles a branch condition, the arms it does not
+        // execute contain no call the program reaches, so minting their
+        // certificates would demand shape rules for functions never called (a
+        // string search under a `tableOnFile = false` guard, for one). This
+        // mirrors the statement-level fold in `discover_statement`; an unproven
+        // condition still discovers both arms.
+        if let Expression::If {
+            branches,
+            else_branch,
+            span,
         } = expression
-            && elements.iter().all(|element| {
-                matches!(
-                    element,
-                    Expression::Array {
-                        is_matrix: true,
-                        ..
-                    }
-                )
-            })
         {
-            // Parse reserves an all-matrix-child node for the `;`
-            // spelling. Its child rows may contain vectors or matrices:
-            // the checked promoted-concatenation constructor owns their
-            // exact shape. Descend through the row wrappers so calls are
-            // still discovered, without applying the deliberately narrower
-            // top-level horizontal-row rejection to those operands.
-            return self.discover_promoted_matrix_calls(elements, values);
+            return self.discover_conditional_calls(branches, else_branch, *span, values);
         }
         if let Expression::ArrayComprehension {
             expr,
@@ -790,23 +1071,57 @@ impl ShapeAnalyzer<'_> {
         self.discover_calls(body, &scoped)
     }
 
-    fn discover_promoted_matrix_calls(
+    /// Discover the calls a conditional expression can reach, pruning arms whose
+    /// condition this specialization proves are never taken (MLS §11.5).
+    fn discover_conditional_calls(
         &mut self,
-        rows: &[Expression],
+        branches: &[(Expression, Expression)],
+        else_branch: &Expression,
+        span: Span,
         values: &ShapeEnvironment,
     ) -> Result<(), ToDaeError> {
-        for row in rows {
-            let Expression::Array {
-                elements: operands, ..
-            } = row
-            else {
-                unreachable!("semicolon-row predicate proves every child")
-            };
-            for operand in operands {
-                self.discover_calls(operand, values)?;
+        // An equation conditional kept as a run-time branch (SPEC_0040 DAE-C22)
+        // can take any arm, so every arm's calls are certified. An arm whose
+        // calls cannot be certified makes the guard a structural selection:
+        // the attempt is rolled back and only the reachable arms are kept.
+        let run_time = !self.analysis.structural_selections.contains(&span)
+            && values.evaluable().is_some_and(|evaluable| {
+                retains_flat_guard(self.flat, evaluable, branches, else_branch)
+            });
+        if run_time {
+            let checkpoint = self.checkpoint();
+            let every_arm = branches
+                .iter()
+                .flat_map(|(condition, value)| [condition, value])
+                .chain(std::iter::once(else_branch))
+                .try_for_each(|arm| self.discover_calls(arm, values));
+            // A certified callee must also have a representable body.
+            let representable = every_arm.is_ok()
+                && self.analysis.certificates[checkpoint.certificates..]
+                    .iter()
+                    .all(|certificate| {
+                        analysis::validate_function_certificate(
+                            self.flat,
+                            &self.analysis,
+                            certificate,
+                        )
+                        .is_ok()
+                    });
+            if representable {
+                return Ok(());
+            }
+            self.restore(checkpoint);
+            self.analysis.structural_selections.insert(span);
+        }
+        for (condition, value) in branches {
+            self.discover_calls(condition, values)?;
+            match values.proven_value(condition) {
+                Some(ProvenValue::Boolean(false)) => continue,
+                Some(ProvenValue::Boolean(true)) => return self.discover_calls(value, values),
+                _ => self.discover_calls(value, values)?,
             }
         }
-        Ok(())
+        self.discover_calls(else_branch, values)
     }
 
     fn discover_expression(
@@ -1128,6 +1443,38 @@ impl ShapeAnalyzer<'_> {
             self.discover_calls(default, values)?;
         }
         Ok(())
+    }
+
+    /// The discovery state to roll an uncertifiable run-time arm back to.
+    fn checkpoint(&self) -> DiscoveryCheckpoint {
+        DiscoveryCheckpoint {
+            certificates: self.analysis.certificates.len(),
+            call_keys: self.analysis.call_certificates.keys().cloned().collect(),
+            constructor_keys: self
+                .analysis
+                .constructor_fields_by_key
+                .keys()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn restore(&mut self, checkpoint: DiscoveryCheckpoint) {
+        let count = checkpoint.certificates;
+        self.analysis.certificates.truncate(count);
+        self.analysis.dependencies.truncate(count);
+        for dependencies in &mut self.analysis.dependencies {
+            dependencies.retain(|&dependency| dependency < count);
+        }
+        self.analysis
+            .certificate_by_key
+            .retain(|_, &mut index| index < count);
+        self.analysis
+            .call_certificates
+            .retain(|key, _| checkpoint.call_keys.contains(key));
+        self.analysis
+            .constructor_fields_by_key
+            .retain(|key, _| checkpoint.constructor_keys.contains(key));
     }
 
     fn record_dependency(&mut self, caller: Option<usize>, dependency: usize) {
@@ -1542,7 +1889,8 @@ fn concrete_model_shapes(
     flat: &flat::Model,
     constants: &EvalContext,
 ) -> Result<ShapeEnvironment, ToDaeError> {
-    let mut values = ShapeEnvironment::with_capacity(flat.variables.len());
+    let mut values =
+        ShapeEnvironment::with_capacity(flat.variables.len() + flat.record_instances.len());
     values.enumeration_type_declarations = Arc::new(
         flat.type_ids_by_def_id
             .iter()
@@ -1561,6 +1909,13 @@ fn concrete_model_shapes(
             }
             _ => values.insert(name.clone(), shape),
         }
+    }
+    // MLS §10.4/§12.2: structural field projections also read the shape of
+    // their record-valued base. Its declared axes live on the retained
+    // container, not on a primitive coordinate (including empty records).
+    for (name, record) in &flat.record_instances {
+        let shape = concrete_dimensions(&record.dims, record.source_span, "model record")?;
+        values.insert(name.clone(), shape);
     }
     values.insert(VarName::new("time"), Vec::new());
     // MLS §4.8.5.2: an enumeration literal's semantic identity is its ordinal,
@@ -1620,7 +1975,7 @@ fn resolve_certificate(
     // formal's dimension read an earlier formal — both its shape and, for a
     // dimension-typed scalar, its proven value.
     for (ordinal, (parameter, actual)) in function.inputs.iter().zip(&key.inputs).enumerate() {
-        let shape = resolve_declared_shape(parameter, Some(actual), &values)?;
+        let shape = resolve_declared_shape(parameter, Some(actual), None, &values)?;
         let name = VarName::new(&parameter.name);
         match key.input_values.get(ordinal).copied().flatten() {
             Some(ProvenValue::IntegerRange { lower, upper }) if shape.is_empty() => {
@@ -1635,7 +1990,7 @@ fn resolve_certificate(
     }
     let mut results = Vec::with_capacity(function.outputs.len());
     for result in &function.outputs {
-        let shape = resolve_declared_shape(result, None, &values)?;
+        let shape = resolve_declared_shape(result, None, Some(&function.body), &values)?;
         values.insert(VarName::new(&result.name), shape.clone());
         results.push(shape);
     }
@@ -1649,22 +2004,33 @@ fn resolve_certificate(
     let assigned = assigned_function_targets(&function.body);
     for local in &function.locals {
         let entry_shape = local_entry_shape(local, &assigned, &values);
-        let shape = resolve_declared_shape(local, entry_shape.as_ref(), &values)?;
+        let shape =
+            resolve_declared_shape(local, entry_shape.as_ref(), Some(&function.body), &values)?;
         let name = VarName::new(&local.name);
         match local.default.as_ref() {
-            Some(default)
-                if shape.is_empty()
-                    && !assigned.contains(&local.name)
-                    && is_dimension_typed_scalar(flat, local) =>
-            {
+            Some(default) if shape.is_empty() && !assigned.contains(&local.name) => {
                 // A declaration equation this scope cannot settle simply leaves
                 // the local without a value. That is not an error here: the
                 // local is still a well-shaped scalar, and any *extent* written
                 // over it is rejected by name where it is read.
-                match evaluate_shape_integer(default, &values).ok() {
-                    Some(value) => {
-                        values.bind_scalar_value(name, EvalValue::Integer(value));
-                    }
+                let folded = if is_dimension_typed_scalar(flat, local) {
+                    // MLS §4.4.2 admits this local's value in a dimension, so it
+                    // is folded through the extent evaluator that also honours
+                    // `size(...)` and the checked constant-index bounds.
+                    evaluate_shape_integer(default, &values)
+                        .ok()
+                        .map(EvalValue::Integer)
+                } else {
+                    // A Real (or other scalar) local is not itself an extent,
+                    // but MLS §12.4.4 fixes its declaration value for the whole
+                    // call, so a later local's colon axis sized from a range or
+                    // comprehension over it (`Real d = 1/a; Real v[:] = 0+d:d:1`)
+                    // can read that value. Non-scalar and non-foldable values
+                    // simply leave the local without one.
+                    values.fold_value(default).filter(is_scalar_value)
+                };
+                match folded {
+                    Some(value) => values.bind_scalar_value(name, value),
                     None => values.insert(name, shape),
                 }
             }
@@ -1706,6 +2072,7 @@ fn local_entry_shape(
 fn resolve_declared_shape(
     value: &rumoca_core::FunctionParam,
     actual: Option<&ValueShape>,
+    body: Option<&[rumoca_core::Statement]>,
     values: &ShapeEnvironment,
 ) -> Result<ValueShape, ToDaeError> {
     if let Some(actual) = actual
@@ -1732,6 +2099,20 @@ fn resolve_declared_shape(
         scoped
     });
     let scope = self_scope.as_ref().unwrap_or(values);
+    // MLS §12.4.5: a local or output array dimension declared with `:` takes
+    // its size from the array bound or assigned to it, so a colon axis with no
+    // call-site actual is sized from the binding or, absent one, from the body
+    // assignment. Computed once, and only when it can be read.
+    let has_colon_axis = actual.is_none()
+        && value
+            .shape_expr
+            .iter()
+            .any(|source| matches!(source, Subscript::Colon { .. }));
+    let declared_value_shape = if has_colon_axis {
+        local_binding_shape(value, body, scope)?
+    } else {
+        None
+    };
     let mut shape = Vec::with_capacity(value.dimensions().len());
     for (axis, declared) in value.dimensions().iter().copied().enumerate() {
         let source = value.shape_expr.get(axis);
@@ -1744,18 +2125,9 @@ fn resolve_declared_shape(
             })?
         } else {
             match source {
-                Some(Subscript::Colon { .. }) => actual
-                    .and_then(|shape| shape.get(axis))
-                    .copied()
-                    .ok_or_else(|| {
-                        shape_error(
-                            value,
-                            format!(
-                                "axis {} is variable-size but has no call-site equality",
-                                axis + 1
-                            ),
-                        )
-                    })?,
+                Some(Subscript::Colon { .. }) => {
+                    colon_axis_extent(value, axis, actual, declared_value_shape.as_ref())?
+                }
                 Some(Subscript::Index { value: extent, .. }) => {
                     concrete_extent(*extent, value, axis)?
                 }
@@ -1789,6 +2161,150 @@ fn resolve_declared_shape(
         shape.push(resolved);
     }
     Ok(shape)
+}
+
+/// The extent of one `:`-declared axis, from the call site or the binding.
+///
+/// An input's colon axis is pinned by the call site (MLS §12.2); its rank was
+/// matched before this call, so the axis is present. A local or output's colon
+/// axis is sized by the binding or body assignment (MLS §12.4.5), and reports a
+/// precise rejection when neither proves it.
+fn colon_axis_extent(
+    value: &rumoca_core::FunctionParam,
+    axis: usize,
+    actual: Option<&ValueShape>,
+    declared_value_shape: Option<&ValueShape>,
+) -> Result<u32, ToDaeError> {
+    if let Some(actual) = actual {
+        return actual.get(axis).copied().ok_or_else(|| {
+            shape_error(
+                value,
+                format!(
+                    "axis {} is variable-size but has no call-site equality",
+                    axis + 1
+                ),
+            )
+        });
+    }
+    declared_value_shape
+        .and_then(|proven| proven.get(axis))
+        .copied()
+        .ok_or_else(|| {
+            shape_error(
+                value,
+                format!(
+                    "axis {} is variable-size and neither a binding nor an assignment sizes it",
+                    axis + 1
+                ),
+            )
+        })
+}
+
+/// The shape MLS §12.4.5 gives a local or output whose axes are declared `:`.
+///
+/// "The dimension sizes of such a variable are determined as follows ... from
+/// the binding equation ... or from the assignment in the body." The binding
+/// is tried first, then the whole-array assignments; neither proving a size
+/// leaves it unproven, which the colon axis reports precisely.
+fn local_binding_shape(
+    value: &rumoca_core::FunctionParam,
+    body: Option<&[rumoca_core::Statement]>,
+    scope: &ShapeEnvironment,
+) -> Result<Option<ValueShape>, ToDaeError> {
+    if let Some(default) = &value.default
+        && let Some(shape) = binding_expression_shape(default, scope)
+    {
+        return Ok(Some(shape));
+    }
+    match body {
+        Some(statements) => assigned_target_shape(statements, value, scope),
+        None => Ok(None),
+    }
+}
+
+/// The proven shape of an expression bound or assigned to a colon-sized local.
+///
+/// The structural shape rules ([`call_free_expression_shape`]) prove a
+/// comprehension's iterator length, an array constructor's element count, an
+/// Integer range's cardinality, and a `size(...)`-derived extent. A binding
+/// those rules do not decompose (most notably an MLS §10.4.3 Real range whose
+/// cardinality is a floating-point quotient, not an Integer one) is folded to
+/// its settled value and sized from that value's array shape.
+fn binding_expression_shape(
+    expression: &Expression,
+    scope: &ShapeEnvironment,
+) -> Option<ValueShape> {
+    if let Some(shape) = call_free_expression_shape(expression, scope) {
+        return Some(shape);
+    }
+    array_value_shape(&scope.fold_value(expression)?)
+}
+
+/// The shape every top-level whole-array assignment to the local proves.
+///
+/// MLS §12.4.5 sizes a colon-declared local from the array assigned to it, and
+/// permits more than one such assignment. This phase constructs one fixed DAE
+/// extent, so every provable whole-array assignment must agree: agreement
+/// proves the size, a disagreement is a runtime resize this canonical form does
+/// not represent and is rejected by name, and no provable assignment leaves the
+/// size unproven for the colon axis to report. Only an unsubscripted assignment
+/// to the local sizes it; an element or slice write does not establish the
+/// array's own extent.
+fn assigned_target_shape(
+    statements: &[rumoca_core::Statement],
+    value: &rumoca_core::FunctionParam,
+    scope: &ShapeEnvironment,
+) -> Result<Option<ValueShape>, ToDaeError> {
+    let mut proven: Option<ValueShape> = None;
+    for statement in statements {
+        let rumoca_core::Statement::Assignment {
+            comp, value: rhs, ..
+        } = statement
+        else {
+            continue;
+        };
+        let [part] = comp.parts() else {
+            continue;
+        };
+        if part.ident != value.name || !part.subs.is_empty() {
+            continue;
+        }
+        let Some(shape) = binding_expression_shape(rhs, scope) else {
+            continue;
+        };
+        match &proven {
+            Some(existing) if *existing != shape => {
+                return Err(shape_error(
+                    value,
+                    format!(
+                        "is assigned arrays of differing shapes {existing:?} and {shape:?}; \
+                         resizing a variable-size local is unsupported"
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => proven = Some(shape),
+        }
+    }
+    Ok(proven)
+}
+
+/// The rectangular shape of a settled array value, outermost axis first.
+///
+/// A scalar folds to the empty shape; an empty array ends the descent at the
+/// axis whose extent is zero. Every case yields a shape whose per-axis extents
+/// the caller cross-checks against the declared rank.
+fn array_value_shape(value: &EvalValue) -> Option<ValueShape> {
+    let mut shape = Vec::new();
+    let mut current = value;
+    while let EvalValue::Array(elements) = current {
+        shape.push(u32::try_from(elements.len()).ok()?);
+        match elements.first() {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    Some(shape)
 }
 
 /// Whether an input's declared type lets its *value* name an array dimension.
@@ -1981,3 +2497,6 @@ fn checked_shape_arithmetic(
         )
     })
 }
+
+// SPEC_0021 file-size exception: this file is 2237 lines, over the 2000-line
+// action threshold; split plan: extract the FunctionSpecializationKey construction and the per-shape provenance derivation into sibling modules under function_shapes/.

@@ -945,6 +945,28 @@ impl Session {
             .map(|resolved| resolved.as_ref().clone())
     }
 
+    /// Construct the strict-compile resolution plan for the loaded sources
+    /// now, so later strict compiles in this session start from it instead of
+    /// building it inside the first compile.
+    ///
+    /// The plan is session state invalidated by any source change, so it is
+    /// shared exactly by the compiles that see the same sources.
+    pub fn prepare_strict_compile_plan(&mut self) -> Result<()> {
+        self.build_resolution_plan_for_strict_compile()
+            .map(drop)
+            .map_err(|diags| diagnostics_to_anyhow(&diags))
+    }
+
+    /// Whether the strict-compile resolution plan for the current sources is
+    /// already constructed.
+    pub fn strict_compile_plan_ready(&self) -> bool {
+        self.query_state
+            .resolved
+            .builds
+            .strict_compile_recovery
+            .is_some()
+    }
+
     /// Get a strict-recovery planning tree for an active editor target.
     ///
     /// This supports syntax-aware hover/goto planning when unrelated parse or

@@ -1,93 +1,220 @@
-//! Translation-time evaluation of array comprehensions (MLS §10.4.1).
+//! Array comprehensions `{expr for i in range, ...}` (MLS §10.4.1) in
+//! model-scope constant evaluation.
 //!
-//! `{e for i in r}` is the array of `e` evaluated for each value of `r`; with
-//! several iterators the first iterator is the outermost dimension. Each value
-//! is substituted into the body as a literal, so evaluation needs no mutable
-//! scope.
+//! Each iterator binds its name for the iterations of its own range only, so a
+//! binder shadows any outer name of the same spelling for exactly the
+//! sub-expressions it scopes. The first iterator is the outermost array
+//! dimension, the same element order the function-body evaluator produces.
 
+use std::borrow::Cow;
+
+use rumoca_core::{ComprehensionIndex, Span};
+
+use super::errors::EvalError;
 use super::expr_eval::eval_expr_with_span;
-use super::{EvalContext, EvalError, Value};
-use rumoca_core::{ComprehensionIndex, Expression, ExpressionRewriter, Literal, Span, Subscript};
+use super::value::Value;
+use super::{DeferredParameterSource, EvalEnvironment, Expression, Function};
 
-/// Upper bound on comprehension elements evaluated at translation time.
-const MAX_ELEMENTS: usize = 100_000;
+/// One comprehension iterator bound to its current value over an outer scope.
+struct BinderScope<'scope> {
+    outer: &'scope dyn EvalEnvironment,
+    name: &'scope str,
+    value: Value,
+}
 
+impl EvalEnvironment for BinderScope<'_> {
+    fn get_value(&self, name: &str) -> Option<Cow<'_, Value>> {
+        if name == self.name {
+            return Some(Cow::Borrowed(&self.value));
+        }
+        self.outer.get_value(name)
+    }
+
+    fn get_enum(&self, name: &str) -> Option<&(String, String)> {
+        if name == self.name {
+            return None;
+        }
+        self.outer.get_enum(name)
+    }
+
+    fn get_function(&self, name: &str) -> Option<&Function> {
+        self.outer.get_function(name)
+    }
+
+    fn get_array_dimensions(&self, name: &str) -> Option<&[i64]> {
+        if name == self.name {
+            return None;
+        }
+        self.outer.get_array_dimensions(name)
+    }
+
+    fn deferred_parameter(&self, name: &str) -> Option<DeferredParameterSource> {
+        if name == self.name {
+            return None;
+        }
+        self.outer.deferred_parameter(name)
+    }
+}
+
+/// Evaluate `{expr for indices if filter}` to a nested constant array.
 pub(super) fn eval_comprehension(
-    body: &Expression,
+    expr: &Expression,
     indices: &[ComprehensionIndex],
     filter: Option<&Expression>,
-    ctx: &EvalContext,
+    ctx: &dyn EvalEnvironment,
     span: Span,
 ) -> Result<Value, EvalError> {
-    let unsupported = || EvalError::UnsupportedExpression {
-        kind: "ArrayComprehension".to_string(),
-        span,
+    let Some((index, remaining)) = indices.split_first() else {
+        return eval_expr_with_span(expr, ctx, span);
     };
-    if filter.is_some() {
-        return Err(unsupported());
-    }
-    let Some((index, rest)) = indices.split_first() else {
-        return Err(unsupported());
+    let range = match eval_expr_with_span(&index.range, ctx, span)? {
+        Value::Array(values) => values,
+        other => return Err(EvalError::type_mismatch("Array", other.type_name(), span)),
     };
-    let Value::Array(values) = eval_expr_with_span(&index.range, ctx, span)? else {
-        return Err(unsupported());
-    };
-    if values.len() > MAX_ELEMENTS {
-        return Err(unsupported());
-    }
-    let mut elements = Vec::with_capacity(values.len());
-    for value in values {
-        let literal = value_literal(&value, span).ok_or_else(unsupported)?;
-        let mut substitution = Substitute {
+    let mut elements = Vec::with_capacity(range.len());
+    for value in range {
+        let scope = BinderScope {
+            outer: ctx,
             name: &index.name,
-            value: &literal,
+            value,
         };
-        let body = substitution.rewrite_expression(body);
-        let rest = rest
-            .iter()
-            .map(|later| ComprehensionIndex {
-                name: later.name.clone(),
-                range: substitution.rewrite_expression(&later.range),
-            })
-            .collect::<Vec<_>>();
-        elements.push(if rest.is_empty() {
-            eval_expr_with_span(&body, ctx, span)?
-        } else {
-            eval_comprehension(&body, &rest, None, ctx, span)?
-        });
+        if !remaining.is_empty() {
+            elements.push(eval_comprehension(expr, remaining, filter, &scope, span)?);
+            continue;
+        }
+        if let Some(filter) = filter {
+            let keep = eval_expr_with_span(filter, &scope, span)?;
+            match keep.as_bool() {
+                Some(true) => {}
+                Some(false) => continue,
+                None => return Err(EvalError::type_mismatch("Boolean", keep.type_name(), span)),
+            }
+        }
+        elements.push(eval_expr_with_span(expr, &scope, span)?);
     }
     Ok(Value::Array(elements))
 }
 
-fn value_literal(value: &Value, span: Span) -> Option<Expression> {
-    let literal = match value {
-        Value::Integer(v) => Literal::Integer(*v),
-        Value::Real(v) => Literal::Real(*v),
-        Value::Bool(v) => Literal::Boolean(*v),
-        Value::String(v) => Literal::String(v.clone()),
-        _ => return None,
-    };
-    Some(Expression::Literal {
-        value: literal,
-        span,
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constant::EvalContext;
 
-struct Substitute<'a> {
-    name: &'a str,
-    value: &'a Expression,
-}
+    fn span() -> Span {
+        Span::from_offsets(
+            rumoca_core::SourceId::from_source_name("comprehension_eval_tests.mo"),
+            0,
+            1,
+        )
+    }
 
-impl ExpressionRewriter for Substitute<'_> {
-    fn rewrite_var_ref_expression(
-        &mut self,
-        name: &rumoca_core::Reference,
-        subscripts: &[Subscript],
-        span: Span,
-    ) -> Expression {
-        if name.as_str() == self.name && subscripts.is_empty() {
-            return self.value.clone();
+    fn int(value: i64) -> Expression {
+        Expression::Literal {
+            value: rumoca_core::Literal::Integer(value),
+            span: span(),
         }
-        self.walk_var_ref_expression(name, subscripts, span)
+    }
+
+    fn var(name: &str) -> Expression {
+        Expression::VarRef {
+            name: name.into(),
+            subscripts: vec![],
+            span: span(),
+        }
+    }
+
+    fn vector(values: &[i64]) -> Expression {
+        Expression::Array {
+            elements: values.iter().map(|value| int(*value)).collect(),
+            kind: rumoca_core::ArrayConstructor::Array,
+            span: span(),
+        }
+    }
+
+    fn index(name: &str, values: &[i64]) -> ComprehensionIndex {
+        ComprehensionIndex {
+            name: name.to_string(),
+            range: vector(values),
+        }
+    }
+
+    fn binary(op: rumoca_core::OpBinary, lhs: Expression, rhs: Expression) -> Expression {
+        Expression::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            span: span(),
+        }
+    }
+
+    /// The binder hides exactly its own name from every outer lookup and
+    /// forwards every other name to the enclosing scope.
+    #[test]
+    fn a_binder_shadows_only_its_own_name() {
+        let mut outer = EvalContext::new();
+        outer.add_parameter("n", Value::Integer(3));
+        outer.add_array_dimensions("a", vec![2]);
+        outer.add_array_dimensions("i", vec![5]);
+        outer.add_function(Function::new("f", span()));
+        let scope = BinderScope {
+            outer: &outer,
+            name: "i",
+            value: Value::Integer(1),
+        };
+        assert_eq!(scope.get_value("i").as_deref(), Some(&Value::Integer(1)));
+        assert_eq!(scope.get_value("n").as_deref(), Some(&Value::Integer(3)));
+        assert_eq!(scope.get_array_dimensions("a"), Some(&[2_i64][..]));
+        assert_eq!(scope.get_array_dimensions("i"), None);
+        assert!(scope.get_function("f").is_some());
+        assert!(scope.get_enum("i").is_none());
+        assert!(scope.deferred_parameter("i").is_none());
+    }
+
+    /// Nested iterators give nested arrays with the first iterator outermost,
+    /// and a filter keeps only the elements it admits.
+    #[test]
+    fn nested_iterators_and_filters_shape_the_array() {
+        let ctx = EvalContext::new();
+        let product = binary(rumoca_core::OpBinary::Mul, var("i"), var("j"));
+        let nested = eval_comprehension(
+            &product,
+            &[index("i", &[1, 2]), index("j", &[10, 20])],
+            None,
+            &ctx,
+            span(),
+        );
+        let row = |a, b| Value::Array(vec![Value::Integer(a), Value::Integer(b)]);
+        assert_eq!(
+            nested.ok(),
+            Some(Value::Array(vec![row(10, 20), row(20, 40)]))
+        );
+
+        let filter = binary(rumoca_core::OpBinary::Gt, var("i"), int(1));
+        let filtered = eval_comprehension(
+            &var("i"),
+            &[index("i", &[1, 2, 3])],
+            Some(&filter),
+            &ctx,
+            span(),
+        );
+        assert_eq!(
+            filtered.ok(),
+            Some(Value::Array(vec![Value::Integer(2), Value::Integer(3)]))
+        );
+    }
+
+    /// A filter must be Boolean, and an iterator range must be an array.
+    #[test]
+    fn ill_typed_filters_and_ranges_are_reported() {
+        let ctx = EvalContext::new();
+        let filter = int(1);
+        let filtered =
+            eval_comprehension(&var("i"), &[index("i", &[1])], Some(&filter), &ctx, span());
+        assert!(filtered.is_err());
+        let scalar_range = ComprehensionIndex {
+            name: "i".to_string(),
+            range: int(1),
+        };
+        assert!(eval_comprehension(&var("i"), &[scalar_range], None, &ctx, span()).is_err());
     }
 }

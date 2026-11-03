@@ -7,16 +7,41 @@
 //! replaced by the exact symbolic derivative of its definition, which
 //! [`differentiation`](super::differentiation) supplies.
 
+mod scoped_cache;
+
 use rumoca_ir_dae as dae;
 
-use super::DirectStateConstraint;
+use scoped_cache::ScopedReconstructionCache;
+
 use super::constraints::DifferentiationFacts;
 use super::declarations::RebuiltDomain;
 use super::differentiation::Derivative;
-use super::equalities::FunctionCallContext;
 use super::functions::RebuiltFunction;
 use super::temporal::RebuiltClock;
 use super::variables::{ReservedVariable, TargetVariable};
+use super::{DirectStateConstraint, StateDefinition};
+use rumoca_eval_dae::FunctionCallContext;
+
+pub(super) fn shaped_zero<'target>(
+    target: &mut dae::Expressions<'_, 'target>,
+    dimensions: &[u32],
+    provenance: dae::DaeProvenance,
+) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+    if dimensions.is_empty() {
+        return target.at(provenance).literal(dae::DaeLiteral::Real(0.0));
+    }
+    let extents = dimensions
+        .iter()
+        .map(|&extent| {
+            target
+                .at(provenance)
+                .literal(dae::DaeLiteral::Integer(i64::from(extent)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    target
+        .at(provenance)
+        .builtin(dae::PureBuiltin::Zeros, extents)
+}
 
 pub(super) struct ExpressionRebuilder<'source, 'borrow, 'storage, 'target> {
     pub(super) source: dae::DaeView<'source>,
@@ -30,15 +55,29 @@ pub(super) struct ExpressionRebuilder<'source, 'borrow, 'storage, 'target> {
     previous: &'borrow [dae::PreviousId<'target>],
     terminals: &'borrow [dae::TerminalId<'target>],
     pub(super) facts: &'borrow DifferentiationFacts,
-    candidate: Option<DirectStateConstraint>,
+    pub(super) auxiliary_functions: &'borrow super::auxiliary_blocks::AuxiliaryFunctions<'target>,
+    pub(super) auxiliary_expressions: std::collections::BTreeMap<
+        (u32, u8, bool),
+        super::auxiliary_blocks::AuxiliaryExpression<'target>,
+    >,
+    pub(super) candidate: Option<DirectStateConstraint>,
     substitute_demoted_value: bool,
     pub(super) state_only_derivative: bool,
+    pub(super) formal_derivatives: bool,
+    pub(super) derivative_anchors: super::equalities::DerivativeAnchors,
     pub(super) function_context: FunctionCallContext<'source>,
+    pub(super) scoped_cache: ScopedReconstructionCache<'source, 'target>,
+    /// STRUCT-T10(b): source call nodes replaced by their substituted body.
+    inline_calls: &'borrow [bool],
+    /// SPEC_0043 §4: source expressions replaced by their literal values.
+    literal_expressions:
+        &'borrow [Option<std::sync::Arc<super::evaluable_parameters::FoldedValue>>],
     rebuilt: &'borrow mut [Option<dae::ExprId<'target>>],
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct RebuiltBaseIdentities<'borrow, 'target> {
+    pub(super) auxiliary_functions: &'borrow super::auxiliary_blocks::AuxiliaryFunctions<'target>,
     pub(super) types: &'borrow [dae::ValueTypeId<'target>],
     pub(super) variables: &'borrow [ReservedVariable<'target>],
     pub(super) domains: &'borrow [RebuiltDomain<'target>],
@@ -55,6 +94,60 @@ pub(super) struct RebuiltIdentities<'borrow, 'target> {
 }
 
 impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 'storage, 'target> {
+    pub(super) fn rebuilt_derivative(
+        &self,
+        source: dae::FunctionDerivativeId<'source>,
+    ) -> dae::FunctionDerivativeId<'target> {
+        self.functions[source.function().index() as usize].derivatives[source.ordinal() as usize]
+    }
+
+    pub(super) fn rebuild_call_value(
+        &mut self,
+        source_id: dae::ExprId<'source>,
+        arguments: &[dae::ExprId<'target>],
+        provenance: dae::DaeProvenance,
+    ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        let source = self.source.expression(source_id).expect("checked call");
+        let dae::ExpressionOperation::Call {
+            owner,
+            function,
+            output,
+            ..
+        } = source.operation()
+        else {
+            unreachable!("call reconstruction consumes a call")
+        };
+        if owner != source_id {
+            let owner = self.rebuild_call_value(owner, arguments, provenance)?;
+            return self.target.at(provenance).call_projection(
+                owner,
+                self.functions[function.index() as usize].id,
+                output as usize,
+                arguments.iter().copied(),
+            );
+        }
+        if let Some((primal, link)) = source.call_derivative() {
+            let dae::ExpressionOperation::Call {
+                arguments: prefix, ..
+            } = self.source.expression(primal).unwrap().operation()
+            else {
+                unreachable!("derivative origin is a checked call")
+            };
+            let primal = self.rebuild_call_value(primal, &arguments[..prefix.len()], provenance)?;
+            let link = self.rebuilt_derivative(link);
+            return self.target.at(provenance).differentiated_call(
+                primal,
+                link.ordinal(),
+                arguments.iter().copied(),
+            );
+        }
+        self.target.at(provenance).call(
+            self.functions[function.index() as usize].id,
+            output as usize,
+            arguments.iter().copied(),
+        )
+    }
+
     pub(super) fn new(
         source: dae::DaeView<'source>,
         target: &'borrow mut dae::Expressions<'storage, 'target>,
@@ -75,10 +168,17 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             previous: identities.base.previous,
             terminals: identities.base.terminals,
             facts,
+            auxiliary_functions: identities.base.auxiliary_functions,
+            auxiliary_expressions: std::collections::BTreeMap::new(),
             candidate,
             substitute_demoted_value: false,
             state_only_derivative: false,
+            formal_derivatives: false,
+            derivative_anchors: Default::default(),
             function_context: FunctionCallContext::default(),
+            scoped_cache: ScopedReconstructionCache::default(),
+            inline_calls: &[],
+            literal_expressions: &[],
             rebuilt,
         }
     }
@@ -89,6 +189,29 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
     pub(super) fn substituting_demoted_value(mut self) -> Self {
         assert!(self.candidate.is_some());
         self.substitute_demoted_value = true;
+        self
+    }
+
+    /// Replace the flagged source calls by their substituted bodies.
+    pub(super) fn inlining_calls(mut self, inline_calls: &'borrow [bool]) -> Self {
+        self.inline_calls = inline_calls;
+        self
+    }
+
+    /// Replace the planned source expressions by their literal values.
+    pub(super) fn replacing_literals(
+        mut self,
+        literal_expressions: &'borrow [Option<
+            std::sync::Arc<super::evaluable_parameters::FoldedValue>,
+        >],
+    ) -> Self {
+        self.literal_expressions = literal_expressions;
+        self
+    }
+
+    pub(super) fn with_formal_derivatives(mut self) -> Self {
+        assert!(self.candidate.is_none());
+        self.formal_derivatives = true;
         self
     }
 
@@ -124,9 +247,15 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             .expression(source_id)
             .expect("finalized expression identity resolves");
         let provenance = source.provenance();
-        let value_type = self.types[source.value_type_id().index() as usize];
-        let rebuilt =
-            self.rebuild_operation(source_id, source.operation(), provenance, value_type)?;
+        let rebuilt = match self.literal_expressions.get(index).cloned().flatten() {
+            Some(value) => {
+                super::evaluable_parameters::folded_literal(self.target, &value, provenance)?
+            }
+            None => {
+                let value_type = self.types[source.value_type_id().index() as usize];
+                self.rebuild_operation(source_id, source.operation(), provenance, value_type)?
+            }
+        };
         self.rebuilt[index] = Some(rebuilt);
         Ok(rebuilt)
     }
@@ -141,31 +270,98 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             .function_context
             .scoped_to_expression(self.source, source_id);
         let previous = std::mem::replace(&mut self.function_context, scoped);
-        let rebuilt = self.rebuild_instantiated_scoped(source_id);
+        let provenance = self.source.expression(source_id).unwrap().provenance();
+        let key = self.scoped_reconstruction_key(source_id, 0, provenance);
+        let rebuilt = match self.scoped_cache.instantiated.get(&key).copied() {
+            Some(value) => Ok(value),
+            None => {
+                let result = self
+                    .rebuild_instantiated_scoped(source_id)
+                    .and_then(|value| self.preserve_real_value_type(source_id, value, provenance));
+                if let Ok(value) = result {
+                    self.scoped_cache.instantiated.insert(key, value);
+                }
+                result
+            }
+        };
         self.function_context = previous;
         rebuilt
     }
 
+    /// STRUCT-T10(b): the single straight-line result of an admitted call,
+    /// with the call's own arguments substituted.
+    fn rebuild_inlined_call(
+        &mut self,
+        call: dae::ExprId<'source>,
+    ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        let (result, context) = FunctionCallContext::default()
+            .call_result(self.source, call)
+            .expect("the inline plan admits only single-assignment callees");
+        let previous = std::mem::replace(&mut self.function_context, context);
+        let value = self.rebuild_instantiated(result);
+        self.function_context = previous;
+        value
+    }
+
+    /// Substitution retains the MLS §10.6.13 promotion at a Real argument,
+    /// result, or value anchor. Scalar scaling preserves compact tensor shapes
+    /// and lets the ordinary mixed-numeric constructor derive the Real type.
+    pub(super) fn preserve_real_value_type(
+        &mut self,
+        source_id: dae::ExprId<'source>,
+        value: dae::ExprId<'target>,
+        provenance: dae::DaeProvenance,
+    ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        let expected = self.source.expression(source_id).unwrap().value_type();
+        if expected.scalar_type() != dae::ScalarType::Real
+            || self.target.value_type(value, provenance)?.scalar_type() != dae::ScalarType::Integer
+        {
+            return Ok(value);
+        }
+        let one = self
+            .target
+            .at(provenance)
+            .literal(dae::DaeLiteral::Real(1.0))?;
+        self.target
+            .at(provenance)
+            .binary(dae::BinaryOperator::Multiply, one, value)
+    }
+
+    // SPEC_0021: Exception - exhaustive dispatch of instantiated expression owners.
+    #[allow(clippy::too_many_lines)]
     fn rebuild_instantiated_scoped(
         &mut self,
         source_id: dae::ExprId<'source>,
     ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
-        if let Some((result, nested)) = self.function_context.call_result(self.source, source_id) {
-            let previous = std::mem::replace(&mut self.function_context, nested);
-            let rebuilt = self.rebuild_instantiated(result);
-            self.function_context = previous;
-            return rebuilt;
+        if let Some(branch) = self
+            .function_context
+            .selected_branch(self.source, source_id)
+        {
+            return self.rebuild_instantiated(branch);
         }
         let source = self
             .source
             .expression(source_id)
-            .expect("instantiated function expression resolves");
+            .expect("instantiated expression resolves");
+        if let dae::ExpressionOperation::Call { arguments, .. } = source.operation() {
+            if source.function_scope().is_none() && source.binder_domain().is_none() {
+                return self.rebuild(source_id);
+            }
+            let arguments = arguments
+                .iter()
+                .map(|argument| self.rebuild_instantiated(argument))
+                .collect::<Result<Vec<_>, _>>()?;
+            return self.rebuild_call_value(source_id, &arguments, source.provenance());
+        }
         if source.function_scope().is_none() && source.binder_domain().is_none() {
             return self.rebuild(source_id);
         }
         let provenance = source.provenance();
         match source.operation() {
             dae::ExpressionOperation::Literal(literal) => self.rebuild_literal(literal, provenance),
+            dae::ExpressionOperation::Coordinate(dae::CoordinateView::Binder(_)) => {
+                self.rebuild(source_id)
+            }
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::FunctionParameter(
                 parameter,
             )) => {
@@ -191,15 +387,35 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                     .collect::<Result<Vec<_>, _>>()?;
                 self.target.at(provenance).array(elements)
             }
+            dae::ExpressionOperation::Record(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| self.rebuild_instantiated(field))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let value_type = self.types[source.value_type_id().index() as usize];
+                self.target.at(provenance).record(value_type, fields)
+            }
             dae::ExpressionOperation::Field { base, field } => {
-                let (projected, projected_context) = self
-                    .function_context
-                    .projected_field(self.source, base, field)
-                    .expect("instantiation proof resolves this record field");
+                let Some((projected, projected_context)) =
+                    self.function_context
+                        .projected_field(self.source, base, field)
+                else {
+                    // A field of a record value no straight-line projection
+                    // resolves (the result of a multi-statement call such as
+                    // IF97 `waterBaseProp_pT`) is the field of that rebuilt
+                    // record value.
+                    let base = self.rebuild_instantiated(base)?;
+                    return self.target.at(provenance).field(base, field as usize);
+                };
                 let previous = std::mem::replace(&mut self.function_context, projected_context);
                 let rebuilt = self.rebuild_instantiated(projected);
                 self.function_context = previous;
                 rebuilt
+            }
+            dae::ExpressionOperation::Index { base, subscripts } => {
+                let base = self.rebuild_instantiated(base)?;
+                let subscripts = self.rebuild_instantiated_subscripts(subscripts)?;
+                self.target.at(provenance).index(base, subscripts)
             }
             dae::ExpressionOperation::Builtin { builtin, arguments } => {
                 let arguments = arguments
@@ -260,7 +476,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 format,
             } => self.rebuild_string_conversion(declaration, value, format, provenance)?,
             dae::ExpressionOperation::Conditional(operands) => {
-                self.rebuild_conditional(operands, provenance)?
+                self.rebuild_conditional(source_id, operands, provenance)?
             }
             dae::ExpressionOperation::Array(operands) => {
                 if operands.is_empty() {
@@ -303,8 +519,19 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                     .array_update(base, value, subscripts)?
             }
             dae::ExpressionOperation::Builtin { builtin, arguments } => {
+                let function = (builtin == dae::PureBuiltin::LinearSolve
+                    && self
+                        .source
+                        .expression(source_id)
+                        .expect("source expression")
+                        .function_scope()
+                        .is_none())
+                .then(|| self.linear_solve_function(arguments));
                 let arguments = self.rebuild_operands(arguments)?;
-                self.target.at(provenance).builtin(builtin, arguments)?
+                match function {
+                    Some(function) => self.target.at(provenance).call(function, 0, arguments)?,
+                    None => self.target.at(provenance).builtin(builtin, arguments)?,
+                }
             }
             dae::ExpressionOperation::Call {
                 owner,
@@ -312,12 +539,18 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 output,
                 arguments,
             } => {
+                if self
+                    .inline_calls
+                    .get(source_id.index() as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return self.rebuild_inlined_call(source_id);
+                }
                 let arguments = self.rebuild_operands(arguments)?;
                 let function = self.functions[function.index() as usize].id;
                 if owner == source_id {
-                    self.target
-                        .at(provenance)
-                        .call(function, output as usize, arguments)?
+                    self.rebuild_call_value(source_id, &arguments, provenance)?
                 } else {
                     let owner = self.rebuild(owner)?;
                     self.target.at(provenance).call_projection(
@@ -427,7 +660,61 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
         self.target.at(provenance).range(start, explicit_step, stop)
     }
 
+    /// Rebuild an MLS §3.6.5 if-expression, selecting through every condition
+    /// a STRUCT-T10(a) fold settles.
+    ///
+    /// A branch whose condition folds to `false` is never selected and a
+    /// condition that folds to `true` makes every later branch unreachable,
+    /// so neither contributes a read. The selection keeps the conditional's
+    /// value type; a branch of a different type keeps the whole conditional.
     fn rebuild_conditional(
+        &mut self,
+        conditional: dae::ExprId<'source>,
+        operands: dae::ExpressionOperands<'source>,
+        provenance: dae::DaeProvenance,
+    ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        let mut selected = operands
+            .get(operands.len() - 1)
+            .expect("checked conditional has a fallback");
+        let mut live = Vec::with_capacity((operands.len() - 1) / 2);
+        for index in (0..operands.len() - 1).step_by(2) {
+            let condition = operands
+                .get(index)
+                .expect("checked conditional branch has a condition");
+            let value = operands
+                .get(index + 1)
+                .expect("checked conditional branch has a value");
+            match self.settled_condition(condition) {
+                Some(false) => {}
+                Some(true) => {
+                    selected = value;
+                    break;
+                }
+                None => live.push((condition, value)),
+            }
+        }
+        let value_type = |expression: dae::ExprId<'source>| {
+            self.source
+                .expression(expression)
+                .and_then(|node| self.source.value_type(node.value_type_id()))
+        };
+        let result_type = value_type(conditional);
+        let keeps_type = |expression| value_type(expression) == result_type;
+        if !keeps_type(selected) || live.iter().any(|(_, value)| !keeps_type(*value)) {
+            return self.rebuild_conditional_arms(operands, provenance);
+        }
+        let fallback = self.rebuild(selected)?;
+        if live.is_empty() {
+            return Ok(fallback);
+        }
+        let mut branches = Vec::with_capacity(live.len());
+        for (condition, value) in live {
+            branches.push((self.rebuild(condition)?, self.rebuild(value)?));
+        }
+        self.target.at(provenance).conditional(branches, fallback)
+    }
+
+    fn rebuild_conditional_arms(
         &mut self,
         operands: dae::ExpressionOperands<'source>,
         provenance: dae::DaeProvenance,
@@ -455,9 +742,51 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
         self.target.at(provenance).conditional(branches, fallback)
     }
 
+    /// The value a condition has once STRUCT-T10(a) folds its parameters: a
+    /// Boolean literal, a folded scalar Boolean parameter, or its negation.
+    fn settled_condition(&self, condition: dae::ExprId<'source>) -> Option<bool> {
+        let node = self.source.expression(condition)?;
+
+        match node.operation() {
+            dae::ExpressionOperation::Literal(dae::DaeLiteral::Boolean(value)) => Some(*value),
+            dae::ExpressionOperation::Coordinate(dae::CoordinateView::Parameter(parameter)) => {
+                let folded = self.variables[parameter.index() as usize]
+                    .folded
+                    .as_deref()?;
+                match (folded.scalar, &*folded.values) {
+                    (dae::ScalarType::Boolean, [value]) => Some(*value != 0.0),
+                    _ => None,
+                }
+            }
+            dae::ExpressionOperation::Unary {
+                operator: dae::UnaryOperator::Not,
+                operand,
+            } => self.settled_condition(operand).map(|value| !value),
+            _ => None,
+        }
+    }
+
     pub(super) fn rebuild_subscripts(
         &mut self,
         subscripts: dae::SubscriptsView<'source>,
+    ) -> Result<Vec<dae::Subscript<'target>>, dae::DaeConstructionError> {
+        self.rebuild_subscripts_with(subscripts, Self::rebuild)
+    }
+
+    pub(super) fn rebuild_instantiated_subscripts(
+        &mut self,
+        subscripts: dae::SubscriptsView<'source>,
+    ) -> Result<Vec<dae::Subscript<'target>>, dae::DaeConstructionError> {
+        self.rebuild_subscripts_with(subscripts, Self::rebuild_instantiated)
+    }
+
+    fn rebuild_subscripts_with(
+        &mut self,
+        subscripts: dae::SubscriptsView<'source>,
+        rebuild: fn(
+            &mut Self,
+            dae::ExprId<'source>,
+        ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError>,
     ) -> Result<Vec<dae::Subscript<'target>>, dae::DaeConstructionError> {
         subscripts
             .iter()
@@ -466,7 +795,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                     expression,
                     provenance,
                 } => Ok(dae::Subscript::Index {
-                    expression: self.rebuild(expression)?,
+                    expression: rebuild(self, expression)?,
                     provenance,
                 }),
                 dae::SubscriptView::Whole { provenance } => {
@@ -476,7 +805,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                     expression,
                     provenance,
                 } => Ok(dae::Subscript::Slice {
-                    expression: self.rebuild(expression)?,
+                    expression: rebuild(self, expression)?,
                     provenance,
                 }),
             })
@@ -499,6 +828,9 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             && state.index() == candidate.state
         {
             return self.rebuild_demoted_derivative(candidate);
+        }
+        if let Some(rebuilt) = self.rebuild_coordinate_alias(coordinate, provenance) {
+            return rebuilt;
         }
         let coordinate = match coordinate {
             dae::CoordinateView::Parameter(id) => {
@@ -591,6 +923,52 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
         self.target.at(provenance).coordinate(coordinate)
     }
 
+    /// Read a STRUCT-T09 derivative alias, a STRUCT-T10(a) folded parameter
+    /// as its value, or an eliminated STRUCT-T02 alias member through its
+    /// class representative, keeping the source occurrence's provenance.
+    fn rebuild_coordinate_alias(
+        &mut self,
+        coordinate: dae::CoordinateView<'source>,
+        provenance: dae::DaeProvenance,
+    ) -> Option<Result<dae::ExprId<'target>, dae::DaeConstructionError>> {
+        if let dae::CoordinateView::Derivative(state) = coordinate
+            && let Some(alias) = self.variables[state.index() as usize].derivative_alias
+        {
+            return Some(
+                self.target
+                    .at(provenance)
+                    .coordinate(dae::CoordinateInput::Algebraic(alias)),
+            );
+        }
+        if let dae::CoordinateView::Parameter(parameter) = coordinate {
+            let folded = self.variables[parameter.index() as usize]
+                .folded
+                .as_deref()?;
+            return Some(super::evaluable_parameters::folded_literal(
+                self.target,
+                folded,
+                provenance,
+            ));
+        }
+        let dae::CoordinateView::Algebraic(id) = coordinate else {
+            return None;
+        };
+        let alias = self.variables[id.index() as usize].value_alias?;
+        let value = self
+            .target
+            .at(provenance)
+            .coordinate(super::variables::value_alias_coordinate(alias));
+        Some(value.and_then(|value| {
+            if alias.negated {
+                self.target
+                    .at(provenance)
+                    .unary(dae::UnaryOperator::Negate, value)
+            } else {
+                Ok(value)
+            }
+        }))
+    }
+
     fn rebuild_demoted_value(
         &mut self,
         candidate: DirectStateConstraint,
@@ -600,12 +978,18 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             candidate.owner.span(),
         )?;
         let previous = std::mem::replace(&mut self.substitute_demoted_value, false);
-        let value = self.materialize_exact_value(
-            self.source
-                .expression_id(candidate.rhs as usize)
-                .expect("candidate RHS resolves"),
-            generated,
-        );
+        let value = match candidate.rhs {
+            StateDefinition::DerivativeExpression(_) => {
+                unreachable!("manifold preflight requires an exact value definition")
+            }
+            StateDefinition::Expression(rhs) => self.materialize_exact_value(
+                self.source
+                    .expression_id(rhs as usize)
+                    .expect("candidate RHS resolves"),
+                generated,
+            ),
+            StateDefinition::Auxiliary(variable) => self.auxiliary_value(variable, 0, generated),
+        };
         self.substitute_demoted_value = previous;
         let value = value?;
         match candidate.rhs_sign {
@@ -625,12 +1009,18 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             dae::DaeGeneration::IndexReduction,
             candidate.owner.span(),
         )?;
-        let derivative = self.differentiate(
-            self.source
-                .expression_id(candidate.rhs as usize)
-                .expect("candidate RHS resolves"),
-            generated,
-        )?;
+        let derivative = match candidate.rhs {
+            StateDefinition::Expression(rhs) | StateDefinition::DerivativeExpression(rhs) => self
+                .differentiate(
+                self.source
+                    .expression_id(rhs as usize)
+                    .expect("candidate RHS resolves"),
+                generated,
+            )?,
+            StateDefinition::Auxiliary(variable) => {
+                Derivative::Expression(self.auxiliary_value(variable, 1, generated)?)
+            }
+        };
         match (candidate.rhs_sign, derivative) {
             (_, Derivative::Zero) => self.zero_for_demoted_state(candidate.state, generated),
             (super::equalities::EqualitySign::Same, Derivative::Expression(expression)) => {
@@ -656,23 +1046,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             .value_type()
             .dimensions()
             .to_vec();
-        if dimensions.is_empty() {
-            return self
-                .target
-                .at(provenance)
-                .literal(dae::DaeLiteral::Real(0.0));
-        }
-        let extents = dimensions
-            .into_iter()
-            .map(|extent| {
-                self.target
-                    .at(provenance)
-                    .literal(dae::DaeLiteral::Integer(i64::from(extent)))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.target
-            .at(provenance)
-            .builtin(dae::PureBuiltin::Zeros, extents)
+        shaped_zero(self.target, &dimensions, provenance)
     }
 
     fn rebuild_discrete_coordinate(

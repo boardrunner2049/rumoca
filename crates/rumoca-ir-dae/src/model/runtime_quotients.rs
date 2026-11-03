@@ -1,6 +1,6 @@
 use super::*;
 use crate::ConditionInput;
-use crate::expression::PureBuiltin;
+use crate::expression::{PureBuiltin, QuotientScope};
 use crate::{ConditionId, RelationId, RootId};
 
 /// Finalized identity of one dynamic-quotient owner.
@@ -96,9 +96,11 @@ impl<'dae> DaeConstruction<'dae> {
         let generated_at =
             DaeProvenance::generated(DaeGeneration::RuntimeDiscontinuity, provenance.span())?;
         let quotient = self.expressions(|expressions| {
-            expressions
-                .at(provenance)
-                .checked_runtime_quotient(builtin, arguments)
+            expressions.at(provenance).checked_runtime_quotient(
+                builtin,
+                arguments,
+                QuotientScope::Model,
+            )
         })?;
         let generated = self.expressions(|expressions| {
             let ratio = expressions.at(generated_at).binary(
@@ -198,9 +200,11 @@ impl<'dae> DaeConstruction<'dae> {
             validate_function_value_reads(self.storage, body, argument, provenance)?;
         }
         let quotient = self.expressions(|expressions| {
-            expressions
-                .at(provenance)
-                .checked_runtime_quotient(builtin, arguments)
+            expressions.at(provenance).checked_runtime_quotient(
+                builtin,
+                arguments,
+                QuotientScope::FunctionBody,
+            )
         })?;
         self.storage.record_quotient_owner(
             RuntimeQuotientOwnerEntry {

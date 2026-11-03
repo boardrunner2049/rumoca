@@ -587,6 +587,7 @@ fn build_model_diagnostics_for_typed_model(
 
     collected.extend(synthesized_inner_diagnostics(
         &overlay.synthesized_inners,
+        &overlay.synthesized_inner_messages,
         model_span,
     ));
 
@@ -594,6 +595,54 @@ fn build_model_diagnostics_for_typed_model(
         diagnostics: model_diagnostics_for_tree(tree, collected),
         blocks_model_stage: false,
     }
+}
+
+/// One WD001 warning per structural use of ordinary parameters: a guard
+/// selecting between structurally different branches (MLS 3.7 §8.3.4), an
+/// array dimension (§10.1), or a for-equation range (§8.3.3). Each fixes its
+/// parameters at translation, so they cannot be set (SPEC_0040 DAE-C22).
+fn structural_selection_warnings(
+    selections: &[rumoca_phase_dae::StructuralSelection],
+) -> Vec<CommonDiagnostic> {
+    selections
+        .iter()
+        .map(|selection| {
+            let plural = if selection.parameters.len() == 1 {
+                ""
+            } else {
+                "s"
+            };
+            let parameters = selection.parameters.join(", ");
+            let (message, label) = match selection.kind {
+                rumoca_ir_flat::StructuralParameterUse::BranchSelection => (
+                    format!(
+                        "the branch of this equation is selected at translation, so parameter{plural} \
+                         {parameters} cannot be set: its branches differ in structure (MLS 3.7 §8.3.4)"
+                    ),
+                    "branch fixed at translation",
+                ),
+                rumoca_ir_flat::StructuralParameterUse::ArrayDimension => (
+                    format!(
+                        "this array dimension is fixed at translation, so parameter{plural} \
+                         {parameters} cannot be set (MLS 3.7 §10.1)"
+                    ),
+                    "dimension fixed at translation",
+                ),
+                rumoca_ir_flat::StructuralParameterUse::ForRange => (
+                    format!(
+                        "this for-equation range is fixed at translation, so parameter{plural} \
+                         {parameters} cannot be set (MLS 3.7 §8.3.3)"
+                    ),
+                    "range fixed at translation",
+                ),
+            };
+            CommonDiagnostic::warning(
+                "WD001",
+                message,
+                PrimaryLabel::new(selection.span).with_message(label),
+            )
+        })
+        .collect()
 }
 
 fn build_model_diagnostics_for_dae_model(
@@ -606,7 +655,11 @@ fn build_model_diagnostics_for_dae_model(
         class_primary_span(tree, model_name).unwrap_or_else(|| default_tree_span(&tree.source_map));
 
     match dae_outcome {
-        DaeModelOutcome::Success(_) => {}
+        DaeModelOutcome::Success(artifact) => {
+            collected.extend(structural_selection_warnings(
+                &artifact.structural_selections,
+            ));
+        }
         DaeModelOutcome::NeedsInner {
             missing_inners,
             missing_spans,
@@ -649,12 +702,17 @@ fn build_model_diagnostics_for_dae_model(
 
 fn synthesized_inner_diagnostics(
     synthesized_inners: &[String],
+    synthesized_inner_messages: &[String],
     model_span: Span,
 ) -> Vec<CommonDiagnostic> {
-    InstantiateWarning::synthesized_inner(synthesized_inners, model_span)
-        .map(|warning| warning.to_diagnostic())
-        .into_iter()
-        .collect()
+    InstantiateWarning::synthesized_inner(
+        synthesized_inners,
+        synthesized_inner_messages,
+        model_span,
+    )
+    .map(|warning| warning.to_diagnostic())
+    .into_iter()
+    .collect()
 }
 
 pub(super) fn resolve_diagnostic_in_target_files(

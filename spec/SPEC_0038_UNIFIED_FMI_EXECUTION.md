@@ -31,14 +31,22 @@ Modelica -> checked IR pipeline -> checked Solve/GALEC kernel
 | `rumoca-solver` implements the FMI 3 ME importer/host contract | solver facade | Solver code never consumes `SolveModel` directly |
 | Numerical methods implement an internal FMI 3 ME-host integrator contract | solver implementations | Solver choice does not change model semantics |
 | Private `MeRuntimeHost` implements `MeSimulationSession`'s sole FMI 3 ME master algorithm | solver facade | The session remains the semantic owner; initialization, Event Mode, discrete-state iteration, output scheduling, and trace roles cannot fork by numerical method |
+| Default root-location accuracy uses the existing host time-roundoff policy, independently of state-error tolerances and state units | common host option construction | State accuracy cannot define a duration |
 | Numerical plugins implement only `MeIntegratorBackend` | solver implementations | A new solver supplies numerical advance/reset; it cannot invoke FMI lifecycle transitions, schedule observations, or construct traces |
 | `MeSimulationSession` is the incremental master algorithm | solver facade | Batch simulation, live stepping, inputs, reset, events, timeouts, and observation ordering share one state machine |
 | `FmiComponent` is the only linked or packaged component source | checked FMI projection | Runtime and emitted metadata share one inventory |
 | Component operations are exact FMI 3.0.2 semantic projections | FMI component | Private extensions cannot become solver dependencies |
 | Integrator boundary values use checked constructors and private fields | solver facade | Invalid outcomes never enter the master algorithm |
 | Native in-process calls may be zero-copy | FMI host | Preserve current performance |
+| Completed-step callbacks execute their event/history dependencies and never evaluate state derivatives solely to populate a cache | FMI component | Numerical plugins request derivatives when their method needs them |
+| A speculative event-left observation retains its sampled state and pre-callback FMU snapshot; output evaluation is deferred until publication is required, with the current component state restored on every exit | FMI host | Unpublished candidates must not force complete algebraic evaluation on every integration step |
 | Repeated directional seeds may reuse a bitwise-identical settled coordinate | FMI component | Avoid redundant algebraic projection |
+| Algebraic sensitivities may reuse matrices and factorizations only for constructor-certified repeatable primal/JVP blocks at identical full Y/P/time coordinates, bound to their issued block and immutable table/call context | FMI component | Seeds share a matrix |
+| Algebraic sensitivity acceptance uses the solved direction's coordinate scales and a fresh original JVP at unchanged tolerance; primal matrix reuse MUST NOT reuse primal or previous-direction acceptance scales | numerical projection | A derivative direction can change magnitude independently of its primal coordinates |
 | Root evaluation may warm-start its complete checked refresh plan from a bitwise-identical derivative-settled coordinate | FMI component | Keep roots on the same algebraic branch without omitting root dependencies |
+| Derivative and root refreshes certify convergence of every recovered algebraic coordinate as well as the reduced residual; a reused derivative coordinate carries the same accuracy obligation | FMI component numerical projection | Small tear residuals can conceal amplified coordinate errors and move or erase an event |
+| Torn coordinate certification bounds the linearized recovered correction before adding it to floating-point coordinates; a rounded no-op is not convergence evidence | numerical projection | Rounding can hide a large recovered-coordinate error |
+| Reduced affine factorization solves the complete original right-hand side and recovers every coordinate, including during mandatory original-residual refinement. Failed reduced factorization or refinement retains the full implicit solve from the same arithmetic origin and unchanged tolerances. | affine numerical projection | Reduction cannot discard small-coordinate corrections or manufacture convergence |
 | At a bitwise-identical derivative-settled coordinate, root evaluation may omit covered value stages and execute only a construction-issued checked-BLT remainder; it may omit the complete refresh only when that remainder is empty | FMI component | Remove duplicate work without turning a warm start into an unchecked semantic shortcut |
 | Settled-coordinate caches invalidate on lifecycle or parameter mutation | FMI component | Never reuse stale algebraics |
 | An empty checked manifold-projection artifact certifies that continuous-state projection returns unchanged without settling observation algebraics | FMI component | Do not execute algebraic work for a structurally absent constraint system |
@@ -65,54 +73,51 @@ Modelica -> checked IR pipeline -> checked Solve/GALEC kernel
 
 ### Internal Solver Boundary
 
-`SolveProblem` remains compiler IR. It is projected once into an FMI 3 ME
-component kernel. Diffsol, RK methods, BDF implementations, and future
-integrators interact only through the FMI 3 ME lifecycle, state, derivative,
+`SolveProblem` is compiler IR, projected once into an FMI 3 ME component kernel.
+All numerical integrators use only FMI 3 ME lifecycle, state, derivative,
 event-indicator, time, continuous-state, and discrete-state operations. They
-MUST NOT inspect Solve rows, layouts, opcodes, events, or private runtime
-objects.
+MUST NOT inspect Solve rows, layouts, opcodes, events, or private runtime objects.
 
-The sole-host state machine, checked integrator aggregates, event-domain rule,
-cutover deletion inventory, and required differential evidence are cataloged in
-[SPEC_0044 §§6-8](SPEC_0044_FMI_EXECUTION_CATALOG.md#6-common-me-host-and-integrator-contract).
-Those rows are normative by reference. A concrete numerical solver implements
-only that one-step contract; it never owns an FMI lifecycle transition, output
-schedule, trace policy, or component-private Modelica state.
+[SPEC_0044 §§6-8](SPEC_0044_FMI_EXECUTION_CATALOG.md#6-common-me-host-and-integrator-contract)
+normatively defines the host, integrator, event-domain, deletion, and evidence
+requirements. Plugins own numerical steps, never FMI lifecycle transitions,
+output schedules, traces, or component-private Modelica state. Step clipping
+preserves coefficient-dependent Jacobian refresh and convergence-estimate
+policies (ME-INT-004).
 
 The component-facing surface is an exact semantic projection of FMI 3.0.2 ME.
 Host conveniences derive only from standard calls and the checked
 `modelDescription`; no convenience reveals Solve rows, relation memory,
 projection artifacts, internal delay samples or storage layout, or event
-ownership. A namespaced annotation may identify a normal FMI variable carrying
-an importer numerical bound derived from current Modelica expressions; that
-value is not a private component operation or a view of delay storage. The
+ownership. Namespaced annotations may mark a normal FMI variable carrying an
+importer numerical bound derived from current Modelica expressions, or a nested
+declaration's `input`/`output` prefix; neither is a private component operation
+or storage view. The
 strict surface and removal disposition are cataloged in
 [SPEC_0044 §8](SPEC_0044_FMI_EXECUTION_CATALOG.md#8-strict-fmi-component-surface).
 
 Native static dispatch, borrowed slices, and batching MAY optimize this
-interface but MUST preserve its state machine and observable results. In-process
-execution is a deployment form, not another model or solver interface.
+interface but MUST preserve its state machine and observable results.
 
-Automatic integrator selection is importer numerical policy. Its exact
-capability decision and failure-preservation obligations are cataloged in
+Importer policy selects integrators under the capability and failure-preservation
+obligations in
 [SPEC_0044 §5](SPEC_0044_FMI_EXECUTION_CATALOG.md#5-automatic-integrator-selection).
 
 ### Bounded ME Verification Profile
 
-The linked FMI 3 ME component exposes a checked lifecycle aggregate and pure
-property functions shared by production code and verification drivers. Small
-finite domains are exhausted by ordinary tests; bounded Kani harnesses are
-reserved for symbolic floating-point and typed-state domains that cannot be
-practically enumerated. The normative transition table, obligations, evidence
-kind, exact bounded domains, and claim limits are cataloged in
+The linked FMI 3 ME component shares its checked lifecycle aggregate and pure
+properties between production and verification. Ordinary tests exhaust small
+finite domains; Kani is reserved for symbolic floating-point and typed-state domains
+that resist practical enumeration. Normative transitions, obligations, evidence
+kinds, bounded domains, and claim limits are in
 [SPEC_0044 §1](SPEC_0044_FMI_EXECUTION_CATALOG.md#1-bounded-me-verification-profile).
 That bounded evidence does not claim arbitrary-model trajectory correctness,
 floating-point accuracy, solver convergence, or end-to-end Modelica refinement.
 
 ### Phasing
 
-The cutover has four phases. Code movement MUST prove bit-identical traces
-against the pre-phase binary unless its row states otherwise.
+Code movement MUST prove bit-identical traces against each phase's prior binary,
+except where stated below.
 
 | Phase | Scope | Exit evidence |
 |---|---|---|
@@ -184,14 +189,13 @@ Modelica, DAE, or Solve lowering.
 | eFMI Algorithm Code | Integrator/toolchain | eFMU |
 | eFMI Production Code | Generated production runtime | eFMU, generated C |
 
-CLI profile names MUST select capabilities of one generator and MUST NOT own
-independent equation lowering, initialization, event, or state-machine code.
+CLI profiles select one generator's capabilities; independent equation lowering,
+initialization, event, and state-machine code are prohibited.
 A raw derivative-only C kernel may remain an internal fixture, but MUST NOT be
 a user-visible target once FMI 2/3 are exposed.
 
-Symbolic exports project computable checked Solve IR and MUST NOT repeat
-structural analysis. They are not FMI profiles; a symbolic engine's FMI ME
-host role is separate.
+Symbolic exports are not FMI profiles; a symbolic engine's FMI ME host role
+is separate.
 
 ### FMI-LS-DAE Layered Profile
 
@@ -211,12 +215,11 @@ optional product: a symbolic backend may consume compatible artifacts or derive
 them itself. Optionality is represented by the presence of the artifact product,
 not by silent empty or default derivatives inside a claimed artifact product.
 
-The OMC trace comparator owns model selection, time grids, output selection,
-tolerances, diagnostics, and result classification. Candidate runners only
-compile a model to a runnable artifact, enumerate outputs, execute the requested
-grid, and return a trace. Native FMI 3 and Wasm FMI-LS are separate runners of
-that same contract; neither the comparator nor its model inventory depends on
-Diffsol or a private in-memory Rumoca backend.
+The OMC comparator owns model selection, time grids, outputs, tolerances,
+diagnostics, and classification. Runners only compile executable artifacts,
+enumerate outputs, execute requested grids, and return traces. Native FMI 3
+and Wasm FMI-LS share this contract. The comparator and its inventory depend
+on neither Diffsol nor a private Rumoca backend.
 
 ### Evidence
 

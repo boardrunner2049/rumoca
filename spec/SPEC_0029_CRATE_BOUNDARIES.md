@@ -64,9 +64,8 @@ atomically. Keep read-only traversal/query helpers and rewrite-shape helpers
 separate so reviewers can see observation versus mutation.
 
 Analysis consumes IR, never the reverse: an IR crate MUST NOT depend on an
-analysis crate. Reusable analyses over IR are passes governed by
-[SPEC_0052](SPEC_0052_MODEL_ANALYSIS_PASSES.md); their crate placement is
-[SPEC_0041 §6](SPEC_0041_CRATE_OWNERSHIP_CATALOG.md#6-analysis-pass-ownership-catalog-spec_0029-3).
+analysis crate. Reusable analyses over IR are passes governed by [SPEC_0054](SPEC_0054_MODEL_ANALYSIS_PASSES.md);
+their crate placement is [SPEC_0041 §7](SPEC_0041_CRATE_OWNERSHIP_CATALOG.md#7-analysis-pass-ownership-catalog-spec_0029-3).
 
 ### 3a. Foundation Types Live in rumoca-core
 
@@ -329,6 +328,8 @@ Steady-state CI rejects reverse dependencies across this chain. `rumoca-compile`
 MUST NOT depend on concrete solvers or visualization assets; backend-selection
 APIs MUST affect runtime behavior, not only metadata.
 
+Every executable installs one process allocator with a fixed startup bound on reserved address space: [SPEC_0041 §6](SPEC_0041_CRATE_OWNERSHIP_CATALOG.md#6-process-allocator-catalog-spec_0029-12).
+
 ## Dependency Tiers
 
 Workspace crates use six tiers. Dependencies flow downward.
@@ -346,5 +347,4 @@ Within Tier 3, phases MUST compose through IR/evaluation crates rather than depe
 Shared prerequisite analyses are the sole reasoned, bidirectionally gated
 exception; test fixtures are outside this production rule.
 
-Input-boundary and simulation-composition ownership is
-[SPEC_0041 §5](SPEC_0041_CRATE_OWNERSHIP_CATALOG.md#5-input-and-simulation-composition-catalog-spec_0029-dependency-tiers).
+Input-boundary and simulation-composition ownership is [SPEC_0041 §5](SPEC_0041_CRATE_OWNERSHIP_CATALOG.md#5-input-and-simulation-composition-catalog-spec_0029-dependency-tiers).

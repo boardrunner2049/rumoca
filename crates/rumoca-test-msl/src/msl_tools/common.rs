@@ -3,7 +3,7 @@ use rumoca_core::{msl_cache_dir_from_manifest, workspace_root_from_manifest_dir}
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -32,10 +32,6 @@ const MSL_PACKAGE_SPECS: &[MslPackageSpec] = &[
     MslPackageSpec {
         package_name: "Complex",
         candidates: &["Complex.mo"],
-    },
-    MslPackageSpec {
-        package_name: "ModelicaServices",
-        candidates: &["ModelicaServices 4.1.0/package.mo"],
     },
     MslPackageSpec {
         package_name: "Modelica",
@@ -200,6 +196,8 @@ fn resolve_msl_packages(paths: &MslPaths) -> Vec<(&'static str, PathBuf)> {
 }
 
 pub fn msl_load_lines(paths: &MslPaths) -> Vec<String> {
+    // OMC supplies its own ModelicaServices. Preloading the generic MSL
+    // implementation replaces URI resolution with fullPathName(uri).
     resolve_msl_packages(paths)
         .into_iter()
         .map(|(_, path)| format!("loadFile(\"{}\");", path.display()))
@@ -410,7 +408,7 @@ pub fn load_target_models(path: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Repository-relative path of the tracked trace-comparison exclusion list.
+/// Repository-relative path of the tracked trace-exception list.
 ///
 /// Owned here rather than by either consumer because two of them read it: the
 /// comparator (which skips the model) and the band table (which records *why* a
@@ -418,81 +416,312 @@ pub fn load_target_models(path: &Path) -> Result<Vec<String>> {
 pub const TRACE_EXCLUSIONS_FILE_REL: &str =
     "crates/rumoca-test-msl/tests/msl_tests/msl_trace_compare_exclusions.json";
 
-/// Schema tag of the exclusions file, so a foreign list is rejected rather than
-/// read as "nothing is excluded".
-pub const TRACE_EXCLUSIONS_SCHEMA: &str = "msl_trace_compare_exclusions";
+/// Schema tag of the exception file, so a foreign or free-form list is
+/// rejected rather than read as "nothing is excepted".
+pub const TRACE_EXCLUSIONS_SCHEMA: &str = "msl_trace_exceptions_v2";
 
-/// Read the tracked exclusion list: model name -> the reason that model is not
-/// compared.
+/// Why a model that simulates is not held to strict-high pointwise parity
+/// (SPEC_0033 typed trace exceptions). There is no other kind: a model that
+/// simulates without one of these must reach the strict-high band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceExceptionKind {
+    /// A random or impure source: traces differ by construction, so the
+    /// obligation is statistical, not pointwise.
+    ImpureSource,
+    /// The OMC reference does not resolve the model: it is not converged or
+    /// not accurate enough for the observables compared.
+    ReferenceFailure,
+    /// A documented property of the model, such as chaos, a discontinuity
+    /// wrapped in `noEvent` by design, or an observable the model leaves
+    /// underdetermined, makes one trajectory non-identifying.
+    ModelIssue,
+    /// A reviewed proof that pointwise comparison cannot identify the model.
+    Nonidentifiable,
+    /// The comparator, not the model or the reference, cannot identify the
+    /// channels; the row names the comparator improvement that retires it.
+    ComparatorLimitation,
+}
+
+impl TraceExceptionKind {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "impure_source" => Self::ImpureSource,
+            "reference_failure" => Self::ReferenceFailure,
+            "model_issue" => Self::ModelIssue,
+            "nonidentifiable" => Self::Nonidentifiable,
+            "comparator_limitation" => Self::ComparatorLimitation,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ImpureSource => "impure_source",
+            Self::ReferenceFailure => "reference_failure",
+            Self::ModelIssue => "model_issue",
+            Self::Nonidentifiable => "nonidentifiable",
+            Self::ComparatorLimitation => "comparator_limitation",
+        }
+    }
+}
+
+/// The comparator improvement that would retire a `comparator_limitation`
+/// row. The end state is fewer exceptions through a better comparator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparatorImprovement {
+    /// Normalize channels whose reference is zero in exact arithmetic by a
+    /// physical scale instead of the reference's own near-zero spread.
+    NearZeroChannelScaling,
+    /// Align samples at an event instant by event side, so pre- and
+    /// post-event values recorded at shifted coordinates compare.
+    EventInstantAlignment,
+    /// Compare period aggregates (Mean, RMS) at the model's annotation
+    /// tolerance rather than at the reference's integration residue.
+    AggregateToleranceAtAnnotationScale,
+    /// Compare angle channels on the circle, so pi and -pi across the atan2
+    /// branch cut agree, and treat the angle of an exactly zero phasor as
+    /// undefined rather than as whichever of 0, pi or -pi its signed zeros
+    /// select.
+    AngleBranchAwareComparison,
+}
+
+impl ComparatorImprovement {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "near_zero_channel_scaling" => Self::NearZeroChannelScaling,
+            "event_instant_alignment" => Self::EventInstantAlignment,
+            "aggregate_tolerance_at_annotation_scale" => Self::AggregateToleranceAtAnnotationScale,
+            "angle_branch_aware_comparison" => Self::AngleBranchAwareComparison,
+            _ => return None,
+        })
+    }
+}
+
+/// The checkable evidence behind one exception: the facts the review
+/// measured (channel counts, tolerances, event times, reference values), and
+/// where recorded, the artifact and the commit that recorded it. Documentation
+/// shipped with the pinned MSL (`msl:<class>`) is its own record and needs no
+/// commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TraceExceptionEvidence {
+    pub facts: Vec<String>,
+    pub commit: Option<String>,
+    pub artifact: Option<String>,
+}
+
+/// One typed trace exception.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TraceException {
+    pub kind: TraceExceptionKind,
+    pub reason: String,
+    pub evidence: TraceExceptionEvidence,
+    /// Present exactly for [`TraceExceptionKind::ComparatorLimitation`].
+    pub retired_by: Option<ComparatorImprovement>,
+}
+
+/// Read the tracked exception list: model name -> its typed exception.
 ///
 /// # Acceptance contract
 ///
 /// Accepts exactly an object carrying [`TRACE_EXCLUSIONS_SCHEMA`] and an
-/// `exclusions` array whose every entry has a non-empty `model_name` and a
-/// non-empty `reason`. It rejects a bare name list (the shape this file used to
-/// have), an entry without a reason, and a duplicated model.
-///
-/// The per-entry reason is mandatory because the caller *records* it: with one
-/// shared reason constant, excluding a non-stochastic model would publish a
-/// false rationale in every artifact that quotes the exclusion.
+/// `exceptions` array whose every entry has a non-empty `model_name`, a known
+/// `kind`, a non-empty `reason`, and `evidence` with at least one non-empty
+/// fact. An evidence `commit` must be hexadecimal with at least seven digits;
+/// a repository `artifact` needs the commit that recorded it, and only
+/// `msl:<class>` documentation is its own record. A `comparator_limitation`
+/// row names a known `retired_by` improvement and no other kind carries one.
+/// It rejects the free-form v1 list, an entry missing any of these, and a
+/// duplicated model: nothing reaches the gate unreviewed.
 pub fn load_trace_exclusions_file(
     path: &Path,
-) -> Result<std::collections::BTreeMap<String, String>> {
+) -> Result<std::collections::BTreeMap<String, TraceException>> {
     let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read trace exclusions '{}'", path.display()))?;
+        .with_context(|| format!("failed to read trace exceptions '{}'", path.display()))?;
     let payload: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse trace exclusions '{}'", path.display()))?;
+        .with_context(|| format!("failed to parse trace exceptions '{}'", path.display()))?;
     parse_trace_exclusions(&payload)
-        .with_context(|| format!("invalid trace exclusions '{}'", path.display()))
+        .with_context(|| format!("invalid trace exceptions '{}'", path.display()))
 }
 
-fn parse_trace_exclusions(payload: &Value) -> Result<std::collections::BTreeMap<String, String>> {
+/// Each exception as the reason text the comparator and band table record:
+/// its kind, then its reason, so every artifact quoting it names the kind.
+#[must_use]
+pub fn typed_exception_reasons(
+    exceptions: std::collections::BTreeMap<String, TraceException>,
+) -> std::collections::BTreeMap<String, String> {
+    exceptions
+        .into_iter()
+        .map(|(model, exception)| {
+            let reason = format!("{}: {}", exception.kind.as_str(), exception.reason);
+            (model, reason)
+        })
+        .collect()
+}
+
+fn parse_trace_exclusions(
+    payload: &Value,
+) -> Result<std::collections::BTreeMap<String, TraceException>> {
     let Some(object) = payload.as_object() else {
-        bail!(
-            "trace exclusions must be an object with '{TRACE_EXCLUSIONS_SCHEMA}' and per-entry \
-             reasons; a bare model-name list cannot say why a model is excluded"
-        );
+        bail!("trace exceptions must be an object with '{TRACE_EXCLUSIONS_SCHEMA}' and typed rows");
     };
     let schema = object.get("schema").and_then(Value::as_str).unwrap_or("");
     if schema != TRACE_EXCLUSIONS_SCHEMA {
-        bail!("trace exclusions schema is '{schema}', expected '{TRACE_EXCLUSIONS_SCHEMA}'");
+        bail!("trace exceptions schema is '{schema}', expected '{TRACE_EXCLUSIONS_SCHEMA}'");
     }
-    let Some(entries) = object.get("exclusions").and_then(Value::as_array) else {
-        bail!("trace exclusions object is missing the `exclusions` array");
+    let Some(entries) = object.get("exceptions").and_then(Value::as_array) else {
+        bail!("trace exceptions object is missing the `exceptions` array");
     };
-    let mut exclusions = std::collections::BTreeMap::new();
+    let mut exceptions = std::collections::BTreeMap::new();
     for (index, entry) in entries.iter().enumerate() {
-        let model_name = entry
-            .get("model_name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .with_context(|| format!("exclusions[{index}] has no `model_name`"))?;
-        let reason = entry
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|reason| !reason.is_empty())
-            .with_context(|| {
-                format!("exclusion '{model_name}' has no `reason`; every exclusion must record why")
-            })?;
-        if exclusions
-            .insert(model_name.to_string(), reason.to_string())
-            .is_some()
-        {
-            bail!("exclusions list '{model_name}' more than once");
+        let (model_name, exception) = parse_trace_exception(index, entry)?;
+        if exceptions.insert(model_name.clone(), exception).is_some() {
+            bail!("exceptions list '{model_name}' more than once");
         }
     }
-    Ok(exclusions)
+    Ok(exceptions)
+}
+
+fn nonempty_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn parse_trace_exception(index: usize, entry: &Value) -> Result<(String, TraceException)> {
+    let model_name = nonempty_str(entry, "model_name")
+        .with_context(|| format!("exceptions[{index}] has no `model_name`"))?;
+    let kind = nonempty_str(entry, "kind")
+        .and_then(TraceExceptionKind::parse)
+        .with_context(|| {
+            format!(
+                "exception '{model_name}' has no known `kind` (impure_source, reference_failure, \
+                 model_issue, nonidentifiable, comparator_limitation)"
+            )
+        })?;
+    let reason = nonempty_str(entry, "reason")
+        .with_context(|| format!("exception '{model_name}' has no `reason`"))?;
+    let evidence = entry
+        .get("evidence")
+        .with_context(|| format!("exception '{model_name}' has no `evidence`"))?;
+    let evidence = parse_trace_exception_evidence(model_name, evidence)?;
+    let retired_by = parse_retired_by(model_name, kind, entry)?;
+    Ok((
+        model_name.to_string(),
+        TraceException {
+            kind,
+            reason: reason.to_string(),
+            evidence,
+            retired_by,
+        },
+    ))
+}
+
+fn parse_trace_exception_evidence(
+    model_name: &str,
+    evidence: &Value,
+) -> Result<TraceExceptionEvidence> {
+    let facts = evidence
+        .get("facts")
+        .and_then(Value::as_array)
+        .map(|facts| {
+            facts
+                .iter()
+                .map(|fact| fact.as_str().map(str::trim).filter(|fact| !fact.is_empty()))
+                .collect::<Option<Vec<_>>>()
+        })
+        .with_context(|| format!("exception '{model_name}' evidence has no `facts` array"))?
+        .with_context(|| format!("exception '{model_name}' evidence has an empty fact"))?;
+    if facts.is_empty() {
+        bail!("exception '{model_name}' evidence states no checkable fact");
+    }
+    let commit = nonempty_str(evidence, "commit");
+    if let Some(commit) = commit
+        && (commit.len() < 7 || !commit.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        bail!("exception '{model_name}' evidence commit '{commit}' is not a commit hash");
+    }
+    let artifact = nonempty_str(evidence, "artifact");
+    if let Some(artifact) = artifact
+        && commit.is_none()
+        && !artifact.starts_with("msl:")
+    {
+        bail!(
+            "exception '{model_name}' evidence needs the commit that recorded '{artifact}'; only \
+             pinned MSL documentation (`msl:<class>`) is its own record"
+        );
+    }
+    Ok(TraceExceptionEvidence {
+        facts: facts.into_iter().map(str::to_string).collect(),
+        commit: commit.map(str::to_string),
+        artifact: artifact.map(str::to_string),
+    })
+}
+
+fn parse_retired_by(
+    model_name: &str,
+    kind: TraceExceptionKind,
+    entry: &Value,
+) -> Result<Option<ComparatorImprovement>> {
+    let retired_by = nonempty_str(entry, "retired_by");
+    match (kind, retired_by) {
+        (TraceExceptionKind::ComparatorLimitation, Some(value)) => {
+            ComparatorImprovement::parse(value)
+                .map(Some)
+                .with_context(|| {
+                    format!(
+                        "exception '{model_name}' names no known `retired_by` improvement \
+                     (near_zero_channel_scaling, event_instant_alignment, \
+                     aggregate_tolerance_at_annotation_scale, angle_branch_aware_comparison)"
+                    )
+                })
+        }
+        (TraceExceptionKind::ComparatorLimitation, None) => bail!(
+            "exception '{model_name}' is a comparator_limitation without the `retired_by` \
+             improvement that retires it"
+        ),
+        (
+            TraceExceptionKind::ImpureSource
+            | TraceExceptionKind::ReferenceFailure
+            | TraceExceptionKind::ModelIssue
+            | TraceExceptionKind::Nonidentifiable,
+            Some(_),
+        ) => bail!(
+            "exception '{model_name}' carries `retired_by` but is not a comparator_limitation"
+        ),
+        (
+            TraceExceptionKind::ImpureSource
+            | TraceExceptionKind::ReferenceFailure
+            | TraceExceptionKind::ModelIssue
+            | TraceExceptionKind::Nonidentifiable,
+            None,
+        ) => Ok(None),
+    }
 }
 
 pub fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create '{}'", parent.display()))?;
     let payload = serde_json::to_string_pretty(value).context("failed to serialize JSON")?;
-    std::fs::write(path, payload).with_context(|| format!("failed to write '{}'", path.display()))
+    // Cache materialization hard-links traces across runs. Replace this path
+    // only after the new payload is complete, preserving the other links.
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create replacement for '{}'", path.display()))?;
+    replacement
+        .write_all(payload.as_bytes())
+        .with_context(|| format!("failed to write '{}'", path.display()))?;
+    replacement
+        .persist(path)
+        .with_context(|| format!("failed to replace '{}'", path.display()))?;
+    Ok(())
 }
 
 pub fn unix_timestamp_seconds() -> i64 {
@@ -612,7 +841,7 @@ mod tests {
 
         let paths = test_paths(msl_dir.to_path_buf());
         let lines = msl_load_lines(&paths);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 3);
         assert!(
             lines.iter().any(|line| line.contains("Complex.mo")),
             "expected Complex.mo loadFile entry"
@@ -624,10 +853,8 @@ mod tests {
             "expected Modelica release-layout package load"
         );
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("ModelicaServices 4.1.0/package.mo")),
-            "expected ModelicaServices release-layout package load"
+            !lines.iter().any(|line| line.contains("ModelicaServices")),
+            "OMC must load its own tool-specific services"
         );
         assert!(
             lines
@@ -654,6 +881,26 @@ mod tests {
                 .any(|line| line.contains("ModelicaTest/package.mo")),
             "expected source-tree ModelicaTest package load"
         );
+    }
+
+    #[test]
+    fn replacing_json_preserves_hard_linked_reference_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let historical = temp.path().join("historical.json");
+        let current = temp.path().join("current.json");
+        let old = serde_json::json!({"value": 1.0});
+        let new = serde_json::json!({"value": 2.0});
+        write_pretty_json(&historical, &old).expect("write original reference");
+        std::fs::hard_link(&historical, &current).expect("materialize cache reference");
+
+        write_pretty_json(&current, &new).expect("regenerate current reference");
+
+        let read = |path: &Path| {
+            serde_json::from_slice::<Value>(&std::fs::read(path).expect("read reference"))
+                .expect("parse reference")
+        };
+        assert_eq!(read(&current), new);
+        assert_eq!(read(&historical), old);
     }
 
     #[test]
@@ -692,95 +939,137 @@ mod tests {
         );
     }
 
-    /// Every entry carries its own reason, so an artifact that quotes an
-    /// exclusion quotes the rationale that was actually reviewed for it.
-    #[test]
-    fn trace_exclusions_carry_a_reason_per_entry() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("exclusions.json");
+    fn write_exceptions(dir: &Path, name: &str, rows: &str) -> PathBuf {
+        let path = dir.join(name);
         fs::write(
             &path,
-            r#"{"schema":"msl_trace_compare_exclusions","exclusions":[
-                {"model_name":"A.Stochastic","reason":"stochastic random-input model"},
-                {"model_name":"B.Timing","reason":"wall-clock dependent"}
-            ]}"#,
+            format!(r#"{{"schema":"{TRACE_EXCLUSIONS_SCHEMA}","exceptions":[{rows}]}}"#),
         )
-        .expect("write exclusions");
-
-        let exclusions = load_trace_exclusions_file(&path).expect("load exclusions");
-
-        assert_eq!(exclusions.len(), 2);
-        assert_eq!(
-            exclusions.get("B.Timing").map(String::as_str),
-            Some("wall-clock dependent"),
-            "each entry must keep its own reason rather than a shared constant"
-        );
+        .expect("write exceptions");
+        path
     }
 
+    /// Each row keeps its own kind, reason, evidence, and retirement path.
     #[test]
-    fn trace_exclusions_reject_a_bare_name_list_and_a_reasonless_entry() {
+    fn trace_exceptions_are_typed_rows_with_evidence() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let bare = temp.path().join("bare.json");
-        fs::write(&bare, r#"["A.Stochastic"]"#).expect("write bare list");
-        let error = load_trace_exclusions_file(&bare)
-            .expect_err("a bare name list cannot say why a model is excluded")
-            .to_string();
-        assert!(
-            format!("{error:#}").contains("exclusions"),
-            "got: {error:#}"
+        let path = write_exceptions(
+            temp.path(),
+            "ok.json",
+            r#"{"model_name":"A.Noise","kind":"impure_source","reason":"random input",
+                "evidence":{"facts":["seeded xorshift source"],"commit":"abcdef1","artifact":"docs/noise.md"}},
+               {"model_name":"B.Chaos","kind":"model_issue","reason":"chaotic",
+                "evidence":{"facts":["StopTime=50000 s"],"artifact":"msl:B.Chaos"}},
+               {"model_name":"C.Node","kind":"comparator_limitation","reason":"zero node",
+                "evidence":{"facts":["374/391 channels high"]},"retired_by":"near_zero_channel_scaling"}"#,
         );
-
-        let reasonless = temp.path().join("reasonless.json");
-        fs::write(
-            &reasonless,
-            r#"{"schema":"msl_trace_compare_exclusions","exclusions":[{"model_name":"A.Stochastic"}]}"#,
-        )
-        .expect("write reasonless");
-        let error = load_trace_exclusions_file(&reasonless)
-            .expect_err("an exclusion without a reason must be rejected");
-        assert!(
-            format!("{error:#}").contains("no `reason`"),
-            "got: {error:#}"
+        let exceptions = load_trace_exclusions_file(&path).expect("load exceptions");
+        assert_eq!(exceptions.len(), 3);
+        let noise = &exceptions["A.Noise"];
+        assert_eq!(noise.kind, TraceExceptionKind::ImpureSource);
+        assert_eq!(noise.evidence.commit.as_deref(), Some("abcdef1"));
+        assert_eq!(noise.retired_by, None);
+        assert_eq!(
+            exceptions["C.Node"].retired_by,
+            Some(ComparatorImprovement::NearZeroChannelScaling)
+        );
+        assert_eq!(
+            typed_exception_reasons(exceptions)["B.Chaos"],
+            "model_issue: chaotic"
         );
     }
 
-    /// The tracked list is the one the comparator and the band table both read;
-    /// a shape change that breaks it would silence models with no reason on
-    /// record.
+    /// Nothing free-form reaches the gate: the v1 list, a missing or unknown
+    /// kind, missing facts, an uncommitted artifact, and a comparator row
+    /// without its retirement path are all refused.
     #[test]
-    fn tracked_exclusions_are_reviewed_and_reasoned() {
-        let path = workspace_root_from_manifest_dir(env!("CARGO_MANIFEST_DIR"))
-            .join(TRACE_EXCLUSIONS_FILE_REL);
-        let exclusions = load_trace_exclusions_file(&path).expect("tracked exclusions must parse");
-        let expected = [
-            "Modelica.Blocks.Examples.DemoSignalCharacteristic",
-            "Modelica.Electrical.Analog.Examples.ChuaCircuit",
-            "Modelica.Electrical.Analog.Examples.ControlledSwitchWithArc",
-            "Modelica.Electrical.Analog.Examples.OpAmps.ControlCircuit",
-            "Modelica.Electrical.Analog.Examples.OpAmps.Multivibrator",
-            "Modelica.Electrical.Analog.Examples.SwitchWithArc",
-            "Modelica.Electrical.Machines.Examples.DCMachines.DCPM_CurrentControlled",
-            "Modelica.Electrical.Machines.Examples.DCMachines.DCPM_Drive",
-            "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2Pulse.ThyristorBridge2Pulse_RLV_Characteristic",
-            "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.DiodeBridge2mPulse",
-            "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.HalfControlledBridge2mPulse",
-            "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.ThyristorBridge2mPulse_R",
-            "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.ThyristorBridge2mPulse_RL",
-            "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierCenterTap2Pulse.ThyristorCenterTap2Pulse_RLV_Characteristic",
-            "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierCenterTap2mPulse.ThyristorCenterTap2mPulse_RLV",
-            "Modelica.Electrical.PowerConverters.Examples.DCDC.HBridge.HBridge_TrianglePWM_RL",
-            "Modelica.Mechanics.Translational.Examples.PreLoad",
-            "Modelica.Thermal.FluidHeatFlow.Examples.ParallelPumpDropOut",
-        ];
-        assert_eq!(exclusions.len(), expected.len());
-        for model_name in expected {
-            let reason = exclusions
-                .get(model_name)
-                .unwrap_or_else(|| panic!("missing reviewed exclusion for {model_name}"));
-            assert!(
-                reason.split_whitespace().count() >= 8,
-                "reviewed exclusion for {model_name} must explain the oracle-test boundary"
-            );
+    fn trace_exceptions_refuse_untyped_or_unevidenced_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let v1 = temp.path().join("v1.json");
+        fs::write(
+            &v1,
+            r#"{"schema":"msl_trace_compare_exclusions","exclusions":[{"model_name":"A","reason":"why"}]}"#,
+        )
+        .expect("write v1");
+        assert!(load_trace_exclusions_file(&v1).is_err());
+        for (name, row, needle) in [
+            (
+                "nokind",
+                r#"{"model_name":"A","reason":"r","evidence":{"facts":["f"]}}"#,
+                "`kind`",
+            ),
+            (
+                "badkind",
+                r#"{"model_name":"A","kind":"allowance","reason":"r","evidence":{"facts":["f"]}}"#,
+                "`kind`",
+            ),
+            (
+                "noevidence",
+                r#"{"model_name":"A","kind":"model_issue","reason":"r"}"#,
+                "no `evidence`",
+            ),
+            (
+                "nofacts",
+                r#"{"model_name":"A","kind":"model_issue","reason":"r","evidence":{"facts":[]}}"#,
+                "no checkable fact",
+            ),
+            (
+                "nocommit",
+                r#"{"model_name":"A","kind":"reference_failure","reason":"r","evidence":{"facts":["f"],"artifact":"docs/x.md"}}"#,
+                "needs the commit",
+            ),
+            (
+                "badcommit",
+                r#"{"model_name":"A","kind":"reference_failure","reason":"r","evidence":{"facts":["f"],"commit":"main"}}"#,
+                "not a commit hash",
+            ),
+            (
+                "noretire",
+                r#"{"model_name":"A","kind":"comparator_limitation","reason":"r","evidence":{"facts":["f"]}}"#,
+                "without the `retired_by`",
+            ),
+            (
+                "badretire",
+                r#"{"model_name":"A","kind":"comparator_limitation","reason":"r","evidence":{"facts":["f"]},"retired_by":"wider_tolerance"}"#,
+                "no known `retired_by`",
+            ),
+            (
+                "strayretire",
+                r#"{"model_name":"A","kind":"model_issue","reason":"r","evidence":{"facts":["f"]},"retired_by":"event_instant_alignment"}"#,
+                "not a comparator_limitation",
+            ),
+        ] {
+            let path = write_exceptions(temp.path(), name, row);
+            let error = format!("{:#}", load_trace_exclusions_file(&path).expect_err(name));
+            assert!(error.contains(needle), "{name}: {error}");
+        }
+    }
+
+    /// Every tracked row is typed and evidenced, and every artifact it cites
+    /// is in the repository or the pinned MSL (SPEC_0033 typed trace
+    /// exceptions).
+    #[test]
+    fn tracked_exceptions_are_typed_and_evidenced() {
+        let root = workspace_root_from_manifest_dir(env!("CARGO_MANIFEST_DIR"));
+        let exceptions = load_trace_exclusions_file(&root.join(TRACE_EXCLUSIONS_FILE_REL))
+            .expect("tracked exceptions must parse");
+        assert_eq!(exceptions.len(), 38);
+        let count = |kind| {
+            exceptions
+                .values()
+                .filter(|exception| exception.kind == kind)
+                .count()
+        };
+        assert_eq!(count(TraceExceptionKind::ReferenceFailure), 13);
+        assert_eq!(count(TraceExceptionKind::ModelIssue), 6);
+        assert_eq!(count(TraceExceptionKind::ComparatorLimitation), 19);
+        for (model, exception) in &exceptions {
+            if let Some(artifact) = &exception.evidence.artifact {
+                assert!(
+                    artifact.starts_with("msl:") || root.join(artifact).is_file(),
+                    "{model}: evidence artifact {artifact} is not in the repository"
+                );
+            }
         }
     }
 }

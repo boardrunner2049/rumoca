@@ -443,6 +443,27 @@ fn binding_is_event_clock(binding: &Expression, class: &ClassDef) -> bool {
     }
 }
 
+/// Whether a `shiftSample(u, shiftCounter, resolution)` call states a
+/// resolution literal other than 1. An event clock shifts by whole ticks with
+/// the default resolution 1 (MLS §16.5.2); a resolution that is not a literal
+/// is checked once it is evaluated.
+fn shift_resolution_is_not_one(args: &[Expression]) -> bool {
+    let named = args.iter().find_map(|arg| match arg {
+        Expression::NamedArgument { name, value, .. } if name.text.as_ref() == "resolution" => {
+            Some(value.as_ref())
+        }
+        _ => None,
+    });
+    let resolution = named.or_else(|| {
+        args.iter()
+            .filter(|arg| !matches!(arg, Expression::NamedArgument { .. }))
+            .nth(2)
+    });
+    resolution
+        .and_then(numeric_literal_value)
+        .is_some_and(|value| value != 1.0)
+}
+
 struct EventClockOpCollector<'a> {
     event_clocks: &'a HashSet<&'a str>,
     found: Vec<(String, Token)>,
@@ -461,6 +482,7 @@ impl ast::Visitor for EventClockOpCollector<'_> {
                 .find(|arg| !matches!(arg, Expression::NamedArgument { .. }))
             && let [part] = arg.parts.as_slice()
             && self.event_clocks.contains(part.ident.text.as_ref())
+            && (name != "shiftSample" || shift_resolution_is_not_one(args))
         {
             self.found.push((name.to_string(), part.ident.clone()));
         }

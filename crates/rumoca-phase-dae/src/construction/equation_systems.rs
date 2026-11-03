@@ -9,18 +9,26 @@ pub(super) fn lower_equation_systems<'dae>(
     functions: &FunctionRegistry<'_, 'dae>,
     clocks: &LoweredClocks<'dae>,
 ) -> Result<(), dae::DaeConstructionError> {
+    let continuous_excluded_families = analysis
+        .derived_parameter_families
+        .union(&analysis.record_equality_families)
+        .copied()
+        .collect::<HashSet<_>>();
+    let initial_excluded_families = initial_excluded_families(analysis);
     let mut excluded_equation_rows = analysis.continuous_family_rows.clone();
-    let row_owned = &analysis.aggregate_discrete_connections;
-    excluded_equation_rows.retain(|row| !row_owned.row_owned_rows().contains(row));
     excluded_equation_rows.extend(&analysis.clock_equation_rows);
     excluded_equation_rows.extend(&analysis.derived_parameter_rows);
     let no_clocked_owners = HashMap::new();
     let no_semi_linear_rules = SemiLinearRules::default();
     let no_aggregate_connections = AggregateDiscreteConnections::default();
-    let mut excluded_families = analysis.derived_parameter_families.clone();
-    excluded_families.extend(row_owned.row_owned_families());
     let mut excluded_initial_rows = analysis.initialization_family_rows.clone();
     excluded_initial_rows.extend(&analysis.initial_discrete_equation_rows);
+    excluded_initial_rows.extend(
+        analysis
+            .initial_parameter_equations
+            .iter()
+            .map(|definition| definition.row),
+    );
     lower_equations(
         construction,
         discrete_values,
@@ -50,7 +58,7 @@ pub(super) fn lower_equation_systems<'dae>(
         StructuredEquationRows {
             equations: &flat.equations,
             families: &flat.structured_equations,
-            excluded_families: &excluded_families,
+            excluded_families: &continuous_excluded_families,
             environment: Some(StructuredEquationEnvironment {
                 flat,
                 roles: &analysis.roles,
@@ -94,7 +102,7 @@ pub(super) fn lower_equation_systems<'dae>(
         StructuredEquationRows {
             equations: &flat.initial_equations,
             families: &flat.initial_structured_equations,
-            excluded_families: &HashSet::new(),
+            excluded_families: &initial_excluded_families,
             environment: None,
             initialization: true,
         },
@@ -106,7 +114,7 @@ pub(super) fn lower_equation_expression<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     coordinates: &HashMap<VarName, Coordinate<'dae>>,
     functions: &FunctionRegistry<'_, 'dae>,
-    owner_clock: Option<dae::PeriodicClockId<'dae>>,
+    owner_clock: Option<dae::ClockId<'dae>>,
     expression: &Expression,
     generated_root: Option<dae::DaeGeneration>,
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
@@ -133,4 +141,15 @@ pub(super) fn lower_equation_expression<'dae>(
             generated_root,
         ),
     }
+}
+
+/// Initialization families that own none of their rows: families of typed
+/// initial discrete-value definitions and families that are a second view of
+/// whole-record equalities (MLS 3.7 §10.6.1).
+fn initial_excluded_families(analysis: &Analysis) -> HashSet<usize> {
+    analysis
+        .initial_discrete_families
+        .union(&analysis.initial_record_equality_families)
+        .copied()
+        .collect()
 }

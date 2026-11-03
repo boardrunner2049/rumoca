@@ -5,6 +5,7 @@
 //! rejection rather than a panic or an invalid model.
 
 mod clock_transport;
+mod v0101_transport;
 
 use crate::build::Builder;
 use crate::codec::{Encoding, decode, encode};
@@ -78,6 +79,7 @@ fn variable(id: u32, name: &str, role: RbcRole) -> RbcVariable {
         name: name.into(),
         role,
         causality: RbcCausality::Local,
+        declared_causality: None,
         value_type: TypeId(0),
         scalar_count: 1,
         discrete_input: false,
@@ -94,6 +96,10 @@ fn variable(id: u32, name: &str, role: RbcRole) -> RbcVariable {
         max: None,
         nominal: None,
         fixed: None,
+        fixed_elements: None,
+        evaluable: false,
+        held: false,
+        state_select: RbcStateSelect::Default,
         tunable: false,
         from_source: true,
         connector: None,
@@ -163,6 +169,7 @@ fn a_discrete_value_variable_carries_its_definition() {
         provenance: source_provenance(),
     });
     model.discrete_definitions.push(RbcDiscreteDefinition {
+        observed: false,
         targets: vec![target],
         branches: vec![RbcDiscreteBranch {
             activation: RbcDiscreteActivation::Always,
@@ -252,6 +259,7 @@ fn a_discrete_branch_must_match_its_target_count() {
     flag.value_type = TypeId(1);
     model.variables.push(flag);
     model.discrete_definitions.push(RbcDiscreteDefinition {
+        observed: false,
         targets: vec![target],
         branches: vec![RbcDiscreteBranch {
             activation: RbcDiscreteActivation::Always,
@@ -1130,6 +1138,7 @@ fn a_carried_function_body_cannot_recurse_through_the_call_graph() {
         parameters: vec![],
         results: vec![real],
         inline: RbcInline::Unstated,
+        derivatives: Vec::new(),
         body: RbcFunctionBody::Modelica { statements: vec![] },
         declaration: source_provenance(),
     });

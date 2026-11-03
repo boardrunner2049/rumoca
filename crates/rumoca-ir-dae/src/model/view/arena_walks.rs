@@ -130,9 +130,12 @@ fn time_event_view(entry: &TimeEventEntry) -> TimeEventView<'_> {
 
 fn event_action_view(entry: &EventActionEntry) -> EventActionView<'_> {
     let operation = match entry.kind {
-        EventActionKind::Assert { message, level } => EventActionOperation::Assert {
+        EventActionKind::Assert { message } => EventActionOperation::Assert {
             message: ExprId::from_raw(message),
-            level: level.map(ExprId::from_raw),
+        },
+        EventActionKind::Warning { message, condition } => EventActionOperation::Warning {
+            message: ExprId::from_raw(message),
+            condition: ExprId::from_raw(condition),
         },
         EventActionKind::Terminate { message } => EventActionOperation::Terminate {
             message: ExprId::from_raw(message),
@@ -156,6 +159,15 @@ fn clock_view(entry: &ClockEntry) -> ClockView<'_> {
         crate::clocks::ClockKind::Triggered(condition) => {
             ClockOperation::Triggered(ConditionId::from_raw(*condition))
         }
+        crate::clocks::ClockKind::Shifted {
+            base,
+            counter,
+            condition,
+        } => ClockOperation::Shifted {
+            base: ClockId::from_raw(*base),
+            counter: *counter,
+            condition: ConditionId::from_raw(*condition),
+        },
     };
     ClockView {
         operation,

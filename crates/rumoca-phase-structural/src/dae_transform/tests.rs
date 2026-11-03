@@ -1,11 +1,30 @@
+mod alternative_definitions;
+mod defining_equations;
+mod demotion_bounds;
+mod demotion_owners;
+mod derivative_chains;
 mod equalities;
+mod forwarding_equalities;
+mod function_zeros;
 mod functions;
+mod identity_auxiliary;
 mod initial_pins;
 mod initial_values;
 mod invariant_balances;
+mod lift_owners;
+mod manifold_fields;
+mod projected_initial_pins;
+mod rate_values;
 mod reconstruction_failures;
 mod reduction_observation;
 mod runtime_quotients;
+mod scalar_auxiliary_blocks;
+mod scalar_state_offsets;
+mod shared_differentiation;
+mod state_invariant_balances;
+mod tensor_linear_map;
+mod tensor_state_blocks;
+mod value_identities;
 
 pub(super) use reconstruction_failures::independent_constraint_model;
 
@@ -513,7 +532,7 @@ fn insert_fixture_record_companion<'dae>(
                 dae::VariableAttributes {
                     binding: Some(binding),
                     start: Some(start),
-                    fixed: Some(true),
+                    fixed: Some(vec![true]),
                     description: Some("record companion".to_owned()),
                     ..dae::VariableAttributes::default()
                 },
@@ -1596,7 +1615,7 @@ fn assert_primitive_record_companion_attributes(view: dae::DaeView<'_>) {
         .find(|(_, variable)| variable.name().as_str() == "recordCompanion")
         .expect("primitive record companion survives");
     assert_eq!(companion.role(), dae::VariableRole::Parameter);
-    assert_eq!(companion.fixed(), Some(true));
+    assert_eq!(companion.fixed_uniform(), Some(true));
     assert_eq!(companion.description(), Some("record companion"));
     assert_eq!(
         view.source_text(companion.declaration()),

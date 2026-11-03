@@ -88,6 +88,66 @@ cargo xtask repo msl parity-manifest \
 Compare `msl_quality_current.json`, `parity_fail_manifest.json`, and the
 per-model `[sim_*]` log lines before inspecting emitted IR artifacts.
 
+## Simulation soundness and typed trace exceptions
+
+The rule the gate enforces is that a model that compiles simulates correctly.
+Every model that completes a simulation must be strict-high against OMC or be
+covered by a typed trace exception row. A completion that is neither (near,
+deviation, fallback, a missing trace on either side, a comparator failure, or a
+pointwise non-identifiable trace without a row) is unexcepted, and the target
+count of unexcepted completions is zero.
+
+Until that count is zero, the baseline names each unexcepted completion in
+`unexcepted_non_high_models`. The quality gate fails when a current completion is
+outside that roster, and the baseline ratchet refuses a promotion that adds to
+it, so the roster only shrinks. The PR comment's **Simulation Soundness Roster**
+section lists the current roster grouped by triage package (the first three name
+segments, such as `Modelica.Electrical.Analog`) and marks any entry that is not
+in the baseline roster as `new`.
+
+Exceptions live in `crates/rumoca-test-msl/tests/msl_tests/msl_trace_compare_exclusions.json`
+under schema `msl_trace_exceptions_v2`. Every row is typed and evidenced:
+
+```json
+{
+  "model_name": "Modelica.Electrical.PowerConverters.Examples.ACDC.RectifierBridge2mPulse.ThyristorBridge2mPulse_R",
+  "kind": "comparator_limitation",
+  "reason": "The 17 differing channels are all aliases of one degenerate node ...",
+  "evidence": {
+    "facts": [
+      "17 differing channels are aliases of the supply star point, 0 V in exact arithmetic",
+      "all 401 other channels strict-high"
+    ]
+  },
+  "retired_by": "near_zero_channel_scaling"
+}
+```
+
+| Kind | Meaning |
+|---|---|
+| `impure_source` | the model draws from a random or otherwise impure source, so traces are not pointwise comparable |
+| `reference_failure` | the OMC reference is not converged or not accurate enough for the compared observables |
+| `model_issue` | a documented property of the model (chaos, a discontinuity wrapped in `noEvent` by design, an observable the model leaves underdetermined) |
+| `nonidentifiable` | a reviewed proof that pointwise comparison cannot identify the model |
+| `comparator_limitation` | the comparator cannot identify the channels; `retired_by` names the improvement that retires the row |
+
+A `comparator_limitation` row names one of `near_zero_channel_scaling`,
+`event_instant_alignment`, `aggregate_tolerance_at_annotation_scale`, or
+`angle_branch_aware_comparison`. The end state is fewer exceptions through a
+better comparator.
+
+The loader refuses an unknown kind, an empty reason, evidence with no stated
+fact, a malformed commit (at least seven hex digits), a repository artifact
+without the commit that recorded it, and a `retired_by` that is missing, unknown,
+or on a row of another kind. Only an `msl:` artifact, which names MSL
+documentation, is its own record. There are no free-form allowances: an
+exception is reviewed like code. The band table records the file's SHA-256, and the
+quality gate fails unless it equals the digest the reviewed baseline boundary
+pins, so adding or changing a row also needs a new reviewed boundary with its
+evidence. Where a whole model class is known to simulate
+incorrectly, the compiler refuses it at construction with a diagnostic instead
+of producing a wrong trace.
+
 ## Cohort pinning: the per-model band table
 
 Aggregate band counts (`agreement_high`, `agreement_minor`,
@@ -107,7 +167,7 @@ reason, not a gap:
 | Field | Meaning |
 |---|---|
 | `band` | `high` / `near` / `deviation` for a compared model, `absent` otherwise |
-| `exit_reason` | mandatory on `absent`: `sim_failed`, `not_attempted`, `rumoca_trace_missing`, `reference_missing`, `trace_missing_side_unrecorded`, `comparator_failed`, `no_comparable_samples`, `excluded`, `not_compared` |
+| `exit_reason` | mandatory on `absent`: `sim_failed`, `not_attempted`, `rumoca_trace_missing`, `reference_missing`, `trace_missing_side_unrecorded`, `comparator_failed`, `no_comparable_samples`, `trace_nonidentifiable`, `excluded`, `not_compared` |
 | `exit_detail` | the solver status + error code, the phase the run stopped at, the OMC message, or that exclusion's own rationale |
 | `run_scope` | `full` for a cohort run, `partial` for a focused one |
 | `source.trace_comparison_digest` | content hash of the comparator output the rows came from — the table's run identity |
@@ -118,8 +178,9 @@ Each exit reason names the boundary that stopped the comparison, and the
 comparator decides it where the knowledge is: `sim_trace_comparison.json` records
 `{kind, detail}` per entry in `skipped` and `missing_trace`, so a comparator
 crash is never filed as a policy exclusion and our own missing trace is never
-filed as a missing OMC reference. Policy exclusions come from the tracked
-`msl_trace_compare_exclusions.json`, where every entry carries its own reason.
+filed as a missing OMC reference. Exclusions come from the typed rows of the
+tracked `msl_trace_compare_exclusions.json`, and the row records its kind and
+reason.
 
 ### Rotation and run scope
 

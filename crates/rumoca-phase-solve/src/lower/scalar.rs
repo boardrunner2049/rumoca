@@ -1,11 +1,16 @@
+mod affine_derivative;
 mod arrays;
 mod builtins;
 mod call_scoped_actions;
+pub(in crate::lower) use call_scoped_actions::action_kind;
 mod conditions;
 mod constants;
 mod coordinates;
 mod functions;
+mod literal_values;
 mod operators;
+mod register_folding;
+mod selected_arm;
 mod selector;
 
 use std::cell::RefCell;
@@ -13,6 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::*;
+pub(super) use affine_derivative::AffineScalarDerivative;
 
 /// The operands of one checked array-update expression.
 ///
@@ -135,6 +141,9 @@ pub(super) struct ParameterBindingSubstitutions<'dae> {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ScalarContextFrame<'dae> {
+    NoEvent {
+        parent: u64,
+    },
     Activation {
         parent: u64,
         condition: ActivationCondition<'dae>,
@@ -158,7 +167,8 @@ enum ScalarContextFrame<'dae> {
     Derivative {
         parent: u64,
         state: u32,
-        scalar: usize,
+        definition: dae::ExprId<'dae>,
+        domain_point: Option<(dae::DomainId<'dae>, Vec<i64>)>,
     },
     DerivativeSeed {
         parent: u64,
@@ -166,11 +176,28 @@ enum ScalarContextFrame<'dae> {
     },
 }
 
+impl ScalarContextFrame<'_> {
+    const fn parent(&self) -> u64 {
+        match self {
+            Self::NoEvent { parent }
+            | Self::Activation { parent, .. }
+            | Self::Function { parent, .. }
+            | Self::Domain { parent, .. }
+            | Self::Parameter { parent, .. }
+            | Self::Derivative { parent, .. }
+            | Self::DerivativeSeed { parent, .. } => *parent,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ActivationCondition<'dae> {
     Expression(dae::ExprId<'dae>),
     GuardedAssignment {
         clock: Option<dae::ClockId<'dae>>,
+        /// Whether `clock` is periodic, so the activation is the guard's level
+        /// rather than the rise of the trigger.
+        periodic: bool,
         trigger: dae::ConditionId<'dae>,
         guard: dae::ConditionId<'dae>,
         trigger_memory: usize,
@@ -375,6 +402,17 @@ impl<'dae> ParameterBindingSubstitutions<'dae> {
     }
 }
 
+/// A packed elementwise operation: its context, operation, whether it is a
+/// scaled tensor product (whose packing structural incidence gates), and its
+/// operands.
+type TensorBinaryKey<'dae> = (
+    u64,
+    solve::BinaryOp,
+    bool,
+    dae::ExprId<'dae>,
+    dae::ExprId<'dae>,
+);
+
 pub(super) struct ScalarCompiler<'layout, 'dae> {
     view: dae::DaeView<'dae>,
     layout: &'layout LoweredLayout<'dae>,
@@ -391,7 +429,7 @@ pub(super) struct ScalarCompiler<'layout, 'dae> {
     fold_guard_base: usize,
     active_clock: Option<dae::ClockId<'dae>>,
     sampled_source: bool,
-    derivative_definitions: Option<&'layout DerivativeRowIndex<'dae>>,
+    derivative_definitions: Option<&'layout ContinuousRowIndex<'dae>>,
     affine_derivative_systems: Option<&'layout AffineDerivativeSystems<'dae>>,
     active_derivatives: Vec<(u32, usize)>,
     derivative_seeds: Option<HashMap<(u32, usize), f64>>,
@@ -401,6 +439,14 @@ pub(super) struct ScalarCompiler<'layout, 'dae> {
     ops: Vec<solve::LinearOp>,
     next_register: solve::Reg,
     integer_registers: Vec<Option<i64>>,
+    /// The exact value of each register loaded from a literal or folded from
+    /// literals, and the operand of each register that negates another.
+    real_registers: Vec<Option<f64>>,
+    negated_registers: Vec<Option<solve::Reg>>,
+    /// The incidence proofs of exactly zero product terms, shared with
+    /// structural analysis so both omit the same terms.
+    zero_coefficients: rumoca_eval_dae::ZeroCoefficients<'dae>,
+    unary_values: HashMap<(u64, solve::UnaryOp, solve::Reg), solve::Reg>,
     expression_cache: rustc_hash::FxHashMap<(u64, dae::ExprId<'dae>, usize), solve::Reg>,
     packed_expression_cache: rustc_hash::FxHashMap<(u64, dae::ExprId<'dae>), solve::Reg>,
     typed_pure_call_cache: rustc_hash::FxHashMap<
@@ -412,8 +458,7 @@ pub(super) struct ScalarCompiler<'layout, 'dae> {
     >,
     matrix_multiply_cache:
         HashMap<(u64, dae::ExprId<'dae>, dae::ExprId<'dae>), (solve::Reg, usize)>,
-    tensor_binary_cache:
-        HashMap<(u64, solve::BinaryOp, dae::ExprId<'dae>, dae::ExprId<'dae>), (solve::Reg, usize)>,
+    tensor_binary_cache: HashMap<TensorBinaryKey<'dae>, (solve::Reg, usize)>,
     tensor_transpose_cache: HashMap<(u64, dae::ExprId<'dae>), (solve::Reg, usize)>,
     tensor_concatenate_cache: HashMap<(u64, dae::ExprId<'dae>), (solve::Reg, usize)>,
     tensor_update_cache: HashMap<(u64, dae::ExprId<'dae>), (solve::Reg, usize)>,
@@ -466,7 +511,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             fold_guard_base: 0,
             active_clock: None,
             sampled_source: false,
-            derivative_definitions: layout.derivative_definitions.get(),
+            derivative_definitions: None,
             affine_derivative_systems: None,
             active_derivatives: Vec::new(),
             derivative_seeds: None,
@@ -476,6 +521,10 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             ops: Vec::new(),
             next_register: 0,
             integer_registers: Vec::new(),
+            real_registers: Vec::new(),
+            negated_registers: Vec::new(),
+            zero_coefficients: rumoca_eval_dae::ZeroCoefficients::default(),
+            unary_values: HashMap::new(),
             expression_cache: rustc_hash::FxHashMap::default(),
             packed_expression_cache: rustc_hash::FxHashMap::default(),
             typed_pure_call_cache: rustc_hash::FxHashMap::default(),
@@ -654,12 +703,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                     function: candidate,
                     ..
                 } if *candidate == function => return context,
-                ScalarContextFrame::Activation { parent, .. }
-                | ScalarContextFrame::Function { parent, .. }
-                | ScalarContextFrame::Domain { parent, .. }
-                | ScalarContextFrame::Parameter { parent, .. }
-                | ScalarContextFrame::Derivative { parent, .. }
-                | ScalarContextFrame::DerivativeSeed { parent, .. } => context = *parent,
+                frame => context = frame.parent(),
             }
         }
         0
@@ -669,7 +713,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
     /// row the structural proof matched to that derivative.
     pub(super) const fn with_derivative_definitions(
         mut self,
-        definitions: &'layout DerivativeRowIndex<'dae>,
+        definitions: &'layout ContinuousRowIndex<'dae>,
     ) -> Self {
         self.derivative_definitions = Some(definitions);
         self
@@ -708,7 +752,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
     ) -> Result<Vec<solve::LinearOp>, LowerError> {
         let output = self.expression(expression, scalar)?;
         self.ops.push(solve::LinearOp::StoreOutput { src: output });
-        Ok(self.ops)
+        Ok(solve::prune_dead_constants(self.ops))
     }
 
     /// Compile several scalar projections into one source-owned program.
@@ -725,7 +769,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             let output = self.expression(expression, scalar)?;
             self.ops.push(solve::LinearOp::StoreOutput { src: output });
         }
-        Ok(self.ops)
+        Ok(solve::prune_dead_constants(self.ops))
     }
 
     /// Compile complete aggregate expressions before projecting their scalar
@@ -788,7 +832,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                 });
             }
         }
-        Ok(std::mem::take(&mut self.ops))
+        Ok(solve::prune_dead_constants(std::mem::take(&mut self.ops)))
     }
 
     pub(super) fn clocked_program(
@@ -800,7 +844,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         self.active_clock = Some(clock);
         let output = self.expression(expression, scalar)?;
         self.ops.push(solve::LinearOp::StoreOutput { src: output });
-        Ok(self.ops)
+        Ok(solve::prune_dead_constants(self.ops))
     }
 
     /// Compile the source of MLS §16.5.1 `sample(u)` against event-entry
@@ -816,39 +860,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         self.sampled_source = true;
         let output = self.expression(expression, scalar)?;
         self.ops.push(solve::LinearOp::StoreOutput { src: output });
-        Ok(self.ops)
-    }
-
-    /// Compile the signed sum `Σ ±termᵢ` into one program.
-    ///
-    /// An empty sum is the value zero: the terms a structural proof hands over
-    /// are already reduced, so a displacement that cancelled leaves nothing to
-    /// add rather than a missing row.
-    pub(super) fn signed_sum_program(
-        mut self,
-        terms: &[(dae::ExprId<'dae>, usize, bool)],
-        span: Span,
-    ) -> Result<Vec<solve::LinearOp>, LowerError> {
-        let mut total: Option<solve::Reg> = None;
-        for (expression, scalar, negated) in terms.iter().copied() {
-            let value = self.expression(expression, scalar)?;
-            let operator = if negated {
-                dae::BinaryOperator::Subtract
-            } else {
-                dae::BinaryOperator::Add
-            };
-            total = Some(match (total, negated) {
-                (None, false) => value,
-                (None, true) => self.unary(dae::UnaryOperator::Negate, value, span)?,
-                (Some(total), _) => self.binary(operator, total, value, span)?,
-            });
-        }
-        let output = match total {
-            Some(total) => total,
-            None => self.constant(0.0, span)?,
-        };
-        self.ops.push(solve::LinearOp::StoreOutput { src: output });
-        Ok(self.ops)
+        Ok(solve::prune_dead_constants(self.ops))
     }
 
     /// Compile `slot - Σ ±termᵢ` into one residual program.
@@ -892,7 +904,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         }
         self.ops
             .push(solve::LinearOp::StoreOutput { src: residual });
-        Ok(self.ops)
+        Ok(solve::prune_dead_constants(self.ops))
     }
 
     /// Compile `slot - start` for one exact scalar initialization equation.
@@ -931,7 +943,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         };
         self.ops
             .push(solve::LinearOp::StoreOutput { src: residual });
-        Ok(self.ops)
+        Ok(solve::prune_dead_constants(self.ops))
     }
 
     pub(super) fn scaled_derivative_program(
@@ -943,63 +955,9 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             numerator = self.unary(dae::UnaryOperator::Negate, numerator, input.span)?;
         }
         let coefficient = self.expression(input.coefficient, input.coefficient_scalar)?;
-        let output = self.binary(
-            dae::BinaryOperator::Divide,
-            numerator,
-            coefficient,
-            input.span,
-        )?;
+        let output = self.affine_quotient(numerator, coefficient, input.span)?;
         self.ops.push(solve::LinearOp::StoreOutput { src: output });
-        Ok(self.ops)
-    }
-
-    /// `der(x) = (numerator - Σ offsets) / coefficient` as one program.
-    pub(super) fn summed_derivative_program(
-        mut self,
-        numerator: Option<(dae::ExprId<'dae>, usize)>,
-        summed: &super::summed_derivative::SummedDerivative<'dae>,
-        span: Span,
-    ) -> Result<Vec<solve::LinearOp>, LowerError> {
-        let output = self.summed_derivative_value(numerator, summed, span)?;
-        self.ops.push(solve::LinearOp::StoreOutput { src: output });
-        Ok(self.ops)
-    }
-
-    /// The register holding `(numerator - Σ offsets)` with the derivative's
-    /// factors and sign undone.
-    pub(super) fn summed_derivative_value(
-        &mut self,
-        numerator: Option<(dae::ExprId<'dae>, usize)>,
-        summed: &super::summed_derivative::SummedDerivative<'dae>,
-        span: Span,
-    ) -> Result<solve::Reg, LowerError> {
-        let mut value = match numerator {
-            Some((numerator, scalar)) => self.expression(numerator, scalar)?,
-            None => self.constant(0.0, span)?,
-        };
-        for term in &summed.offsets {
-            let operand = self.expression(term.expression, term.scalar)?;
-            // Moving `s_i * t_i` to the other side flips its sign.
-            let operator = if term.negated {
-                dae::BinaryOperator::Add
-            } else {
-                dae::BinaryOperator::Subtract
-            };
-            value = self.binary(operator, value, operand, span)?;
-        }
-        for factor in &summed.factors {
-            let operand = self.expression(factor.expression, factor.scalar)?;
-            let operator = if factor.divides {
-                dae::BinaryOperator::Multiply
-            } else {
-                dae::BinaryOperator::Divide
-            };
-            value = self.binary(operator, value, operand, span)?;
-        }
-        if summed.derivative_negated {
-            value = self.unary(dae::UnaryOperator::Negate, value, span)?;
-        }
-        Ok(value)
+        Ok(solve::prune_dead_constants(self.ops))
     }
 
     pub(super) fn packed_pair(
@@ -1261,9 +1219,13 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                 ) {
                     return self.pack_promoted_concatenation(expression, builtin, arguments, span);
                 }
+                if builtin == dae::PureBuiltin::NoEvent {
+                    let argument = arguments.get(0).expect("checked noEvent argument");
+                    return self.with_no_event(|compiler| compiler.pack_expression(argument));
+                }
                 let alias = match builtin {
                     dae::PureBuiltin::Smooth => arguments.get(1),
-                    dae::PureBuiltin::NoEvent | dae::PureBuiltin::Vector => arguments.get(0),
+                    dae::PureBuiltin::Vector => arguments.get(0),
                     _ => None,
                 };
                 if let Some(alias) = alias {
@@ -1307,9 +1269,47 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         Ok(start)
     }
 
+    fn expression(
+        &mut self,
+        expression: dae::ExprId<'dae>,
+        scalar: usize,
+    ) -> Result<solve::Reg, LowerError> {
+        if let Some(index) = self.buffered_relation_slot(expression) {
+            return self.load_slot(
+                solve::scalar_slot_p(index),
+                self.node(expression).provenance().span(),
+            );
+        }
+        self.unbuffered_expression(expression, scalar)
+    }
+
+    fn buffered_relation_slot(&self, expression: dae::ExprId<'dae>) -> Option<usize> {
+        let slot = self.layout.buffered_relations.expression_slot(expression)?;
+        let mut context = self.context_id;
+        while let Some(frame) = self.context_frames.get(&context) {
+            if matches!(frame, ScalarContextFrame::NoEvent { .. }) {
+                return None;
+            }
+            context = frame.parent();
+        }
+        Some(slot)
+    }
+
+    fn with_no_event<T>(
+        &mut self,
+        lower: impl FnOnce(&mut Self) -> Result<T, LowerError>,
+    ) -> Result<T, LowerError> {
+        self.enter_context(ScalarContextFrame::NoEvent {
+            parent: self.context_id,
+        });
+        let result = lower(self);
+        self.leave_context();
+        result
+    }
+
     // SPEC_0021: Exception - exhaustive scalar dispatch over expression operation variants.
     #[allow(clippy::too_many_lines)]
-    fn expression(
+    fn unbuffered_expression(
         &mut self,
         expression: dae::ExprId<'dae>,
         scalar: usize,
@@ -1344,6 +1344,13 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         }
         let node = self.node(expression);
         self.expect_scalar(node, scalar)?;
+        if !matches!(node.operation(), dae::ExpressionOperation::Literal(_))
+            && let Some(value) = self.exact_literal(expression, scalar)
+        {
+            let result = self.constant(value, node.provenance().span())?;
+            self.expression_cache.insert(key, result);
+            return Ok(result);
+        }
         let result = match node.operation() {
             dae::ExpressionOperation::Literal(value) => {
                 self.literal(value, node.provenance().span())
@@ -1357,6 +1364,11 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             }
             dae::ExpressionOperation::Binary { operator, lhs, rhs } => {
                 self.binary_expression(operator, lhs, rhs, scalar, node.provenance().span())
+            }
+            dae::ExpressionOperation::Conditional(operands)
+                if node.function_scope().is_none() && !self.conditional_is_total(operands) =>
+            {
+                self.selected_arm_conditional(operands, scalar, node.provenance().span())
             }
             dae::ExpressionOperation::Conditional(operands) => {
                 self.conditional(operands, scalar, node.provenance().span())
@@ -1468,7 +1480,9 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                 .get(&context)
                 .expect("non-root scalar context has a frame")
             {
-                ScalarContextFrame::Function { .. } | ScalarContextFrame::DerivativeSeed { .. } => {
+                ScalarContextFrame::NoEvent { .. }
+                | ScalarContextFrame::Function { .. }
+                | ScalarContextFrame::DerivativeSeed { .. } => {
                     return None;
                 }
                 ScalarContextFrame::Activation { parent, .. }
@@ -1549,6 +1563,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             solve::ScalarSlot::Time => self.ops.push(solve::LinearOp::LoadTime { dst }),
             solve::ScalarSlot::Constant(value) => {
                 self.ops.push(solve::LinearOp::Const { dst, value });
+                self.real_registers[dst as usize] = Some(value);
             }
         }
         Ok(dst)
@@ -1583,6 +1598,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
     fn constant(&mut self, value: f64, span: Span) -> Result<solve::Reg, LowerError> {
         let dst = self.register(span)?;
         self.ops.push(solve::LinearOp::Const { dst, value });
+        self.real_registers[dst as usize] = Some(value);
         self.set_integer_register(dst, exact_i64(value));
         Ok(dst)
     }
@@ -1609,6 +1625,8 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             .checked_add(1)
             .ok_or_else(|| LowerError::contract("Solve register index overflow", span))?;
         self.integer_registers.push(None);
+        self.real_registers.push(None);
+        self.negated_registers.push(None);
         Ok(register)
     }
 

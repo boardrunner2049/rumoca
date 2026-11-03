@@ -20,10 +20,15 @@ pub(super) fn resolve_override_member_name(
     }
     let scope = reference.component_scope()?;
     let member_leaf = scope.leaf_ident()?;
-    let package = if let Some(source_package_def_id) = reference
-        .target_def_id()
-        .and_then(|def_id| ctx.class_index.parent_def_id(def_id))
-    {
+    // MLS 3.7.2: `time` is the predefined simulation time, never a package member.
+    if member_leaf == "time" && !reference.as_str().contains('.') {
+        return None;
+    }
+    // A resolved reference is a package member only when its declaration's
+    // owner is a package in an active override chain. A declaration without
+    // an owning class (a for-loop index, for example) is never captured.
+    let package = if let Some(def_id) = reference.target_def_id() {
+        let source_package_def_id = ctx.class_index.parent_def_id(def_id)?;
         ctx.active_override_package_for_source_package(source_package_def_id)?
     } else {
         ctx.unique_active_override_package()?

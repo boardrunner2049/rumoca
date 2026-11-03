@@ -5,7 +5,9 @@ use std::sync::Arc;
 pub(crate) struct FlattenGraphData {
     pub(crate) vcg_data: vcg::VcgPreScanData,
     pub(crate) optional_edges: Vec<(String, String)>,
-    pub(crate) required_forest: vcg::RequiredEdgeForest,
+    /// The one selected MLS §9.4 spanning forest; `Connections.rooted` and
+    /// connection-equation emission both follow it.
+    pub(crate) spanning_forest: vcg::SelectedSpanningForest,
 }
 
 pub(crate) struct OverlayScopeIndex<'a> {
@@ -953,7 +955,7 @@ pub(crate) fn prepare_context_for_equation_flattening(
     Ok(FlattenGraphData {
         vcg_data,
         optional_edges,
-        required_forest,
+        spanning_forest: vcg_result.spanning_forest,
     })
 }
 
@@ -994,6 +996,8 @@ pub(crate) struct FinalizeFlatModelInput<'a, 'tree> {
     pub(crate) component_override_map: &'a ComponentOverrideMap,
 }
 
+// SPEC_0021: Exception - flattening entry point running ordered finalization passes.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn finalize_flat_model(
     input: FinalizeFlatModelInput<'_, '_>,
 ) -> Result<(), FlattenError> {
@@ -1017,6 +1021,7 @@ pub(crate) fn finalize_flat_model(
     crate::algorithm_events::hoist_algorithm_event_actions(flat);
 
     seed_flat_functions_from_context(ctx, flat);
+    functions::collect_functions(flat, overlay, tree, class_index, Some(model_name))?;
     rewrite_function_extends_aliases_in_flat_functions(flat, tree, class_index)?;
     functions::collect_functions(flat, overlay, tree, class_index, Some(model_name))?;
     // MLS §14.5: operator-record arithmetic denotes operator-function calls;
@@ -1024,20 +1029,15 @@ pub(crate) fn finalize_flat_model(
     if crate::postprocess::lower_operator_record_equations(flat, class_index) {
         functions::collect_functions(flat, overlay, tree, class_index, Some(model_name))?;
     }
-    // Callable identity is attached once, after the rewrite fixed point below,
-    // where it also covers every call the fixed point introduced.
+    functions::canonicalize_collected_function_calls(flat, class_index)?;
     mark_record_constructor_calls(flat, tree);
     canonicalize_varrefs_via_record_aliases(flat, ctx);
     normalize_record_array_field_access_bindings(flat);
     drop_invalid_field_access_bindings(flat);
     propagate_unexpanded_record_array_dims(flat, overlay);
-    let assertion_error_literal =
-        tree.scope_tree
-            .predefined_member(&rumoca_core::ComponentPath::from_parts([
-                "AssertionLevel",
-                "error",
-            ]));
-    constant_injection::check_structural_initial_asserts(flat, ctx, assertion_error_literal)?;
+    let assertion_levels = constant_injection::predefined_assertion_levels(tree);
+    constant_injection::settle_assertion_levels(flat, assertion_levels);
+    constant_injection::fold_structural_initial_asserts(flat, ctx, assertion_levels.error)?;
     flat.oc_break_edge_scalar_count = vcg::compute_break_edge_scalar_count(
         &flatten_graph.vcg_data.branches,
         &flatten_graph.optional_edges,
@@ -1046,8 +1046,10 @@ pub(crate) fn finalize_flat_model(
         flat,
     );
 
-    collapse_index_refs_to_known_varrefs(flat);
+    collapse_index_refs_to_known_varrefs(flat)?;
+    inject_referenced_qualified_class_constants(tree, class_index, model_name, flat, overlay, ctx)?;
     ctx.seed_expanded_component_keys(flat);
+    substitute_known_constants_in_flat(flat, ctx)?;
     ctx.build_parameter_lookup(flat, tree);
     if ctx.recompute_symbolic_component_dimensions(flat, overlay, tree)? {
         ctx.build_parameter_lookup(flat, tree);
@@ -1066,19 +1068,34 @@ pub(crate) fn finalize_flat_model(
     // collection, index collapse and dimension recovery introduced.
     mark_record_constructor_calls(flat, tree);
     if collected_new_functions {
-        collapse_index_refs_to_known_varrefs(flat);
+        inject_referenced_qualified_class_constants(
+            tree,
+            class_index,
+            model_name,
+            flat,
+            overlay,
+            ctx,
+        )?;
+        substitute_known_constants_in_flat(flat, ctx)?;
+        mark_record_constructor_calls(flat, tree);
+        collapse_index_refs_to_known_varrefs(flat)?;
     }
     functions::canonicalize_collected_function_calls(flat, class_index)?;
     // Materialize source-level defaults while record inputs still have their
     // source signatures. Record-field bindings belong to the constructor and
     // must not be copied onto the scalar ABI parameters created below.
     functions::materialize_flat_function_call_args(flat)?;
-    functions::specialize_function_inputs(flat, tree)?;
+    functions::specialize_function_arguments(flat)?;
     // Record parameter signatures and every call site must change together.
     // Run this only after the rewrite fixed point: earlier lowering allowed a
     // later rewrite to reintroduce source-shaped record arguments against an
     // already decomposed signature.
     functions::lower_record_function_params(flat)?;
+    functions::split_branch_assigned_records(flat);
+    expand_record_array_field_projections_in_equations(flat);
+    // Record ABI lowering introduces field projections at call sites. Resolve
+    // those through the same occurrence owner as source-written projections.
+    collapse_index_refs_to_known_varrefs(flat)?;
     // Recheck the decomposed ABI and materialize defaults of any scalar calls
     // introduced by record projection.
     functions::materialize_flat_function_call_args(flat)?;
@@ -1089,23 +1106,18 @@ pub(crate) fn finalize_flat_model(
     inject_referenced_qualified_class_constants(tree, class_index, model_name, flat, overlay, ctx)?;
     substitute_constants_collecting_calls(flat, ctx, overlay, tree, class_index, model_name)?;
     fold_time_invariant_derivatives(flat);
-    crate::postprocess::accumulate_loop_assertions(flat);
     crate::postprocess::split_discrete_array_equations(flat);
     crate::postprocess::give_discrete_inputs_history(flat)?;
     crate::postprocess::scalarize_when_element_arrays(flat)?;
     crate::postprocess::rewrite_array_domain_comprehensions(flat)?;
     resolve_nested_constructor_field_access_bindings(flat);
+    crate::postprocess::fold_invariant_scalar_bindings(flat);
     // MLS §4.5 / §12.3: an explicitly frozen artifact may specialize pure
     // bindings at their immutable inputs. This profile is not enabled by the
     // default optimization pipeline or by literals at an ordinary call site.
     if options.specialize_frozen_bindings {
         functions::specialize_frozen_bindings(flat)?;
     }
-    // Reachability is decided from the call graph as written, before any call
-    // is folded to its result. Folding first makes a pure call with settled
-    // arguments vanish, and the callee is then pruned as unreachable although
-    // the source calls it -- which emptied the collected table for every
-    // fixture whose calls take literal arguments.
     functions::prune_unreachable_functions(flat);
     // Pure calls with settled inputs are folded by the `fold-pure-calls`
     // bitcode pass, not here; the frontend only proves their bindings in
@@ -1169,7 +1181,7 @@ fn finalize_flat_connections(
     outer_refs::redirect_outer_refs(flat, &overlay.outer_prefix_to_inner);
     let connections_start = maybe_start_timer();
     let mut oc_forest =
-        vcg::OverconstrainedEquationForest::new(flatten_graph.required_forest.clone());
+        vcg::OverconstrainedEquationForest::new(flatten_graph.spanning_forest.clone());
     let result = connections::process_connections(
         flat,
         overlay,

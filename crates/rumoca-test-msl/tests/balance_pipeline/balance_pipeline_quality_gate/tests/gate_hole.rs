@@ -235,3 +235,60 @@ fn the_hard_floor_is_silent_without_a_reading_because_unmeasured_already_fails()
         "and it is the unmeasured reason that fails the run instead"
     );
 }
+
+/// The strict-high roster alone cannot see a completion that never was
+/// strict-high: one near model replaced by another holds every aggregate flat.
+/// The unexcepted roster names them, and a model outside it fails the gate.
+#[test]
+fn unexcepted_roster_catches_a_new_uncertified_completion() {
+    let baseline = MslQualityBaseline {
+        unexcepted_non_high_models: IndexSet::from_iter(["Near0".into()]),
+        ..baseline_quality_template()
+    };
+    assert!(unexcepted_roster_growth_reasons(&baseline, &measured_cohort(2, 1)).is_empty());
+
+    let reasons = unexcepted_roster_growth_reasons(&baseline, &measured_cohort(2, 2));
+    assert_eq!(reasons.len(), 1, "got: {reasons:?}");
+    assert!(reasons[0].contains("Near1"), "got: {reasons:?}");
+    assert!(
+        reasons[0].contains("not in the baseline roster"),
+        "got: {reasons:?}"
+    );
+}
+
+#[test]
+fn unexcepted_roster_refuses_a_model_that_is_also_certified() {
+    let baseline = MslQualityBaseline {
+        certified_strict_high_models: IndexSet::from_iter(["High0".into()]),
+        unexcepted_non_high_models: IndexSet::from_iter(["High0".into()]),
+        ..baseline_quality_template()
+    };
+    let error = validate_unexcepted_non_high_roster(&baseline).expect_err("overlap");
+    assert!(error.to_string().contains("both certified"), "{error}");
+}
+
+/// A well-formed exception row the reviewed boundary does not pin cannot
+/// retire a roster member: the file the run read must be the reviewed one.
+#[test]
+fn an_unreviewed_exception_file_fails_the_gate() {
+    let reviewed = reviewed_reference_boundary_migration()
+        .metric
+        .exclusions_sha256;
+    let reading = |sha256: &str| {
+        let mut table = parity_measurement::fixtures::cohort_table(2, 0);
+        table.source.exclusions_sha256 = sha256.to_string();
+        MslParityMeasurement::measured(
+            parity_with(trace_stats(2, 2, 0)),
+            MslCohortReading {
+                table,
+                transitions: None,
+                previous_not_diffable: None,
+                persisted: true,
+            },
+        )
+    };
+    let reasons = exception_file_reasons(&reading("an unreviewed row"));
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].contains("new reviewed boundary"), "{reasons:?}");
+    assert!(exception_file_reasons(&reading(&reviewed)).is_empty());
+}

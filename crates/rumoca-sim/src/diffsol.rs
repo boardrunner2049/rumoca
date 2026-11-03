@@ -4,7 +4,6 @@ use std::time::Instant;
 #[cfg(feature = "scheduled-sim")]
 use indexmap::IndexMap;
 use rumoca_ir_dae as dae;
-use rumoca_ir_solve as solve;
 
 use crate::BuildSimulationTimings;
 #[cfg(feature = "scheduled-sim")]
@@ -13,6 +12,11 @@ use crate::me_backend::{
     BackendSimulationSession, batch_options, instance_config, plugin_for_host,
 };
 use crate::simulation_session::SessionState;
+
+const BDF_INTEGRATOR: crate::me_backend::IntegratorFactory = crate::me_backend::IntegratorFactory {
+    method: "bdf",
+    build: rumoca_solver_diffsol::model_exchange_integrator,
+};
 use crate::solve_lowering::{
     SimulationDiagnosticError, apply_correlated_simulation_overrides, finish_runtime_fmi_artifact,
     lower_correlated_for_simulation_with_stage_timing_and_param_overrides, tunable_param_overrides,
@@ -29,6 +33,7 @@ use crate::{SimError, SimFailureStage};
 
 pub struct PreparedSimulation {
     opts: rumoca_solver::SimOptions,
+    root_location: rumoca_ir_solve::fmi::RootLocationPlan,
     retained: RefCell<rumoca_solver::fmi_me::session::MeRetainedComponent>,
 }
 
@@ -39,10 +44,11 @@ pub(crate) enum BdfCapability {
     InitialLinearizationUnavailable { reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 pub(crate) enum SelectedAutoIntegrator {
-    Bdf,
+    /// BDF, with the component the capability probe instantiated and checked
+    /// under the simulation's own configuration when there was one to probe.
+    Bdf(Option<Box<PreparedSimulation>>),
     RkLike,
 }
 
@@ -51,20 +57,29 @@ pub(crate) fn assess_bdf_capability(
     artifact: &rumoca_solver::fmi_me::MeModelArtifact,
     opts: &rumoca_solver::SimOptions,
     execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
-) -> Result<BdfCapability, SimError> {
+) -> Result<(BdfCapability, Option<PreparedSimulation>), SimError> {
     if artifact.continuous_state_count() == 0 {
-        return Ok(BdfCapability::Eligible);
+        return Ok((BdfCapability::Eligible, None));
     }
+    // The probe is the BDF simulation's own component: the same admitted
+    // backend and instance configuration, instantiated and checked once.
+    let Ok(execution_backend) =
+        rumoca_solver::fmi_me::admit_execution_backend(opts.execution_policy, execution_backend)
+    else {
+        return Ok((BdfCapability::Eligible, None));
+    };
     let retained = rumoca_solver::fmi_me::session::MeRetainedComponent::instantiate(
         artifact.source(),
-        &instance_config("bdf-capability", opts)?,
+        &instance_config("bdf", opts)?,
         execution_backend,
     )?;
     let prepared = PreparedSimulation {
         opts: opts.clone(),
+        root_location: artifact.root_location(),
         retained: RefCell::new(retained),
     };
-    classify_bdf_capability(check_prepared_component(&prepared))
+    let capability = classify_bdf_capability(check_prepared_component(&prepared))?;
+    Ok((capability, Some(prepared)))
 }
 
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
@@ -95,8 +110,10 @@ pub(crate) fn select_auto_integrator(
     execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
 ) -> Result<SelectedAutoIntegrator, SimError> {
     match assess_bdf_capability(artifact, opts, execution_backend)? {
-        BdfCapability::Eligible => Ok(SelectedAutoIntegrator::Bdf),
-        BdfCapability::InitialLinearizationUnavailable { reason } => {
+        (BdfCapability::Eligible, prepared) => {
+            Ok(SelectedAutoIntegrator::Bdf(prepared.map(Box::new)))
+        }
+        (BdfCapability::InitialLinearizationUnavailable { reason }, _) => {
             tracing::debug!(
                 target: "rumoca_sim::solver_selection",
                 %reason,
@@ -160,14 +177,15 @@ pub fn build_simulation_with_stage_timing(
     opts: &rumoca_solver::SimOptions,
     begin_stage: impl FnMut(&'static str),
 ) -> Result<(PreparedSimulation, BuildSimulationTimings), SimError> {
-    build_simulation_with_stage_timing_and_solve_model(dae_model, opts, begin_stage, |_| {})
+    build_simulation_with_stage_timing_and_lowered_model(dae_model, opts, begin_stage, |_| {})
 }
 
-pub fn build_simulation_with_stage_timing_and_solve_model(
+/// Observe the exact immutable DAE/Solve pair before it becomes an FMI component.
+pub fn build_simulation_with_stage_timing_and_lowered_model(
     dae_model: &dae::Dae,
     opts: &rumoca_solver::SimOptions,
     mut begin_stage: impl FnMut(&'static str),
-    mut observe_solve_model: impl FnMut(&solve::SolveModel),
+    mut observe_lowered_model: impl FnMut(&rumoca_phase_solve::LoweredSolveModel<'_>),
 ) -> Result<(PreparedSimulation, BuildSimulationTimings), SimError> {
     let param_overrides = tunable_param_overrides(dae_model, opts).map_err(diagnostic_sim_error)?;
     let (mut lowered, solve_timings) =
@@ -183,7 +201,7 @@ pub fn build_simulation_with_stage_timing_and_solve_model(
     apply_correlated_simulation_overrides(&mut lowered, dae_model, opts)
         .map_err(diagnostic_sim_error)?;
     let override_apply_seconds = override_apply_start.elapsed().as_secs_f64();
-    observe_solve_model(lowered.model());
+    observe_lowered_model(&lowered);
     begin_stage("sim_build");
     let backend_build_start = Instant::now();
     let (artifact, execution_backend) =
@@ -217,6 +235,7 @@ fn build_simulation_artifact(
     )?;
     let prepared = PreparedSimulation {
         opts: opts.clone(),
+        root_location: artifact.root_location(),
         retained: RefCell::new(retained),
     };
     drop(check_prepared_component(&prepared));
@@ -233,8 +252,17 @@ pub(crate) fn simulate_artifact(
     simulate_prepared(&prepared)
 }
 
+/// Simulate the component a BDF capability probe already instantiated and
+/// checked, exactly as [`simulate_artifact`] simulates the one it builds.
+#[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
+pub(crate) fn simulate_probed(
+    prepared: &PreparedSimulation,
+) -> Result<rumoca_solver::SimResult, SimError> {
+    simulate_prepared(prepared)
+}
+
 fn simulate_prepared(prepared: &PreparedSimulation) -> Result<rumoca_solver::SimResult, SimError> {
-    let options = batch_options(&prepared.opts)?;
+    let options = batch_options(&prepared.root_location, &prepared.opts)?;
     let mut cursor = rumoca_solver::fmi_me::driver::batch_output_cursor(&options)?;
     let mut retained =
         prepared
@@ -248,18 +276,14 @@ fn simulate_prepared(prepared: &PreparedSimulation) -> Result<rumoca_solver::Sim
     if host.is_terminated() {
         return Ok(host.finish());
     }
-    let plugin = plugin_for_host(
-        &host,
-        &prepared.opts,
-        rumoca_solver_diffsol::model_exchange_integrator,
-    )?;
+    let plugin = plugin_for_host(&host, &prepared.opts, BDF_INTEGRATOR)?;
     let mut session = host.into_session(plugin)?;
     session.run_to_stop(&mut cursor)?;
     Ok(session.finish())
 }
 
 fn check_prepared_component(prepared: &PreparedSimulation) -> Result<(), SimError> {
-    let options = batch_options(&prepared.opts)?;
+    let options = batch_options(&prepared.root_location, &prepared.opts)?;
     let mut retained =
         prepared
             .retained
@@ -272,11 +296,7 @@ fn check_prepared_component(prepared: &PreparedSimulation) -> Result<(), SimErro
     if host.is_terminated() {
         return Ok(());
     }
-    let plugin = plugin_for_host(
-        &host,
-        &prepared.opts,
-        rumoca_solver_diffsol::model_exchange_integrator,
-    )?;
+    let plugin = plugin_for_host(&host, &prepared.opts, BDF_INTEGRATOR)?;
     drop(host.into_session(plugin)?);
     Ok(())
 }
@@ -333,7 +353,7 @@ impl SimulationSession {
             &opts,
             execution_backend,
             "diffsol",
-            rumoca_solver_diffsol::model_exchange_integrator,
+            BDF_INTEGRATOR,
         )
         .map_err(|err| SimulationDiagnosticError::Solver(err.to_string()))?;
         Ok(Self { inner })
@@ -608,6 +628,24 @@ mod native_policy_tests {
     }
 
     impl CompiledSolveJacobianExpression for CountingJacobian {
+        fn call_program_output(
+            &self,
+            coordinate: (usize, usize),
+            y: &[f64],
+            p: &[f64],
+            t: f64,
+            seed: &[f64],
+            external_tables: &[rumoca_core::ExternalTableData],
+        ) -> Result<Option<f64>, String> {
+            let result = self
+                .inner
+                .call_program_output(coordinate, y, p, t, seed, external_tables);
+            if !matches!(result, Ok(None)) {
+                self.counters.jacobian.observe(&result);
+            }
+            result
+        }
+
         fn call(
             &self,
             y: &[f64],
@@ -858,10 +896,8 @@ mod native_policy_tests {
     }
 
     /// Mutation fixture: a backend whose compiles succeed but whose every
-    /// compiled call returns `Err`. The runtime's documented semantics treat a
-    /// compiled-call failure as permission to fall back to the interpreter, so
-    /// a run over this backend can still complete — the success/failure
-    /// accounting is what must expose it.
+    /// compiled call returns `Err`. Exact projection must propagate the error,
+    /// and the success/failure accounting must expose the failed execution.
     struct FailingCompiled;
 
     impl CompiledSolveExpression for FailingCompiled {
@@ -944,9 +980,8 @@ mod native_policy_tests {
     }
 
     /// Discriminator (a): the Auto/native BDF path really executes compiled
-    /// expression, JVP, and exact-assignment native calls — SUCCESSFULLY. The
-    /// runtime treats a compiled-call failure as permission to interpret, so
-    /// each class asserts `succeeded > 0` (recorded only after the delegated
+    /// expression, JVP, and exact-assignment native calls — SUCCESSFULLY. Each
+    /// class asserts `succeeded > 0` (recorded only after the delegated
     /// call returns `Ok`) AND `failed == 0`: a mutation that drops, ignores,
     /// or re-composes the handle zeroes the successes, and a backend that
     /// errors its way into silent interpreter fallback trips the zero-failure
@@ -993,18 +1028,20 @@ mod native_policy_tests {
     }
 
     /// Discriminator (a-mutation): a backend whose every compiled call fails
-    /// must NOT satisfy the native-success evidence. The runtime's current
-    /// fallback semantics let the simulation complete on the interpreter (this
-    /// slice deliberately does not restructure that), so the proof is in the
-    /// accounting: nonzero failures, zero successes, evidence predicate false.
+    /// must fail the simulation and must NOT satisfy the native-success
+    /// evidence: nonzero failures, zero successes, evidence predicate false.
     #[test]
     fn failing_native_backend_cannot_satisfy_the_success_evidence() {
         let opts = sim_opts(SimExecutionPolicy::Auto);
         let model = state_fixture(&opts);
         let (_backend, counters, handle) = counting_handle_over(Rc::new(FailingBackend));
-        let result = simulate_artifact(model.artifact(), &opts, Some(handle))
-            .expect("current runtime semantics fall back to the interpreter and complete");
-        assert!(!result.times.is_empty(), "fallback run produced no samples");
+        let error = simulate_artifact(model.artifact(), &opts, Some(handle))
+            .expect_err("native exact projection errors must reach the caller");
+        assert!(
+            error
+                .to_string()
+                .contains("injected native assignment failure")
+        );
         assert!(
             counters.total_failed() > 0,
             "the failing backend was never even attempted — the mutation fixture is vacuous"

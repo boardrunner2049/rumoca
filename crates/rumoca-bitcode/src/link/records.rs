@@ -6,8 +6,15 @@ impl Shift for RbcClock {
     fn shift(&mut self, m: &Map<'_>) -> Result<()> {
         self.id.shift(m)?;
         self.provenance.shift(m)?;
-        if let RbcClockNode::Triggered { condition } = &mut self.node {
-            condition.shift(m)?;
+        match &mut self.node {
+            RbcClockNode::Triggered { condition } => condition.shift(m)?,
+            RbcClockNode::Shifted {
+                base, condition, ..
+            } => {
+                base.shift(m)?;
+                condition.shift(m)?;
+            }
+            RbcClockNode::Periodic { .. } => {}
         }
         Ok(())
     }
@@ -131,6 +138,13 @@ impl Shift for RbcFunction {
             folds,
             body
         );
+        for derivative in &mut self.derivatives {
+            derivative.target.shift(m)?;
+            derivative.provenance.shift(m)?;
+            if let Some((source, _)) = &mut derivative.previous {
+                source.shift(m)?;
+            }
+        }
         for p in &mut self.parameters {
             p.value_type.shift(m)?;
             p.declaration.shift(m)?;
@@ -183,6 +197,7 @@ impl Shift for RbcFunctionStatement {
                 condition,
                 message,
                 provenance,
+                ..
             } => {
                 condition.shift(m)?;
                 message.shift(m)?;

@@ -402,3 +402,32 @@ end Shapes;
         .resolve_strict_target("Shapes.Probe")
         .unwrap_or_else(|_| panic!("pruned strict Resolve must retain the redeclared function"));
 }
+
+#[test]
+fn a_prepared_strict_plan_serves_compiles_until_the_sources_change() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "lib.mo",
+            "package Lib\n  model Base\n    Real x;\n  equation\n    der(x) = -x;\n  end Base;\nend Lib;\n",
+        )
+        .expect("lib should parse");
+    assert!(!session.strict_compile_plan_ready());
+    session
+        .prepare_strict_compile_plan()
+        .expect("the plan should construct");
+    assert!(session.strict_compile_plan_ready());
+    session
+        .compile_model_dae_strict_reachable_uncached_with_recovery("Lib.Base")
+        .expect("the prepared plan should compile the model");
+    assert!(session.strict_compile_plan_ready());
+    assert!(
+        session
+            .update_document(
+                "lib.mo",
+                "package Lib\n  model Base\n    Real y;\n  equation\n    der(y) = -y;\n  end Base;\nend Lib;\n",
+            )
+            .is_none()
+    );
+    assert!(!session.strict_compile_plan_ready());
+}

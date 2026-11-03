@@ -1,9 +1,11 @@
 use super::type_overrides::{
     TypeOverrideMap, build_type_override_map, class_redeclare_modifier_args,
-    extract_component_class_overrides, find_nested_class_in_hierarchy,
-    resolve_class_override_modifier_targets, validate_component_class_redeclare_target,
+    extract_component_class_overrides, find_all_nested_classes_in_hierarchy,
+    find_nested_class_in_hierarchy, resolve_class_override_modifier_targets,
+    validate_component_class_redeclare_target,
 };
 use super::{InstantiateContext, InstantiateError, InstantiateResult, location_to_span};
+use rumoca_core::DefId;
 use rumoca_ir_ast as ast;
 use rumoca_ir_ast::AstIndexMap as IndexMap;
 use std::collections::BTreeSet;
@@ -243,6 +245,7 @@ pub(super) fn resolve_component_nested_type_overrides(
 ) -> InstantiateResult<NestedTypeOverrides> {
     let mut class_overrides =
         extract_component_class_overrides(tree, comp, class_def, Some(mod_env))?;
+    select_redeclare_values_in_scope(&mut class_overrides, type_overrides);
     let mut has_forwarding_class_redeclare = false;
 
     if let Some(target_class) = class_def {
@@ -283,15 +286,10 @@ pub(super) fn resolve_component_nested_type_overrides(
                     effective_def_id,
                     class_redeclare_modifier_args(mod_expr),
                 )?;
-                class_overrides.insert(
-                    alias_def_id,
-                    ast::ClassOverride::new(
-                        target_name.clone(),
-                        alias_def_id,
-                        effective_def_id,
-                        class_redeclare_target_ref(mod_expr),
-                    )
-                    .with_modifier_args(modifier_args),
+                insert_forwarded_declaration_overrides(
+                    &mut class_overrides,
+                    (tree, target_class, target_name),
+                    (effective_def_id, mod_expr, modifier_args),
                 );
                 has_forwarding_class_redeclare = true;
             }
@@ -332,6 +330,55 @@ pub(super) fn resolve_component_nested_type_overrides(
         has_forwarding_class_redeclare,
         nested_type_overrides,
     ))
+}
+
+/// Replace a redeclare value that names a replaceable alias of the enclosing
+/// scope with the class that scope selected for it.
+///
+/// MLS §7.3: in `Inner a(redeclare package Medium = MA)`, `MA` denotes the
+/// class `MA` is in this occurrence of the enclosing class, which a
+/// redeclaration of the enclosing occurrence may have replaced. The recorded
+/// override is the selection every later phase reads, so it names that class
+/// rather than the lexical alias, whose default would otherwise be selected.
+fn select_redeclare_values_in_scope(
+    class_overrides: &mut IndexMap<DefId, ast::ClassOverride>,
+    type_overrides: &TypeOverrideMap,
+) {
+    for class_override in class_overrides.values_mut() {
+        let mut visited = rustc_hash::FxHashSet::default();
+        while visited.insert(class_override.target_def_id)
+            && let Some(selected) =
+                type_overrides.target_for_alias_def_id(class_override.target_def_id)
+        {
+            class_override.target_def_id = selected;
+        }
+    }
+}
+
+/// Record a forwarded redeclare for every inherited declaration of the member.
+///
+/// MLS 7.1.2: several bases may declare the same element; the redeclare
+/// reaches each declaration, not only the first one found.
+fn insert_forwarded_declaration_overrides(
+    class_overrides: &mut IndexMap<DefId, ast::ClassOverride>,
+    (tree, target_class, target_name): (&ast::ClassTree, &ast::ClassDef, &str),
+    (effective_def_id, mod_expr, modifier_args): (DefId, &ast::Expression, Vec<ast::Expression>),
+) {
+    for declaration in find_all_nested_classes_in_hierarchy(tree, target_class, target_name) {
+        let Some(declaration_def_id) = declaration.def_id else {
+            continue;
+        };
+        class_overrides.insert(
+            declaration_def_id,
+            ast::ClassOverride::new(
+                target_name.to_string(),
+                declaration_def_id,
+                effective_def_id,
+                class_redeclare_target_ref(mod_expr),
+            )
+            .with_modifier_args(modifier_args.clone()),
+        );
+    }
 }
 
 fn exposed_type_package<'a>(

@@ -5,18 +5,16 @@
 //! `div`/`rem` truncated — because §3.7.2 function bodies are event-free.
 //! These pins value-check each operator against its MLS definition computed
 //! independently in Rust, straddling a wrap boundary and a sign change, pin
-//! the mixed Integer-operand promotion, and pin that a checked Integer
-//! result keeps the typed pure-call rejection instead of riding Binary64.
+//! the mixed Integer-operand promotion, and pin that an Integer result is an
+//! exact typed Integer quotient instead of riding Binary64.
 
 use rumoca::Compiler;
 use rumoca_sim::{SimOptions, SimResult, simulate_dae_with_diagnostics};
 
 fn series<'a>(result: &'a SimResult, name: &str) -> &'a [f64] {
-    let index = result
-        .names
-        .iter()
-        .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("simulation result missing column {name}"));
+    let Some(index) = result.names.iter().position(|candidate| candidate == name) else {
+        panic!("simulation result missing column {name}");
+    };
     result.data[index].as_slice()
 }
 
@@ -238,21 +236,27 @@ end IntegerResult;
 "#;
 
 #[test]
-fn integer_result_quotient_keeps_the_typed_pure_call_rejection() {
-    // The [148] boundary: an Integer-result quotient must not ride Binary64
-    // (exact above 2^53 is unrepresentable), so preparation fails typed
-    // until a dedicated typed integer quotient operation exists.
+fn integer_result_quotient_is_an_exact_integer_division() {
+    // MLS §3.7.2: `div(7, 2)` in an Integer-result function is the exact
+    // truncating Integer quotient 3, computed as a typed Integer operation
+    // rather than through Binary64.
     let compiled = Compiler::new()
         .model("IntegerResult")
         .compile_str(INTEGER_RESULT, "IntegerResult.mo")
-        .expect("the Integer-result fixture still constructs its DAE");
-    let error = simulate_dae_with_diagnostics(&compiled.dae, &SimOptions::default())
-        .expect_err("an Integer-result function quotient must fail typed");
-    let message = error.to_string();
-    assert!(
-        message.contains("pure-call argument or slot interface is invalid"),
-        "expected the typed pure-call rejection, got: {message}"
-    );
+        .expect("the Integer-result fixture constructs its DAE");
+    let result = match simulate_dae_with_diagnostics(&compiled.dae, &SimOptions::default()) {
+        Ok(result) => result,
+        Err(error) => panic!("the Integer-result quotient simulates: {error}"),
+    };
+    let y = series(&result, "y");
+    assert!(y.len() > 5, "IntegerResult produced an output grid");
+    let x = series(&result, "x");
+    for (y, x) in y.iter().zip(x) {
+        assert!(
+            (y - x - 3.0).abs() < 1e-12,
+            "div(7, 2) + x: {y} with x = {x}"
+        );
+    }
 }
 
 const NO_EVENT_IN_FUNCTION: &str = r#"

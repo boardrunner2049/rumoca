@@ -1,9 +1,17 @@
+mod affine_coordinates;
+mod affine_elimination;
 mod certification;
+mod colored_rows;
+mod column_gradient;
 mod manifold;
 mod order_robustness;
 mod saturation;
 mod scaled_systems;
+mod sensitivity_roundoff;
+mod sensitivity_scaling;
 mod singular_isolation;
+mod torn_roundoff;
+mod unlocalizable_fold;
 
 use std::cell::Cell;
 
@@ -29,6 +37,7 @@ fn project_initial_y_plan<M: AlgebraicProjectionModel>(
                     .copied()
                     .map(solve::scalar_slot_y)
                     .collect(),
+                scales: vec![solve::InitializationUnknownScale::Solver; block.y_indices.len()],
             })
             .collect(),
     };
@@ -83,6 +92,8 @@ impl ImplicitProjectionModel for PoorlyScaledProjectionModel {
 }
 
 struct ContinuousCausalAssignmentModel {
+    affinity_queries: Cell<usize>,
+    affine: bool,
     residual_calls: Cell<usize>,
     residual_row_calls: Cell<usize>,
     jacobian_calls: Cell<usize>,
@@ -240,6 +251,11 @@ impl ImplicitProjectionModel for ScaledContinuousAssignmentModel {
 }
 
 impl ImplicitProjectionModel for ContinuousCausalAssignmentModel {
+    fn algebraic_projection_block_is_affine(&self, _block_index: usize) -> bool {
+        self.affinity_queries.set(self.affinity_queries.get() + 1);
+        self.affine
+    }
+
     fn eval_residual(
         &self,
         y: &[f64],
@@ -557,6 +573,7 @@ fn coupled_projection_uses_selected_residual_and_jacobian_rows() {
                 rows: vec![0, 1],
                 y_indices: vec![0, 1],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -582,6 +599,7 @@ fn coupled_projection_skips_structurally_zero_jacobian_entries() {
                 rows: vec![0, 1],
                 y_indices: vec![0, 1],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -606,25 +624,27 @@ fn coupled_projection_sensitivity_uses_selected_jacobian_rows() {
                 rows: vec![0, 1],
                 y_indices: vec![0, 1],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
     let y = vec![2.0, 3.0];
     let mut seed = vec![0.0; 2];
-    let mut unit_seed = vec![0.0; 2];
 
     project_algebraic_seed_with_plan(
         &model,
         &model.plan,
         &y,
-        AlgebraicProjectionArgs {
-            parameters: &[],
-            time: 0.0,
-            state_count: 0,
-            tolerance: 1.0e-12,
-        },
+        (
+            AlgebraicProjectionArgs {
+                parameters: &[],
+                time: 0.0,
+                state_count: 0,
+                tolerance: 1.0e-12,
+            },
+            &unnamed_singular_mode,
+        ),
         &mut seed,
-        &mut unit_seed,
     )
     .expect("coupled sensitivity projection should evaluate selected scalar rows");
 
@@ -632,8 +652,8 @@ fn coupled_projection_sensitivity_uses_selected_jacobian_rows() {
     assert_eq!(model.full_jacobian_calls.get(), 0);
     assert_eq!(
         model.jacobian_row_calls.get(),
-        12,
-        "the selected rows are also evaluated to certify the residual in row-scaled units"
+        8,
+        "row-scale certification reuses the Jacobian already formed at the same point"
     );
 }
 
@@ -692,6 +712,7 @@ impl AlgebraicProjectionModel for BlockProjectionModel {
         p: &[f64],
         t: f64,
         v: &[f64],
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.eval_jacobian_v(y, p, t, v, out)
@@ -770,6 +791,7 @@ impl AlgebraicProjectionModel for InitialCausalAssignmentModel {
         p: &[f64],
         t: f64,
         v: &[f64],
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.eval_jacobian_v(y, p, t, v, out)
@@ -865,6 +887,7 @@ impl AlgebraicProjectionModel for RectInitialProjectionModel {
         p: &[f64],
         t: f64,
         v: &[f64],
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.eval_jacobian_v(y, p, t, v, out)
@@ -937,6 +960,7 @@ impl AlgebraicProjectionModel for TargetedInitialProjectionModel {
         p: &[f64],
         t: f64,
         v: &[f64],
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.eval_jacobian_v(y, p, t, v, out)
@@ -991,6 +1015,7 @@ impl ImplicitProjectionModel for CoupledTargetedInitialProjectionModel {
                 rows: vec![0, 1],
                 y_indices: vec![0, 1],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         })
     }
@@ -1017,6 +1042,7 @@ impl AlgebraicProjectionModel for CoupledTargetedInitialProjectionModel {
         p: &[f64],
         t: f64,
         v: &[f64],
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.eval_jacobian_v(y, p, t, v, out)
@@ -1040,11 +1066,13 @@ fn project_algebraics_uses_solve_projection_plan_blocks() {
                     rows: vec![0],
                     y_indices: vec![0],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
                 solve::AlgebraicProjectionBlock {
                     rows: vec![1],
                     y_indices: vec![1],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
             ],
         },
@@ -1066,6 +1094,7 @@ fn project_algebraics_backtracks_to_variable_resolution() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -1123,7 +1152,22 @@ fn scaled_backtracking_preserves_a_tiny_but_significant_trust_step() {
 
 #[test]
 fn continuous_singleton_assignment_avoids_jacobian_projection() {
+    for affine in [false, true] {
+        check_singleton_assignment_queries(affine, false);
+    }
+}
+
+#[test]
+fn continuous_singleton_with_tearing_retains_degree_selection() {
+    for affine in [false, true] {
+        check_singleton_assignment_queries(affine, true);
+    }
+}
+
+fn check_singleton_assignment_queries(affine: bool, torn: bool) {
     let model = ContinuousCausalAssignmentModel {
+        affinity_queries: Cell::new(0),
+        affine,
         residual_calls: Cell::new(0),
         residual_row_calls: Cell::new(0),
         jacobian_calls: Cell::new(0),
@@ -1133,7 +1177,12 @@ fn continuous_singleton_assignment_avoids_jacobian_projection() {
             blocks: vec![solve::AlgebraicProjectionBlock {
                 rows: vec![0],
                 y_indices: vec![0],
-                tearing: None,
+                tearing: torn.then(|| solve::BlockTearing {
+                    tear_y_indices: vec![0],
+                    residual_rows: vec![0],
+                    causal_steps: vec![],
+                }),
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -1143,10 +1192,19 @@ fn continuous_singleton_assignment_avoids_jacobian_projection() {
         .expect("singleton assignment should project");
 
     assert_eq!(y, vec![5.0]);
+    if torn {
+        assert!(model.affinity_queries.get() > 0);
+        return;
+    }
     assert_eq!(model.residual_calls.get(), 0);
     // The constructor certificate makes runtime residual re-proving redundant.
     assert_eq!(model.residual_row_calls.get(), 0);
     assert_eq!(model.jacobian_calls.get(), 0);
+    assert_eq!(
+        model.affinity_queries.get(),
+        0,
+        "an exact singleton assignment needs no polynomial-degree query"
+    );
 }
 
 #[test]
@@ -1163,6 +1221,7 @@ fn resistor_assignment_reports_sub_tolerance_current_as_semantic_progress() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -1201,11 +1260,13 @@ fn reverse_ordered_resistor_blocks_revisit_a_locally_settled_current() {
                     rows: vec![0],
                     y_indices: vec![0],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
                 solve::AlgebraicProjectionBlock {
                     rows: vec![1],
                     y_indices: vec![1],
                     tearing: None,
+                    alternate_charts: Vec::new(),
                 },
             ],
         },
@@ -1232,6 +1293,7 @@ fn algebraic_seed_certifies_residual_in_row_units() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -1268,6 +1330,7 @@ fn coupled_projection_prefers_complete_reverse_row_gradients() {
                 rows: vec![0, 1],
                 y_indices: vec![0, 1],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -1290,6 +1353,7 @@ fn partial_projection_ignores_unselected_residuals_and_unknowns() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
         initial_residual_len: 0,
@@ -1306,6 +1370,8 @@ fn partial_projection_ignores_unselected_residuals_and_unknowns() {
 #[test]
 fn continuous_singleton_assignment_does_not_accept_inexact_improvement() {
     let model = ContinuousCausalAssignmentModel {
+        affinity_queries: Cell::new(0),
+        affine: false,
         residual_calls: Cell::new(0),
         residual_row_calls: Cell::new(0),
         jacobian_calls: Cell::new(0),
@@ -1316,6 +1382,7 @@ fn continuous_singleton_assignment_does_not_accept_inexact_improvement() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -1326,6 +1393,7 @@ fn continuous_singleton_assignment_does_not_accept_inexact_improvement() {
 
     assert_eq!(y, vec![5.0]);
     assert!(model.jacobian_calls.get() > 0);
+    assert!(model.affinity_queries.get() > 0);
 }
 
 #[test]
@@ -1338,6 +1406,7 @@ fn initial_singleton_assignment_is_certified_by_complete_residual() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
     };
@@ -1363,6 +1432,7 @@ fn initial_projection_rejects_omitted_residual_and_restores_candidate() {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         },
         initial_residual_len: 2,
@@ -1403,6 +1473,7 @@ fn project_algebraic_block_rejects_rectangular_inventory() {
         rows: vec![0],
         y_indices: vec![0, 1],
         tearing: None,
+        alternate_charts: Vec::new(),
     };
     let mut y = vec![0.0, 0.0];
 
@@ -1435,6 +1506,7 @@ fn project_algebraic_block_rejects_row_outside_residual_vector() {
         rows: vec![2],
         y_indices: vec![0],
         tearing: None,
+        alternate_charts: Vec::new(),
     };
     let mut y = vec![0.0, 0.0];
 
@@ -1526,6 +1598,7 @@ impl ImplicitProjectionModel for ScaledResidualProjectionModel {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
+                alternate_charts: Vec::new(),
             }],
         })
     }
@@ -1556,6 +1629,7 @@ impl AlgebraicProjectionModel for ScaledResidualProjectionModel {
         p: &[f64],
         t: f64,
         v: &[f64],
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.eval_jacobian_v(y, p, t, v, out)
@@ -1577,6 +1651,7 @@ fn project_initial_block_rejects_rectangular_inventory() {
         rows: vec![0, 1],
         y_indices: vec![0],
         tearing: None,
+        alternate_charts: Vec::new(),
     };
     let mut y = vec![0.0, 0.0];
 
@@ -1594,6 +1669,7 @@ fn project_initial_block_rejects_rectangular_targeted_inventory() {
         rows: vec![0],
         y_indices: vec![0, 1],
         tearing: None,
+        alternate_charts: Vec::new(),
     };
     let mut y = vec![0.0, 0.0];
 
@@ -1650,6 +1726,7 @@ fn project_initial_variables_rejects_plan_rows_outside_residual_vector() {
             rows: vec![2],
             y_indices: vec![0],
             tearing: None,
+            alternate_charts: Vec::new(),
         }],
     };
     let mut y = vec![0.0, 0.0];
@@ -1725,6 +1802,7 @@ impl AlgebraicProjectionModel for ParameterInitialProjectionModel {
         p: &[f64],
         _t: f64,
         v: &[f64],
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         out[0] = 2.0 * p[0] * v[0];
@@ -1741,6 +1819,7 @@ fn project_initial_variables_solves_fixed_false_parameter_unknown() {
         blocks: vec![solve::InitializationProjectionBlock {
             rows: vec![0],
             unknowns: vec![solve::scalar_slot_p(0)],
+            scales: vec![solve::InitializationUnknownScale::GuessMagnitude],
         }],
     };
     let mut y = Vec::new();
@@ -1750,4 +1829,51 @@ fn project_initial_variables_solves_fixed_false_parameter_unknown() {
         .expect("nonlinear fixed=false parameter should project");
 
     assert!((p[0] - 2.0).abs() <= 1.0e-10);
+}
+
+#[test]
+fn nudge_singular_zero_seed_advances_only_vanished_zero_columns() {
+    let block = solve::AlgebraicProjectionBlock {
+        rows: vec![0, 1],
+        y_indices: vec![2, 3],
+        tearing: None,
+        alternate_charts: Vec::new(),
+    };
+    let scales = vec![1.0, 4.0];
+
+    // Column 0 (unknown y[2]) vanishes at the seed while column 1 (unknown y[3])
+    // stays live. Only the vanished-column zero advances, to +scale; the
+    // live-column zero is a determined value and is left untouched.
+    let jacobian = DMatrix::from_row_slice(2, 2, &[0.0, 1.0, 0.0, 2.0]);
+    let mut y = vec![0.0, 0.0, 0.0, 0.0];
+    assert!(nudge_singular_zero_seed(&mut y, &block, &jacobian, &scales));
+    assert_eq!(y[2], 1.0, "vanished-column zero seed advances to +scale");
+    assert_eq!(
+        y[3], 0.0,
+        "a live-column zero is a determined value, untouched"
+    );
+
+    // With both columns vanished, a nonzero seed keeps its chosen branch and a
+    // zero seed advances to that unknown's +scale.
+    let jacobian = DMatrix::from_row_slice(2, 2, &[0.0, 0.0, 0.0, 0.0]);
+    let mut y = vec![0.0, 0.0, -5.0, 0.0];
+    assert!(nudge_singular_zero_seed(&mut y, &block, &jacobian, &scales));
+    assert_eq!(y[2], -5.0, "a nonzero seed keeps its chosen branch");
+    assert_eq!(y[3], 4.0, "a vanished-column zero seed advances to +scale");
+
+    // A fully regular block never nudges, whatever the seeds.
+    let jacobian = DMatrix::from_row_slice(2, 2, &[3.0, 1.0, 1.0, 2.0]);
+    let mut y = vec![0.0, 0.0, 0.0, 7.0];
+    assert!(!nudge_singular_zero_seed(
+        &mut y, &block, &jacobian, &scales
+    ));
+    assert_eq!(y[2], 0.0);
+    assert_eq!(y[3], 7.0);
+}
+
+fn unnamed_singular_mode(
+    _block: &solve::AlgebraicProjectionBlock,
+    _p: &[f64],
+) -> Option<(String, String)> {
+    None
 }

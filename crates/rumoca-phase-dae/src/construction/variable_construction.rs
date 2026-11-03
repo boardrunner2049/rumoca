@@ -40,6 +40,8 @@ pub(super) fn insert_variable_identities<'flat, 'dae>(
                     assigned_discrete_targets: &analysis.assigned_discrete_targets,
                     derived_parameters: &analysis.derived_parameters,
                     initial_parameters: &analysis.initial_parameters,
+                    evaluable_parameters: &analysis.evaluable_parameters,
+                    native_table_ids: &analysis.native_table_ids,
                 },
                 VariableSpec {
                     flat: variable,
@@ -151,6 +153,10 @@ pub(super) struct VariableDefinitionContext<'scope, 'dae> {
     pub(super) derived_parameters: &'scope HashMap<VarName, DerivedParameterPlan>,
     /// `fixed = false` parameters an initial algorithm determines (MLS §8.6).
     pub(super) initial_parameters: &'scope HashMap<VarName, Expression>,
+    /// Parameters STRUCT-T10(a) may fold (MLS §18.6).
+    pub(super) evaluable_parameters: &'scope HashSet<VarName>,
+    /// The one-based id of each native table handle (MLS §12.9.7).
+    pub(super) native_table_ids: &'scope HashMap<VarName, u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -263,19 +269,27 @@ fn lower_variable_attributes<'dae>(
     variable: VariableSpec<'_, 'dae>,
 ) -> Result<dae::VariableAttributes<'dae>, dae::DaeConstructionError> {
     let binding = lower_variable_binding(construction, context, variable)?;
-    let start = match variable.flat.start.as_ref() {
-        Some(start) => Some(lower_variable_attribute_expression(
-            construction,
-            context,
-            variable,
-            start,
-        )?),
-        None if needs_default_start(variable) => Some(default_start_expression(
-            construction,
-            variable.scalar_type,
-            variable.flat.source_span,
-        )?),
-        None => None,
+    // A native table handle is folded to its opaque integer id by the binding
+    // above; its declared `start` is the same ExternalObject constructor call,
+    // which is not numeric, so no start attribute is materialized for it.
+    let is_native_table_handle = context.native_table_ids.contains_key(&variable.flat.name);
+    let start = if is_native_table_handle {
+        None
+    } else {
+        match variable.flat.start.as_ref() {
+            Some(start) => Some(lower_variable_attribute_expression(
+                construction,
+                context,
+                variable,
+                start,
+            )?),
+            None if needs_default_start(variable) => Some(default_start_expression(
+                construction,
+                variable.scalar_type,
+                variable.flat.source_span,
+            )?),
+            None => None,
+        }
     };
     let min = lower_optional_variable_attribute(
         construction,
@@ -306,7 +320,7 @@ fn lower_variable_attributes<'dae>(
         component_ref: variable.flat.component_ref.clone(),
         binding,
         start,
-        fixed: variable.flat.fixed,
+        fixed: variable.flat.fixed.clone(),
         min,
         max,
         nominal,
@@ -314,9 +328,11 @@ fn lower_variable_attributes<'dae>(
         state_select: variable.flat.state_select,
         description: variable.flat.description.clone(),
         causality,
+        declared_causality: declared_causality(&variable.flat.causality),
         is_tunable: matches!(variable.role, RuntimeVariableRole::Parameter)
             && !derived_parameter
-            && !variable.flat.evaluate,
+            && !variable.flat.evaluate
+            && !context.evaluable_parameters.contains(&variable.flat.name),
         is_held: matches!(
             variable.role,
             RuntimeVariableRole::DiscreteReal | RuntimeVariableRole::DiscreteValue
@@ -324,6 +340,9 @@ fn lower_variable_attributes<'dae>(
             && !context
                 .assigned_discrete_targets
                 .contains(&variable.flat.name),
+        evaluable: matches!(variable.role, RuntimeVariableRole::Parameter)
+            && binding.is_some()
+            && context.evaluable_parameters.contains(&variable.flat.name),
         origin: dae::VariableOrigin::Source,
     })
 }
@@ -345,7 +364,9 @@ fn needs_default_start(variable: VariableSpec<'_, '_>) -> bool {
             | RuntimeVariableRole::DiscreteReal
             | RuntimeVariableRole::DiscreteValue
     ) || (matches!(variable.role, RuntimeVariableRole::Parameter)
-        && variable.flat.fixed == Some(false))
+        // Parameter `fixed` is uniform (flatten refuses non-uniform parameter
+        // arrays, EF033), so this whole-declaration reduction is exact.
+        && variable.flat.fixed_uniform() == Some(false))
 }
 
 fn lower_variable_binding<'dae>(
@@ -353,6 +374,24 @@ fn lower_variable_binding<'dae>(
     context: VariableDefinitionContext<'_, 'dae>,
     variable: VariableSpec<'_, 'dae>,
 ) -> Result<Option<dae::ExprId<'dae>>, dae::DaeConstructionError> {
+    if let Some(&id) = context.native_table_ids.get(&variable.flat.name) {
+        // MLS §12.9.7: a native table handle is folded to its opaque integer
+        // table id here; the ExternalObject constructor call is not lowered,
+        // and the loaded table descriptor travels with the DAE (see to_dae).
+        let provenance = dae::DaeProvenance::source(variable.flat.source_span)?;
+        let id = i64::try_from(id).map_err(|_| dae::DaeConstructionError::CapacityExceeded {
+            arena: "native table id",
+            attempted_index: usize::MAX,
+            span: variable.flat.source_span,
+        })?;
+        return construction
+            .expressions(|expressions| {
+                expressions
+                    .at(provenance)
+                    .literal(dae::DaeLiteral::Integer(id))
+            })
+            .map(Some);
+    }
     if let Some(plan) = context.derived_parameters.get(&variable.flat.name) {
         return lower_derived_parameter_binding(
             construction,
@@ -462,6 +501,15 @@ fn variable_causality(
         (Causality::Output(_), _, true) => dae::VariableCausality::Output,
         (_, RuntimeVariableRole::Parameter, _) => dae::VariableCausality::Parameter,
         _ => dae::VariableCausality::Local,
+    }
+}
+
+/// The declaration's own prefix, kept at every nesting depth (MLS §4.4.2.2).
+const fn declared_causality(causality: &Causality) -> dae::DeclaredCausality {
+    match causality {
+        Causality::Empty => dae::DeclaredCausality::None,
+        Causality::Input(_) => dae::DeclaredCausality::Input,
+        Causality::Output(_) => dae::DeclaredCausality::Output,
     }
 }
 

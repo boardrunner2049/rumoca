@@ -1,3 +1,5 @@
+// SPEC_0021 file-size exception - split plan: move the soundness roster and reviewed-boundary checks into balance_pipeline_quality_gate/soundness.rs, leaving the stage and trace floor checks here; tracked as MSL gate cleanup debt (SPEC_0021 follow-up).
+
 mod cache;
 mod certified_cohort;
 mod compiler_contract_migration;
@@ -5,6 +7,7 @@ mod parity_measurement;
 mod reference_stage;
 mod runtime_cohort;
 mod schema_migrations;
+mod soundness_roster;
 mod status;
 #[cfg(test)]
 mod tests;
@@ -19,6 +22,7 @@ pub(super) use reference_stage::*;
 use rumoca_test_msl::msl_tools::band_table::BandLabel;
 use runtime_cohort::*;
 use schema_migrations::*;
+use soundness_roster::*;
 use status::*;
 
 // =============================================================================
@@ -73,11 +77,11 @@ pub(super) fn omc_sim_reference_timeout_secs() -> u64 {
 }
 /// Force low-impact OpenMP/BLAS threading in OMC child processes.
 pub(super) const OMC_PARITY_THREADS_DEFAULT: usize = 1;
-/// Version 4 classifies the source-static partial cohort before compilation and
-/// pins its exact roster. Version 3's reviewed pointwise-oracle boundary remains
-/// recorded independently as historical migration evidence.
-pub(super) const MSL_QUALITY_GATE_VERSION: u32 = 4;
-const PREVIOUS_MSL_QUALITY_GATE_VERSION: u32 = 3;
+/// Version 7 records a reviewed non-identifiable discrete-flag and internal-node
+/// boundary without changing any baseline floor. Earlier reference-convergence
+/// and conditioned-observable boundaries and version 4's source-static partial
+/// roster remain pinned.
+pub(super) const MSL_QUALITY_GATE_VERSION: u32 = 11;
 pub(super) const MSL_QUALITY_RUN_SCOPE_FULL: &str = "full";
 pub(super) const MSL_QUALITY_RUN_SCOPE_PARTIAL: &str = "partial";
 pub(super) const MSL_QUALITY_BASELINE_FILE_REL: &str = "tests/msl_tests/msl_quality_baseline.json";
@@ -218,7 +222,7 @@ pub(super) struct MslTensorPreservationBaseline {
     preservation_percent: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct MslMetricSchemaMigration {
     from_quality_gate_version: u32,
     to_quality_gate_version: u32,
@@ -230,6 +234,32 @@ pub(super) struct MslMetricSchemaMigration {
     excluded_non_high_before: usize,
     exclusions_file: String,
     exclusions_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct MslReferenceBoundaryMigration {
+    #[serde(flatten)]
+    metric: MslMetricSchemaMigration,
+    evidence_git_commit: String,
+    evidence_run: String,
+    policy_excluded_before: usize,
+    /// Models this boundary adds to the unexcepted non-high roster, each
+    /// naming its open defect (SPEC_0050).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    roster_additions: Vec<MslRosterAddition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<Box<MslReferenceBoundaryMigration>>,
+}
+
+/// A reviewed roster addition: a completion that is neither strict-high nor
+/// covered by a typed exception because of an open Rumoca defect, which the
+/// roster names instead of an exception row hiding it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct MslRosterAddition {
+    model_name: String,
+    cause: String,
+    facts: Vec<String>,
+    owner: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,11 +325,26 @@ pub(super) struct MslQualityBaseline {
     /// not disappear while another entered, so the baseline owns the roster.
     #[serde(default, skip_serializing_if = "IndexSet::is_empty")]
     certified_strict_high_models: IndexSet<String>,
+    /// Models that simulated without strict-high parity and without a typed
+    /// trace exception. The target is empty; the gate fails when a current
+    /// model is outside this roster, so it only shrinks (SPEC_0033).
+    #[serde(default)]
+    unexcepted_non_high_models: IndexSet<String>,
+    /// SHA-256 of the typed trace exception file the run compared under; it
+    /// equals the reviewed boundary's digest (SPEC_0050).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace_exceptions_sha256: Option<String>,
+    /// Which run each group of figures comes from, when a reviewed boundary
+    /// carries earlier figures forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence_provenance: Option<String>,
     #[serde(default)]
     trace_accuracy_stats: Option<MslTraceAccuracyStatsBaseline>,
     tensor_preservation: MslTensorPreservationBaseline,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metric_schema_migration: Option<MslMetricSchemaMigration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference_boundary_migration: Option<MslReferenceBoundaryMigration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     partial_classification_migration: Option<MslPartialClassificationMigration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -500,6 +545,7 @@ pub(super) fn load_msl_quality_baseline(path: &Path) -> io::Result<MslQualityBas
     let baseline: MslQualityBaseline = serde_json::from_reader(file)
         .map_err(|error| io::Error::other(format!("invalid MSL quality baseline JSON: {error}")))?;
     validate_certified_strict_high_roster(&baseline)?;
+    validate_unexcepted_non_high_roster(&baseline)?;
     Ok(baseline)
 }
 
@@ -1022,6 +1068,9 @@ pub(super) fn current_msl_quality_baseline(
                 .then(|| parity.runtime_model_ratios.keys().cloned().collect())
         }),
         certified_strict_high_models: IndexSet::new(),
+        unexcepted_non_high_models: IndexSet::new(),
+        trace_exceptions_sha256: None,
+        evidence_provenance: None,
         trace_accuracy_stats: parity_input.and_then(|parity| parity.trace_accuracy_stats.clone()),
         tensor_preservation: MslTensorPreservationBaseline {
             models_reported: gate_input.tensor_models_reported,
@@ -1035,6 +1084,7 @@ pub(super) fn current_msl_quality_baseline(
             ),
         },
         metric_schema_migration: Some(quality_gate_v3_metric_schema_migration()),
+        reference_boundary_migration: Some(reviewed_reference_boundary_migration()),
         partial_classification_migration: Some(reviewed_partial_classification_migration()),
         compiler_contract_migration: Some(checked_dae_compiler_contract_migration()),
     }
@@ -1186,6 +1236,7 @@ pub(super) fn write_current_msl_quality_snapshot(
                     ))
                 })?,
             );
+            insert_soundness_roster(root, &cohort.table)?;
         }
     }
     let baseline_path = msl_quality_current_path();
@@ -1216,6 +1267,14 @@ pub(super) fn msl_quality_context_mismatch_reason(
     }
     if let Some(reason) = partial_classification_context_mismatch_reason(baseline) {
         return Some(reason);
+    }
+    if baseline.reference_boundary_migration.as_ref()
+        != Some(&reviewed_reference_boundary_migration())
+    {
+        return Some(
+            "oracle policy migration differs from the reviewed reference boundary chain"
+                .to_string(),
+        );
     }
     if baseline.run_scope != MSL_QUALITY_RUN_SCOPE_FULL {
         return Some(format!(
@@ -1285,7 +1344,7 @@ pub(super) fn msl_quality_regression_reasons(
     }
     push_tensor_preservation_regression_reasons(&mut reasons, gate_input, baseline);
     push_trace_regression_reasons(&mut reasons, baseline, parity_input);
-    push_trace_soundness_reasons(&mut reasons, gate_input, parity_input);
+    push_trace_soundness_reasons(&mut reasons, gate_input, baseline, parity_input);
     push_runtime_ratio_regression_reasons(&mut reasons, baseline, parity_input);
     reasons
 }
@@ -1689,30 +1748,6 @@ pub(super) fn push_trace_regression_reasons(
     }
 }
 
-/// Fail closed when a completed simulation has neither strict-high OMC parity
-/// nor a reviewed reason that pointwise comparison is non-identifying.
-pub(super) fn push_trace_soundness_reasons(
-    reasons: &mut Vec<String>,
-    gate_input: MslQualityGateInput<'_>,
-    parity_input: Option<&MslParityGateInput>,
-) {
-    let Some(trace) = parity_input.and_then(|parity| parity.trace_accuracy_stats.as_ref()) else {
-        return;
-    };
-    let reviewed_boundaries = trace.policy_excluded_models + trace.trace_nonidentifiable_models;
-    let classified = trace.agreement_high + reviewed_boundaries;
-    if gate_input.sim_ok != classified {
-        reasons.push(format!(
-            "simulation soundness requires every sim_ok model to be strict-high or carry a reviewed pointwise-oracle boundary: sim_ok={} strict_high={} reviewed_exceptions={} unclassified={} overclassified={}",
-            gate_input.sim_ok,
-            trace.agreement_high,
-            reviewed_boundaries,
-            gate_input.sim_ok.saturating_sub(classified),
-            classified.saturating_sub(gate_input.sim_ok),
-        ));
-    }
-}
-
 pub(super) fn msl_quality_gate_failure_message(
     gate_input: MslQualityGateInput<'_>,
     baseline: &MslQualityBaseline,
@@ -1811,6 +1846,17 @@ pub(super) fn enforce_msl_quality_gate(
     // one model leaving and another entering holds `agreement_high` flat. The
     // resolved baseline owns the certified identities, and the current table
     // proves each one is still strict-high. Workflow history is diagnostic only.
+    // A completion that is neither strict-high nor typed-excepted must already
+    // be on the baseline roster: the roster only shrinks toward empty.
+    for reason in exception_file_reasons(&measurement)
+        .into_iter()
+        .chain(unexcepted_roster_growth_reasons(&baseline, &measurement))
+    {
+        gate_failure = Some(match gate_failure {
+            Some(existing) => format!("{existing}; {reason}"),
+            None => reason,
+        });
+    }
     for reason in certified_cohort_regression_reasons(&baseline, &measurement) {
         gate_failure = Some(match gate_failure {
             Some(existing) => format!("{existing}; {reason}"),

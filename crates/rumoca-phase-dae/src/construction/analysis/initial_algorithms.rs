@@ -41,9 +41,14 @@
 //! input coordinate from an algorithm, and inventing one would replace a
 //! missing capability with an unproven guess.
 mod checking_calls;
+mod element_definitions;
+mod loops;
+mod relations;
 
 use super::*;
 use checking_calls::{checking_call, expand_checking_call, reject_unsupported_checking_call};
+use element_definitions::{ElementDefinitions, ElementTarget, element_ordinal};
+use relations::{InitialEquationShape, InitialRelation, settle_initial_relations};
 use rumoca_core::ExpressionRewriter;
 
 pub(super) struct InitialAlgorithmAnalysis {
@@ -61,47 +66,115 @@ pub(super) struct InitialAlgorithmAnalysis {
 /// Flat preserves an equality as `lhs - rhs`; either side may name the
 /// coordinate directly or through `pre(m)`. Both spellings determine the one
 /// MLS §8.6 initialization value that seeds current and pre storage. The
-/// checked DAE constructor remains responsible for scalar type,
-/// initialization-settled reads, and unique ownership.
+/// checked DAE constructor remains responsible for type and shape,
+/// initialization-settled reads, and unique ownership. Element definitions of
+/// a discrete array are claimed together, as one aggregate value, when they
+/// determine every element exactly once.
 pub(super) fn claim_initial_discrete_equations(
     flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
     definitions: &mut HashMap<VarName, InitialDiscreteValue>,
 ) -> Result<HashSet<usize>, ToDaeError> {
     let mut claimed = HashSet::new();
+    let mut elements = ElementDefinitions::default();
+    let mut relations = Vec::new();
     for (row, equation) in flat.initial_equations.iter().enumerate() {
-        let Some((target, value)) = initial_discrete_equation(flat, &equation.residual, roles)?
-        else {
-            continue;
+        let (target, value) = match initial_discrete_equation(flat, &equation.residual, roles)? {
+            Some(InitialEquationShape::Definition(target, value)) => (target, value),
+            Some(InitialEquationShape::Relation(lhs, rhs)) => {
+                relations.push(InitialRelation {
+                    row,
+                    lhs,
+                    rhs,
+                    span: equation.span,
+                });
+                continue;
+            }
+            None => continue,
         };
-        if definitions
-            .insert(
-                target.clone(),
-                InitialDiscreteValue {
+        match target {
+            InitialTargetRef::Whole(target) => {
+                let definition = InitialDiscreteValue {
                     value: value.clone(),
                     span: equation.span,
-                },
-            )
-            .is_some()
-        {
-            return Err(unsupported(
-                format!(
-                    "`{target}` is determined by more than one initial owner; an \
-                     initialization-determined coordinate has exactly one determining owner"
-                ),
-                equation.span,
-            ));
+                };
+                insert_initial_definition(definitions, target, definition)?;
+                claimed.insert(row);
+            }
+            InitialTargetRef::Element(target) => {
+                elements.record(target, row, value, equation.span);
+            }
         }
-        claimed.insert(row);
     }
+    for (target, definition, rows) in elements.complete(flat) {
+        insert_initial_definition(definitions, target, definition)?;
+        claimed.extend(rows);
+    }
+    settle_initial_relations(flat, roles, &relations, definitions, &mut claimed)?;
     Ok(claimed)
+}
+
+/// The materialized initialization families every row of which is a claimed
+/// discrete definition: their rows are owned by those definitions, so the
+/// family itself contributes no initialization residual.
+pub(super) fn claimed_initial_families(
+    flat: &flat::Model,
+    claimed: &HashSet<usize>,
+) -> HashSet<usize> {
+    flat.initial_structured_equations
+        .iter()
+        .enumerate()
+        .filter(|(_, family)| {
+            let Some(rows) = family.materialized_rows() else {
+                return false;
+            };
+            family.interiors_materialized
+                && !rows.is_empty()
+                && rows.into_iter().all(|row| claimed.contains(&row))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn insert_initial_definition(
+    definitions: &mut HashMap<VarName, InitialDiscreteValue>,
+    target: &VarName,
+    definition: InitialDiscreteValue,
+) -> Result<(), ToDaeError> {
+    let span = definition.span;
+    if definitions.insert(target.clone(), definition).is_some() {
+        return Err(unsupported(
+            format!(
+                "`{target}` is determined by more than one initial owner; an \
+                 initialization-determined coordinate has exactly one determining owner"
+            ),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+/// The coordinate, or the element of a discrete array, an initial equation
+/// determines.
+enum InitialTargetRef<'flat> {
+    Whole(&'flat VarName),
+    Element(ElementTarget<'flat>),
+}
+
+impl InitialTargetRef<'_> {
+    fn name(&self) -> &VarName {
+        match self {
+            Self::Whole(name) => name,
+            Self::Element(element) => element.name,
+        }
+    }
 }
 
 fn initial_discrete_equation<'flat>(
     flat: &'flat flat::Model,
     residual: &'flat Expression,
     roles: &HashMap<VarName, PlannedRole>,
-) -> Result<Option<(&'flat VarName, &'flat Expression)>, ToDaeError> {
+) -> Result<Option<InitialEquationShape<'flat>>, ToDaeError> {
     let Expression::Binary {
         op: OpBinary::Sub,
         lhs,
@@ -112,12 +185,15 @@ fn initial_discrete_equation<'flat>(
         return Ok(None);
     };
     let definition = match (
-        initial_discrete_target(lhs, roles),
-        initial_discrete_target(rhs, roles),
+        initial_discrete_target(flat, lhs, roles),
+        initial_discrete_target(flat, rhs, roles),
     ) {
         (Some(target), None) => Some((target, rhs.as_ref())),
         (None, Some(target)) => Some((target, lhs.as_ref())),
         (None, None) => None,
+        (Some(InitialTargetRef::Whole(lhs)), Some(InitialTargetRef::Whole(rhs))) => {
+            return Ok(Some(InitialEquationShape::Relation(lhs, rhs)));
+        }
         (Some(_), Some(_)) => {
             return Err(unsupported(
                 "an initial equation relating two unsettled discrete coordinates has no proven \
@@ -129,55 +205,115 @@ fn initial_discrete_equation<'flat>(
     let Some((target, value)) = definition else {
         return Ok(None);
     };
-    if !has_only_initialization_settled_reads(flat, value, roles) {
+    // A discrete Real target that reads a continuous coordinate stays a numeric
+    // initialization row, which the projection solves simultaneously with the
+    // coordinates it reads. A discrete-valued target has no numeric row, so it
+    // is the definition Solve orders after the projection.
+    let reads_continuous = matches!(roles.get(target.name()), Some(PlannedRole::DiscreteValue));
+    if !has_only_initial_definition_reads(flat, value, roles, reads_continuous) {
         return Ok(None);
     }
-    Ok(Some((target, value)))
+    Ok(Some(InitialEquationShape::Definition(target, value)))
 }
 
-/// Whether a definition can be evaluated directly at the initialization
-/// instant, without participating in the numeric initialization system.
+/// Whether a definition reads only values the initialization system settles
+/// before it is applied.
+///
+/// MLS 3.7 §8.6 solves the initial equations together with the model
+/// equations, so `pre(m) = f(x)` determines `m` from whatever value the
+/// continuous unknowns `x` take in that solution. `time`, parameters, and
+/// constants are settled before it; states, algebraics, inputs, and outputs
+/// are settled by the projection, after which Solve applies the definition
+/// once its read cone is proven not to depend on `m` itself.
 ///
 /// This selects the owner; the checked DAE constructor independently proves
-/// the same property before accepting an [`InitialDiscreteValue`]. A discrete
-/// target defined from an input, output, state, algebraic, `pre`, or another
-/// discrete coordinate remains an initialization residual, because those
-/// values are settled together by that system rather than before it.
-fn has_only_initialization_settled_reads(
+/// the same read set before accepting an [`InitialDiscreteValue`]. Continuous
+/// reads are admitted only with `reads_continuous`, for a discrete-valued
+/// target: a discrete Real target that reads one stays a numeric row the
+/// projection solves simultaneously. A definition that reads `pre`, a
+/// derivative, another discrete coordinate, or any other history or clocked
+/// operator remains an initialization residual, because no owner orders those
+/// reads against this definition.
+fn has_only_initial_definition_reads(
     flat: &flat::Model,
     expression: &Expression,
     roles: &HashMap<VarName, PlannedRole>,
+    reads_continuous: bool,
 ) -> bool {
-    if let Expression::FunctionCall { name, .. } = expression
-        && let Some(function) = flat.functions.get(name.var_name())
-        && !function.body_is_pure()
-    {
-        return false;
-    }
-    if let Expression::VarRef { name, .. } = expression {
-        let referenced = name.var_name();
-        if referenced.as_str() != "time"
-            && !matches!(
-                roles.get(referenced),
-                Some(
-                    PlannedRole::Parameter
-                        | PlannedRole::Constant
-                        | PlannedRole::EnumerationLiteral
-                )
-            )
+    match expression {
+        Expression::FunctionCall { name, .. }
+            if flat
+                .functions
+                .get(name.var_name())
+                .is_some_and(|function| !function.body_is_pure()) =>
         {
             return false;
         }
+        Expression::BuiltinCall { function, .. } if reads_history_or_clock(*function) => {
+            return false;
+        }
+        Expression::VarRef { name, .. } => {
+            let referenced = name.var_name();
+            let settled = referenced.as_str() == "time"
+                || matches!(
+                    roles.get(referenced),
+                    Some(
+                        PlannedRole::Parameter
+                            | PlannedRole::Constant
+                            | PlannedRole::EnumerationLiteral
+                    )
+                );
+            let continuous = matches!(
+                roles.get(referenced),
+                Some(
+                    PlannedRole::State
+                        | PlannedRole::Algebraic
+                        | PlannedRole::Input
+                        | PlannedRole::Output
+                )
+            );
+            if !(settled || reads_continuous && continuous) {
+                return false;
+            }
+        }
+        _ => {}
     }
     expression_children(expression)
         .into_iter()
-        .all(|child| has_only_initialization_settled_reads(flat, child, roles))
+        .all(|child| has_only_initial_definition_reads(flat, child, roles, reads_continuous))
+}
+
+/// Operators whose value is a derivative, a left limit, a delayed value, or a
+/// clocked quantity rather than a function of the current coordinates.
+fn reads_history_or_clock(function: BuiltinFunction) -> bool {
+    matches!(
+        function,
+        BuiltinFunction::Der
+            | BuiltinFunction::Pre
+            | BuiltinFunction::Edge
+            | BuiltinFunction::Change
+            | BuiltinFunction::Reinit
+            | BuiltinFunction::Delay
+            | BuiltinFunction::Sample
+            | BuiltinFunction::Clock
+            | BuiltinFunction::Hold
+            | BuiltinFunction::Previous
+            | BuiltinFunction::Interval
+            | BuiltinFunction::FirstTick
+            | BuiltinFunction::SubSample
+            | BuiltinFunction::SuperSample
+            | BuiltinFunction::ShiftSample
+            | BuiltinFunction::BackSample
+            | BuiltinFunction::NoClock
+            | BuiltinFunction::Terminal
+    )
 }
 
 fn initial_discrete_target<'flat>(
+    flat: &flat::Model,
     expression: &'flat Expression,
     roles: &HashMap<VarName, PlannedRole>,
-) -> Option<&'flat VarName> {
+) -> Option<InitialTargetRef<'flat>> {
     let expression = match expression {
         Expression::BuiltinCall {
             function: BuiltinFunction::Pre,
@@ -192,15 +328,18 @@ fn initial_discrete_target<'flat>(
     else {
         return None;
     };
-    if !subscripts.is_empty()
-        || !matches!(
-            roles.get(name.var_name()),
-            Some(PlannedRole::DiscreteReal | PlannedRole::DiscreteValue)
-        )
-    {
+    let name = name.var_name();
+    if !matches!(
+        roles.get(name),
+        Some(PlannedRole::DiscreteReal | PlannedRole::DiscreteValue)
+    ) {
         return None;
     }
-    Some(name.var_name())
+    if subscripts.is_empty() {
+        return Some(InitialTargetRef::Whole(name));
+    }
+    let ordinal = element_ordinal(flat, name, subscripts)?;
+    Some(InitialTargetRef::Element(ElementTarget { name, ordinal }))
 }
 
 /// One discrete coordinate's initialization-instant value.
@@ -230,14 +369,17 @@ pub(super) fn reject_unsupported_initial_algorithm_statements(
 ) -> Result<(), ToDaeError> {
     for algorithm in &flat.initial_algorithms {
         require_span(algorithm.span, "initial algorithm")?;
-        reject_unsupported_statements(flat, &algorithm.statements)?;
+        reject_unsupported_statements(flat, &algorithm.statements, false)?;
     }
     Ok(())
 }
 
+/// `in_loop` defers the target check of an assignment inside a `for` body to
+/// the replay, which sees the target with its index bound.
 fn reject_unsupported_statements(
     flat: &flat::Model,
     statements: &[rumoca_core::Statement],
+    in_loop: bool,
 ) -> Result<(), ToDaeError> {
     for statement in statements {
         if let Some(assertion) = assertion_call(flat, statement) {
@@ -255,11 +397,10 @@ fn reject_unsupported_statements(
             rumoca_core::Statement::Empty { .. } => {}
             rumoca_core::Statement::Assignment { comp, span, .. } => {
                 require_span(*span, "initial algorithm assignment")?;
-                if comp.parts().is_empty()
-                    || !rumoca_core::component_ref_element_subscripts(comp).is_empty()
-                {
+                if !in_loop && assignment_target(flat, comp).is_none() {
                     return Err(unsupported(
-                        "an assignment target must be one whole, unsubscripted coordinate",
+                        "an assignment target must be one whole declared coordinate, \
+                         addressed by literal subscripts at most",
                         *span,
                     ));
                 }
@@ -277,19 +418,19 @@ fn reject_unsupported_statements(
                     ));
                 }
                 for block in cond_blocks {
-                    reject_unsupported_statements(flat, &block.stmts)?;
+                    reject_unsupported_statements(flat, &block.stmts, in_loop)?;
                 }
                 if let Some(statements) = else_block {
-                    reject_unsupported_statements(flat, statements)?;
+                    reject_unsupported_statements(flat, statements, in_loop)?;
                 }
             }
-            // MLS §11.2.2: a `for` over a parameter-evaluable range is exactly
-            // its unrolled sequence; the range itself is evaluated at replay.
+            // A `for` unrolls over its evaluated range (see `loops`); its body
+            // obeys this same grammar.
             rumoca_core::Statement::For {
                 equations, span, ..
             } => {
                 require_span(*span, "initial algorithm for statement")?;
-                reject_unsupported_statements(flat, equations)?;
+                reject_unsupported_statements(flat, equations, true)?;
             }
             rumoca_core::Statement::FunctionCall {
                 comp,
@@ -316,9 +457,9 @@ fn reject_unsupported_statements(
                     required_statement_span(statement, "unsupported initial algorithm statement")?;
                 return Err(unsupported(
                     "an initial algorithm is accepted as sequential scalar assignments, `if` \
-                     conditionals, `for` loops over parameter-evaluable ranges, and `assert` \
-                     statements; `while`, `when`, and `reinit` carry implicit memory with no \
-                     checked initialization owner",
+                     conditionals, `for` loops over evaluable ranges, and `assert` statements; \
+                     `while`, `when`, and `reinit` carry implicit memory with no checked \
+                     initialization owner",
                     span,
                 ));
             }
@@ -333,6 +474,7 @@ pub(super) fn analyze_initial_algorithms(
     roles: &HashMap<VarName, PlannedRole>,
     states: &HashSet<VarName>,
     constants: &EvalContext,
+    shapes: &ShapeEnvironment,
 ) -> Result<InitialAlgorithmAnalysis, ToDaeError> {
     let mut analysis = InitialAlgorithmAnalysis {
         parameters: HashMap::new(),
@@ -343,6 +485,7 @@ pub(super) fn analyze_initial_algorithms(
         let mut replay = Replay {
             flat,
             constants,
+            shapes,
             origin: flat::EquationOrigin::Algorithm {
                 component: algorithm.origin.clone(),
             },
@@ -515,7 +658,9 @@ fn plan_initial_parameter(
     value: ReplayedValue,
 ) -> Result<Expression, ToDaeError> {
     let variable = &flat.variables[target];
-    if variable.fixed != Some(false) {
+    // This target is a parameter; its `fixed` is uniform (flatten refuses
+    // non-uniform parameter arrays, EF033), so the reduction is exact.
+    if variable.fixed_uniform() != Some(false) {
         return Err(unsupported(
             format!(
                 "parameter `{target}` is not declared `fixed = false`; MLS §8.6 lets an initial \
@@ -712,6 +857,9 @@ struct Replay<'flat> {
     /// Parameter values and array shapes, so a checking call's loop bounds
     /// resolve to the iterations the model actually has.
     constants: &'flat EvalContext,
+    /// Evaluable model values, so a `for` range unrolls only when no
+    /// settable parameter bounds it.
+    shapes: &'flat ShapeEnvironment,
     origin: flat::EquationOrigin,
     assertions: Vec<flat::AssertEquation>,
 }
@@ -761,15 +909,15 @@ impl Replay<'_> {
         match statement {
             rumoca_core::Statement::Empty { .. } => Ok(()),
             rumoca_core::Statement::Assignment { comp, value, span } => {
-                let target = rumoca_core::component_ref_to_base_reference(comp)
-                    .var_name()
-                    .clone();
-                if !self.flat.variables.contains_key(&target) {
+                let Some(target) = assignment_target(self.flat, comp) else {
                     return Err(unsupported(
-                        format!("assignment target `{target}` is not a declared coordinate"),
+                        format!(
+                            "assignment target `{}` is not a declared coordinate",
+                            rumoca_core::component_ref_to_base_reference(comp).var_name()
+                        ),
                         *span,
                     ));
-                }
+                };
                 let expression = substitute(value, values);
                 reject_oversized_replay(
                     &target,
@@ -793,8 +941,10 @@ impl Replay<'_> {
                 span,
             } => self.conditional(cond_blocks, else_block.as_deref(), guard, *span, values),
             rumoca_core::Statement::For {
-                indices, equations, ..
-            } => self.unrolled(indices, equations, guard, values),
+                indices,
+                equations,
+                span,
+            } => self.unrolled(indices, equations, *span, guard, values),
             _ => unreachable!("the statement grammar is proven before analysis replays it"),
         }
     }
@@ -821,88 +971,6 @@ impl Replay<'_> {
             }
         };
         Some(ReplayedValue { expression, span })
-    }
-
-    /// Replay a `for` as its unrolled sequence (MLS §11.2.2).
-    ///
-    /// Each iteration binds the index to its Integer literal in the same
-    /// substitution map the assignments use, so a subscript `a[i]` and a
-    /// condition `i == 1` read the iteration's value; the binding is removed
-    /// (and any shadowed one restored) once the loop ends, so the index never
-    /// becomes a written coordinate.
-    fn unrolled(
-        &mut self,
-        indices: &[rumoca_core::ForIndex],
-        body: &[rumoca_core::Statement],
-        guard: Option<&Expression>,
-        values: &mut ReplayValues,
-    ) -> Result<(), ToDaeError> {
-        let Some((index, rest)) = indices.split_first() else {
-            return self.statements(body, guard, values);
-        };
-        let name = VarName::new(&index.ident);
-        let range_span = expression_span(&index.range)?;
-        let (start, step, end) = self.evaluated_range(&index.range, values, range_span)?;
-        let shadowed = values.remove(&name);
-        let mut current = start;
-        while (step > 0 && current <= end) || (step < 0 && current >= end) {
-            let literal = Expression::Literal {
-                value: rumoca_core::Literal::Integer(current),
-                span: range_span,
-            };
-            values.insert(
-                name.clone(),
-                ReplayedValue {
-                    expression: literal,
-                    span: range_span,
-                },
-            );
-            self.unrolled(rest, body, guard, values)?;
-            let Some(next) = current.checked_add(step) else {
-                break;
-            };
-            current = next;
-        }
-        values.remove(&name);
-        if let Some(shadowed) = shadowed {
-            values.insert(name, shadowed);
-        }
-        Ok(())
-    }
-
-    fn evaluated_range(
-        &self,
-        range: &Expression,
-        values: &ReplayValues,
-        span: Span,
-    ) -> Result<(i64, i64, i64), ToDaeError> {
-        let Expression::Range {
-            start, step, end, ..
-        } = range
-        else {
-            return Err(unsupported(
-                "a `for` in an initial algorithm must iterate over a range with \
-                 parameter-evaluable bounds",
-                span,
-            ));
-        };
-        let bound = |expression: &Expression| {
-            eval_expr(&substitute(expression, values), self.constants)
-                .ok()
-                .and_then(|value| value.as_integer())
-                .ok_or_else(|| {
-                    unsupported(
-                        "a `for` bound in an initial algorithm is not a parameter-evaluable \
-                         Integer, so its iterations are not known at translation time",
-                        span,
-                    )
-                })
-        };
-        let step = step.as_deref().map(bound).transpose()?.unwrap_or(1);
-        if step == 0 {
-            return Err(unsupported("a `for` range has a zero step", span));
-        }
-        Ok((bound(start)?, step, bound(end)?))
     }
 
     /// Replay one `if` chain into a conditional value per written coordinate.
@@ -1069,11 +1137,11 @@ fn branch_value(
         })
 }
 
-struct AssertionCall<'statement> {
-    condition: &'statement Expression,
-    message: &'statement Expression,
-    level: Option<&'statement Expression>,
-    span: Span,
+pub(super) struct AssertionCall<'statement> {
+    pub(super) condition: &'statement Expression,
+    pub(super) message: &'statement Expression,
+    pub(super) level: Option<&'statement Expression>,
+    pub(super) span: Span,
 }
 
 /// Recognize MLS §8.3.7 `assert` in both forms Flat produces for a statement.
@@ -1082,7 +1150,7 @@ struct AssertionCall<'statement> {
 /// to the predefined operator, while an equation-section `assert` reaches it as
 /// the dedicated statement. A user function may not shadow the operator here: a
 /// callee the Flat function table registers is a user call, not the operator.
-fn assertion_call<'statement>(
+pub(super) fn assertion_call<'statement>(
     flat: &flat::Model,
     statement: &'statement rumoca_core::Statement,
 ) -> Option<AssertionCall<'statement>> {
@@ -1161,6 +1229,48 @@ fn negate(condition: &Expression, span: Span) -> Expression {
 
 fn unsupported(detail: impl Into<String>, span: Span) -> ToDaeError {
     ToDaeError::unsupported_algorithm("initial", detail, span)
+}
+
+/// The one declared scalar coordinate an assignment target names.
+///
+/// Flat declares each element of a component array as its own coordinate
+/// (`s[1].count`), so a target whose subscripts are all literal indices names
+/// exactly that coordinate; a computed subscript or an element of an array
+/// coordinate names no whole declared coordinate.
+fn assignment_target(
+    flat: &flat::Model,
+    comp: &rumoca_core::ComponentReference,
+) -> Option<VarName> {
+    let mut rendered = String::new();
+    for (position, part) in comp.parts().iter().enumerate() {
+        if position > 0 {
+            rendered.push('.');
+        }
+        rendered.push_str(&part.ident);
+        if part.subs.is_empty() {
+            continue;
+        }
+        let indices = part
+            .subs
+            .iter()
+            .map(|subscript| match subscript {
+                Subscript::Index { value, .. } => Some(value.to_string()),
+                Subscript::Expr { expr, .. } => match expr.as_ref() {
+                    Expression::Literal {
+                        value: rumoca_core::Literal::Integer(value),
+                        ..
+                    } => Some(value.to_string()),
+                    _ => None,
+                },
+                Subscript::Colon { .. } => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        rendered.push('[');
+        rendered.push_str(&indices.join(","));
+        rendered.push(']');
+    }
+    let target = VarName::new(&rendered);
+    flat.variables.contains_key(&target).then_some(target)
 }
 
 /// Substitute every coordinate the section has already written.

@@ -92,6 +92,7 @@ pub enum FmiEventFreeError {
 #[derive(Debug)]
 pub struct FmiEventFreeCodegenView {
     pub(super) metadata: FmiMetadata,
+    pub(super) co_simulation: super::CoSimulationStepPlan,
     pub(super) model: Arc<SolveModel>,
 }
 
@@ -110,6 +111,7 @@ impl FmiCodegenView {
         }
         Ok(FmiEventFreeCodegenView {
             metadata: self.metadata,
+            co_simulation: self.co_simulation,
             model: self.model,
         })
     }

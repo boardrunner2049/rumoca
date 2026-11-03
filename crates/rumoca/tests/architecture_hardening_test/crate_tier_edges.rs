@@ -20,17 +20,10 @@ use std::path::PathBuf;
 /// Pinned (not a "must not contain rumoca-solver" check) so that *any* new
 /// dependency on a Tier 4/5 crate is a deliberate, reviewable change rather
 /// than an accident.
-///
-/// `serde_json` and `sha1` are admitted deliberately. Both are external leaf
-/// crates, not rumoca tiers, so neither can invert the layering this file
-/// exists to protect: the edge SPEC_0029 forbids is an evaluation crate
-/// reaching *up* into the driver, and nothing here reaches anywhere. They pay
-/// for the solve-domain diagnostics -- a JSON evidence record and the SHA-1
-/// program fingerprint that identifies which evaluated program a fault came
-/// from -- which the evaluator has to produce because it is the only layer
-/// that sees the faulting row.
 const EVAL_SOLVE_DEPENDENCIES: &[&str] = &[
+    "faer",
     "indexmap",
+    "nalgebra",
     "rumoca-core",
     "rumoca-ir-solve",
     "serde_json",
@@ -62,7 +55,7 @@ fn test_eval_solve_dependency_set_is_pinned() {
     assert_eq!(
         names, expected,
         "rumoca-eval-solve [dependencies] must stay exactly {expected:?} \
-(SPEC_0029 Dependency Tiers: a Tier 3 evaluation crate may not depend on a \
+(faer is the pure numeric dense-SVD library, not a solver crate; SPEC_0029 Dependency Tiers: a Tier 3 evaluation crate may not depend on a \
 Tier 4/5 crate such as rumoca-solver). Found {names:?}."
     );
 }

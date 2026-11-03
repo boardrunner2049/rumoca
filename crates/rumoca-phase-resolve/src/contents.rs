@@ -11,6 +11,8 @@ use crate::traversal_adapter::{
 use rumoca_core::{ComponentPath, DefId, Diagnostic, PrimaryLabel, ScopeId};
 use rumoca_ir_ast as ast;
 
+mod derivative_annotations;
+
 type ClassDef = ast::ClassDef;
 type ComponentReference = ast::ComponentReference;
 type Expression = ast::Expression;
@@ -132,10 +134,15 @@ impl Resolver {
                     class_scope,
                     short_class_modifier_scope.unwrap_or(class_scope),
                 );
+                self.bind_redeclared_base_slot(modification, ext.base_def_id);
             }
         }
 
         self.resolve_subscripts(&mut class.array_subscripts, class_scope);
+
+        if class.class_type == rumoca_core::ClassType::Function {
+            self.resolve_derivative_annotations(&mut class.annotation, class_scope);
+        }
 
         // Resolve component references in equations and algorithms
         // MLS §5.3: Full name lookup happens during instantiation/flattening,
@@ -238,6 +245,32 @@ impl Resolver {
             .filter(|def_id| self.dynamic_member_root_ids.contains(def_id))
     }
 
+    /// Bind the target of an `extends`-clause redeclaration to the base element
+    /// it replaces (MLS §7.3).
+    ///
+    /// The derived class's own view of that name is the replacing class (see
+    /// `apply_extends_class_redeclarations`), but the modification target
+    /// names the element of the extended base, which strict reachability and
+    /// instantiation must keep as the replaced slot.
+    fn bind_redeclared_base_slot(
+        &self,
+        modification: &mut ast::ExtendModification,
+        base_def_id: Option<DefId>,
+    ) {
+        if !modification.redeclare {
+            return;
+        }
+        let Expression::Modification { target, .. } = &mut modification.expr else {
+            return;
+        };
+        let (Some(base), [part]) = (base_def_id, target.parts.as_mut_slice()) else {
+            return;
+        };
+        if let Some(slot) = self.lookup_class_member(base, &part.ident.text) {
+            part.def_id = Some(slot);
+        }
+    }
+
     /// Resolve one modification of an `extends` clause.
     ///
     /// Resolve an extends modification without conflating its target and value
@@ -290,7 +323,8 @@ impl Resolver {
         while let Some((current, resolve_class_target)) = pending.pop() {
             self.resolve_source_class_value_target(current, class_scope, resolve_class_target);
             match current {
-                Expression::Modification { value, .. } => {
+                Expression::Modification { target, value, .. } => {
+                    self.resolve_modifier_subscripts(target, class_scope);
                     pending.push((std::sync::Arc::make_mut(value), true));
                 }
                 Expression::ClassModification { modifications, .. } => {
@@ -317,6 +351,18 @@ impl Resolver {
             return;
         };
         self.resolve_function_reference(target, class_scope);
+    }
+
+    fn resolve_modifier_subscripts(
+        &mut self,
+        target: &mut rumoca_ir_ast::ComponentReference,
+        class_scope: ScopeId,
+    ) {
+        for part in &mut target.parts {
+            if let Some(subscripts) = &mut part.subs {
+                self.resolve_subscripts(subscripts, class_scope);
+            }
+        }
     }
 
     /// Try partial type resolution for qualified names (MLS §7.3).

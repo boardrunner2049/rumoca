@@ -84,6 +84,13 @@ pub fn sim_error_diagnostic_code(err: &SimError) -> Option<String> {
         ),
         SimError::RuntimeContract { .. } => Some(runtime_preparation_code().to_string()),
         SimError::ModelExchangeSession(session) if session.is_timeout() => None,
+        // A component failure that carries a delegated code (the ES016 fold of a
+        // `noEvent` loop switch) keeps it, as every other surface does.
+        SimError::ModelExchangeSession(session)
+            if embedded_diagnostic_code(&session.to_string()).is_some() =>
+        {
+            embedded_diagnostic_code(&session.to_string())
+        }
         SimError::ModelExchangeSession(session) if session.is_integrator_failure() => {
             Some(solver_failure_code().to_string())
         }

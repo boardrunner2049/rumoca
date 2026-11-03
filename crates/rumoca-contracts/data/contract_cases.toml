@@ -562,6 +562,13 @@ kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
+contract_id = 'DECL-037'
+case_id = 'decl_037_structural_parameters'
+test_file = 'tests/decl_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'EQN-001'
 case_id = 'eqn_001_ode_balanced'
 test_file = 'tests/eqn_contracts.rs'
@@ -849,6 +856,27 @@ kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
+contract_id = 'EXPR-012'
+case_id = 'expr_012_continuous_definition_of_boolean_fails'
+test_file = 'tests/expr_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
+
+[[cases]]
+contract_id = 'EXPR-012'
+case_id = 'expr_012_event_generating_boolean_definition_ok'
+test_file = 'tests/expr_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'EXPR-012'
+case_id = 'expr_012_unread_continuous_definition_of_integer_is_observed'
+test_file = 'tests/expr_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'EXPR-013'
 case_id = 'expr_013_end_in_subscript'
 test_file = 'tests/expr_contracts.rs'
@@ -1017,6 +1045,13 @@ kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
+contract_id = 'EXPR-041'
+case_id = 'expr_041_smooth_relation_over_a_state'
+test_file = 'tests/expr_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'FUNC-001'
 case_id = 'func_001_input_output_ok'
 test_file = 'tests/func_contracts.rs'
@@ -1113,6 +1148,13 @@ case_id = 'func_014_single_algorithm'
 test_file = 'tests/func_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
+
+[[cases]]
+contract_id = 'FUNC-014'
+case_id = 'func_014_extended_function_with_second_algorithm_rejected'
+test_file = 'tests/func_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
 
 [[cases]]
 contract_id = 'FUNC-017'
@@ -1222,6 +1264,13 @@ outcome = 'Reject'
 [[cases]]
 contract_id = 'INST-010'
 case_id = 'inst_010_final_cannot_modify'
+test_file = 'tests/inst_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
+
+[[cases]]
+contract_id = 'INST-010'
+case_id = 'inst_010_declaration_cannot_modify_final_type_attribute'
 test_file = 'tests/inst_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
@@ -1378,6 +1427,27 @@ contract_id = 'INST-053'
 case_id = 'inst_053_conditional_true_kept'
 test_file = 'tests/inst_contracts.rs'
 kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-054'
+case_id = 'inst_054_outer_without_inner_synthesizes_default'
+test_file = 'tests/inst_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-055'
+case_id = 'inst_055_extends_modifier_redeclared_record_is_the_derived_packages_record'
+test_file = 'tests/inst_extends_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-056'
+case_id = 'inst_056_sibling_binding_selects_from_modified_constant'
+test_file = 'tests/inst_extends_contracts.rs'
+kind = 'Sim'
 outcome = 'Accept'
 
 [[cases]]
@@ -2004,6 +2074,20 @@ kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
+contract_id = 'STRM-012'
+case_id = 'strm_012_flow_weighted_actual_stream_owns_no_event'
+test_file = 'tests/strm_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'STRM-013'
+case_id = 'strm_013_receive_only_connector_drops_out_of_in_stream'
+test_file = 'tests/strm_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'TYPE-005'
 case_id = 'type_005_class_component_mismatch'
 test_file = 'tests/type_contracts.rs'
@@ -2086,6 +2170,20 @@ case_id = 'type_034_integer_division_real'
 test_file = 'tests/type_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
+
+[[cases]]
+contract_id = 'TYPE-036'
+case_id = 'type_036_type_chain_attributes_reach_simulation'
+test_file = 'tests/type_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'TYPE-036'
+case_id = 'type_036_derived_type_cannot_modify_final_base_attribute'
+test_file = 'tests/type_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
 
 [[cases]]
 contract_id = 'EQN-009'
@@ -2188,56 +2286,56 @@ outcome = 'Reject'
 [[cases]]
 contract_id = 'INST-013'
 case_id = 'inst_013_enclosing_package_constant_accessible'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
 contract_id = 'INST-013'
 case_id = 'inst_013_enclosing_non_constant_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-013'
 case_id = 'inst_013_enclosing_parameter_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-018'
 case_id = 'inst_018_outer_type_mismatch_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-019'
 case_id = 'inst_019_inner_of_partial_class_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-021'
 case_id = 'inst_021_partial_component_instantiation_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-023'
 case_id = 'inst_023_redeclare_to_public_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Parse'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-033'
 case_id = 'inst_033_unknown_global_class_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
@@ -2480,6 +2578,13 @@ kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
+contract_id = 'ARR-040'
+case_id = 'arr_040_boolean_min_max_order_false_before_true'
+test_file = 'tests/arr_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'ARR-041'
 case_id = 'arr_041_diagonal_of_vector_accepted'
 test_file = 'tests/arr_contracts.rs'
@@ -2506,6 +2611,20 @@ case_id = 'arr_042_outer_product_of_matrix_rejected'
 test_file = 'tests/arr_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
+
+[[cases]]
+contract_id = 'ARR-043'
+case_id = 'arr_043_record_array_equality_is_element_wise'
+test_file = 'tests/arr_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'ARR-044'
+case_id = 'arr_044_zero_sized_der_equation_has_no_scalars'
+test_file = 'tests/arr_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
 
 [[cases]]
 contract_id = 'ALG-011'
@@ -2802,6 +2921,13 @@ kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
+contract_id = 'EQN-036'
+case_id = 'eqn_036_violated_warning_level_assertion_never_aborts'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'EQN-038'
 case_id = 'eqn_038_connections_root_in_noneval_if_rejected'
 test_file = 'tests/eqn_contracts.rs'
@@ -2879,37 +3005,44 @@ kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
+contract_id = 'FUNC-039'
+case_id = 'func_039_protected_binding_reads_record_input_fields'
+test_file = 'tests/func_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'INST-009'
 case_id = 'inst_009_member_of_final_component_modification_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-017'
 case_id = 'inst_017_redeclare_with_condition_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Parse'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-020'
 case_id = 'inst_020_inner_connector_with_input_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-024'
 case_id = 'inst_024_function_extends_connector_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-030'
 case_id = 'inst_030_final_parameter_modification_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
@@ -3112,21 +3245,21 @@ outcome = 'Accept'
 [[cases]]
 contract_id = 'INST-041'
 case_id = 'inst_041_modification_size_mismatch_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-047'
 case_id = 'inst_047_break_on_parameter_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
 [[cases]]
 contract_id = 'INST-049'
 case_id = 'inst_049_break_partial_component_accepted'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
@@ -3252,14 +3385,14 @@ outcome = 'Accept'
 [[cases]]
 contract_id = 'INST-025'
 case_id = 'inst_025_diamond_inherited_equations_deduplicated'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
 contract_id = 'INST-050'
 case_id = 'inst_050_ambiguous_unqualified_import_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
@@ -3334,6 +3467,13 @@ kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
+contract_id = 'ARR-036'
+case_id = 'arr_036_zero_sized_generator_argument_simulates'
+test_file = 'tests/arr_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'ARR-039'
 case_id = 'arr_039_empty_array_reduction_identities'
 test_file = 'tests/arr_contracts.rs'
@@ -3350,21 +3490,21 @@ outcome = 'Reject'
 [[cases]]
 contract_id = 'INST-004'
 case_id = 'inst_004_inherited_declaration_order_preserved'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
 contract_id = 'INST-035'
 case_id = 'inst_035_record_constructor_and_type_lookup_coexist'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
 contract_id = 'INST-036'
 case_id = 'inst_036_enum_conversion_and_type_lookup_coexist'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
@@ -3462,7 +3602,7 @@ outcome = 'Reject'
 [[cases]]
 contract_id = 'INST-048'
 case_id = 'inst_048_break_matches_conditional_component'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
@@ -3486,6 +3626,13 @@ case_id = 'clk_011_shiftsample_on_event_clock_rejected'
 test_file = 'tests/clk_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
+
+[[cases]]
+contract_id = 'CLK-011'
+case_id = 'clk_011_shiftsample_on_event_clock_by_whole_ticks_accepted'
+test_file = 'tests/clk_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
 
 [[cases]]
 contract_id = 'CLK-012'
@@ -3523,6 +3670,13 @@ kind = 'Sim'
 outcome = 'Accept'
 
 [[cases]]
+contract_id = 'ALG-018'
+case_id = 'alg_018_bounded_while_loop_runs_until_its_condition_fails'
+test_file = 'tests/alg_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
 contract_id = 'FUNC-032'
 case_id = 'func_032_external_function_without_purity_warns'
 test_file = 'tests/func_contracts.rs'
@@ -3544,11 +3698,39 @@ kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
+contract_id = 'FUNC-040'
+case_id = 'func_040_function_name_and_partial_application_arguments'
+test_file = 'tests/func_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'FUNC-026'
+case_id = 'func_026_vectorized_call_through_selected_replaceable_package_accepted'
+test_file = 'tests/func_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'FUNC-026'
+case_id = 'func_026_vectorized_call_of_unselected_callee_rejected'
+test_file = 'tests/func_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
+
+[[cases]]
 contract_id = 'FUNC-027'
 case_id = 'func_027_vectorized_args_size_mismatch_rejected'
 test_file = 'tests/func_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
+
+[[cases]]
+contract_id = 'FUNC-027'
+case_id = 'func_027_vectorized_call_evaluates_at_translation'
+test_file = 'tests/func_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
 
 [[cases]]
 contract_id = 'TYPE-032'
@@ -3588,7 +3770,7 @@ outcome = 'Reject'
 [[cases]]
 contract_id = 'INST-026'
 case_id = 'inst_026_class_extends_of_non_replaceable_rejected'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Reject'
 
@@ -3630,28 +3812,28 @@ outcome = 'Accept'
 [[cases]]
 contract_id = 'INST-028'
 case_id = 'inst_028_break_composes_with_sibling_modifications'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
 contract_id = 'INST-042'
 case_id = 'inst_042_break_modification_removes_binding'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
 contract_id = 'INST-031'
 case_id = 'inst_031_outer_class_short_definition_accepted'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
 [[cases]]
 contract_id = 'INST-032'
 case_id = 'inst_032_disabled_conditional_outer_needs_no_inner'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
@@ -3714,7 +3896,7 @@ outcome = 'Accept'
 [[cases]]
 contract_id = 'INST-038'
 case_id = 'inst_038_inner_outer_modification_accepted'
-test_file = 'tests/inst_contracts.rs'
+test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Compile'
 outcome = 'Accept'
 
@@ -3737,4 +3919,95 @@ contract_id = 'OPREC-011'
 case_id = 'oprec_011_unused_zero_sized_array_is_legal'
 test_file = 'tests/oprec_contracts.rs'
 kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'ANN-017'
+case_id = 'ann_017_evaluate_and_final_parameters_are_marked_evaluable'
+test_file = 'tests/ann_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'ANN-017'
+case_id = 'ann_017_folded_parameters_keep_their_values_in_simulation'
+test_file = 'tests/ann_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'EQN-039'
+case_id = 'eqn_039_parameter_guard_over_equal_branches_stays_run_time'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'EQN-039'
+case_id = 'eqn_039_mismatched_branch_counts_fix_the_parameter'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'EQN-039'
+case_id = 'eqn_039_differentiated_branches_fix_the_parameter'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'EQN-009'
+case_id = 'eqn_009_binder_derivative_subscripts_are_static'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Compile'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'EQN-009'
+case_id = 'eqn_009_variable_derivative_subscripts_stay_dynamic'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
+
+[[cases]]
+contract_id = 'EQN-039'
+case_id = 'eqn_039_evaluate_false_guard_with_unequal_counts_rejected'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
+
+[[cases]]
+contract_id = 'EQN-039'
+case_id = 'eqn_039_fixed_false_guard_with_unequal_counts_rejected'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'
+
+[[cases]]
+contract_id = 'EQN-040'
+case_id = 'eqn_040_initial_pre_reads_a_bound_continuous_variable'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'EQN-040'
+case_id = 'eqn_040_initial_pre_reads_the_initialized_state'
+test_file = 'tests/eqn_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-057'
+case_id = 'inst_057_member_tail_follows_each_occurrence'
+test_file = 'tests/inst_lookup_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-058'
+case_id = 'inst_058_redeclare_value_alias_selects_the_outer_redeclaration'
+test_file = 'tests/inst_lookup_contracts.rs'
+kind = 'Sim'
 outcome = 'Accept'

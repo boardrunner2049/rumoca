@@ -1,4 +1,4 @@
-# TOOLBUG-121 — expandable-connector member source count (EF033)
+# TOOLBUG-121 — expandable-connector member source count (EF037)
 
 **Status:** fixed.
 **Severity:** high (every hierarchical bus model in the IBPSA/AixLib/IDEAS/
@@ -16,7 +16,7 @@ Buildings heat-pump family, ThermoPower plant controls, VehicleInterfaces).
    block Wrap  RO iceFac; Src s; equation connect(s.y, iceFac); end Wrap;
    model M  Bus sigBus; Wrap w; RO out;
    equation
-     connect(w.iceFac, sigBus.iceFacMea);   // EF033: "has 5 sources"
+     connect(w.iceFac, sigBus.iceFacMea);   // EF037: "has 5 sources"
      connect(w.iceFac, out);
    end M;
    ```
@@ -36,7 +36,7 @@ Buildings heat-pump family, ThermoPower plant controls, VehicleInterfaces).
    connector), so DAE construction treats it as a model input; an undriven
    member of a *nested* bus stays an unknown and the balance check reports it.
 
-Affected (cluster F, EF033, 18 models): AixLib `NoCooling`, `Safety.OnOff`,
+Affected (cluster F, EF037, 18 models): AixLib `NoCooling`, `Safety.OnOff`,
 `Frosting.Validation.WetterAfjei1997`; Buildings `DualFanDualDuct.Controls.
 {Cooling,Heating}CoilTemperatureSetpoint`, `RefrigerantCycleConditional`;
 IBPSA `Safety.AntiFreeze`, `Safety.MinimalFlowRate`, `FunctionalIcingFactor`;

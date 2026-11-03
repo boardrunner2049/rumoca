@@ -220,9 +220,51 @@ fn translation_time_guard_selects_its_affine_derivative_branch() {
     assert!(
         !program
             .iter()
-            .any(|operation| matches!(operation, LinearOp::Select { .. })),
-        "a guard fixed at translation time leaves no runtime selection: {program:?}"
+            .any(|operation| matches!(operation, LinearOp::LoadP { index: 0, .. })),
+        "the structural guard is absent from runtime dependencies: {program:?}"
     );
+    let block =
+        rumoca_eval_solve::to_scalar_program_block(&solve.continuous.derivative_rhs).unwrap();
+    for coefficient in [2.0, 4.0] {
+        for guard in [0.0, 1.0] {
+            let mut parameters = vec![0.0; solve.solve_layout.compiled_parameter_len];
+            parameters[0] = guard;
+            parameters[1] = coefficient;
+            let mut output = [f64::NAN];
+            rumoca_eval_solve::eval_scalar_program_block(
+                &block,
+                &[6.0],
+                &parameters,
+                0.0,
+                None,
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(
+                output[0],
+                6.0 / coefficient,
+                "only the coefficient remains live"
+            );
+        }
+    }
+    for coefficient in [0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        let mut parameters = vec![0.0; solve.solve_layout.compiled_parameter_len];
+        parameters[1] = coefficient;
+        let mut output = [0.0];
+        let evaluated = rumoca_eval_solve::eval_scalar_program_block(
+            &block,
+            &[6.0],
+            &parameters,
+            0.0,
+            None,
+            &mut output,
+        );
+        assert!(
+            evaluated.is_err() || !output[0].is_finite(),
+            "invalid coefficient {coefficient} returned {}",
+            output[0]
+        );
+    }
 }
 
 #[test]
@@ -259,7 +301,7 @@ fn translation_time_guard_that_deletes_the_derivative_is_rejected() {
 /// Only one row can be the derivative's definition; the other reads it, and
 /// reading it recovers the defining right-hand side rather than a coordinate
 /// with no Solve storage.
-fn derivative_alias_model(read_from_discrete: bool) -> dae::Dae {
+fn derivative_alias_model(read_from_discrete: bool, wrappers: &[dae::UnaryOperator]) -> dae::Dae {
     let source = TestSource::new("Real x; Real a; discrete Real d; a=der(x); der(x)=-x; d=der(x);");
     let state_at = source.at(0, 6);
     let algebraic_at = source.at(8, 14);
@@ -318,11 +360,14 @@ fn derivative_alias_model(read_from_discrete: bool) -> dae::Dae {
             let negated = expressions
                 .at(definition_at)
                 .unary(dae::UnaryOperator::Negate, value)?;
-            let definition = expressions.at(definition_at).binary(
+            let mut definition = expressions.at(definition_at).binary(
                 dae::BinaryOperator::Subtract,
                 derivative,
                 negated,
             )?;
+            for wrapper in wrappers {
+                definition = expressions.at(definition_at).unary(*wrapper, definition)?;
+            }
             Ok((alias, definition))
         })?;
         model.continuous(|continuous| continuous.value_equation(alias_at, alias))?;
@@ -352,7 +397,7 @@ fn derivative_alias_model(read_from_discrete: bool) -> dae::Dae {
 
 #[test]
 fn algebraic_row_reads_a_derivative_through_its_defining_equation() {
-    let model = derivative_alias_model(false);
+    let model = derivative_alias_model(false, &[]);
     let solve = lower_solve_problem(&model).unwrap();
     solve
         .validate()
@@ -389,11 +434,58 @@ fn discrete_row_reads_a_derivative_through_its_defining_equation() {
     // A discrete owner (a Boolean `u = der(y) > 0`, a sampled `v = der(x)`)
     // is evaluated at an event instant from the current state, so the
     // derivative it reads is its definition's right-hand side there.
-    let model = derivative_alias_model(true);
+    let model = derivative_alias_model(true, &[]);
     let solve = lower_solve_problem(&model).unwrap();
     solve
         .validate()
         .expect("the discrete derivative read satisfies the Solve shape contract");
+}
+
+#[test]
+fn positive_derivative_residual_wrapper_preserves_the_derivative_alias() {
+    check_wrapped_derivative_alias(&[dae::UnaryOperator::Plus]);
+}
+
+#[test]
+fn negated_derivative_residual_wrapper_preserves_the_derivative_alias() {
+    check_wrapped_derivative_alias(&[dae::UnaryOperator::Negate]);
+}
+
+#[test]
+fn nested_derivative_residual_wrappers_preserve_the_derivative_alias() {
+    check_wrapped_derivative_alias(&[
+        dae::UnaryOperator::Plus,
+        dae::UnaryOperator::Negate,
+        dae::UnaryOperator::Plus,
+    ]);
+}
+
+fn check_wrapped_derivative_alias(wrappers: &[dae::UnaryOperator]) {
+    // MLS Appendix B.1: R=0, +R=0, and -R=0 define the same state derivative.
+    let model = derivative_alias_model(false, wrappers);
+    let solve =
+        lower_solve_problem(&model).expect("signed equation wrappers preserve computability");
+    assert_eq!(solve.solve_layout.solver_maps.names, ["x", "a"]);
+    let derivative = rumoca_eval_solve::to_scalar_program_block(&solve.continuous.derivative_rhs)
+        .expect("derivative has a checked execution view");
+    let residual = rumoca_eval_solve::to_scalar_program_block(&solve.continuous.residual)
+        .expect("algebraic alias has a checked execution view");
+    let parameters = vec![0.0; solve.solve_layout.compiled_parameter_len];
+    for (state, alias) in [(2.0, -2.0), (-3.0, 3.0), (0.0, 0.0), (2.0, 1.0)] {
+        for (program, expected) in [(&derivative, -state), (&residual, alias + state)] {
+            let mut output = [f64::NAN];
+            rumoca_eval_solve::eval_scalar_program_block(
+                program,
+                &[state, alias],
+                &parameters,
+                0.0,
+                None,
+                &mut output,
+            )
+            .expect("the derivative and its algebraic use evaluate");
+            assert_eq!(output, [expected]);
+        }
+    }
 }
 
 fn scaled_state_model(source: TestSource, coefficient: f64) -> dae::Dae {
@@ -488,12 +580,17 @@ fn affine_state_equation_preserves_its_runtime_parameter_coefficient() {
 #[test]
 fn zero_affine_derivative_coefficient_fails_before_runtime() {
     let source = TestSource::new("parameter Real p=0; Real x; p*der(x)-x=0;");
+    let state_span = source.at(20, 26).span();
     let model = scaled_state_model(source, 0.0);
 
     let error = lower_solve_problem(&model).unwrap_err();
-    assert!(matches!(
-        error,
-        LowerError::NonComputable { reason, .. }
-            if reason.contains("zero affine coefficient")
-    ));
+    assert!(
+        matches!(
+            &error,
+            LowerError::Structural { reason, span }
+                if reason == "structurally singular system: 0 matched out of 1 equations and 1 unknowns"
+                    && *span == Some(state_span)
+        ),
+        "a fixed zero coefficient cannot match the derivative: {error:?}"
+    );
 }

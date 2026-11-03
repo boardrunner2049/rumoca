@@ -7,7 +7,7 @@
 use rumoca_ir_dae as dae;
 use serde_json::{Value, json};
 
-pub(super) const TEMPLATE_SCHEMA_VERSION: u16 = 5;
+pub(super) const TEMPLATE_SCHEMA_VERSION: u16 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum DaeBackendError {
@@ -124,7 +124,9 @@ fn project_variables(view: dae::DaeView<'_>) -> Result<Vec<Value>, DaeBackendErr
                 "binding_values": binding_values,
                 "start": variable.start().map(|id| id.index()),
                 "start_values": start_values,
-                "fixed": variable.fixed(),
+                // Text/JSON emission metadata: a non-uniform continuous `fixed`
+                // reduces to null here and is not part of the numeric solve.
+                "fixed": variable.fixed_uniform(),
                 "minimum": variable.minimum().map(|id| id.index()),
                 "minimum_values": minimum_values,
                 "maximum": variable.maximum().map(|id| id.index()),
@@ -158,9 +160,7 @@ fn numeric_values<'dae>(
     numeric_expression
         .map(|expression| {
             let mut values = evaluator.expression(expression)?;
-            if values.len() == 1 && variable.scalar_count() > 1 {
-                values.resize(variable.scalar_count(), values[0]);
-            }
+            variable.broadcast_values(&mut values);
             if values.len() != variable.scalar_count() {
                 return Err(DaeBackendError::AttributeShape {
                     variable: variable.name().to_string(),
@@ -325,11 +325,13 @@ fn project_function_statement(statement: dae::FunctionStatementView<'_>) -> Valu
         dae::FunctionStatementView::Assertion {
             condition,
             message,
+            level,
             provenance,
         } => json!({
             "kind": "assertion",
             "condition": condition.index(),
             "message": message.index(),
+            "level": level,
             "provenance": provenance,
         }),
         dae::FunctionStatementView::For {
@@ -697,6 +699,14 @@ fn project_continuous_owner(owner: dae::ContinuousOwnerView<'_>) -> Value {
 
 fn project_initialization(view: dae::DaeView<'_>) -> Value {
     json!({
+        "parameter_values": view
+            .initial_parameter_values()
+            .map(|definition| json!({
+                "target": definition.target().index(),
+                "value": definition.value().index(),
+                "provenance": definition.provenance(),
+            }))
+            .collect::<Vec<_>>(),
         // MLS §8.6 initialization-instant values of discrete coordinates. A
         // template that renders only `owners` would start those coordinates
         // from their declared `start` instead, so the definitions are their own
@@ -959,10 +969,14 @@ fn project_events(view: dae::DaeView<'_>) -> Value {
 
 fn project_event_action(operation: dae::EventActionOperation<'_>) -> Value {
     match operation {
-        dae::EventActionOperation::Assert { message, level } => json!({
+        dae::EventActionOperation::Assert { message } => json!({
             "kind": "assert",
             "message": message.index(),
-            "level": level.map(|id| id.index()),
+        }),
+        dae::EventActionOperation::Warning { message, condition } => json!({
+            "kind": "warning",
+            "message": message.index(),
+            "condition": condition.index(),
         }),
         dae::EventActionOperation::Terminate { message } => json!({
             "kind": "terminate",
@@ -992,6 +1006,16 @@ fn project_clocks(view: dae::DaeView<'_>) -> Value {
                     }),
                     dae::ClockOperation::Triggered(condition) => json!({
                         "kind": "triggered",
+                        "condition": condition.index(),
+                    }),
+                    dae::ClockOperation::Shifted {
+                        base,
+                        counter,
+                        condition,
+                    } => json!({
+                        "kind": "shifted",
+                        "base": base.index(),
+                        "counter": counter,
                         "condition": condition.index(),
                     }),
                 };

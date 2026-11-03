@@ -1,6 +1,6 @@
 //! EXPR (Expression/Operator) contract tests - MLS §3
 //!
-//! Tests for the 40 expression contracts defined in SPEC_0022.
+//! Tests for the 41 expression contracts defined in SPEC_0022.
 
 use rumoca_compile::compile::FailedPhase;
 use rumoca_contracts::test_support::{
@@ -100,6 +100,69 @@ fn expr_012_variable_to_parameter_fails() {
     "#,
         "Test",
         "ER006",
+    );
+}
+
+#[test]
+fn expr_012_continuous_definition_of_boolean_fails() {
+    // MLS 3.7 §3.8.5: a Boolean is discrete-time; a call with a continuous-time
+    // argument is a continuous-time expression, and `y` reads `b`.
+    expect_failure_in_phase_with_code(
+        r#"
+        model Test
+            function positive
+                input Real x;
+                output Boolean y;
+            algorithm
+                y := x > 0.5;
+            end positive;
+            Boolean b = positive(time);
+            Real y = if b then 1 else 0;
+        end Test;
+    "#,
+        "Test",
+        FailedPhase::ToDae,
+        "ED023",
+    );
+}
+
+#[test]
+fn expr_012_event_generating_boolean_definition_ok() {
+    expect_success(
+        r#"
+        model Test
+            function both
+                input Boolean u;
+                input Boolean v;
+                output Boolean y;
+            algorithm
+                y := u and v;
+            end both;
+            Boolean b = both(time > 0.5, time < 0.8);
+            Integer n = integer(3*time);
+        end Test;
+    "#,
+        "Test",
+    );
+}
+
+#[test]
+fn expr_012_unread_continuous_definition_of_integer_is_observed() {
+    // Documented deviation: nothing reads `k`, so it cannot influence the
+    // simulation and is evaluated at every output point instead.
+    expect_success(
+        r#"
+        model Test
+            function level
+                input Real x;
+                output Integer k;
+            algorithm
+                k := if x > 0.5 then 2 else 1;
+            end level;
+            Integer k = level(time);
+        end Test;
+    "#,
+        "Test",
     );
 }
 
@@ -1041,7 +1104,7 @@ fn der_of_parameter_is_zero() {
 }
 
 /// `der(u)` of a top-level input needs the input's derivative, which the DAE
-/// does not carry: a source diagnostic (ED022), not a panic.
+/// does not carry: a source diagnostic (ED024), not a panic.
 #[test]
 fn der_of_top_level_input_is_diagnosed() {
     expect_failure_in_phase_with_code(
@@ -1056,6 +1119,34 @@ fn der_of_top_level_input_is_diagnosed() {
     "#,
         "M",
         FailedPhase::ToDae,
-        "ED022",
+        "ED024",
+    );
+}
+
+// =============================================================================
+// EXPR-041: smooth event freedom (MLS §3.7.5)
+// "A tool is free to not generate events for expressions inside smooth.
+// However, smooth does not guarantee that no events will be generated."
+//
+// A relation inside `smooth` over a state keeps the freedom and compiles as a
+// continuous expression. The exception (a relation whose operands are
+// unknowns of its own algebraic block owns an event, SPEC_0044 ME-EVENT-008)
+// needs the block structure of Solve lowering, so both sides of the rule are
+// checked in crates/rumoca/tests/suite_core/loop_guarded_smooth_relations.rs.
+// =============================================================================
+
+#[test]
+fn expr_041_smooth_relation_over_a_state() {
+    expect_balanced(
+        r#"
+        model Test
+            Real x(start = -1, fixed = true);
+            Real y;
+        equation
+            der(x) = 1;
+            y = smooth(0, if x < 0 then 0 else x);
+        end Test;
+    "#,
+        "Test",
     );
 }

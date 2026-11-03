@@ -1,5 +1,5 @@
 mod accumulator_reductions;
-mod conditional_assertions;
+mod bounded_while;
 mod dependent_domains;
 /// Dataflow liveness over the function statement tree, and the store-deletion
 /// evidence built from it.
@@ -39,7 +39,6 @@ mod preservation_programs;
 mod preservation_values;
 
 use accumulator_reductions::compact_accumulator_loops;
-use conditional_assertions::hoist_conditional_assertions;
 use dependent_domains::{integer_range, rectangularize_dependent_loops};
 use loop_local_substitution::{
     LocalSubstitution, compact_perfect_inner_element_loops, expression_dependencies_change,
@@ -109,6 +108,8 @@ pub(super) fn compact_function_loops(
         function,
         flat,
     )?;
+    let settled =
+        bounded_while::bound_while_loops(&settled, shapes, &bounded_while::entry_values(function));
     let mut bounded_shapes = shapes.clone();
     infer_function_integer_bounds(&settled, &mut bounded_shapes);
     let settled = rectangularize_bounded_slice_assignments(&settled, &bounded_shapes);
@@ -133,7 +134,6 @@ pub(super) fn compact_function_loops(
     let compacted = rectangularize_dependent_loops(&compacted, static_integers, &bounded_shapes)?;
     let compacted =
         push_invariant_conditions_to_fixpoint(compacted, &output_names, &defined_outputs);
-    let compacted = hoist_conditional_assertions(&compacted);
     let Some(span) = first_dependent_loop_range(&compacted, static_integers, &bounded_shapes)?
     else {
         return Ok(compacted);

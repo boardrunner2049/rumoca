@@ -27,6 +27,8 @@ mod fmi_projection_tests;
 mod galec_golden_tests;
 #[cfg(test)]
 mod galec_manifest_template_tests;
+mod me_projection;
+mod pure_call_families;
 mod render_expr;
 mod render_solve;
 mod render_solve_ops;
@@ -34,6 +36,7 @@ mod render_stmt;
 #[cfg(test)]
 mod scalar_plan_template_tests;
 mod scalar_program_plan;
+mod scalar_region_plan;
 mod solve_lazy;
 mod solve_renderer;
 #[cfg(test)]
@@ -43,6 +46,8 @@ mod solve_template_context_tests;
 #[cfg(test)]
 mod stencil_codegen_tests;
 mod symbol_alloc;
+#[cfg(test)]
+mod template_function_tests;
 #[cfg(test)]
 mod wgsl_ode_tests;
 
@@ -60,6 +65,7 @@ use symbol_alloc::{
     allocate_symbols_function, emitted_symbol, lookup_symbol_value, symbol_function,
 };
 
+pub use me_projection::me_refresh_admissible;
 pub use solve_lazy::explicit_algebraic_assignment_complete;
 
 /// Result type for internal render functions.

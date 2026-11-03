@@ -1630,23 +1630,10 @@ self.onmessage = async (event) => {
     }
 
     function enableLiveInputModelSource(source) {
-        let next = source.replace(
+        return source.replace(
             /(\bparameter\s+Boolean\s+interactive\s*=\s*)false\b/,
             '$1true',
         );
-        next = next.replace(
-            /\n  parameter Real sc\[NX, NY\] = \{[\s\S]*?\n  \} "Chordwise coordinate in the pitched airfoil frame";/,
-            '\n  Real sc[NX, NY] "Chordwise coordinate in the pitched airfoil frame";',
-        );
-        next = next.replace(
-            /\n  parameter Real nc\[NX, NY\] = \{[\s\S]*?\n  \} "Chord-normal coordinate in the pitched airfoil frame";/,
-            '\n  Real nc[NX, NY] "Chord-normal coordinate in the pitched airfoil frame";',
-        );
-        next = next.replace(
-            /\n  parameter Real sig\[NX, NY\] = \{[\s\S]*?\n  \} "Solid mask \(1 inside the airfoil\)";/,
-            '\n  Real sig[NX, NY] "Solid mask (1 inside the airfoil)";',
-        );
-        return next;
     }
 
     // The API handed to editable `js,rumoca-viz` blocks (and used by the
@@ -3107,11 +3094,13 @@ self.onmessage = async (event) => {
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Rumoca interactive viewer</title>
 <style>
 html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #071825; color: #d8e6f3; font-family: system-ui, sans-serif; }
 #viewer { position: fixed; inset: 0; outline: none; }
-#status { position: fixed; top: 0.75rem; left: 0.75rem; z-index: 4; padding: 0.35rem 0.55rem; border-radius: 5px; background: rgba(5, 10, 16, 0.72); font: 12px monospace; }
+#status { position: fixed; top: calc(0.75rem + env(safe-area-inset-top, 0px)); left: calc(0.75rem + env(safe-area-inset-left, 0px)); z-index: 4; max-width: calc(100vw - 1.5rem); box-sizing: border-box; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0.35rem 0.55rem; border-radius: 5px; background: rgba(5, 10, 16, 0.72); font: 12px monospace; }
+#viewer.has-touch-controls .rumoca-interactive-controls { top: calc(2.75rem + env(safe-area-inset-top, 0px)); flex-wrap: wrap; }
 .rumoca-interactive-canvas { display: block; width: 100%; height: 100%; touch-action: none; }
 .rumoca-interactive-flight-hud { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
 .rumoca-interactive-controls { position: absolute; left: 0.75rem; right: 0.75rem; bottom: 0.75rem; z-index: 3; display: flex; gap: 0.4rem; pointer-events: auto; }
@@ -3763,7 +3752,9 @@ html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background:
                         .filter(Boolean)
                         .join(', ')
                     : '';
-                help.textContent = `Press Capture to enable mouse and configured keys${keyboardHelp ? ` (${keyboardHelp})` : ''}. Move to orbit/tilt, middle or right drag to pan, wheel to zoom, and Esc to release.`;
+                help.textContent = window.matchMedia?.('(pointer: coarse)').matches
+                    ? 'Use the on-screen thumb sticks and buttons; they follow the gamepad bindings of this scenario.'
+                    : `Press Capture to enable mouse and configured keys${keyboardHelp ? ` (${keyboardHelp})` : ''}. Move to orbit/tilt, middle or right drag to pan, wheel to zoom, and Esc to release.`;
                 shell.append(host, help);
                 output.replaceChildren(shell);
                 output.hidden = false;

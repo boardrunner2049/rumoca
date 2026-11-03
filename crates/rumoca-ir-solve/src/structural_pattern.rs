@@ -9,6 +9,14 @@ use crate::{
     AffineStencilLoadStride, BinaryOp, LinearOp, Reg, ScalarProgramBlock, TensorOutputMap,
 };
 
+mod state_jacobian;
+mod tensor_update;
+
+#[cfg(test)]
+mod state_jacobian_tests;
+#[cfg(test)]
+mod tensor_update_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PatternDerivation {
@@ -694,7 +702,7 @@ impl StructuralPattern {
         let capacity = self.nonzero_upper_bound().unwrap_or(0);
         let mut coordinates = Vec::with_capacity(capacity);
         for row in 0..self.rows as usize {
-            self.visit_row_columns(row, |column| coordinates.push((row, column)));
+            self.visit_row_columns(row, &mut |column| coordinates.push((row, column)));
         }
         coordinates
     }
@@ -702,12 +710,12 @@ impl StructuralPattern {
     /// Visit the certified columns in one row without materializing the
     /// complete sparse relation. Columns are yielded in ascending order.
     #[inline]
-    pub fn visit_row_columns(&self, row: usize, mut visitor: impl FnMut(usize)) {
+    pub fn visit_row_columns(&self, row: usize, visitor: &mut dyn FnMut(usize)) {
         debug_assert!(row < self.rows as usize);
         match &self.representation {
             PatternRepresentation::Empty => {}
             PatternRepresentation::Full => {
-                (0..self.columns as usize).for_each(&mut visitor);
+                (0..self.columns as usize).for_each(&mut *visitor);
             }
             PatternRepresentation::Diagonal => {
                 if row < self.columns as usize {
@@ -723,7 +731,7 @@ impl StructuralPattern {
                     .saturating_add(*upper_bandwidth as usize)
                     .saturating_add(1)
                     .min(self.columns as usize);
-                (start..end).for_each(&mut visitor);
+                (start..end).for_each(&mut *visitor);
             }
             PatternRepresentation::Csr {
                 row_offsets,
@@ -742,7 +750,7 @@ impl StructuralPattern {
             } => {
                 if let Some(columns) = affine_columns_for_row(domain, *row_start, column_maps, row)
                 {
-                    columns.into_iter().for_each(&mut visitor);
+                    columns.into_iter().for_each(&mut *visitor);
                 }
             }
         }
@@ -845,6 +853,21 @@ impl StructuralPattern {
             Ok(indices)
         })
         .collect()
+    }
+
+    /// Exact AD seed dependencies of every output of one checked scalar
+    /// program, in output order.
+    pub fn derive_output_seed_index_dependencies(
+        program: &[LinearOp],
+        span: Option<Span>,
+    ) -> Result<Vec<BTreeSet<usize>>, StructuralPatternError> {
+        program_output_dependencies(program, span)?
+            .into_iter()
+            .map(|dependencies| {
+                let DependencyState::Known(indices) = dependencies;
+                Ok(indices)
+            })
+            .collect()
     }
 
     /// Whether each output of one checked scalar program depends on an AD
@@ -989,13 +1012,27 @@ impl StructuralPattern {
             } => append_csr_column_rows(&mut columns, row_offsets, column_indices),
             PatternRepresentation::Affine { .. } => {
                 for row in 0..self.rows as usize {
-                    self.visit_row_columns(row, |column| columns[column].push(row));
+                    self.visit_row_columns(row, &mut |column| columns[column].push(row));
                 }
             }
         }
         columns
     }
 
+    /// Partition the columns into groups no two of which share a row.
+    ///
+    /// This is structurally orthogonal column partitioning for Jacobian
+    /// compression: one directional derivative per group recovers every entry
+    /// of the columns in it, so the sweep count drops from `columns` to
+    /// `groups`. A. R. Curtis, M. J. D. Powell and J. K. Reid, "On the
+    /// estimation of sparse Jacobian matrices", Journal of the Institute of
+    /// Mathematics and its Applications 13(1):117-119, 1974, introduced the
+    /// technique; T. F. Coleman and J. J. More, "Estimation of sparse Jacobian
+    /// matrices and graph coloring problems", SIAM Journal on Numerical
+    /// Analysis 20(1):187-209, 1983, doi:10.1137/0720013, recast it as graph
+    /// coloring. The survey is A. H. Gebremedhin, F. Manne and A. Pothen,
+    /// "What color is your Jacobian? Graph coloring for computing derivatives",
+    /// SIAM Review 47(4):629-705, 2005, doi:10.1137/S0036144504444711.
     pub fn column_coloring(&self) -> ColumnColoring {
         match &self.representation {
             PatternRepresentation::Empty | PatternRepresentation::Diagonal => {
@@ -1074,6 +1111,13 @@ fn coloring_for_full_columns(columns: u32) -> ColumnColoring {
     }
 }
 
+/// Closed-form coloring for a banded pattern.
+///
+/// A band of total width `lower + upper + 1` needs exactly that many groups and
+/// they are the residue classes of the column index modulo the width. This is
+/// the band case of Curtis, Powell and Reid (1974), where the optimal partition
+/// is known without running a coloring heuristic; see the citation on
+/// [`StructuralPattern::column_coloring`].
 fn coloring_for_banded_columns(columns: u32, lower: u32, upper: u32) -> ColumnColoring {
     let color_count = u64::from(lower)
         .saturating_add(u64::from(upper))
@@ -1575,6 +1619,12 @@ fn program_output_dependencies_with_fold(
 /// The walk holds no evaluated value: every method reads `LinearOp` register
 /// flow only, which is what makes the derived pattern a structural proof
 /// rather than a sampled observation.
+struct PureCallInputDependencies<'a> {
+    starts: &'a [Reg],
+    types: &'a [crate::SolveValueType],
+    whole: Vec<DependencyState>,
+}
+
 struct DependencyWalk<'a> {
     registers: Vec<Option<DependencyState>>,
     outputs: Vec<DependencyState>,
@@ -1676,12 +1726,10 @@ fn apply_dependency_op(
         LinearOp::FunctionConditional { dst_start, capture_start, program } =>
             walk.function_conditional(*dst_start, *capture_start, program)?,
         LinearOp::PureCall { dst_start, input_starts, site } => walk.pure_call(
-            *dst_start, input_starts, site.inputs(), site.output_scalar_count(),
-            "pure-call output width overflows",
+            *dst_start, input_starts, site.inputs(), site.outputs(), site.output_dependencies(),
         )?,
         LinearOp::PureCallDirectional { dst_start, input_starts, site } => walk.pure_call(
-            *dst_start, input_starts, site.inputs(), site.output_scalar_count(),
-            "directional pure-call output width overflows",
+            *dst_start, input_starts, site.inputs(), site.outputs(), site.output_dependencies(),
         )?,
         LinearOp::StoreOutputFoldTensorUpdate {
             source_base, source_stride, dimensions, updates, nodes, lanes, ..
@@ -2216,57 +2264,6 @@ impl DependencyWalk<'_> {
         })
     }
 
-    fn tensor_update(
-        &mut self,
-        dst_start: Reg,
-        base_start: Reg,
-        value_start: Reg,
-        dimensions: &[u32],
-        subscripts: &[crate::TensorUpdateSubscript],
-        lanes: usize,
-    ) -> Result<(), StructuralPatternError> {
-        let count = saturating_tensor_extent(dimensions);
-        let (value_count, selector) = self.tensor_update_patch(dimensions, subscripts, lanes)?;
-        let patch = self.range(value_start, value_count)?.union(selector);
-        for element in 0..count {
-            for lane in 0..lanes {
-                let offset = element * lanes + lane;
-                let dependencies = self.get(base_start + offset as Reg)?.union(patch.clone());
-                self.set(dst_start + offset as Reg, dependencies);
-            }
-        }
-        Ok(())
-    }
-
-    /// Width of the patch value range and the dependencies of the runtime
-    /// coordinates that select where the patch lands.
-    fn tensor_update_patch(
-        &self,
-        dimensions: &[u32],
-        subscripts: &[crate::TensorUpdateSubscript],
-        lanes: usize,
-    ) -> Result<(usize, DependencyState), StructuralPatternError> {
-        let mut value_count = lanes;
-        let mut selector = DependencyState::empty();
-        for (&extent, subscript) in dimensions.iter().zip(subscripts.iter()) {
-            match subscript {
-                crate::TensorUpdateSubscript::Whole => {
-                    value_count = value_count.saturating_mul(extent as usize);
-                }
-                crate::TensorUpdateSubscript::Index(crate::TensorIndex::Runtime(register_id)) => {
-                    selector = selector.union(self.get(*register_id)?);
-                }
-                crate::TensorUpdateSubscript::Index(crate::TensorIndex::Constant(_)) => {}
-                crate::TensorUpdateSubscript::Slice { start, dimensions } => {
-                    let slice_count = saturating_tensor_extent(dimensions);
-                    selector = selector.union(self.range(*start, slice_count)?);
-                    value_count = value_count.saturating_mul(slice_count);
-                }
-            }
-        }
-        Ok((value_count, selector))
-    }
-
     fn tensor_fill(
         &mut self,
         dst_start: Reg,
@@ -2438,29 +2435,109 @@ impl DependencyWalk<'_> {
         Ok(dependency)
     }
 
-    /// Every ordered result of a typed pure call depends on every typed input:
-    /// the call owner is opaque to this structural walk, so the conservative
-    /// closure is the only sound one. The plain and directional sites differ
-    /// only in the diagnostic their output-width overflow reports.
+    /// Substitute the issued output summary into the invocation's input ranges.
+    /// The owner retains typed leaves; this scalar consumer expands their ranges.
     fn pure_call(
         &mut self,
         dst_start: Reg,
         input_starts: &[Reg],
         inputs: &[crate::SolveValueType],
-        output_scalar_count: Option<usize>,
-        message: &'static str,
+        outputs: &[crate::SolvePureCallOutput],
+        summaries: &[Box<[crate::SolveCallDependency]>],
     ) -> Result<(), StructuralPatternError> {
-        let mut dependency = DependencyState::empty();
-        for (start, value_type) in input_starts.iter().zip(inputs) {
-            let count = value_type.scalar_count() as usize;
-            dependency = self.union_scalar_range(dependency, *start, count)?;
+        if input_starts.len() != inputs.len() || summaries.len() != outputs.len() {
+            return Err(dependency_error(
+                "pure-call dependency interface mismatch",
+                self.span,
+            ));
         }
-        let output_count =
-            output_scalar_count.ok_or_else(|| dependency_error(message, self.span))?;
-        for offset in 0..output_count {
-            self.set(dst_start + offset as Reg, dependency.clone());
+        let input_dependencies = input_starts
+            .iter()
+            .zip(inputs)
+            .map(|(start, value_type)| {
+                self.union_scalar_range(
+                    DependencyState::empty(),
+                    *start,
+                    value_type.scalar_count() as usize,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = PureCallInputDependencies {
+            starts: input_starts,
+            types: inputs,
+            whole: input_dependencies,
+        };
+        let mut destination = dst_start;
+        for (output, summary) in outputs.iter().zip(summaries) {
+            destination = self.pure_call_output(destination, &inputs, output, summary)?;
         }
         Ok(())
+    }
+
+    fn pure_call_output(
+        &mut self,
+        mut destination: Reg,
+        inputs: &PureCallInputDependencies<'_>,
+        output: &crate::SolvePureCallOutput,
+        summary: &[crate::SolveCallDependency],
+    ) -> Result<Reg, StructuralPatternError> {
+        for element in 0..output.value_type().scalar_count() as usize {
+            let dependency =
+                summary
+                    .iter()
+                    .try_fold(DependencyState::empty(), |dependency, source| {
+                        let source = self.pure_call_input_dependency(
+                            source,
+                            inputs,
+                            output.value_type(),
+                            element,
+                        )?;
+                        Ok::<_, StructuralPatternError>(dependency.union(source))
+                    })?;
+            self.set(destination, dependency);
+            destination = destination
+                .checked_add(1)
+                .ok_or_else(|| dependency_error("pure-call output width overflows", self.span))?;
+        }
+        Ok(destination)
+    }
+
+    fn pure_call_input_dependency(
+        &self,
+        source: &crate::SolveCallDependency,
+        inputs: &PureCallInputDependencies<'_>,
+        output: &crate::SolveValueType,
+        element: usize,
+    ) -> Result<DependencyState, StructuralPatternError> {
+        let index = source.input_index();
+        let input = inputs.types.get(index).ok_or_else(|| {
+            dependency_error(
+                "pure-call dependency input is outside its interface",
+                self.span,
+            )
+        })?;
+        if source.is_whole_input() {
+            return Ok(inputs.whole[index].clone());
+        }
+        let elements = source
+            .input_elements(output, element, input)
+            .ok_or_else(|| {
+                dependency_error(
+                    "pure-call coordinate dependency is outside its interface",
+                    self.span,
+                )
+            })?;
+        elements
+            .into_iter()
+            .try_fold(DependencyState::empty(), |dependency, offset| {
+                let register = Reg::try_from(offset)
+                    .ok()
+                    .and_then(|offset| inputs.starts[index].checked_add(offset))
+                    .ok_or_else(|| {
+                        dependency_error("pure-call dependency register overflows", self.span)
+                    })?;
+                Ok(dependency.union(self.get(register)?))
+            })
     }
 
     fn store_fold_tensor_update(

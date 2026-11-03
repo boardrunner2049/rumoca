@@ -17,29 +17,53 @@ checked component state.
 - FMI 3 value references address complete tensor variables with declared
   dimensions.
 - ME and CS are lifecycle profiles of one kernel, not independent lowerings.
+- A Co-Simulation step runs the component's `CoSimulationStepPlan`:
+  error-controlled Dormand-Prince 5(4) substeps within the setup tolerance
+  (1e-6 when the importer defines none), ending exactly at the communication
+  point. Accuracy follows the tolerance rather than the communication step
+  size; a step that cannot meet it within the plan's substep budget is rolled
+  back and returns Discard. The FMI 2 target shares this rule.
 
 ## Unsupported
 
+Public variables keep their FMI value types: Real as Float64, Integer and
+enumeration ordinals as Int32, Boolean as Boolean, and String parameters and
+constants as String with their literal start text. A String whose declaration
+gives no literal start is refused.
+
 The current profile supports parameter-dependent error assertions, including
-assertions inside pure array functions. The checked profile retains their
+assertions inside pure array functions, and discrete equations and condition
+memories determined by parameters alone. The checked profile retains the
 predicates and original messages; invalid parameters fail initialization or the
-next FMI evaluation after a legal parameter change. Time-, state-, and
-input-dependent assertions remain outside this profile.
+next FMI evaluation after a legal parameter change. Discrete equations settle
+with the parameter bindings in dependency order. Time-, state-, and
+input-dependent assertions and discrete updates remain outside this profile.
 
-Dependent parameters retain their Solve initialization assignments and export
-as calculated parameters. Changing an independent tunable parameter recomputes
-these bindings before checking assertions or reading outputs. Initialization
-residuals, projections, and state assignments remain unsupported.
+Dependent parameters retain their Solve initialization assignments, evaluated
+in dependency order, and export as calculated parameters. Changing an
+independent tunable parameter recomputes these bindings before checking
+assertions or reading outputs. An initialization residual runs the runtime's
+settled initialization (bindings and the initialization projection alternate
+until the bindings stop changing, each residual row evaluated after the
+algebraic refresh) through the shared projection kernel at the FMI tolerance.
+Initialization rows over declaration seeds, homotopy continuation, delay
+histories, and retained state-manifold rows are refused.
 
-The current profile rejects general events, clocks, runtime event history, external
-calls/tables, random operations, and coupled or non-isolable implicit residual
-systems. A continuous algebraic system is supported only when every canonical
-BLT block is a singleton with a construction-checked exact assignment. The
-issued schedule preserves causal BLT order, including chains between singleton
-algebraics. Dynamic-coefficient, coupled, and non-isolable systems remain
-unsupported. Non-finite refreshed values fail the FMI call and a failed CS step
-rolls back its state. Unimplemented FMI capabilities are absent from metadata
-and reject at the ABI.
+The current profile rejects general events, clocks, runtime event history,
+external calls/tables, and random operations. A derivative inside a matrix
+product (`J * der(w) = f`) lowers to a Solve IR `LinSolve` that the state
+derivative kernel evaluates by the linked kernel's Gauss-Jordan elimination
+with partial pivoting; a singular matrix fails the evaluation. A `LinSolve` in
+a residual, projection, or initialization block is refused. Algebraic systems
+run the shared ME projection kernel of SPEC_0044 ME-PROJ-001. Non-finite
+refreshed values fail the FMI call and a failed CS step rolls back its state.
+Unimplemented FMI capabilities are absent from metadata and reject at the ABI.
+
+The C sources are split into translation units that compile in parallel:
+`model.c` (FMI surface, refresh, kernel), `rmc_assign.c` (exact assignments),
+`rmc_rows.c` (residual rows), `rmc_jacobian.c` (forward Jacobians),
+`rmc_isolators.c` (isolators and causal runs), and `rmc_functions.c` (pure
+functions), sharing `model.h`.
 
 ## Verification
 
@@ -51,10 +75,13 @@ and reject at the ABI.
 - `packaged_fmi_tensor_products_and_transpose_match_independent_numpy_values`
   checks rectangular matrix/vector products and rank-three transpose against
   NumPy through both interfaces and FMI versions.
+- `packaged_fmi_mass_matrix_derivatives_match_the_matrix_exponential` runs
+  `J * der(w) = -w` (issue #363), including a pivoting inertia tensor, through
+  both interfaces and FMI versions against the matrix exponential.
 - `cargo test -p rumoca --features template-runtime-tests --test suite_template_runtime -- backend_template_runtime_regression::fmi2_and_fmi3_consume_an_exact_isolable_algebraic_schedule`
   proves both FMI consumers accept the checked exact schedule through their shared C kernel.
 - `cargo test -p rumoca --features template-runtime-tests --test suite_template_runtime -- backend_template_runtime_regression::fmi3_exact_runtime_`
-  compiles and runs final-RK4 refresh, non-finite rollback, and chained-singleton
+  compiles and runs final-step refresh, non-finite rollback, and chained-singleton
   order discriminators against the rendered C.
 - `cargo test -p rumoca --features template-runtime-tests --test suite_template_runtime -- backend_template_runtime_regression::fmi2_and_fmi3_reject_a_tunable_algebraic_coefficient`
   proves the explicit profile fails closed when a runtime coefficient would

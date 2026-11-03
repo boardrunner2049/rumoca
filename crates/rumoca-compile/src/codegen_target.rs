@@ -134,6 +134,11 @@ pub struct TargetCapabilities {
     /// The target directly executes construction-issued exact algebraic
     /// assignment schedules when no residual projection remains.
     pub exact_algebraic_assignments: Option<bool>,
+    /// The target executes construction-issued algebraic projection stages
+    /// (singleton, affine, torn, and dense block solves) with the shared
+    /// Model-Exchange projection kernel, so a staged refresh plan with coupled
+    /// blocks renders without residual export.
+    pub algebraic_projection: Option<bool>,
     /// The target consumes compact DAE `structured_equations` as the
     /// authoritative body instead of blindly iterating placeholder scalar rows.
     pub structured_equation_families: Option<bool>,
@@ -299,6 +304,7 @@ pub struct TargetCompatibilityEntry {
     pub reverse_ad: TargetFeatureSupport,
     pub dynamic_control_flow: TargetFeatureSupport,
     pub host_callbacks: TargetFeatureSupport,
+    pub algebraic_projection: TargetFeatureSupport,
 }
 
 #[derive(Debug, Serialize)]
@@ -617,6 +623,9 @@ fn target_compatibility_entry(id: &str, manifest: &TargetManifest) -> TargetComp
         host_callbacks: feature_support(
             capabilities.and_then(|capabilities| capabilities.host_callbacks),
         ),
+        algebraic_projection: feature_support(
+            capabilities.and_then(|capabilities| capabilities.algebraic_projection),
+        ),
     }
 }
 
@@ -831,7 +840,11 @@ pub fn validate_solve_target_capabilities(
 ) -> Result<()> {
     solve.validate()?;
     if capabilities.residual_equations != Some(true)
-        && solve_requires_residual_equations(solve, capabilities.exact_algebraic_assignments)
+        && solve_requires_residual_equations(
+            solve,
+            capabilities.exact_algebraic_assignments,
+            capabilities.algebraic_projection,
+        )
     {
         unsupported_feature(
             manifest,
@@ -871,9 +884,12 @@ pub fn validate_solve_target_capabilities(
         unsupported_feature(manifest, "clocks", "clock partition entries present")?;
     }
     let mut inventory = solve.compute_node_counts();
-    inventory.add_assign(solve.initialization.residual.compute_node_counts());
+    inventory.add_assign(solve.initialization.residual().compute_node_counts());
     let uses_linear_solve_component = solve.uses_linear_solve_component()
-        || solve.initialization.residual.uses_linear_solve_component();
+        || solve
+            .initialization
+            .residual()
+            .uses_linear_solve_component();
     validate_solve_tensor_inventory(
         manifest,
         capabilities,
@@ -1334,6 +1350,9 @@ fn validate_target_capabilities(
     {
         bail!("exact_algebraic_assignments capability is only valid for Solve-derived targets");
     }
+    if capabilities.algebraic_projection.is_some() && manifest.ir != TargetTemplateIr::Fmi {
+        bail!("algebraic_projection capability is only valid for FMI targets");
+    }
     if capabilities.tensor.is_some()
         && !matches!(manifest.ir, TargetTemplateIr::Solve | TargetTemplateIr::Fmi)
     {
@@ -1383,7 +1402,7 @@ fn unsupported_feature(
 ) -> Result<()> {
     bail!(
         "unsupported-feature:{}: Target '{}' does not support feature '{}': {} \
-         (see `rumoca targets` for a target supporting the '{}' column)",
+         (its target.toml declares `[capabilities] {}` unsupported)",
         feature,
         manifest.name.as_deref().unwrap_or("custom"),
         feature,

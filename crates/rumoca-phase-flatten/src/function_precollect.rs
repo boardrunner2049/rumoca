@@ -1,4 +1,8 @@
+mod result_shapes;
+
 use rumoca_ir_ast as ast;
+
+pub(crate) use result_shapes::FunctionResultShapes;
 
 use crate::pipeline::{
     collect_function_calls_from_equation, collect_function_calls_from_expression,
@@ -46,7 +50,11 @@ pub(crate) fn pre_collect_functions(
     }
 
     for (_def_id, instance_data) in &overlay.components {
-        if let Some(binding) = &instance_data.binding {
+        if let Some(binding) = instance_data
+            .binding_source
+            .as_ref()
+            .or(instance_data.binding.as_ref())
+        {
             collect_function_calls_from_expression(binding, &mut function_names, tree, class_index);
         }
         if let Some(start) = &instance_data.start {
@@ -86,6 +94,7 @@ pub(crate) fn pre_collect_functions(
             }
         }
     }
+    ctx.function_result_shapes = FunctionResultShapes::from_functions(ctx.functions.values());
     Ok(())
 }
 

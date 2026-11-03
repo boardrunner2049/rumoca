@@ -71,8 +71,103 @@ fn function_output<'storage>(
         locals: named_values(locals),
         statements,
         external,
+        derivatives: function
+            .derivatives
+            .iter()
+            .map(|derivative| FunctionDerivativeWire {
+                target: derivative.target,
+                inputs: derivative.inputs.clone(),
+                previous: derivative.previous,
+                priority: derivative.priority,
+                provenance: derivative.provenance,
+            })
+            .collect(),
+        inline: function.inline,
         declaration: function.declaration,
     }
+}
+
+fn reconstruct_available_derivatives<'dae>(
+    wire: &StorageWire,
+    dae: &mut DaeConstruction<'dae>,
+    ids: &WireIds<'dae>,
+    links: &mut [Vec<FunctionDerivativeId<'dae>>],
+) -> Result<(), DaeConstructionError> {
+    loop {
+        let mut added = 0;
+        for (function, entries) in wire.functions.iter().take(ids.functions.len()).enumerate() {
+            added +=
+                reconstruct_function_derivatives(dae, ids, links, function, &entries.derivatives)?;
+        }
+        if added == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn reconstruct_function_derivatives<'dae>(
+    dae: &mut DaeConstruction<'dae>,
+    ids: &WireIds<'dae>,
+    links: &mut [Vec<FunctionDerivativeId<'dae>>],
+    function: usize,
+    entries: &[FunctionDerivativeWire],
+) -> Result<usize, DaeConstructionError> {
+    let before = links[function].len();
+    while let Some(entry) = entries.get(links[function].len()) {
+        let Some(link) = reconstruct_derivative(dae, ids, links, function, entry)? else {
+            break;
+        };
+        links[function].push(link);
+    }
+    Ok(links[function].len() - before)
+}
+
+fn reconstruct_derivative<'dae>(
+    dae: &mut DaeConstruction<'dae>,
+    ids: &WireIds<'dae>,
+    links: &[Vec<FunctionDerivativeId<'dae>>],
+    function: usize,
+    entry: &FunctionDerivativeWire,
+) -> Result<Option<FunctionDerivativeId<'dae>>, DaeConstructionError> {
+    if entry.target as usize >= ids.functions.len() {
+        return Ok(None);
+    }
+    let target = mapped(
+        &ids.functions,
+        entry.target,
+        "derivative function",
+        entry.provenance,
+    )?;
+    let previous = match entry.previous {
+        Some((owner, ordinal)) => {
+            let Some(previous) = links
+                .get(owner as usize)
+                .and_then(|links| links.get(ordinal as usize))
+            else {
+                return Ok(None);
+            };
+            Some(*previous)
+        }
+        None => None,
+    };
+    dae.functions(|functions| match previous {
+        Some(previous) => functions.next_derivative(
+            ids.functions[function],
+            previous,
+            target,
+            entry.inputs.iter().copied(),
+            entry.priority,
+            entry.provenance,
+        ),
+        None => functions.first_derivative(
+            ids.functions[function],
+            target,
+            entry.inputs.iter().copied(),
+            entry.priority,
+            entry.provenance,
+        ),
+    })
+    .map(Some)
 }
 
 fn named_values(
@@ -130,10 +225,12 @@ fn project_statements(
             FunctionStatementWire::Assertion {
                 condition,
                 message,
+                level,
                 provenance,
             } => FunctionStatementInput::Assertion {
                 condition: *condition,
                 message: *message,
+                level: *level,
                 provenance: *provenance,
             },
             FunctionStatementWire::For {
@@ -160,6 +257,7 @@ pub(super) fn reconstruct<'dae>(
     dae: &mut DaeConstruction<'dae>,
     ids: &mut WireIds<'dae>,
 ) -> Result<(), DaeConstructionError> {
+    let mut links = vec![Vec::new(); wire.functions.len()];
     for component in function_graph::function_components(wire)? {
         if component.recursive {
             reconstruct_recursive_component(
@@ -178,6 +276,14 @@ pub(super) fn reconstruct<'dae>(
                 component.expression_end,
             )?;
         }
+        reconstruct_available_derivatives(wire, dae, ids, &mut links)?;
+    }
+    if links
+        .iter()
+        .zip(&wire.functions)
+        .any(|(links, function)| links.len() != function.derivatives.len())
+    {
+        return Err(malformed("function derivative predecessor or target"));
     }
     while ids.next_wire_expression < wire.expressions.nodes.len() {
         let expression = wire_expression(wire, ids.next_wire_expression)?;
@@ -273,7 +379,8 @@ fn function_signature<'dae>(
         map_function_value_types(&ids.types, &function.parameters)?,
         map_function_value_types(&ids.types, &function.outputs)?,
         function.declaration,
-    ))
+    )
+    .with_inline(function.inline))
 }
 
 fn replay_component<'group, 'dae>(
@@ -369,6 +476,7 @@ struct AssignmentInput {
 struct AssertionInput {
     condition: u32,
     message: u32,
+    level: crate::AssertionLevel,
     provenance: DaeProvenance,
 }
 
@@ -542,10 +650,12 @@ fn assertion(statement: &FunctionStatementInput) -> Result<AssertionInput, DaeCo
         FunctionStatementInput::Assertion {
             condition,
             message,
+            level,
             provenance,
         } => Ok(AssertionInput {
             condition: *condition,
             message: *message,
+            level: *level,
             provenance: *provenance,
         }),
         FunctionStatementInput::Assignment { .. }
@@ -761,11 +871,15 @@ fn apply_assertion<'dae>(
     })?;
     dae.functions(|functions| match capability {
         ReplayCapability::Body(body) => {
-            functions.assertion(body, condition, message, input.provenance)
+            functions.assertion_with_level(body, condition, message, input.level, input.provenance)
         }
-        ReplayCapability::Fold(loop_body) => {
-            functions.assertion_loop(loop_body, condition, message, input.provenance)
-        }
+        ReplayCapability::Fold(loop_body) => functions.assertion_loop_with_level(
+            loop_body,
+            condition,
+            message,
+            input.level,
+            input.provenance,
+        ),
         ReplayCapability::External(_) => Err(malformed("functions.external")),
     })
 }

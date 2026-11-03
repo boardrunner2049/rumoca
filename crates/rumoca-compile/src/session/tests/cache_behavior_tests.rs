@@ -351,6 +351,7 @@ fn source_root_completion_cache_collects_names_from_split_within_documents() {
 
 #[test]
 fn body_only_edits_keep_summary_backed_query_caches_warm() {
+    let _guard = session_stats_test_guard();
     let mut session = Session::default();
     session
         .add_document("m.mo", "model M\n  Real x;\nequation\n  x = 1;\nend M;\n")
@@ -1067,6 +1068,7 @@ fn strict_target_source_map_tracks_the_current_planning_revision() {
 
 #[test]
 fn query_methods_fallback_to_partial_parse_and_invalidate_on_update() {
+    let _guard = session_stats_test_guard();
     let mut session = Session::default();
     session
         .add_document(

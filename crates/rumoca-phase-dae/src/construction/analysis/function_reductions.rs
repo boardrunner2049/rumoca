@@ -4,11 +4,17 @@ pub(super) fn validate_integer_reduction(
     function: &rumoca_core::Function,
     context: FunctionValidationContext<'_>,
 ) -> Result<Option<FunctionPlan>, ToDaeError> {
-    if function
-        .body
-        .iter()
-        .any(|statement| matches!(statement, rumoca_core::Statement::While { .. }))
-    {
+    // The integer while-sum owns exactly its `result := 0; i := 0; while ...`
+    // skeleton. Any other `while` is lowered through a proven iteration bound
+    // by the statement path (`bounded_while`), or keeps its typed rejection.
+    if matches!(
+        function.body.as_slice(),
+        [
+            rumoca_core::Statement::Assignment { value: result_zero, .. },
+            rumoca_core::Statement::Assignment { value: index_zero, .. },
+            rumoca_core::Statement::While { .. },
+        ] if is_integer_zero(result_zero) && is_integer_zero(index_zero)
+    ) {
         return validate_while_sum(function, context).map(Some);
     }
     if contains_break(&function.body) {

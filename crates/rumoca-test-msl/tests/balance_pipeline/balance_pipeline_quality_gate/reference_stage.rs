@@ -45,6 +45,10 @@ fn run_simulation_parity_reference_command(
         context.workers.to_string(),
         "--omc-threads".to_string(),
         context.omc_threads.to_string(),
+        "--rumoca-sim-workers".to_string(),
+        simulation_parallelism().to_string(),
+        "--rumoca-stage-workers".to_string(),
+        msl_stage_parallelism().to_string(),
     ];
     // The canonical flow restricts the OMC baseline to models rumoca already
     // simulates, which keeps the gate fast. The long-budget diagnostic lanes opt

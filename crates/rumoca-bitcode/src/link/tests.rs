@@ -226,6 +226,7 @@ fn map_fixture() -> (RbcModel, RbcModel) {
         parameters: vec![],
         results: vec![TypeId(0)],
         inline: RbcInline::Unstated,
+        derivatives: Vec::new(),
         body: RbcFunctionBody::External {
             language: "C".into(),
             symbol: "external_f".into(),
@@ -457,6 +458,7 @@ fn relocates_all_metadata_and_separate_equation_id_spaces() {
         }],
         results: vec![TypeId(0)],
         inline: RbcInline::Never,
+        derivatives: Vec::new(),
         body: RbcFunctionBody::External {
             language: "C".into(),
             symbol: "f_external".into(),
@@ -550,6 +552,7 @@ fn relocates_all_metadata_and_separate_equation_id_spaces() {
         provenance: p,
     });
     m.discrete_definitions.push(RbcDiscreteDefinition {
+        observed: false,
         targets: vec![VariableId(0)],
         branches: vec![RbcDiscreteBranch {
             activation: RbcDiscreteActivation::When {

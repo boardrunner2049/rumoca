@@ -2,6 +2,18 @@
 //! `SolveRuntime`, split out of `runtime.rs` to keep it under the SPEC_0021
 //! file-size limit. Child module of `runtime`, so the `impl SolveRuntime`
 //! here retains access to the runtime's private fields and helper methods.
+//!
+//! # References
+//!
+//! Forward-mode JVP and reverse-mode VJP are the two sweep directions of
+//! algorithmic differentiation: A. Griewank and A. Walther, "Evaluating
+//! Derivatives", 2nd ed., SIAM 2008, doi:10.1137/1.9780898717761, chapters 3
+//! and 4. The steady-state adjoint, in which the adjoint system is solved once
+//! at the converged state rather than integrated backwards, is Y. Cao, S. Li,
+//! L. Petzold and R. Serban, "Adjoint sensitivity analysis for
+//! differential-algebraic equations: the adjoint DAE system and its numerical
+//! solution", SIAM Journal on Scientific Computing 24(3):1076-1089, 2003,
+//! doi:10.1137/S1064827501380630.
 
 use super::*;
 
@@ -11,14 +23,12 @@ use super::*;
 /// The seed spans `[solver-y | parameter]` space: `copy_len` leading entries
 /// come from the caller and the algebraic slots are filled by the projection
 /// forward-sensitivity, so the vector the JVP finally reads is `buffer`, never
-/// `values`. `unit` carries the per-column unit vector of the same span. Both
-/// buffers belong to [`StateDerivativeScratch`] and are reused across sweeps,
-/// so a Jacobian pass stays off the allocator.
+/// `values`. The expansion buffer belongs to [`StateDerivativeScratch`] and
+/// is reused across sweeps.
 struct JacobianSeed<'a> {
     values: &'a [f64],
     copy_len: usize,
     buffer: &'a mut Vec<f64>,
-    unit: &'a mut Vec<f64>,
 }
 
 impl SolveRuntime {
@@ -63,11 +73,7 @@ impl SolveRuntime {
     ) -> Result<(), RuntimeSolveError> {
         self.update_solver_y_guess_from_state(solver_y_guess, state)?;
         let mut scratch = self.derivative_scratch.borrow_mut();
-        let StateDerivativeScratch {
-            seed_buf,
-            unit_seed,
-            ..
-        } = &mut *scratch;
+        let StateDerivativeScratch { seed_buf, .. } = &mut *scratch;
         self.eval_derivative_jacobian_v_at_solver_y(
             lin,
             solver_y_guess,
@@ -75,7 +81,6 @@ impl SolveRuntime {
                 values: seed,
                 copy_len: self.state_count,
                 buffer: seed_buf,
-                unit: unit_seed,
             },
             out,
         )
@@ -97,11 +102,7 @@ impl SolveRuntime {
     ) -> Result<(), RuntimeSolveError> {
         self.validate_refresh_inputs(solver_y, lin.params)?;
         let mut scratch = self.derivative_scratch.borrow_mut();
-        let StateDerivativeScratch {
-            seed_buf,
-            unit_seed,
-            ..
-        } = &mut *scratch;
+        let StateDerivativeScratch { seed_buf, .. } = &mut *scratch;
         self.eval_derivative_jacobian_v_from_settled_solver_y(
             lin,
             solver_y,
@@ -109,7 +110,6 @@ impl SolveRuntime {
                 values: seed,
                 copy_len: self.state_count,
                 buffer: seed_buf,
-                unit: unit_seed,
             },
             out,
         )
@@ -177,11 +177,7 @@ impl SolveRuntime {
     ) -> Result<(), RuntimeSolveError> {
         let AlgebraicLinearization { t, params, settle } = lin;
         let mut scratch = self.derivative_scratch.borrow_mut();
-        let StateDerivativeScratch {
-            solver_y,
-            seed_buf,
-            unit_seed,
-        } = &mut *scratch;
+        let StateDerivativeScratch { solver_y, seed_buf } = &mut *scratch;
         // Linearization point: settle *all* solver-y algebraics from the state
         // (the full plan, not just the derivative-dependency subset) so that leaf
         // algebraics — e.g. a pure output objective — are at their correct value.
@@ -202,11 +198,9 @@ impl SolveRuntime {
         if p_index < seed_buf.len() {
             seed_buf[p_index] = 1.0;
         }
-        unit_seed.clear();
-        unit_seed.resize(seed_len, 0.0);
         // Seed against the full algebraic plan so every solver-y algebraic (states
         // pass through unchanged) receives its `∂(alg)/∂state·v + ∂(alg)/∂p` seed.
-        self.seed_refresh_with_plan(&self.algebraic_refresh, lin, solver_y, seed_buf, unit_seed)?;
+        self.seed_refresh_with_plan(&self.algebraic_refresh, lin, solver_y, seed_buf)?;
         let copy = self.solver_count.min(out.len()).min(seed_buf.len());
         out[..copy].copy_from_slice(&seed_buf[..copy]);
         Ok(())
@@ -408,12 +402,13 @@ impl SolveRuntime {
         out.fill(0.0);
 
         // State (der) rows: ∂der/∂[y|p]ᵀ · λ[0..state_count].
+        let state_lambda = &lambda[..self.state_count];
         self.accumulate_block_vjp(
-            &self.derivative_scalar,
-            t,
-            solver_y,
-            params,
-            &lambda[..self.state_count],
+            &mut |inputs, cot, scratch| {
+                self.derivative_scalar
+                    .reverse_vjp(inputs, state_lambda, cot, scratch)
+            },
+            (t, solver_y, params),
             out,
         )?;
 
@@ -441,7 +436,14 @@ impl SolveRuntime {
         }
         if !alg.is_empty() {
             let mu = self.scatter_algebraic_multipliers(&alg, lambda);
-            self.accumulate_block_vjp(&self.implicit_scalar_rhs, t, solver_y, params, &mu, out)?;
+            self.accumulate_block_vjp(
+                &mut |inputs, cot, scratch| {
+                    self.implicit_scalar_rhs
+                        .reverse_vjp(inputs, &mu, cot, scratch)
+                },
+                (t, solver_y, params),
+                out,
+            )?;
         }
         Ok(())
     }
@@ -451,32 +453,31 @@ impl SolveRuntime {
     /// part). `out` is not cleared, so successive calls sum their contributions.
     fn accumulate_block_vjp(
         &self,
-        block: &PreparedScalarProgramBlock,
-        t: f64,
-        solver_y: &[f64],
-        params: &[f64],
-        cotangents: &[f64],
+        reverse: &mut dyn FnMut(
+            &rumoca_eval_solve::reverse::ReverseInputs<'_>,
+            &mut rumoca_eval_solve::reverse::ReverseCotangents<'_>,
+            &mut rumoca_eval_solve::reverse::ReverseScratch,
+        ) -> Result<(), rumoca_eval_solve::EvalSolveError>,
+        (t, solver_y, params): (f64, &[f64], &[f64]),
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         let mut scratch = rumoca_eval_solve::reverse::ReverseScratch::default();
         let (cot_y, cot_p) = out.split_at_mut(self.solver_count);
-        block
-            .reverse_vjp(
-                &rumoca_eval_solve::reverse::ReverseInputs {
-                    y: solver_y,
-                    p: params,
-                    t,
-                    context: self.row_eval_context(),
-                },
-                cotangents,
-                &mut rumoca_eval_solve::reverse::ReverseCotangents {
-                    y: cot_y,
-                    p: cot_p,
-                    seed: &mut [],
-                },
-                &mut scratch,
-            )
-            .map_err(RuntimeSolveError::from)
+        reverse(
+            &rumoca_eval_solve::reverse::ReverseInputs {
+                y: solver_y,
+                p: params,
+                t,
+                context: self.row_eval_context(),
+            },
+            &mut rumoca_eval_solve::reverse::ReverseCotangents {
+                y: cot_y,
+                p: cot_p,
+                seed: &mut [],
+            },
+            &mut scratch,
+        )
+        .map_err(RuntimeSolveError::from)
     }
 
     /// Build the implicit-residual row cotangent `μ` for the algebraic block: the
@@ -505,11 +506,7 @@ impl SolveRuntime {
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         let mut scratch = self.derivative_scratch.borrow_mut();
-        let StateDerivativeScratch {
-            solver_y,
-            seed_buf,
-            unit_seed,
-        } = &mut *scratch;
+        let StateDerivativeScratch { solver_y, seed_buf } = &mut *scratch;
         self.populate_solver_y_from_state(solver_y, state)?;
         self.eval_derivative_jacobian_v_at_solver_y(
             lin,
@@ -518,7 +515,6 @@ impl SolveRuntime {
                 values: seed,
                 copy_len: seed_copy_len,
                 buffer: seed_buf,
-                unit: unit_seed,
             },
             out,
         )
@@ -549,7 +545,6 @@ impl SolveRuntime {
             values: seed,
             copy_len: seed_copy_len,
             buffer: seed_buf,
-            unit: unit_seed,
         } = seed;
         let AlgebraicLinearization { t, params, .. } = lin;
         validate_derivative_output_len(out, self.state_count)?;
@@ -568,10 +563,8 @@ impl SolveRuntime {
         seed_buf.resize(seed_len, 0.0);
         let n = seed_copy_len.min(seed.len()).min(seed_buf.len());
         seed_buf[..n].copy_from_slice(&seed[..n]);
-        unit_seed.clear();
-        unit_seed.resize(seed_len, 0.0);
         // (2) Forward-propagate the seed through the algebraic projection.
-        self.seed_refresh_derivative_dependencies(lin, solver_y, seed_buf, unit_seed)?;
+        self.seed_refresh_derivative_dependencies(lin, solver_y, seed_buf)?;
         // (3) Total Jacobian-vector product via the derivative JVP.
         let context = RowEvalContext {
             seed: Some(seed_buf.as_slice()),
@@ -592,9 +585,8 @@ impl SolveRuntime {
         lin: AlgebraicLinearization<'_>,
         solver_y: &[f64],
         seed: &mut [f64],
-        unit_seed: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
-        self.seed_refresh_with_plan(&self.derivative_refresh, lin, solver_y, seed, unit_seed)
+        self.seed_refresh_with_plan(&self.derivative_refresh, lin, solver_y, seed)
     }
 
     /// Plan-parameterized forward-sensitivity refresh shared by the
@@ -609,27 +601,58 @@ impl SolveRuntime {
         lin: AlgebraicLinearization<'_>,
         solver_y: &[f64],
         seed: &mut [f64],
-        unit_seed: &mut [f64],
+    ) -> Result<(), RuntimeSolveError> {
+        self.seed_refresh_blocks(
+            (&plan.simultaneous_plan, &plan.simultaneous_block_indices),
+            lin,
+            solver_y,
+            seed,
+        )
+    }
+
+    /// [`Self::seed_refresh_with_plan`] over a projection plan whose blocks
+    /// carry their issued indices, such as a subset of the refresh plan's.
+    pub(super) fn seed_refresh_blocks(
+        &self,
+        (plan, block_indices): (&solve::AlgebraicProjectionPlan, &[usize]),
+        lin: AlgebraicLinearization<'_>,
+        solver_y: &[f64],
+        seed: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         let projection_model = RefreshProjectionModel {
             runtime: self,
-            plan: &plan.simultaneous_plan,
-            block_indices: &plan.simultaneous_block_indices,
+            seed_linearizations: Some(RefCell::new(SeedProjectionCache::at_point(
+                &self.seed_projection_cache,
+                lin,
+                solver_y,
+                self.continuous_structural.algebraic_projection().len(),
+            ))),
+            #[cfg(test)]
+            plan,
+            block_indices,
             plan_validated: false,
             jacobian_v: ProjectionJacobian::SolverYAndParameters(&self.implicit_jacobian_v),
         };
-        project_algebraic_seed_with_plan(
+        let result = project_algebraic_seed_with_plan(
             &projection_model,
-            &plan.simultaneous_plan,
+            plan,
             solver_y,
-            crate::runtime::projection::AlgebraicProjectionArgs {
-                parameters: lin.params,
-                time: lin.t,
-                state_count: self.state_count,
-                tolerance: lin.settle.tol,
-            },
+            (
+                crate::runtime::projection::AlgebraicProjectionArgs {
+                    parameters: lin.params,
+                    time: lin.t,
+                    state_count: self.state_count,
+                    tolerance: lin.settle.tol,
+                },
+                &|block, p| self.singular_active_mode(block, p),
+            ),
             seed,
-            unit_seed,
-        )
+        );
+        if result.is_err()
+            && let Some(cache) = &projection_model.seed_linearizations
+        {
+            cache.borrow_mut().clear();
+        }
+        result
     }
 }

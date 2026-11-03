@@ -10,14 +10,15 @@
 //! real work, turning each borrowed event into an owned [`ReductionRecord`]
 //! for [`crate::inspect_prepare_for_solve`], the sole crate-external surface.
 //! Everything else in this module — the trait, the borrowed event types, the
-//! recorder — stays private to [`super`], so no consumer can acquire the
-//! reduction protocol itself, only the data one recorder already extracted
-//! from it.
+//! recorder — stays private to [`super`]. A stalled intermediate may also
+//! transfer into the recorder when the reducer would otherwise discard it.
+//! Consumers receive only extracted data, never the reduction protocol.
 
 use rumoca_core::Span;
 
-use super::{DirectStateConstraint, HolonomicConstraint};
+use super::{DirectStateConstraint, HolonomicConstraint, ManifoldConstraint, StateDefinition};
 use crate::StructuralError;
+use rumoca_ir_dae as dae;
 
 /// Which fixed-point lane a reduction event belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +39,7 @@ pub(super) enum CandidateGroup {
 #[derive(Clone, Copy)]
 pub(super) struct DirectIdentity {
     pub(super) state_ordinal: u32,
-    pub(super) rhs_ordinal: u32,
+    pub(super) definition: StateDefinition,
     pub(super) provenance_span: Span,
 }
 
@@ -46,7 +47,7 @@ impl From<&DirectStateConstraint> for DirectIdentity {
     fn from(candidate: &DirectStateConstraint) -> Self {
         Self {
             state_ordinal: candidate.state,
-            rhs_ordinal: candidate.rhs,
+            definition: candidate.rhs,
             provenance_span: candidate.owner.span(),
         }
     }
@@ -56,6 +57,8 @@ impl From<&DirectStateConstraint> for DirectIdentity {
 #[derive(Clone, Copy)]
 pub(super) struct HolonomicIdentity<'a> {
     pub(super) owner_ordinal: usize,
+    pub(super) body_ordinal: Option<usize>,
+    pub(super) component_scalar: Option<usize>,
     pub(super) residual_ordinal: u32,
     pub(super) owner_span: Span,
     pub(super) anchored_state_ordinals: &'a [u32],
@@ -65,6 +68,12 @@ impl<'a> From<&'a HolonomicConstraint> for HolonomicIdentity<'a> {
     fn from(candidate: &'a HolonomicConstraint) -> Self {
         Self {
             owner_ordinal: candidate.owner_ordinal,
+            body_ordinal: candidate.body_ordinal,
+            component_scalar: candidate
+                .proof
+                .component
+                .as_ref()
+                .map(|component| component.scalar),
             residual_ordinal: candidate.residual,
             owner_span: candidate.owner.span(),
             anchored_state_ordinals: &candidate.proof.anchored_states,
@@ -98,6 +107,10 @@ pub(super) enum AttemptOutcome<'a> {
     Held { residue: usize },
     /// The rebuilt system's residue is larger; never accepted.
     Raised { residue: usize },
+    /// A structural lower bound proves the residue cannot fall below `bound`,
+    /// at least the current residue, so the candidate was not reconstructed
+    /// while a reducing candidate was sought.
+    CannotReduce { bound: usize },
     /// Reconstruction failed, or the rebuilt system failed to sort for a
     /// reason other than an ordinary singularity; never accepted.
     NonSingularFailure { error: &'a StructuralError },
@@ -158,6 +171,14 @@ pub(super) enum ReductionEvent<'a> {
     RetriedPristine { lane: Lane },
     /// The one terminal event for a whole [`crate::prepare_for_solve`] call.
     Stopped { outcome: StoppedOutcome<'a> },
+    /// One STRUCT-T02 alias class the quotient leaves unchanged, with the
+    /// declaration ordinals of its members and the refusal that decided it.
+    AliasClassUnchanged {
+        /// Which application of the quotient left the class unchanged.
+        scope: super::alias_quotient::QuotientScope,
+        members: &'a [u32],
+        reason: super::alias_quotient::AliasRefusal,
+    },
 }
 
 /// The read-only seam production and diagnostic code share.
@@ -168,6 +189,16 @@ pub(super) enum ReductionEvent<'a> {
 /// — the trait admits no channel back into the reduction it watches.
 pub(super) trait ReductionObserver {
     fn observe(&mut self, event: ReductionEvent<'_>);
+
+    /// Transfers a stalled intermediate only when reduction would discard it.
+    /// The production observer drops these already-owned values unchanged.
+    fn discard_stalled(
+        &mut self,
+        _model: dae::Dae,
+        _manifold: Vec<ManifoldConstraint>,
+        _error: &StructuralError,
+    ) {
+    }
 }
 
 impl ReductionObserver for () {
@@ -250,8 +281,20 @@ pub enum ReductionIdentity {
         rhs_ordinal: u32,
         provenance_span: Span,
     },
+    DerivativeDefinition {
+        state_ordinal: u32,
+        rhs_ordinal: u32,
+        provenance_span: Span,
+    },
+    AuxiliaryState {
+        state_ordinal: u32,
+        variable_ordinal: u32,
+        provenance_span: Span,
+    },
     Holonomic {
         owner_ordinal: usize,
+        body_ordinal: Option<usize>,
+        component_scalar: Option<usize>,
         residual_ordinal: u32,
         owner_span: Span,
         anchored_state_ordinals: Vec<u32>,
@@ -263,20 +306,42 @@ impl From<Identity<'_>> for ReductionIdentity {
         match identity {
             Identity::Direct(DirectIdentity {
                 state_ordinal,
+                definition: StateDefinition::DerivativeExpression(rhs_ordinal),
+                provenance_span,
+            }) => Self::DerivativeDefinition {
+                state_ordinal,
                 rhs_ordinal,
+                provenance_span,
+            },
+            Identity::Direct(DirectIdentity {
+                state_ordinal,
+                definition: StateDefinition::Expression(rhs_ordinal),
                 provenance_span,
             }) => Self::Direct {
                 state_ordinal,
                 rhs_ordinal,
                 provenance_span,
             },
+            Identity::Direct(DirectIdentity {
+                state_ordinal,
+                definition: StateDefinition::Auxiliary(variable_ordinal),
+                provenance_span,
+            }) => Self::AuxiliaryState {
+                state_ordinal,
+                variable_ordinal,
+                provenance_span,
+            },
             Identity::Holonomic(HolonomicIdentity {
                 owner_ordinal,
+                body_ordinal,
+                component_scalar,
                 residual_ordinal,
                 owner_span,
                 anchored_state_ordinals,
             }) => Self::Holonomic {
                 owner_ordinal,
+                body_ordinal,
+                component_scalar,
                 residual_ordinal,
                 owner_span,
                 anchored_state_ordinals: anchored_state_ordinals.to_vec(),
@@ -292,6 +357,7 @@ pub enum ReductionOutcome {
     Reduced { residue: usize },
     Held { residue: usize },
     Raised { residue: usize },
+    CannotReduce { bound: usize },
     NonSingularFailure { error: StructuralError },
     WouldDiscardInitial { variable: String, span: Span },
     WouldInvalidateManifold,
@@ -305,6 +371,7 @@ impl From<AttemptOutcome<'_>> for ReductionOutcome {
             AttemptOutcome::Reduced { residue } => Self::Reduced { residue },
             AttemptOutcome::Held { residue } => Self::Held { residue },
             AttemptOutcome::Raised { residue } => Self::Raised { residue },
+            AttemptOutcome::CannotReduce { bound } => Self::CannotReduce { bound },
             AttemptOutcome::NonSingularFailure { error } => Self::NonSingularFailure {
                 error: error.clone(),
             },
@@ -348,8 +415,9 @@ impl From<StoppedOutcome<'_>> for ReductionStop {
     }
 }
 
-/// One recorded fact from a traced [`crate::inspect_prepare_for_solve`] call,
-/// the owned twin of `ReductionEvent`.
+/// One recorded fact from a traced [`crate::inspect_prepare_for_solve`] or
+/// [`crate::inspect_quotient_aliases`] call, the owned twin of
+/// `ReductionEvent`.
 #[derive(Clone, Debug)]
 pub enum ReductionRecord {
     Round {
@@ -381,13 +449,56 @@ pub enum ReductionRecord {
     Stopped {
         outcome: ReductionStop,
     },
+    /// One STRUCT-T02 alias class left unchanged: member declaration
+    /// ordinals and the reason.
+    AliasClassUnchanged {
+        scope: super::alias_quotient::QuotientScope,
+        members: Vec<u32>,
+        reason: super::alias_quotient::AliasRefusal,
+    },
 }
 
-/// The owned report [`crate::inspect_prepare_for_solve`] returns: every event
-/// the traced call actually observed, in the order it observed them.
-#[derive(Clone, Debug, Default)]
+/// The owned report [`crate::inspect_prepare_for_solve`] and
+/// [`crate::inspect_quotient_aliases`] return: every event the traced call
+/// actually observed, in the order it observed them.
+#[derive(Debug, Default)]
 pub struct ReductionReport {
     pub records: Vec<ReductionRecord>,
+    /// Closest stalled intermediate, retained only when preparation fails.
+    pub stalled: Option<ReductionSnapshot>,
+}
+
+/// A discarded, still-singular DAE and its exact structural failure.
+///
+/// This is diagnostic evidence, never a `PreparedDae`. The manifold ordinals
+/// belong only to this immutable DAE. Ownership moves at the discard point;
+/// inspection does not clone an IR or reconstruct a candidate a second time.
+#[derive(Debug)]
+pub struct ReductionSnapshot {
+    model: dae::Dae,
+    manifold: Vec<ManifoldConstraint>,
+    error: StructuralError,
+    observed_records: usize,
+}
+
+impl ReductionSnapshot {
+    pub fn as_dae(&self) -> &dae::Dae {
+        &self.model
+    }
+
+    pub fn error(&self) -> &StructuralError {
+        &self.error
+    }
+
+    /// Presentation ordinals in this snapshot's expression arena.
+    pub fn manifold_expression_ordinals(&self) -> impl Iterator<Item = u32> + '_ {
+        self.manifold.iter().map(|entry| entry.expression)
+    }
+
+    /// Number of report records observed when this intermediate was discarded.
+    pub fn observed_records(&self) -> usize {
+        self.observed_records
+    }
 }
 
 /// The one `ReductionObserver` outside `()` used in this crate: it clones
@@ -396,17 +507,41 @@ pub struct ReductionReport {
 #[derive(Default)]
 pub(super) struct ReductionRecorder {
     records: Vec<ReductionRecord>,
+    stalled: Option<ReductionSnapshot>,
 }
 
 impl ReductionRecorder {
-    pub(super) fn finish(self) -> ReductionReport {
+    pub(super) fn finish(self, failed: bool) -> ReductionReport {
         ReductionReport {
             records: self.records,
+            stalled: self.stalled.filter(|_| failed),
         }
     }
 }
 
 impl ReductionObserver for ReductionRecorder {
+    fn discard_stalled(
+        &mut self,
+        model: dae::Dae,
+        manifold: Vec<ManifoldConstraint>,
+        error: &StructuralError,
+    ) {
+        let Some(residue) = super::unmatched_residue(error) else {
+            return;
+        };
+        if self.stalled.as_ref().is_some_and(|prior| {
+            super::unmatched_residue(&prior.error).is_some_and(|prior| prior <= residue)
+        }) {
+            return;
+        }
+        self.stalled = Some(ReductionSnapshot {
+            model,
+            manifold,
+            error: error.clone(),
+            observed_records: self.records.len(),
+        });
+    }
+
     fn observe(&mut self, event: ReductionEvent<'_>) {
         let record = match event {
             ReductionEvent::Round { lane, round, error } => {
@@ -467,6 +602,15 @@ impl ReductionObserver for ReductionRecorder {
             }
             ReductionEvent::Stopped { outcome } => ReductionRecord::Stopped {
                 outcome: outcome.into(),
+            },
+            ReductionEvent::AliasClassUnchanged {
+                scope,
+                members,
+                reason,
+            } => ReductionRecord::AliasClassUnchanged {
+                scope,
+                members: members.to_vec(),
+                reason,
             },
         };
         self.records.push(record);

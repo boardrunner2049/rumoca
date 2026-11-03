@@ -1,7 +1,7 @@
 use super::{Context, FlattenError, flat};
 
-/// Report an initial `assert` that translation proves false (MLS §8.3.7,
-/// §10.4) -- the EF030 diagnostic.
+/// Fold structurally decided `assert` statements out of the initial
+/// algorithms (MLS §8.3.7, §10.4).
 ///
 /// The evaluation context is built so that MEMBERSHIP IS THE STRUCTURAL
 /// PROOF: it carries only values whose declarations are translation-frozen —
@@ -11,17 +11,16 @@ use super::{Context, FlattenError, flat};
 /// value the broader structural context happens to know. A condition proven
 /// true is kept: dropping a check that cannot fail is an optimization, done by
 /// the `fold-asserts` bitcode pass (docs/design/minimal-frontend.md). Proven
-/// false at error level with an evaluable message is the
-/// EF030 translation diagnostic at the assertion's own span; proven false at
-/// `AssertionLevel.warning`, or with a message this context cannot evaluate,
-/// keeps the statement for the runtime owner — MLS warning-level failures
-/// are runtime behavior, and a message must never be silently replaced.
+/// false at error level with an evaluable message is the EF030 translation
+/// diagnostic at the assertion's own span; proven false at warning level, or
+/// with a message this context cannot evaluate, keeps the statement for the
+/// runtime owner, because a message must never be silently replaced.
 ///
 /// `error_literal` is the predefined `AssertionLevel.error` declaration
 /// identity from the scope tree: an explicit level counts as error only by
 /// that exact target identity, never by a rendered enum spelling. `None`
 /// fails closed — every explicitly leveled assertion is then kept.
-pub(crate) fn check_structural_initial_asserts(
+pub(crate) fn fold_structural_initial_asserts(
     flat: &mut flat::Model,
     ctx: &Context,
     error_literal: Option<rumoca_core::DefId>,

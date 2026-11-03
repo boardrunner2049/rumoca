@@ -1,12 +1,22 @@
 use super::*;
-use std::sync::Arc;
 
+mod affine_elimination;
 mod clock_partition;
+mod event_schedule;
 mod event_transaction;
+mod guarded_assignment;
+mod jacobian_outputs;
 
+pub use affine_elimination::AffineEliminationLayout;
+pub use event_schedule::{
+    CoupledNewtonPolicy, EventIterationSchedule, EventPassStep, EventScheduleError,
+    RelationPassStep, SettleStep,
+};
 pub use event_transaction::*;
+pub use guarded_assignment::{GuardedAssignmentProgram, GuardedAssignmentTargetRange};
+pub use jacobian_outputs::*;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct ContinuousSolveSystem {
     pub implicit_rhs: ComputeBlock,
     pub implicit_row_targets: Vec<Option<ScalarSlot>>,
@@ -23,6 +33,244 @@ pub struct ContinuousSolveSystem {
     /// Exact checked refresh owners issued during Solve construction. Runtime
     /// adapters prepare these schedules but never discover or filter them.
     pub refresh_owners: ContinuousRefreshOwners,
+    /// Admissible reduced state-selection charts for a definitional
+    /// first-integral coordinate group.
+    ///
+    /// A conserved first integral has no globally injective reduced chart: the
+    /// fixed primary basis folds when one of its dependent coordinates passes
+    /// through zero. Each chart in this bounded set is one alternate
+    /// Dependent/Independent column selection of that group, expressed in the
+    /// same solver-Y space as the primary basis, so a runtime can re-select a
+    /// regular chart across such a fold. Chart index zero is the primary basis.
+    ///
+    /// An empty set is dropped from human-readable serialization, so a model
+    /// with no chart set has byte-identical JSON to one that predates the
+    /// field; positional binary formats keep the field so their fixed layout
+    /// still round-trips. Each alternate plan travels as a delta against this
+    /// system (see `continuous_wire`).
+    pub reduced_chart_set: ReducedChartSet,
+    /// Projection blocks whose own unknowns a relation under `noEvent`
+    /// switches, with no root to localize it (SPEC_0044 ME-EVENT-008, ES016).
+    /// Construction warns about each; a projection of such a block that
+    /// fails is a typed fold of the relation, never a generic failure.
+    pub unlocalizable_guards: Vec<UnlocalizableGuard>,
+}
+
+/// One ES016 fact: the solver unknowns of the block and the relation that
+/// switches them under `noEvent`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnlocalizableGuard {
+    /// Solver-Y indices of the block's unknowns.
+    pub y_indices: Vec<usize>,
+    /// The relation's source text.
+    pub relation: String,
+    /// The block's unknowns by name, as the warning states them.
+    pub unknown_names: String,
+}
+
+impl UnlocalizableGuard {
+    /// The ES016 failure every executor reports when the block's projection
+    /// fails: its branch ended at a fold of the relation.
+    #[must_use]
+    pub fn fold(&self) -> String {
+        format!(
+            "the algebraic loop over {} reached a fold of `{}`: the relation switches its own loop under `noEvent`, so no localized branch continues past it",
+            self.unknown_names, self.relation
+        )
+    }
+
+    /// The ES016 warning every executor states before it runs the model.
+    #[must_use]
+    pub fn warning(&self) -> String {
+        format!(
+            "the algebraic loop over {} switches on its own unknowns at `{}` under `noEvent`: MLS 3.7.3 forbids localizing that switch, so where the branch ends at a fold the simulation fails with a typed error; write the relation without `noEvent` so it owns an event, or give the switch hysteresis with events",
+            self.unknown_names, self.relation
+        )
+    }
+
+    /// The guard whose block contains solver unknown `y_index`, if any.
+    #[must_use]
+    pub fn covering(guards: &[Self], y_index: usize) -> Option<&Self> {
+        guards
+            .iter()
+            .find(|guard| guard.y_indices.contains(&y_index))
+    }
+}
+
+/// A bounded set of admissible reduced state-selection charts. Empty for every
+/// model without a folding definitional first-integral coordinate group or an
+/// admissible single exchange of a reduced constraint group.
+///
+/// `exchanges` is the coverage record of a reduced constraint group: every
+/// ranked single exchange, issued or withheld (SPEC_0040 STRUCT-T07
+/// constraint-fold chart rows). It is empty for a first-integral mirror set and
+/// for every model without such a group, and an empty record is dropped from
+/// human-readable serialization so that IR stays byte-identical.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ReducedChartSet {
+    pub charts: Vec<ReducedChart>,
+    #[serde(default)]
+    pub exchanges: Vec<ChartExchange>,
+}
+
+impl ReducedChartSet {
+    pub fn is_empty(&self) -> bool {
+        self.charts.is_empty()
+    }
+}
+
+impl Serialize for ReducedChartSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let omit_exchanges = serializer.is_human_readable() && self.exchanges.is_empty();
+        let field_count = if omit_exchanges { 1 } else { 2 };
+        let mut state = serializer.serialize_struct("ReducedChartSet", field_count)?;
+        state.serialize_field("charts", &self.charts)?;
+        if !omit_exchanges {
+            state.serialize_field("exchanges", &self.exchanges)?;
+        }
+        state.end()
+    }
+}
+
+/// One ranked single exchange of a reduced constraint group: the primary
+/// reconstructs `dependent` and integrates `incoming`; the exchange reverses
+/// the two roles.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ChartExchange {
+    pub dependent: ChartCoordinate,
+    pub incoming: ChartCoordinate,
+    pub status: ChartExchangeStatus,
+}
+
+/// A source scalar named by its declaration and flat scalar ordinal.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ChartCoordinate {
+    pub variable: String,
+    pub scalar: u32,
+}
+
+/// Whether an exchange became an alternate chart, and why not when withheld.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ChartExchangeStatus {
+    /// Issued as reduced chart `chart` of the set.
+    Issued { chart: usize },
+    /// Ranked below the per-group alternate cap.
+    WithheldByCap,
+    /// Its integrated set has no formal successor at some stage, or its
+    /// checked candidate construction failed.
+    WithheldByConstruction,
+    /// It lowered to a solver layout that differs from the primary's.
+    WithheldByLayout,
+    /// The group's constraint slope is proven constant and nonsingular at
+    /// construction, so no chart of it can fold.
+    WithheldBySlopeInvariance,
+}
+
+/// One admissible reduced chart: a Dependent/Independent column selection of one
+/// definitional first-integral coordinate group, in solver-Y index space.
+///
+/// The Independent coordinates are integrated (bound to generated
+/// `$state_coordinates`); the Dependent coordinates are reconstructed by the
+/// algebraic projection. `trial_rcond` records the reciprocal conditioning of
+/// this chart's dependent Jacobian at the construction trial point, measured
+/// against `trial_singular_threshold`; the mirror of a folding coordinate is a
+/// structurally admissible chart whose `trial_rcond` may be at or below the
+/// threshold at the trial point because it is regular elsewhere.
+///
+/// `plan` carries the chart's executable reconstruction, derivative kernel, and
+/// the runtime-executable solver artifacts of the alternate basis. It is present
+/// only for an ALTERNATE chart (chart index one and above): the primary basis
+/// (chart index zero) is already executed by the enclosing
+/// [`ContinuousSolveSystem`], so it carries no separate plan. An absent plan is
+/// dropped from human-readable serialization by the manual [`Serialize`] below,
+/// keeping the primary chart and every partition-only chart byte-identical to IR
+/// that predates the field; positional binary formats keep the field so their
+/// fixed layout still round-trips.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ReducedChart {
+    pub independent_y_indices: Vec<usize>,
+    pub dependent_y_indices: Vec<usize>,
+    pub trial_rcond: f64,
+    pub trial_singular_threshold: f64,
+    #[serde(default)]
+    pub plan: Option<ReducedChartPlan>,
+}
+
+impl Serialize for ReducedChart {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        // A present plan is always written. An absent plan is dropped only from
+        // human-readable formats (JSON), keeping a partition-only chart
+        // byte-identical, while non-self-describing formats (bincode) retain
+        // every field so a positional round-trip reads back the same layout.
+        let omit_plan = serializer.is_human_readable() && self.plan.is_none();
+        let field_count = if omit_plan { 4 } else { 5 };
+        let mut state = serializer.serialize_struct("ReducedChart", field_count)?;
+        state.serialize_field("independent_y_indices", &self.independent_y_indices)?;
+        state.serialize_field("dependent_y_indices", &self.dependent_y_indices)?;
+        state.serialize_field("trial_rcond", &self.trial_rcond)?;
+        state.serialize_field("trial_singular_threshold", &self.trial_singular_threshold)?;
+        if !omit_plan {
+            state.serialize_field("plan", &self.plan)?;
+        }
+        state.end()
+    }
+}
+
+/// The executable reconstruction and derivative kernel of one alternate reduced
+/// chart, expressed in the same solver-Y index space as the primary basis.
+///
+/// A folding definitional first-integral group has no globally regular reduced
+/// chart, so the primary basis folds when one of its dependent coordinates
+/// passes through zero. This kernel is the alternate basis lowered through the
+/// same machinery that produced the primary: `implicit_rhs`/`implicit_row_targets`
+/// and `residual` compute the alternate reconstruction rows (its generated
+/// `$state_coordinates` identity plus its dependent-coordinate reconstructions),
+/// `algebraic_projection_plan` sequences their solves over the alternate
+/// Dependent coordinates, and `derivative_rhs` advances the alternate Independent
+/// coordinates by their own formal derivatives. It carries no manifold projection
+/// (a reduced first-integral group has none).
+///
+/// `artifacts` and `refresh_owners` complete the runtime-executable image of the
+/// alternate basis: everything the continuous solver constructor reads to run
+/// this chart (the forward-mode AD Jacobian-vector products, the derived
+/// structural patterns, and the issued continuous refresh owners). They are the
+/// alternate analogue of [`ContinuousSolveSystem::refresh_owners`] and the
+/// enclosing model's continuous [`ContinuousSolveArtifacts`].
+///
+/// `refresh_owners` is serialized directly and reconstructs its checked schedules
+/// on decode, exactly as the primary owners do. `artifacts` is derived data: like
+/// the enclosing model's primary artifacts it is never written to the wire and is
+/// rebuilt through the same artifact lowering after decode, so a chart-carrying
+/// model stays byte-identical across formats and every alternate basis is
+/// re-materialized as an executable image before a runtime observes it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReducedChartPlan {
+    pub implicit_rhs: ComputeBlock,
+    pub implicit_row_targets: Vec<Option<ScalarSlot>>,
+    pub algebraic_projection_plan: AlgebraicProjectionPlan,
+    pub residual: ComputeBlock,
+    pub derivative_rhs: ComputeBlock,
+    /// Issued continuous refresh owners of the alternate basis. Serialized and
+    /// decoded through [`ContinuousRefreshOwners`]'s own checked replay.
+    pub refresh_owners: ContinuousRefreshOwners,
+    /// Runtime-executable continuous solver artifacts of the alternate basis:
+    /// its AD Jacobian-vector products and derived structural patterns. Derived
+    /// data, rebuilt after decode by the owning phase, so it is skipped by every
+    /// serializer and defaults to empty until re-materialized.
+    #[serde(skip)]
+    pub artifacts: ContinuousSolveArtifacts,
+    /// The faithful wire delta of this plan against the primary system, issued
+    /// once by [`ChartPlanDelta::diff`] at construction or kept from decoding.
+    #[serde(skip)]
+    pub delta: Option<crate::ChartPlanDelta>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -36,17 +284,58 @@ impl AlgebraicProjectionPlan {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct AlgebraicProjectionBlock {
     pub rows: Vec<usize>,
     pub y_indices: Vec<usize>,
     /// Structural tearing of this coupled block. When present, the runtime
     /// projection iterates Newton only over the tear variables and recovers
-    /// the remaining unknowns by ordered back-substitution, matching the
-    /// causalized solve OpenModelica performs. Absence selects the dense
-    /// block Newton over every unknown.
+    /// the remaining unknowns by ordered back-substitution, in the sense of
+    /// Elmqvist and Otter, ESM'94, and Cellier and Kofman, "Continuous System
+    /// Simulation", chapter 7. OpenModelica causalizes the same loops the same
+    /// way, which makes it a behavioural cross-reference rather than the
+    /// authority for the method. Absence selects the dense block Newton over
+    /// every unknown.
     #[serde(default)]
     pub tearing: Option<BlockTearing>,
+    /// Additional admissible reconstruction charts for this block. Each chart
+    /// re-partitions the block's `y_indices` into dependent (reconstructed) and
+    /// independent (integrated) coordinates over the same `manifold_residual`
+    /// rows; `tearing` remains the primary chart. A definitional first-integral
+    /// manifold has no globally regular reduced chart, so a fixed partition
+    /// folds when a dependent coordinate passes through zero. This bounded set
+    /// of coordinate patches lets a runtime re-select a regular chart across
+    /// such a fold. Empty for every single-chart block.
+    ///
+    /// An empty set is omitted from human-readable serialization by the manual
+    /// [`Serialize`] below, so a single-chart block's JSON is byte-identical to
+    /// a block that predates the field; positional binary formats keep the
+    /// field so their fixed layout still round-trips.
+    #[serde(default)]
+    pub alternate_charts: Vec<BlockTearing>,
+}
+
+impl Serialize for AlgebraicProjectionBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        // A non-empty set is always written. An empty set is dropped only from
+        // human-readable formats (JSON), keeping single-chart IR byte-identical,
+        // while non-self-describing formats (bincode) retain every field so a
+        // positional round-trip reads back the same layout.
+        let omit_alternate = serializer.is_human_readable() && self.alternate_charts.is_empty();
+        let field_count = if omit_alternate { 3 } else { 4 };
+        let mut state = serializer.serialize_struct("AlgebraicProjectionBlock", field_count)?;
+        state.serialize_field("rows", &self.rows)?;
+        state.serialize_field("y_indices", &self.y_indices)?;
+        state.serialize_field("tearing", &self.tearing)?;
+        if !omit_alternate {
+            state.serialize_field("alternate_charts", &self.alternate_charts)?;
+        }
+        state.end()
+    }
 }
 
 /// Tearing of one coupled algebraic block into a reduced iteration set plus an
@@ -70,6 +359,28 @@ pub struct BlockTearing {
 pub struct CausalStep {
     pub row: usize,
     pub y_index: usize,
+    /// Why the step's isolated coefficient is bounded away from zero; set by
+    /// construction and trusted by every executor (SPEC_0043 §4).
+    #[serde(default, skip_serializing_if = "causal_coefficient_unproven")]
+    pub coefficient: CausalCoefficient,
+}
+
+/// The construction proof that a causal step's isolated coefficient is
+/// bounded away from zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum CausalCoefficient {
+    /// No proof: the step is not admissible as a causal step.
+    #[default]
+    Unproven,
+    /// The target enters with a unit coefficient (up to sign and a nonzero
+    /// literal output scale).
+    Unit,
+    /// The coefficient is a nonzero literal.
+    Literal,
+}
+
+fn causal_coefficient_unproven(coefficient: &CausalCoefficient) -> bool {
+    *coefficient == CausalCoefficient::Unproven
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -89,24 +400,90 @@ pub struct InitializationProjectionBlock {
     /// Initialization unknowns may reside in either solver Y storage or
     /// parameter P storage.  Time and constant slots are invalid here.
     pub unknowns: Vec<ScalarSlot>,
+    /// The Newton scale of each unknown, aligned with `unknowns`.
+    pub scales: Vec<InitializationUnknownScale>,
+}
+
+/// The magnitude an initialization unknown is scaled by in the projection's
+/// Newton step (MLS 3.7 §4.8.1: `nominal` exists for solver scaling).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub enum InitializationUnknownScale {
+    /// A solver coordinate keeps its solver variable scale
+    /// ([`SolveModel::solver_variable_scale`]).
+    Solver,
+    /// A `fixed = false` parameter with a declared `nominal`, evaluated once
+    /// at construction; finite and positive.
+    Nominal(f64),
+    /// A `fixed = false` parameter without `nominal` is scaled by the
+    /// magnitude of its §8.6 start guess when the projection begins, or 1 when
+    /// that guess is zero or not finite. A fixed floor would treat a 1e-5 s
+    /// time constant as order 1 and let one Newton step leave its branch.
+    GuessMagnitude,
+}
+
+impl InitializationUnknownScale {
+    /// The scale of a parameter unknown whose projection begins at `guess`.
+    /// A solver coordinate's scale is not this table's; it reads 1 here.
+    pub fn at_guess(self, guess: f64) -> f64 {
+        match self {
+            Self::Nominal(nominal) => nominal,
+            Self::GuessMagnitude if guess.is_finite() && guess != 0.0 => guess.abs(),
+            Self::GuessMagnitude | Self::Solver => 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SolveArtifacts {
     pub continuous: ContinuousSolveArtifacts,
     pub initialization: InitializationSolveArtifacts,
+    pub discrete: DiscreteSolveArtifacts,
+}
+
+/// Forward-mode JVPs of the discrete event rows over `[solver-y | parameter]`
+/// seeds, through which the coupled event Newton differentiates the rows it
+/// solves. Each is `None` when one of its rows has no derivative lowering.
+#[derive(Clone, Debug, Default)]
+pub struct DiscreteSolveArtifacts {
+    /// Row-aligned with [`DiscreteSolveSystem::rhs`].
+    pub rhs_jacobian_v: Option<ScalarProgramBlock>,
+    /// Row-aligned with [`DiscreteSolveSystem::runtime_assignment_rhs`].
+    pub runtime_assignment_jacobian_v: Option<ScalarProgramBlock>,
+    /// Program `i` differentiates guarded assignment `i`, output for output.
+    pub guarded_jacobian_v: Option<ScalarProgramBlock>,
+    /// Row-aligned with the scalar view of
+    /// [`DiscreteSolveSystem::structured_rhs`].
+    pub structured_jacobian_v: Option<ScalarProgramBlock>,
 }
 
 #[derive(Clone, Debug)]
 pub struct JacobianStructure {
     pattern: StructuralPattern,
     coloring: ColumnColoring,
+    output_evaluations: Box<[ProjectionJacobianOutputs]>,
+    residual_output_evaluation: Option<ProjectionOutputSelection>,
+    jacobian_application: Option<ProjectionJacobianApplication>,
+    affine_elimination: Option<AffineEliminationLayout>,
+    linearization_repeatable: bool,
+    /// The pattern's rows per column, formed once for every colored
+    /// Jacobian evaluation that reads them.
+    column_rows: Vec<Vec<usize>>,
 }
 
 impl JacobianStructure {
     pub fn derived(pattern: StructuralPattern) -> Self {
         let coloring = pattern.column_coloring();
-        Self { pattern, coloring }
+        let column_rows = pattern.column_rows();
+        Self {
+            pattern,
+            coloring,
+            column_rows,
+            output_evaluations: Box::default(),
+            residual_output_evaluation: None,
+            jacobian_application: None,
+            affine_elimination: None,
+            linearization_repeatable: false,
+        }
     }
 
     pub const fn pattern(&self) -> &StructuralPattern {
@@ -116,16 +493,45 @@ impl JacobianStructure {
     pub const fn coloring(&self) -> &ColumnColoring {
         &self.coloring
     }
+
+    /// [`StructuralPattern::column_rows`] of this structure's pattern.
+    pub fn column_rows(&self) -> &[Vec<usize>] {
+        &self.column_rows
+    }
+
+    pub fn output_evaluation(&self, color: usize) -> Option<&ProjectionJacobianOutputs> {
+        self.output_evaluations.get(color)
+    }
+
+    pub const fn residual_output_evaluation(&self) -> Option<&ProjectionOutputSelection> {
+        self.residual_output_evaluation.as_ref()
+    }
+
+    pub const fn affine_elimination(&self) -> Option<&AffineEliminationLayout> {
+        self.affine_elimination.as_ref()
+    }
+
+    pub const fn linearization_is_repeatable(&self) -> bool {
+        self.linearization_repeatable
+    }
+
+    pub const fn jacobian_application(&self) -> Option<&ProjectionJacobianApplication> {
+        self.jacobian_application.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ContinuousStructuralArtifacts {
+    algebraic_jacobian_source: Option<ScalarProgramBlock>,
     implicit: Option<JacobianStructure>,
     algebraic_projection: Box<[JacobianStructure]>,
     algebraic_invalidates_earlier: Box<[bool]>,
     manifold: Option<JacobianStructure>,
     manifold_projection: Box<[JacobianStructure]>,
     derivative: Option<JacobianStructure>,
+    /// The state Jacobian `d(der)/d(states)`, derived from `derivative`
+    /// through the algebraic projection ([`StructuralPattern::derive_state_jacobian`]).
+    state_jacobian: Option<StructuralPattern>,
 }
 
 impl ContinuousStructuralArtifacts {
@@ -138,6 +544,7 @@ impl ContinuousStructuralArtifacts {
         derivative: Option<StructuralPattern>,
     ) -> Self {
         Self {
+            algebraic_jacobian_source: None,
             implicit: implicit.map(JacobianStructure::derived),
             algebraic_projection: algebraic_projection
                 .into_iter()
@@ -150,11 +557,44 @@ impl ContinuousStructuralArtifacts {
                 .map(JacobianStructure::derived)
                 .collect(),
             derivative: derivative.map(JacobianStructure::derived),
+            state_jacobian: None,
         }
+    }
+
+    /// Derive the state Jacobian's relation from the derivative relation and
+    /// the implicit relation through `plan`. A system without states has an
+    /// empty one.
+    pub fn with_state_jacobian(
+        mut self,
+        plan: &AlgebraicProjectionPlan,
+        state_count: usize,
+        solver_count: usize,
+    ) -> Result<Self, crate::StructuralPatternError> {
+        self.state_jacobian = match &self.derivative {
+            Some(derivative) => Some(StructuralPattern::derive_state_jacobian(
+                derivative.pattern(),
+                self.implicit.as_ref().map(JacobianStructure::pattern),
+                plan,
+                state_count,
+                solver_count,
+            )?),
+            None => None,
+        };
+        Ok(self)
+    }
+
+    /// The state Jacobian's certified relation, one row per state derivative
+    /// and one column per state.
+    pub const fn state_jacobian(&self) -> Option<&StructuralPattern> {
+        self.state_jacobian.as_ref()
     }
 
     pub const fn implicit(&self) -> Option<&JacobianStructure> {
         self.implicit.as_ref()
+    }
+
+    pub const fn algebraic_jacobian_source(&self) -> Option<&ScalarProgramBlock> {
+        self.algebraic_jacobian_source.as_ref()
     }
 
     pub fn algebraic_projection(&self) -> &[JacobianStructure] {
@@ -257,25 +697,11 @@ pub struct InitializationSolveArtifacts {
     /// Constructor-derived metadata; canonical Solve replay reconstructs it.
     pub structural: InitializationStructuralArtifacts,
     pub residual_jacobian_v: ComputeBlock,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct InitializationSolveSystem {
-    pub residual: ComputeBlock,
-    pub row_targets: Vec<Option<ScalarSlot>>,
-    /// What the initialization projection does with each residual row, indexed by
-    /// equation index alongside `row_targets`.
-    ///
-    /// A runtime that only knows "this row has no target" cannot tell a row the
-    /// rest of the system already determined — a legal MLS §8.6 consistency check
-    /// — from a row nothing solved because it reads a coordinate outside the
-    /// planned unknown space. Reporting the first when it is the second names the
-    /// wrong defect, so the planner records which it is.
-    pub row_roles: Vec<InitializationRowRole>,
-    pub projection_unknowns: Vec<ScalarSlot>,
-    pub projection_plan: InitializationProjectionPlan,
-    pub update_rhs: ScalarProgramBlock,
-    pub update_targets: Vec<ScalarSlot>,
+    /// Forward-mode JVP of the initialization update rows over
+    /// `[solver-y | parameter]` seeds, row-aligned with `update_rhs`. It carries
+    /// a seed through the bindings of the settled initialization view; `None`
+    /// when a row has no derivative lowering.
+    pub update_jacobian_v: Option<ScalarProgramBlock>,
 }
 
 /// What the MLS §8.6 initialization projection does with one residual row.
@@ -365,6 +791,19 @@ pub struct EventIterationRun {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct EventIterationPlan {
     pub runs: Vec<EventIterationRun>,
+    /// How every executor walks the iteration (SPEC_0044 ME-EVENT-006).
+    #[serde(default)]
+    pub schedule: EventIterationSchedule,
+}
+
+impl EventIterationPlan {
+    /// A plan over `runs` walked by the standard schedule.
+    pub fn new(runs: Vec<EventIterationRun>) -> Self {
+        Self {
+            runs,
+            schedule: EventIterationSchedule::standard(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -476,253 +915,6 @@ pub enum ClockPartitionStep {
     /// Refresh one [`DiscreteSolveSystem::clock_partition_intermediates`] row
     /// into private work state (never committed by the discrete pass).
     Intermediate { row: usize },
-}
-
-/// One compact mutable-storage destination for a guarded assignment result.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-pub struct GuardedAssignmentTargetRange {
-    base: ScalarSlot,
-    count: usize,
-}
-
-impl GuardedAssignmentTargetRange {
-    pub const fn base(self) -> ScalarSlot {
-        self.base
-    }
-
-    pub const fn count(self) -> usize {
-        self.count
-    }
-}
-
-/// One checked correlated guarded update.
-///
-/// `program` produces the concatenation of `target_ranges` in source order.
-/// The compact ranges, rather than a per-coordinate target vector, are the
-/// authoritative simultaneous-assignment relation.
-#[derive(Clone, Debug, Serialize)]
-pub struct GuardedAssignmentProgram {
-    program: Arc<[LinearOp]>,
-    span: Span,
-    target_ranges: Box<[GuardedAssignmentTargetRange]>,
-    #[serde(skip)]
-    output_count: usize,
-    #[serde(skip)]
-    register_count: usize,
-    role: DiscreteRowRole,
-    pre_mode: DiscreteEventPreMode,
-    observation_refresh: bool,
-    integrator_history_effect: IntegratorHistoryEffect,
-    clock_owner: Option<PeriodicClockId>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GuardedAssignmentProgramWire {
-    program: Vec<LinearOp>,
-    span: Span,
-    target_ranges: Box<[GuardedAssignmentTargetRangeWire]>,
-    role: DiscreteRowRole,
-    pre_mode: DiscreteEventPreMode,
-    observation_refresh: bool,
-    integrator_history_effect: IntegratorHistoryEffect,
-    clock_owner: Option<PeriodicClockId>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GuardedAssignmentTargetRangeWire {
-    base: ScalarSlot,
-    count: usize,
-}
-
-impl<'de> Deserialize<'de> for GuardedAssignmentProgram {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = GuardedAssignmentProgramWire::deserialize(deserializer)?;
-        let provenance = wire
-            .span
-            .require_provenance("GuardedAssignmentProgram")
-            .map_err(serde::de::Error::custom)?;
-        Self::checked(
-            wire.program,
-            provenance,
-            wire.target_ranges
-                .iter()
-                .map(|range| (range.base, range.count)),
-            wire.role,
-            wire.pre_mode,
-            wire.observation_refresh,
-            wire.integrator_history_effect,
-            wire.clock_owner,
-        )
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-impl GuardedAssignmentProgram {
-    // SPEC_0021: Exception - validated boundary keeps proof-relevant inputs explicit.
-    #[allow(clippy::too_many_arguments)]
-    pub fn checked(
-        program: Vec<LinearOp>,
-        provenance: ProvenanceSpan,
-        target_ranges: impl IntoIterator<Item = (ScalarSlot, usize)>,
-        role: DiscreteRowRole,
-        pre_mode: DiscreteEventPreMode,
-        observation_refresh: bool,
-        integrator_history_effect: IntegratorHistoryEffect,
-        clock_owner: Option<PeriodicClockId>,
-    ) -> Result<Self, SolveProblemShapeContractError> {
-        let span = provenance.span();
-        let target_ranges = target_ranges
-            .into_iter()
-            .map(|(base, count)| GuardedAssignmentTargetRange { base, count })
-            .collect::<Box<[_]>>();
-        validate_guarded_assignment_targets(&target_ranges, span)?;
-        let expected_outputs = target_ranges.iter().try_fold(0usize, |total, range| {
-            total.checked_add(range.count).ok_or(
-                SolveProblemShapeContractError::GuardedAssignmentProgram {
-                    program_index: 0,
-                    detail: "target result width overflows",
-                    span: Some(span),
-                },
-            )
-        })?;
-        let actual_outputs = ScalarProgramBlock::program_output_count(&program);
-        if actual_outputs != expected_outputs {
-            return Err(SolveProblemShapeContractError::GuardedAssignmentProgram {
-                program_index: 0,
-                detail: "program output width does not equal its compact target ranges",
-                span: Some(span),
-            });
-        }
-        crate::validate_function_conditional_owners(
-            "GuardedAssignmentProgram",
-            0,
-            std::slice::from_ref(&program),
-            &[span],
-        )?;
-        let register_count = crate::derive_scalar_program_register_counts(
-            "GuardedAssignmentProgram",
-            0,
-            std::slice::from_ref(&program),
-            &[span],
-        )?[0];
-        Ok(Self {
-            program: program.into(),
-            span,
-            target_ranges,
-            output_count: expected_outputs,
-            register_count,
-            role,
-            pre_mode,
-            observation_refresh,
-            integrator_history_effect,
-            clock_owner,
-        })
-    }
-
-    pub fn program(&self) -> &[LinearOp] {
-        &self.program
-    }
-
-    pub fn shared_program(&self) -> Arc<[LinearOp]> {
-        Arc::clone(&self.program)
-    }
-
-    pub const fn span(&self) -> Span {
-        self.span
-    }
-
-    pub fn target_ranges(&self) -> &[GuardedAssignmentTargetRange] {
-        &self.target_ranges
-    }
-
-    pub const fn role(&self) -> DiscreteRowRole {
-        self.role
-    }
-
-    pub const fn pre_mode(&self) -> DiscreteEventPreMode {
-        self.pre_mode
-    }
-
-    pub const fn observation_refresh(&self) -> bool {
-        self.observation_refresh
-    }
-
-    pub const fn integrator_history_effect(&self) -> IntegratorHistoryEffect {
-        self.integrator_history_effect
-    }
-
-    pub const fn clock_owner(&self) -> Option<PeriodicClockId> {
-        self.clock_owner
-    }
-
-    pub const fn output_count(&self) -> usize {
-        self.output_count
-    }
-
-    /// Exact register capacity proved with this compact owner.
-    pub const fn register_count(&self) -> usize {
-        self.register_count
-    }
-}
-
-fn validate_guarded_assignment_targets(
-    target_ranges: &[GuardedAssignmentTargetRange],
-    span: Span,
-) -> Result<(), SolveProblemShapeContractError> {
-    if target_ranges.is_empty() {
-        return Err(SolveProblemShapeContractError::GuardedAssignmentProgram {
-            program_index: 0,
-            detail: "target-range catalog is empty",
-            span: Some(span),
-        });
-    }
-    let mut covered = Vec::<(u8, usize, usize)>::new();
-    for range in target_ranges {
-        if range.count == 0 {
-            return Err(SolveProblemShapeContractError::GuardedAssignmentProgram {
-                program_index: 0,
-                detail: "target range is empty",
-                span: Some(span),
-            });
-        }
-        let (storage, start) = match range.base {
-            ScalarSlot::Y { index, .. } => (0_u8, index),
-            ScalarSlot::P { index, .. } => (1_u8, index),
-            ScalarSlot::Time | ScalarSlot::Constant(_) => {
-                return Err(SolveProblemShapeContractError::GuardedAssignmentProgram {
-                    program_index: 0,
-                    detail: "target range is not mutable Y/P storage or overflows",
-                    span: Some(span),
-                });
-            }
-        };
-        let end = start.checked_add(range.count).ok_or(
-            SolveProblemShapeContractError::GuardedAssignmentProgram {
-                program_index: 0,
-                detail: "target range is not mutable Y/P storage or overflows",
-                span: Some(span),
-            },
-        )?;
-        if covered
-            .iter()
-            .any(|&(other_storage, other_start, other_end)| {
-                storage == other_storage && start < other_end && other_start < end
-            })
-        {
-            return Err(SolveProblemShapeContractError::GuardedAssignmentProgram {
-                program_index: 0,
-                detail: "target ranges overlap",
-                span: Some(span),
-            });
-        }
-        covered.push((storage, start, end));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -951,10 +1143,12 @@ pub enum SolveStringConversionFormat {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum SolveEventActionKind {
+    /// An error-level assertion: a true action condition aborts the run.
     Assert,
     Terminate,
-    /// `assert(..., level = AssertionLevel.warning)`: a violation is reported
-    /// and the simulation continues (MLS §8.3.7).
+    /// A warning-level assertion (MLS §8.3.7): a true action condition is
+    /// reported and never aborts the run, creates an event, or influences
+    /// step control. It owns no root program.
     Warning,
 }
 

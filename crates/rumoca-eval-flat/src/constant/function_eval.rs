@@ -22,7 +22,7 @@ use rumoca_core::ExpressionVisitor;
 
 use super::errors::EvalError;
 use super::value::Value;
-use super::{EvalContext, EvalIndexMap};
+use super::{EvalEnvironment, EvalIndexMap};
 
 /// Execution limits for function evaluation.
 #[derive(Debug, Clone)]
@@ -45,7 +45,7 @@ impl Default for EvalLimits {
 /// Evaluation state bundling common parameters to reduce argument count.
 #[derive(Clone, Copy)]
 pub struct EvalState<'a> {
-    pub ctx: &'a EvalContext,
+    pub ctx: &'a dyn EvalEnvironment,
     pub limits: &'a EvalLimits,
     pub depth: usize,
     pub span: Span,
@@ -642,7 +642,7 @@ fn create_array_value(default: &Value, dims: &[i64]) -> Value {
 pub fn eval_function(
     func: &Function,
     args: Vec<Value>,
-    ctx: &EvalContext,
+    ctx: &dyn EvalEnvironment,
     limits: &EvalLimits,
     depth: usize,
     span: Span,
@@ -651,11 +651,90 @@ pub fn eval_function(
     eval_function_with_call_args(func, args, ctx, limits, depth, span)
 }
 
+/// The declared rank of the formal input an argument binds, if it names one.
+fn bound_input_rank(func: &Function, position: usize, arg: &FunctionCallArg) -> Option<usize> {
+    let input = match &arg.name {
+        Some(name) => func.inputs.iter().find(|input| &input.name == name)?,
+        None => func.inputs.get(position)?,
+    };
+    Some(input.dimensions().len().max(input.shape_expr.len()))
+}
+
+fn value_rank(value: &Value) -> usize {
+    match value {
+        Value::Array(elements) => 1 + elements.first().map_or(0, value_rank),
+        _ => 0,
+    }
+}
+
+/// MLS 3.7 §12.4.6: a function with one output called with arguments of
+/// higher rank than their formal inputs applies element-wise over the extra
+/// leading dimension. Returns that extent, which every such argument must
+/// share, or `None` for an ordinary call.
+fn vectorized_extent(
+    func: &Function,
+    args: &[FunctionCallArg],
+    span: Span,
+) -> Result<Option<usize>, EvalError> {
+    let mut extent = None;
+    for (position, arg) in args.iter().enumerate() {
+        let Some(rank) = bound_input_rank(func, position, arg) else {
+            continue;
+        };
+        if value_rank(&arg.value) <= rank {
+            continue;
+        }
+        let Value::Array(elements) = &arg.value else {
+            unreachable!("a value of positive rank is an array")
+        };
+        if extent.is_some_and(|extent| extent != elements.len()) {
+            return Err(EvalError::function_error(
+                format!(
+                    "vectorized call of {} has arguments of different sizes",
+                    func.name
+                ),
+                span,
+            ));
+        }
+        extent = Some(elements.len());
+    }
+    if extent.is_some() && func.outputs.len() != 1 {
+        return Err(EvalError::function_error(
+            format!(
+                "{} has {} outputs and cannot be applied element-wise",
+                func.name,
+                func.outputs.len()
+            ),
+            span,
+        ));
+    }
+    Ok(extent)
+}
+
+/// The argument of element `element` of a vectorized call: the element of an
+/// argument of higher rank than its formal, every other argument unchanged.
+fn element_call_arg(
+    func: &Function,
+    position: usize,
+    arg: &FunctionCallArg,
+    element: usize,
+) -> FunctionCallArg {
+    let vectorized =
+        bound_input_rank(func, position, arg).is_some_and(|rank| value_rank(&arg.value) > rank);
+    match &arg.value {
+        Value::Array(elements) if vectorized => FunctionCallArg {
+            name: arg.name.clone(),
+            value: elements[element].clone(),
+        },
+        _ => arg.clone(),
+    }
+}
+
 /// Evaluate a user-defined function with already evaluated positional/named arguments.
 pub fn eval_function_with_call_args(
     func: &Function,
     args: Vec<FunctionCallArg>,
-    ctx: &EvalContext,
+    ctx: &dyn EvalEnvironment,
     limits: &EvalLimits,
     depth: usize,
     span: Span,
@@ -685,6 +764,19 @@ pub fn eval_function_with_call_args(
         ));
     }
 
+    if let Some(extent) = vectorized_extent(func, &args, span)? {
+        return (0..extent)
+            .map(|element| {
+                let args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(position, arg)| element_call_arg(func, position, arg, element))
+                    .collect();
+                eval_function_with_call_args(func, args, ctx, limits, depth, span)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array);
+    }
     let eval = EvalState {
         ctx,
         limits,
@@ -1118,7 +1210,10 @@ fn eval_expr_in_function(
                 .collect::<Result<_, _>>()?;
             super::eval_builtin(function.name(), &arg_values, eval.span)
         }
-        Expression::Array { elements, .. } => eval_array_expr(elements, env, eval),
+        Expression::Array { elements, kind, .. } => {
+            let values = eval_array_values(elements, env, eval)?;
+            super::array_construction::construct(values, *kind, eval.span)
+        }
         Expression::Range {
             start, step, end, ..
         } => eval_range_expr_inline(start, step, end, env, eval),
@@ -1136,7 +1231,9 @@ fn eval_expr_in_function(
             filter,
             ..
         } => eval_array_comprehension(expr, indices, filter, env, eval),
-        Expression::Tuple { elements, .. } => eval_array_expr(elements, env, eval),
+        Expression::Tuple { elements, .. } => {
+            eval_array_values(elements, env, eval).map(Value::Array)
+        }
         Expression::FieldAccess {
             base,
             field,
@@ -1170,7 +1267,7 @@ fn eval_expr_in_function(
 pub(super) fn is_exact_single_record_output(
     base: &Expression,
     field: rumoca_core::DefId,
-    ctx: &EvalContext,
+    ctx: &dyn EvalEnvironment,
 ) -> bool {
     let Expression::FunctionCall { name, .. } = base else {
         return false;
@@ -1178,7 +1275,7 @@ pub(super) fn is_exact_single_record_output(
     let Some(target) = name.target_def_id() else {
         return false;
     };
-    let Some(function) = ctx.functions.get(name.as_str()) else {
+    let Some(function) = ctx.get_function(name.as_str()) else {
         return false;
     };
     function.def_id == Some(target)
@@ -1208,25 +1305,22 @@ fn eval_var_ref(
     if let Some(val) = env.get(name) {
         return apply_subscripts_flat(val.clone(), subscripts, env, eval);
     }
-    if let Some(val) = eval.ctx.get(name) {
-        return Ok(val.clone());
+    if let Some(val) = eval.ctx.get_value(name) {
+        return Ok(val.into_owned());
     }
     if let Some((type_name, literal)) = eval.ctx.get_enum(name) {
         return Ok(Value::Enum(type_name.clone(), literal.clone()));
     }
     // MLS 3.6 §12.2: a record component's fields are read through the joined
     // reference Flat renders, so `z.im` names the field `im` of the bound local
-    // `z`. Resolving it here is also what keeps the enumeration fallback below
-    // honest — a reference whose head segment is a component in scope is never
-    // an enumeration literal, and guessing one folded `z.im` to the enumeration
-    // value `z.im` instead of the record field.
+    // `z`.
     if let Some(value) = read_bound_field_path(reference, env, eval)? {
         return apply_subscripts_flat(value, subscripts, env, eval);
     }
-    // Try parsing as qualified enum.
-    if let Some((type_name, literal)) = reference.scope_split() {
-        return Ok(Value::Enum(type_name.to_string(), literal.to_string()));
-    }
+    // An enumeration literal is a registered value (`get_enum` above). A
+    // qualified name that names no value is unknown: reading it as an
+    // enumeration literal turned an unevaluated package constant
+    // (`Medium.poly_rho`) into the enumeration value `Medium.poly_rho`.
     Err(EvalError::unknown_variable(name, eval.span))
 }
 
@@ -1241,7 +1335,7 @@ fn eval_var_ref(
 /// reference is settled here, and a segment this evaluator cannot follow —
 /// a subscripted field, or a value it holds as something other than a record —
 /// is reported as a form it has no rule for. That refusal leaves the value for
-/// the runtime; it never lets the enumeration fallback below invent one.
+/// the runtime instead of inventing a value.
 fn read_bound_field_path(
     reference: &rumoca_core::Reference,
     env: &FunctionEnv,
@@ -1314,16 +1408,15 @@ fn eval_fn_call_expr(
 }
 
 /// Evaluate an array expression.
-fn eval_array_expr(
+fn eval_array_values(
     elements: &[Expression],
     env: &FunctionEnv,
     eval: &EvalState<'_>,
-) -> Result<Value, EvalError> {
-    let values: Vec<Value> = elements
+) -> Result<Vec<Value>, EvalError> {
+    elements
         .iter()
         .map(|e| eval_expr_in_function(e, env, eval))
-        .collect::<Result<_, _>>()?;
-    Ok(Value::Array(values))
+        .collect()
 }
 
 /// Evaluate a range expression inline.
@@ -1460,7 +1553,7 @@ fn call_function(name: &str, args: Vec<Value>, eval: &EvalState<'_>) -> Result<V
     if super::is_builtin(name) {
         return super::eval_builtin(name, &args, eval.span);
     }
-    if let Some(func) = eval.ctx.functions.get(name) {
+    if let Some(func) = eval.ctx.get_function(name) {
         // Impure/external refusal lives in eval_function_with_call_args, the
         // one entrance every call path shares.
         return eval_function(func, args, eval.ctx, eval.limits, eval.depth + 1, eval.span);
@@ -1859,16 +1952,19 @@ fn set_array_element(
     Ok(Value::Array(vec))
 }
 
-/// Apply AST subscripts to a value.
+/// Apply Flat subscripts using the function's local evaluation environment.
 fn apply_subscripts_flat(
     value: Value,
     subs: &[Subscript],
     env: &FunctionEnv,
     eval: &EvalState<'_>,
 ) -> Result<Value, EvalError> {
-    super::indexing::apply_subscripts(&value, subs, eval.span, &mut |expr| {
-        eval_expr_in_function(expr, env, eval)
-    })
+    super::subscripts::apply_subscripts(
+        value,
+        subs,
+        |expr| eval_expr_in_function(expr, env, eval),
+        eval.span,
+    )
 }
 
 #[cfg(test)]

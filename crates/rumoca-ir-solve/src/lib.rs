@@ -6,21 +6,29 @@
 
 // SPEC_0021 file-size exception - split plan: extract the Solve program validation and invariant checks into ir-solve/src/program_checks.rs, leaving this file as the module facade and re-exports; tracked as RDD2/GALEC cleanup debt (SPEC_0021 follow-up).
 
+mod affinity;
 mod certificate;
 #[cfg(test)]
 mod certificate_tests;
+mod chart_delta;
 #[cfg(test)]
 mod compute_block_tests;
+mod continuous_wire;
 pub mod execution;
 mod feature_query;
 pub mod fmi;
+mod initialization;
 mod layout;
 mod linear_op;
 mod model;
+mod parameter_reads;
 mod refresh;
+mod root_search;
+mod scalar_program_outputs;
 #[cfg(test)]
 mod scalar_program_tests;
 mod shape_error;
+mod tangent_lanes;
 mod typed_program;
 mod variable_bounds;
 pub mod visitor;
@@ -32,11 +40,13 @@ use rumoca_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 pub use certificate::{
     derive_root_reachable_runtime_rows, derive_root_relation_refresh_roles,
     derive_runtime_assignment_roles,
 };
+pub use chart_delta::{ChartDeltaError, ChartPlanDelta};
 pub use feature_query::{
     SolveEventClass, solve_event_class, solve_has_clocks, solve_has_events,
     solve_has_initialization, solve_has_runtime_events,
@@ -47,23 +57,36 @@ pub use layout::{
     VarLayout, VarLayoutShapeContractError, scalar_slot_p, scalar_slot_y,
 };
 pub use linear_op::{
-    BinaryOp, CompareOp, FoldInitialSource, FoldTensorNode, FoldTensorUpdate,
-    FoldTensorUpdateStore, FunctionConditionalArmProgram, FunctionConditionalOwnerId,
-    FunctionConditionalProgram, FunctionFoldProgram, LinearOp, MatrixProductShape, RandomGenerator,
-    Reg, ScalarProgramRegisterError, ScalarProgramRegisterFlow, StridedOperand,
-    TargetAssignmentShape, TensorConcatenateSource, TensorIndex, TensorInputKind, TensorSubscript,
-    TensorUpdateSubscript, UnaryOp, resolve_indexed_slot,
+    AssignmentProgram, CappedValue, SHARED_VALUE_REGISTER_CAP, SharedValueError,
+    SharedValueSegment, SharedValueSegments, share_program_values, shared_value_proof_failures,
+};
+pub use linear_op::{
+    BinaryOp, BlockResidualSplit, BlockResidualSplitError, CompareOp, FoldInitialSource,
+    FoldTensorNode, FoldTensorUpdate, FoldTensorUpdateStore, FunctionConditionalArmProgram,
+    FunctionConditionalOwnerId, FunctionConditionalProgram, FunctionFoldProgram, LinearOp,
+    MAX_TENSOR_LANES, MatrixProductShape, RandomGenerator, Reg, ScalarProgramRegisterError,
+    ScalarProgramRegisterFlow, StridedOperand, TargetAssignmentShape, TensorConcatenateSource,
+    TensorIndex, TensorInputKind, TensorSubscript, TensorUpdateSubscript, UnaryOp,
+    prune_dead_constants, resolve_indexed_slot,
 };
 pub use model::*;
+pub use parameter_reads::read_parameter_slots;
 pub use refresh::*;
+pub use root_search::{RootSearchPlan, RootSearchRole, TimeRootSign, root_neighborhoods};
 pub use shape_error::{AffineTensorNodeKind, SolveProblemShapeContractError};
+pub use tangent_lanes::{
+    ColoredLaneCall, ColoredTangentPlan, TangentLaneError, TangentLaneProgram, TangentRowSource,
+    TornTangentPlan, TornTangentResidual, TornTangentStep, tensor_lanes,
+};
 pub use typed_program::*;
 pub use visitor::{
     LinearOpSliceKind, SolveVisitor, walk_compute_block, walk_compute_node,
     walk_scalar_program_block, walk_solve_artifacts, walk_solve_model, walk_solve_problem,
 };
 
-pub const SOLVE_SCHEMA_VERSION: u16 = 61;
+pub use initialization::{InitializationSolveSystem, InitializationSystemInput};
+
+pub const SOLVE_SCHEMA_VERSION: u16 = 71;
 
 pub fn source_span_from_offsets(source: u64, start: usize, end: usize) -> Span {
     Span::from_offsets(SourceId(source), start, end)
@@ -104,6 +127,11 @@ impl ExternalTables {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct ScalarProgramBlock {
+    data: Arc<ScalarProgramData>,
+}
+
+#[derive(Debug, Default)]
+struct ScalarProgramData {
     programs: Vec<Vec<LinearOp>>,
     program_spans: Vec<Span>,
     output_indices: Vec<usize>,
@@ -135,9 +163,9 @@ impl Serialize for ScalarProgramBlock {
         S: serde::Serializer,
     {
         ScalarProgramBlockWireRef {
-            programs: &self.programs,
-            program_spans: &self.program_spans,
-            output_indices: &self.output_indices,
+            programs: &self.data.programs,
+            program_spans: &self.data.program_spans,
+            output_indices: &self.data.output_indices,
         }
         .serialize(serializer)
     }
@@ -155,6 +183,11 @@ impl<'de> Deserialize<'de> for ScalarProgramBlock {
 }
 
 impl ScalarProgramBlock {
+    /// Whether both handles retain the same complete immutable program owner.
+    pub fn shares_program_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
+    }
+
     /// Constructs programs whose stored outputs use dense local indices.
     ///
     /// Provenance is mandatory at the API boundary:
@@ -173,6 +206,57 @@ impl ScalarProgramBlock {
     ) -> Result<Self, SolveProblemShapeContractError> {
         let output_indices = (0..stored_output_count(&programs)).collect();
         Self::with_output_indices(programs, program_spans, output_indices)
+    }
+
+    /// A block of checked tangent-lane programs, each storing its lane-major
+    /// outputs at local positions. Only these blocks carry tensor aggregates
+    /// wider than two lanes; a backend without that width refuses them.
+    pub fn with_tangent_lane_programs(
+        programs: &[TangentLaneProgram],
+        program_spans: Vec<Span>,
+    ) -> Result<Self, SolveProblemShapeContractError> {
+        let operations = programs
+            .iter()
+            .map(|program| program.ops().to_vec())
+            .collect::<Vec<_>>();
+        let output_indices = operations
+            .iter()
+            .flat_map(|program| 0..Self::program_output_count(program))
+            .collect::<Vec<_>>();
+        validate_scalar_program_metadata_lengths(
+            "ScalarProgramBlock",
+            0,
+            operations.len(),
+            program_spans.len(),
+            output_indices.len(),
+            output_indices.len(),
+            first_span(&program_spans),
+        )?;
+        validate_scalar_program_provenance("ScalarProgramBlock", 0, &program_spans)?;
+        validate_scalar_program_outputs("ScalarProgramBlock", 0, &operations, &program_spans)?;
+        let register_counts = programs
+            .iter()
+            .map(TangentLaneProgram::register_count)
+            .collect();
+        Ok(Self::from_valid_parts(
+            operations,
+            program_spans,
+            output_indices,
+            register_counts,
+        ))
+    }
+
+    /// Largest interleaved lane count of any tensor aggregate in the block:
+    /// 2 for every block but a tangent-lane block. A backend compares it with
+    /// the width it supports.
+    #[must_use]
+    pub fn max_tensor_lanes(&self) -> usize {
+        self.programs()
+            .iter()
+            .flatten()
+            .filter_map(tangent_lanes::tensor_lanes)
+            .max()
+            .unwrap_or(1)
     }
 
     pub fn with_output_indices(
@@ -213,10 +297,12 @@ impl ScalarProgramBlock {
         program_register_counts: Box<[usize]>,
     ) -> Self {
         Self {
-            programs,
-            program_spans,
-            output_indices,
-            program_register_counts,
+            data: Arc::new(ScalarProgramData {
+                programs,
+                program_spans,
+                output_indices,
+                program_register_counts,
+            }),
         }
     }
 
@@ -248,32 +334,32 @@ impl ScalarProgramBlock {
     }
 
     pub fn program_span(&self, row: usize) -> Option<Span> {
-        self.program_spans.get(row).copied()
+        self.data.program_spans.get(row).copied()
     }
 
     pub fn programs(&self) -> &[Vec<LinearOp>] {
-        &self.programs
+        &self.data.programs
     }
 
     pub fn program(&self, index: usize) -> Option<&[LinearOp]> {
-        self.programs.get(index).map(Vec::as_slice)
+        self.data.programs.get(index).map(Vec::as_slice)
     }
 
     pub fn program_spans(&self) -> &[Span] {
-        &self.program_spans
+        &self.data.program_spans
     }
 
     /// Exact register capacity proved when this program entered the block.
     pub fn program_register_count(&self, index: usize) -> Option<usize> {
-        self.program_register_counts.get(index).copied()
+        self.data.program_register_counts.get(index).copied()
     }
 
     pub fn output_indices(&self) -> &[usize] {
-        &self.output_indices
+        &self.data.output_indices
     }
 
     pub fn first_source_span(&self) -> Option<Span> {
-        self.program_spans.first().copied()
+        self.data.program_spans.first().copied()
     }
 
     /// Number of `StoreOutput` ops in a single program.
@@ -294,14 +380,16 @@ impl ScalarProgramBlock {
 
     /// Total number of `StoreOutput` ops produced by this block.
     pub fn stored_output_count(&self) -> usize {
-        self.programs
+        self.data
+            .programs
             .iter()
             .map(|program| Self::program_output_count(program))
             .sum()
     }
 
     pub fn uses_linear_solve_component(&self) -> bool {
-        self.programs
+        self.data
+            .programs
             .iter()
             .any(|program| linear_ops_use_linear_solve_component(program))
     }
@@ -312,10 +400,11 @@ impl ScalarProgramBlock {
     /// its stored-output ordinal and then finds the owning program.
     pub fn program_index_for_output(&self, output: usize) -> Option<usize> {
         let mut remaining = self
+            .data
             .output_indices
             .iter()
             .position(|output_index| *output_index == output)?;
-        for (idx, program) in self.programs.iter().enumerate() {
+        for (idx, program) in self.data.programs.iter().enumerate() {
             let count = Self::program_output_count(program);
             if remaining < count {
                 return Some(idx);
@@ -339,11 +428,12 @@ impl ScalarProgramBlock {
     }
 
     pub fn row_count(&self) -> usize {
-        self.programs.len()
+        self.data.programs.len()
     }
 
     pub fn output_count(&self) -> usize {
-        self.output_indices
+        self.data
+            .output_indices
             .iter()
             .copied()
             .max()
@@ -351,7 +441,8 @@ impl ScalarProgramBlock {
     }
 
     pub fn uses_local_contiguous_output_indices(&self) -> bool {
-        self.output_indices
+        self.data
+            .output_indices
             .iter()
             .copied()
             .eq(0..self.stored_output_count())
@@ -371,7 +462,7 @@ impl ScalarProgramBlock {
                 })?;
             Ok((output_cursor..end).collect())
         } else {
-            Ok(self.output_indices.clone())
+            Ok(self.data.output_indices.clone())
         }
     }
 
@@ -395,7 +486,7 @@ impl ScalarProgramBlock {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.programs.is_empty()
+        self.data.programs.is_empty()
     }
 
     fn first_program_span(&self) -> Option<Span> {
@@ -710,6 +801,57 @@ impl<'de> Deserialize<'de> for SolveProblem {
     }
 }
 
+/// The solver coordinates of a derivative-only problem: one per state, named
+/// by the scalar binding of its `Y` slot.
+fn state_solver_maps(
+    layout: &VarLayout,
+    state_count: usize,
+) -> Result<SolverNameIndexMaps, SolveProblemShapeContractError> {
+    let storage_error =
+        |detail: String| SolveProblemShapeContractError::DerivativeStateStorage { detail };
+    if layout.y_scalars() != state_count {
+        return Err(storage_error(format!(
+            "{state_count} states need {state_count} Y scalars, the layout owns {}",
+            layout.y_scalars()
+        )));
+    }
+    let mut names: Vec<Option<String>> = vec![None; state_count];
+    for (name, slot) in layout.bindings() {
+        let ScalarSlot::Y { index, .. } = *slot else {
+            continue;
+        };
+        let Some(entry) = names.get_mut(index) else {
+            continue;
+        };
+        if layout.shape(name.as_str()).is_some() || entry.is_some() {
+            return Err(storage_error(format!(
+                "state slot Y[{index}] is not named by exactly one scalar binding"
+            )));
+        }
+        *entry = Some(name.as_str().to_string());
+    }
+    let names = names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            name.ok_or_else(|| storage_error(format!("state slot Y[{index}] has no name")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SolverNameIndexMaps {
+        name_to_idx: names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index))
+            .collect(),
+        base_to_indices: names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), vec![index]))
+            .collect(),
+        names,
+    })
+}
+
 impl SolveProblem {
     /// Build a continuous-only problem from one checked derivative program and
     /// the variable layout that program addresses.
@@ -720,14 +862,22 @@ impl SolveProblem {
     /// loads silently aliases derivative columns. The state extent is taken
     /// from the program's checked output count, and the finished problem is
     /// validated before it is returned.
+    ///
+    /// Every solver coordinate of such a problem is a state, so the layout's
+    /// `Y` storage must be exactly the states, each named by one scalar
+    /// binding; those names become the solver coordinates. A layout with more
+    /// or fewer `Y` scalars than states, or with an unnamed state slot, is
+    /// refused.
     pub fn with_derivative_rhs(
         derivative_rhs: ComputeBlock,
         layout: VarLayout,
     ) -> Result<Self, SolveProblemShapeContractError> {
         let state_scalar_count = derivative_rhs.output_count("continuous.derivative_rhs")?;
+        let solver_maps = state_solver_maps(&layout, state_scalar_count)?;
         let problem = Self {
             layout,
             solve_layout: SolveLayout {
+                solver_maps,
                 state_scalar_count,
                 ..SolveLayout::default()
             },
@@ -1875,6 +2025,11 @@ fn validate_continuous_system_shape(
     system
         .refresh_owners
         .validate_against(&system.implicit_rhs)
+        .and_then(|()| {
+            system
+                .refresh_owners
+                .validate_projection_ownership(&system.algebraic_projection_plan)
+        })
         .map_err(
             |error| SolveProblemShapeContractError::ContinuousRefreshOwner {
                 detail: error.to_string(),
@@ -2012,34 +2167,46 @@ fn validate_initialization_system_shape(
     problem: &SolveProblem,
 ) -> Result<(), SolveProblemShapeContractError> {
     let system = &problem.initialization;
+    validate_indices(
+        "initialization.given_state_indices",
+        system.given_state_indices(),
+        problem.solve_layout.state_scalar_count,
+    )?;
+
+    validate_count(
+        "initialization.manifold_row_count",
+        problem.continuous.manifold_residual.len()?,
+        system.manifold_row_count(),
+    )?;
+
     system
-        .residual
+        .residual()
         .validate_shape_contract("initialization.residual")?;
-    let residual_count = system.residual.len()?;
+    let residual_count = system.residual().len()?;
     validate_count(
         "initialization.row_targets",
         residual_count,
-        system.row_targets.len(),
+        system.row_targets().len(),
     )?;
     validate_count(
         "initialization.row_roles",
         residual_count,
-        system.row_roles.len(),
+        system.row_roles().len(),
     )?;
     validate_count(
         "initialization.update_targets",
-        system.update_rhs.len(),
-        system.update_targets.len(),
+        system.update_rhs().len(),
+        system.update_targets().len(),
     )?;
     validate_initial_projection_unknowns(
         "initialization.projection_unknowns",
-        &system.projection_unknowns,
+        system.projection_unknowns(),
         problem.solve_layout.solver_scalar_count(),
         problem.layout.p_scalars(),
     )?;
     validate_initial_projection_plan(
         "initialization.projection_plan",
-        &system.projection_plan,
+        system.projection_plan(),
         residual_count,
         problem.solve_layout.solver_scalar_count(),
         problem.layout.p_scalars(),
@@ -2681,6 +2848,7 @@ fn validate_initial_projection_plan(
     let mut unknowns_seen = BTreeSet::new();
     for block in &plan.blocks {
         validate_projection_block_shape(context, block.rows.len(), block.unknowns.len())?;
+        validate_initial_projection_scales(block)?;
         validate_indices(context, &block.rows, row_upper_bound)?;
         validate_initial_projection_unknowns(
             context,
@@ -2707,6 +2875,35 @@ fn validate_initial_projection_plan(
                 unknown: format!("{unknown:?}"),
                 span: None,
             });
+        }
+    }
+    Ok(())
+}
+
+/// Each unknown carries one scale of its own storage kind: a solver coordinate
+/// its solver scale, a parameter a finite positive `nominal` or its guess.
+fn validate_initial_projection_scales(
+    block: &InitializationProjectionBlock,
+) -> Result<(), SolveProblemShapeContractError> {
+    let invalid = |detail| SolveProblemShapeContractError::InitializationOwnership { detail };
+    if block.scales.len() != block.unknowns.len() {
+        return Err(invalid(
+            "initialization projection scales are not aligned with the block unknowns",
+        ));
+    }
+    for (unknown, scale) in block.unknowns.iter().zip(&block.scales) {
+        let consistent = match (unknown, scale) {
+            (ScalarSlot::Y { .. }, InitializationUnknownScale::Solver) => true,
+            (ScalarSlot::P { .. }, InitializationUnknownScale::GuessMagnitude) => true,
+            (ScalarSlot::P { .. }, InitializationUnknownScale::Nominal(nominal)) => {
+                nominal.is_finite() && *nominal > 0.0
+            }
+            _ => false,
+        };
+        if !consistent {
+            return Err(invalid(
+                "an initialization unknown's scale does not match its storage kind",
+            ));
         }
     }
     Ok(())
@@ -2748,10 +2945,16 @@ fn validate_unique_projection_indices(
     Ok(())
 }
 
-fn projection_unknown_key(slot: ScalarSlot) -> Option<(bool, usize)> {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProjectionUnknownKey {
+    Y(usize),
+    P(usize),
+}
+
+fn projection_unknown_key(slot: ScalarSlot) -> Option<ProjectionUnknownKey> {
     match slot {
-        ScalarSlot::Y { index, .. } => Some((false, index)),
-        ScalarSlot::P { index, .. } => Some((true, index)),
+        ScalarSlot::Y { index, .. } => Some(ProjectionUnknownKey::Y(index)),
+        ScalarSlot::P { index, .. } => Some(ProjectionUnknownKey::P(index)),
         ScalarSlot::Time | ScalarSlot::Constant(_) => None,
     }
 }
@@ -2764,11 +2967,10 @@ fn validate_initial_projection_unknowns(
 ) -> Result<(), SolveProblemShapeContractError> {
     let mut seen = BTreeSet::new();
     for unknown in unknowns {
-        let key = match *unknown {
-            ScalarSlot::Y { index, .. } if index < y_upper_bound => Some((false, index)),
-            ScalarSlot::P { index, .. } if index < p_upper_bound => Some((true, index)),
-            _ => None,
-        };
+        let key = projection_unknown_key(*unknown).filter(|key| match *key {
+            ProjectionUnknownKey::Y(index) => index < y_upper_bound,
+            ProjectionUnknownKey::P(index) => index < p_upper_bound,
+        });
         let Some(key) = key else {
             return Err(SolveProblemShapeContractError::InvalidProjectionUnknown {
                 context,

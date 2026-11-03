@@ -6,13 +6,18 @@ use crate::SimulationSession;
 use crate::{SimOptions, SimSolverMode, simulate_dae, simulate_dae_with_diagnostics};
 
 mod array_trajectories;
+mod block_residual_split;
 mod coincident_strict;
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod input_batches;
+mod jacobian_source_trajectories;
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod parameter_bindings;
+mod probe_jacobian;
+mod settled_initial_tangent;
 mod structure_report;
 mod summed_derivatives;
+mod tangent_jacobian;
 #[cfg(feature = "solver-rk45")]
 mod zero_state_batch;
 
@@ -160,6 +165,9 @@ fn checked_transcendental_builtins_execute_end_to_end() {
     );
 }
 
+/// `root^3 = x` at `x = 0` has a finite value but an infinite sensitivity
+/// `d(root)/dx = 1 / (3 root^2)`: its algebraic sensitivity matrix is singular
+/// (SPEC_0044 ME-AUTO-002).
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 #[test]
 fn auto_selects_explicit_host_for_undefined_initial_directional_derivative() {
@@ -167,10 +175,10 @@ fn auto_selects_explicit_host_for_undefined_initial_directional_derivative() {
         concat!(
             "model UndefinedInitialLinearization\n",
             "  Real x(start=0, fixed=true);\n",
-            "  output Real angle;\n",
+            "  output Real root;\n",
             "equation\n",
-            "  angle = atan2(x, x);\n",
-            "  der(x) = angle;\n",
+            "  root^3 = x;\n",
+            "  der(x) = root;\n",
             "end UndefinedInitialLinearization;\n",
         ),
         "UndefinedInitialLinearization",
@@ -1075,13 +1083,13 @@ fn fixed_false_parameter_is_solved_from_its_initial_equation() {
     let [block] = solve
         .problem
         .initialization
-        .projection_plan
+        .projection_plan()
         .blocks
         .as_slice()
     else {
         panic!(
             "one initialization projection block expected, got {:?}",
-            solve.problem.initialization.projection_plan.blocks
+            solve.problem.initialization.projection_plan().blocks
         );
     };
     assert_eq!(block.rows.len(), 1);
@@ -1138,7 +1146,7 @@ fn fixed_false_parameter_without_explicit_start_uses_the_checked_default_guess()
         solve
             .problem
             .initialization
-            .projection_plan
+            .projection_plan()
             .blocks
             .as_slice(),
         [block]
@@ -1181,7 +1189,7 @@ fn projection_blocks(dae: &rumoca_ir_dae::Dae) -> Vec<(usize, Vec<rumoca_ir_solv
     solve
         .problem
         .initialization
-        .projection_plan
+        .projection_plan()
         .blocks
         .iter()
         .map(|block| (block.rows.len(), block.unknowns.clone()))
@@ -1609,22 +1617,14 @@ fn an_unowned_initialization_row_is_not_reported_as_a_surplus_check() {
         ),
         "UnownedAlgebraic",
     );
-    // An algebraic read no longer excludes the row: the row joins the solve
-    // through algebraic refresh, and `x = a + 7` with `a(0) = 5` gives the
-    // value OpenModelica gives.
     let result = simulate_dae(&algebraic_read, &SimOptions::default())
-        .expect("an algebraic-reading row is solved through algebraic refresh");
-    let initial_x = column(&result, "x")[0];
-    assert!(
-        (initial_x - 12.0).abs() <= 1.0e-9,
-        "expected x(0) = a(0) + 7 = 12, got {initial_x}"
-    );
+        .expect("the continuous matching owns the algebraic dependency");
+    assert!((column(&result, "x")[0] - 12.0).abs() <= 1.0e-9);
+    assert!((column(&result, "a")[0] - 5.0).abs() <= 1.0e-9);
 }
 
-/// Initialization observes settled algebraic/output values, never their
-/// declaration seeds. The steady-state shape once "silently simulated"
-/// `x(0) = 0` (the seeds cancel), then failed closed; with algebraic refresh
-/// joining the projection it is solved, to OpenModelica's `x(0) = 5`.
+/// Initialization must solve through reconstructed algebraic values, including
+/// initial derivative conditions, without certifying declaration seeds.
 #[test]
 fn an_algebraic_reading_initialization_row_cannot_certify_against_a_stale_seed() {
     const SOURCE: &str = concat!(
@@ -1647,12 +1647,9 @@ fn an_algebraic_reading_initialization_row_cannot_certify_against_a_stale_seed()
         ..SimOptions::default()
     };
     let result = simulate_dae(&steady, &options)
-        .expect("der(x) = 0 is solved through the reconstructed algebraic");
-    let steady_x = column(&result, "x")[0];
-    assert!(
-        (steady_x - 5.0).abs() <= 1.0e-9,
-        "the stale zero seeds must not certify x(0) = 0; expected 5, got {steady_x}"
-    );
+        .expect("der(x)=a-x=0 determines x(0)=5 through the algebraic definition");
+    assert!((column(&result, "x")[0] - 5.0).abs() <= 1.0e-9);
+    assert!((column(&result, "a")[0] - 5.0).abs() <= 1.0e-9);
 
     let consistent = compile(
         &format!("{SOURCE}  x = 5;\n  x = a;\nend AlgebraicSeed;\n"),

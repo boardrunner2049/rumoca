@@ -1,0 +1,8 @@
+{
+  "generated_by": "cargo xtask coverage gate",
+  "generated_at_unix_secs": 1790001897,
+  "source_candidates_file": "target/llvm-cov/trim-candidates.json",
+  "workspace_line_coverage_percent": 78.64569192311653,
+  "workspace_lines_covered": 336009,
+  "workspace_lines_total": 427244
+}

@@ -503,6 +503,7 @@ fn process_single_component(
         // Set by instantiation when an extends modification redeclares this
         // inherited component (MLS §7.3); never a parser-visible fact.
         redeclared_by_modification: false,
+        has_unapplied_redeclare: false,
         constrainedby: ctx.constrainedby.clone(),
         is_structural: false,
     };
@@ -737,7 +738,13 @@ fn apply_constraining_clause_to_declaration(
         value
             .source_modification_redeclare_flags
             .push(flag(&list.redeclare_flags, index) || flag(&list.replaceable_flags, index));
-        process_mod_arg(value, arg, each, is_final)?;
+        process_mod_arg(
+            value,
+            arg,
+            each,
+            is_final,
+            flag(&list.redeclare_flags, index),
+        )?;
     }
     Ok(())
 }
@@ -1062,6 +1069,7 @@ fn process_mod_arg(
     arg: &rumoca_ir_ast::Expression,
     has_each: bool,
     has_final: bool,
+    is_redeclare: bool,
 ) -> anyhow::Result<()> {
     let type_name = value.type_name.to_string();
 
@@ -1084,7 +1092,7 @@ fn process_mod_arg(
         ..
     } = arg
     {
-        let param_name = target.to_string();
+        let param_name = component_modifier_target_name(target, is_redeclare);
         let is_builtin = is_builtin_type(&type_name);
         if param_name == "start" {
             // MLS §7.2: alias-backed component declarations still carry
@@ -1162,6 +1170,19 @@ fn process_mod_arg(
     Ok(())
 }
 
+fn component_modifier_target_name(
+    target: &rumoca_ir_ast::ComponentReference,
+    is_redeclare: bool,
+) -> String {
+    if is_redeclare && let [part] = target.parts.as_slice() {
+        // MLS §7.3: these subscripts declare the replacement's dimensions;
+        // they do not select an element for its nested value modifiers.
+        part.ident.text.to_string()
+    } else {
+        target.to_string()
+    }
+}
+
 /// Process modification expression (binding).
 fn process_mod_expr(
     value: &mut rumoca_ir_ast::Component,
@@ -1196,7 +1217,19 @@ fn process_component_modification(
                         .get(idx)
                         .copied()
                         .unwrap_or(false);
-                    process_mod_arg(value, arg, has_each, has_final)?;
+                    let is_redeclare = opt
+                        .argument_list
+                        .redeclare_flags
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(false)
+                        || opt
+                            .argument_list
+                            .replaceable_flags
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(false);
+                    process_mod_arg(value, arg, has_each, has_final, is_redeclare)?;
                 }
             }
             if let Some(mod_opt) = &class_mod.modification_opt {

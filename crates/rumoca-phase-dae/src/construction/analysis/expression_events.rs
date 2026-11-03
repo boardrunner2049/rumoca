@@ -8,7 +8,8 @@
 //! construction only has to build the checked DAE node for it.
 //!
 //! Scope is every binding equation whose expression is runtime-varying, the residual of each
-//! `flat::Model::equations` row, and the activation condition of every `when`.
+//! `flat::Model::equations` row, every model algorithm statement expression outside a
+//! `when` body, and the activation condition of every `when`.
 //! Binding expressions and residuals are the model expressions lowered exactly once, so
 //! one source relation always owns exactly one checked DAE relation, and both
 //! owner kinds are collected for them. Occurrence identity deduplicates a
@@ -23,9 +24,8 @@
 //! an internal buffer, and the value of the expression can only be changed at
 //! event instants"* — so the located crossing lands exactly on `t = 0.5`, where
 //! the strict relation is still false: the activation is consumed without ever
-//! becoming true. Conditions of assertions and of algorithm `if` statements keep
-//! owning their events through their own semantic owners and are deliberately
-//! not collected here.
+//! becoming true. Conditions of assertions keep owning their events through their
+//! own semantic owners and are deliberately not collected here.
 //!
 //! One operator has no arm below on purpose: MLS §3.7.4.5 `semiLinear(x, kp, kn)`
 //! returns `smooth(0, if x >= 0 then kp*x else kn*x)`, so the `x >= 0` relation
@@ -55,6 +55,10 @@ pub(in crate::construction) enum ExpressionEventPlan {
     DynamicTimeEvent(DynamicTimeEventOperand),
     /// `sample(start, interval)`, the MLS §3.7.5 periodic Boolean operator.
     SampleClock(rumoca_core::PeriodicClockSchedule),
+    /// `floor`, `ceil`, or `integer` of a varying argument: MLS §3.7.2 makes
+    /// each integer crossing of the argument an event, located by the
+    /// `sin(pi*x) >= 0` indicator root the dynamic quotients also use.
+    IntegerStep,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +195,7 @@ impl ExpressionEventPlan {
             (Self::TimeEvent(left), Self::TimeEvent(right)) => left == right,
             (Self::DynamicTimeEvent(left), Self::DynamicTimeEvent(right)) => left == right,
             (Self::SampleClock(left), Self::SampleClock(right)) => left == right,
+            (Self::IntegerStep, Self::IntegerStep) => true,
             _ => false,
         }
     }
@@ -228,8 +233,58 @@ pub(super) fn analyze_expression_events(
     }
     for algorithm in &flat.algorithms {
         collect_statement_activation_time_events(&algorithm.statements, &scope, &mut plans)?;
+        collect_statement_event_owners(&algorithm.statements, &scope, &mut plans)?;
     }
     Ok(plans)
+}
+
+/// Collect the MLS §8.5 owners of the relations a model algorithm evaluates
+/// outside `when` bodies: assignment values, `if` conditions, loop ranges, and
+/// call arguments. Such a relation generates events exactly as the same
+/// expression in an equation does, so a discrete target the algorithm assigns
+/// from it changes at the located crossing. A `when` body runs only at its own
+/// activation, whose conditions [`collect_statement_activation_time_events`]
+/// owns.
+fn collect_statement_event_owners(
+    statements: &[rumoca_core::Statement],
+    scope: &EventScope<'_>,
+    plans: &mut ExpressionEventPlans,
+) -> Result<(), ToDaeError> {
+    for statement in statements {
+        match statement {
+            rumoca_core::Statement::Assignment { value, .. } => {
+                collect_event_owners(value, false, scope, plans)?;
+            }
+            rumoca_core::Statement::If {
+                cond_blocks,
+                else_block,
+                ..
+            } => {
+                for block in cond_blocks {
+                    collect_event_owners(&block.cond, false, scope, plans)?;
+                    collect_statement_event_owners(&block.stmts, scope, plans)?;
+                }
+                if let Some(else_block) = else_block {
+                    collect_statement_event_owners(else_block, scope, plans)?;
+                }
+            }
+            rumoca_core::Statement::For {
+                indices, equations, ..
+            } => {
+                for index in indices {
+                    collect_event_owners(&index.range, false, scope, plans)?;
+                }
+                collect_statement_event_owners(equations, scope, plans)?;
+            }
+            rumoca_core::Statement::FunctionCall { args, .. } => {
+                for argument in args {
+                    collect_event_owners(argument, false, scope, plans)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Collect the exactly scheduled MLS §8.5 owners of a `when` activation.
@@ -387,6 +442,17 @@ fn collect_event_owners(
                 ExpressionEventPlan::StateRelation
             };
             plans.insert(*span, &[lhs, rhs], plan)?;
+        }
+        Expression::BuiltinCall {
+            function: BuiltinFunction::Floor | BuiltinFunction::Ceil | BuiltinFunction::Integer,
+            args,
+            span,
+        } if !suppressed => {
+            if let [argument] = args.as_slice()
+                && relation_can_vary(argument, scope)
+            {
+                plans.insert(*span, &[argument], ExpressionEventPlan::IntegerStep)?;
+            }
         }
         _ => {}
     }

@@ -1,12 +1,6 @@
-//! Turning `--trace` and the other diagnostics flags into a tracing filter.
-//!
-//! Split out of `cli.rs` under SPEC_0021: this is subscriber setup and filter
-//! expansion, not command dispatch, and it was the largest block in that file
-//! with no dependency on the rest of it.
+//! Debug tracing filters chosen by the `--trace` diagnostics flags.
 
-use anyhow::Result;
-
-use super::{DEFAULT_DEBUG_TRACE_FILTER, DiagnosticsArgs, PROFILE_TRACE_FILTER};
+use super::*;
 
 pub(crate) fn init_debug_tracing(diagnostics: &DiagnosticsArgs) -> Result<()> {
     let Some(filter) = trace_filter_from_diagnostics(diagnostics) else {
@@ -35,7 +29,7 @@ pub(crate) fn init_debug_tracing(diagnostics: &DiagnosticsArgs) -> Result<()> {
     Ok(())
 }
 
-fn trace_filter_from_diagnostics(diagnostics: &DiagnosticsArgs) -> Option<String> {
+pub(super) fn trace_filter_from_diagnostics(diagnostics: &DiagnosticsArgs) -> Option<String> {
     let mut filters = Vec::new();
     // `--trace` present with no value (Some("")) selects the default phase
     // filter; `--trace=<FILTER>` supplies a custom filter (with short phase
@@ -93,7 +87,7 @@ const TRACE_PHASE_ALIASES: &[(&str, &str)] = &[
 /// `rumoca_phase_<phase>=<level>` (default level `debug`); any token that is not
 /// a known alias passes through unchanged, so full tracing EnvFilter directives
 /// (e.g. `rumoca_phase_dae::profile=debug`) still work.
-pub(crate) fn expand_trace_filter(spec: &str) -> String {
+pub(super) fn expand_trace_filter(spec: &str) -> String {
     spec.split(',')
         .map(str::trim)
         .filter(|token| !token.is_empty())
@@ -109,4 +103,28 @@ pub(crate) fn expand_trace_filter(spec: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diagnostics(trace: Option<&str>) -> DiagnosticsArgs {
+        DiagnosticsArgs {
+            verbose: false,
+            trace: trace.map(str::to_string),
+            trace_profile: false,
+        }
+    }
+
+    #[test]
+    fn the_viewer_subsystem_is_requested_by_name_with_or_without_a_level() {
+        assert!(trace_requests_viewer(&diagnostics(Some("viewer"))));
+        assert!(trace_requests_viewer(&diagnostics(Some(
+            "dae:debug, viewer:trace"
+        ))));
+        assert!(!trace_requests_viewer(&diagnostics(Some("dae,viewers"))));
+        assert!(!trace_requests_viewer(&diagnostics(Some(""))));
+        assert!(!trace_requests_viewer(&diagnostics(None)));
+    }
 }

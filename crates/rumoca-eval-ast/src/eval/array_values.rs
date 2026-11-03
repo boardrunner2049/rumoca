@@ -28,7 +28,7 @@ pub fn eval_real_array_with_scope(
     match expr {
         Expression::Array {
             elements,
-            is_matrix: false,
+            kind: rumoca_core::ArrayConstructor::Array,
             ..
         } => elements
             .iter()

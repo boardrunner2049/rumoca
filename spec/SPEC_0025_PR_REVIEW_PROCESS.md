@@ -84,6 +84,16 @@ fn flatten_if_equation(...) { ... }
 Run every command below under `CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4`
 (SPEC_0033 §6a).
 
+Pre-landing gate (every tip that lands MUST pass it, with coverage):
+
+```bash
+cargo xtask verify gate --rev <tip> --coverage
+```
+
+It snapshots the committed revision, runs the blocking steps below with CI's
+flags in a fresh Cargo target directory, and prints one `GATE_OK` or
+`GATE_FAILED` line naming the revision and its log.
+
 Standard verification commands (all merged code MUST pass):
 
 ```bash
@@ -159,13 +169,19 @@ Rust developer workflow MUST remain Cargo-native.
 | A corrected metric definition MAY lower a checked-in stage count only through a quality-gate schema-version migration that records the prior/new versions, prior/new count, affected diagnostic cohort, and exact affected model set; the checked-in migration takes precedence over an older-schema promoted release until main promotes the new schema | A truthful correction must not preserve a known-bad count, but an ordinary baseline edit must never disguise a compiler regression as measurement cleanup |
 | A checked-in full baseline MAY bridge a promoted asset across multiple reviewed migrations only with the exact source digest, source/target schemas, target count, and ordered evidence commits; all other old assets MUST fail | Promotion lag must not deadlock CI or permit a generic old-schema fallback |
 | Every resolved full baseline MUST own the exact model roster behind its strict-high count; cohort-loss gates compare the current per-model table to that roster, while prior workflow artifacts are diagnostic history only and MUST NOT redefine the ratchet | A failed, cancelled, partial, or merely newer run is not certified evidence, and aggregate counts cannot detect one certified model disappearing while another enters |
+| Every resolved full baseline MUST also own the roster of completions that are neither strict-high nor covered by a typed trace exception (`unexcepted_non_high_models`); the gate fails on a current completion outside it, the ratchet refuses a promotion that adds to it, and the PR comment lists the current roster grouped by triage package (first three name segments) with new entries marked | The simulation soundness target is an empty roster (SPEC_0033); each parity lane reads its own rows, and only removals can land |
 | Cumulative MSL stage counts (parse, flatten, DAE, IR-Solve, initial-condition solve, strict-high simulation) MUST NOT materially decrease on the fixed root-example baseline denominator; full-library runs may tolerate one-model host jitter | A simulation pass requires strict-high trace parity |
 | Balanced / OMC-agreement counts MUST NOT decrease | These are headline correctness and numerical-quality numbers |
 | Focused or limited MSL runs MUST mark quality snapshots as partial and partial snapshots MUST NOT be promoted | Prevents local-debug subsets from becoming the committed release baseline |
 | Trace-quality metrics MUST be gated against the resolved promoted baseline when OMC parity data is available | Prevents balanced-but-numerically-worse simulations from passing unnoticed |
 | Runtime speedup medians (system & wall) MUST NOT regress by > 35% | Tolerates 4-core hosted-runner noise without hiding material regressions |
+| The PR comment's speed report MUST take every aggregate over the trace-agreeing (high or near) models, beside a high-only line, and compare compilation three ways: compiler work (OMC frontend through templates against rumoca front end plus Solve lowering), time to runnable labelled JIT vs C toolchain, and the FMU path, printed as not measured unless a CI job exports FMUs | A speedup that compares a JIT against a C toolchain, or counts disagreeing traces, is not a like-for-like claim |
+| The speed report MUST take agreement from the comparator's band table, count initialization in rumoca's simulation time as OMC's `timeSimulation` does, time only OMC rows collected under the run's own worker count and host, and print a methodology block from recorded values: runner, per-stage parallelism, the integrator that ran and tolerance per tool, output density, cache state, and parity gating; OMC reference collection MUST run at the rumoca compile and simulation worker counts, both tools MUST take the OMC output grid (the experiment `Interval`, else 500 intervals), and unequal recorded counts or grids are flagged | Timings taken under different contention are not comparable |
 | Promoted baseline release-asset updates require a successful full main CI run and a non-regressing ratchet decision; checked-in fallback updates remain explicit via `cargo xtask repo msl promote-quality-baseline` | Prevents silent baseline drift |
-| Coverage trim/gate updates follow `cargo xtask coverage {run,report,gate}` workflow | Coverage promotion is explicit only |
+| The coverage gate (`cargo xtask coverage gate --changed-since <base>`) fails on every function the change adds (its first line lies in an added hunk of `git diff -U0 <base>...HEAD`) that no workspace test executes; closures are exempt | It blames only the change under review; an error-path closure runs only on failure, and dropping error context to move a count is a regression |
+| The one coverage exemption is `#[cfg_attr(coverage_nightly, coverage(off))]` on a function reachable only through an effect no test can drive (process exit, an interactive terminal), with a comment naming it; the crate root enables `#![cfg_attr(coverage_nightly, feature(coverage_attribute))]`, and the gate report lists each one a change adds | An explicit, greppable, reviewed escape; nothing else exempts a new function |
+| Workspace line coverage MUST NOT drop more than 0.25 points below the committed baseline; per-package zero-execution counts are reported, never enforced | Line coverage is stable between runs; the counts drift by about one per crate and would blame whichever change lands next |
+| The line-coverage baseline is updated only by `cargo xtask coverage gate --promote-baseline` over CI's measurement artifacts | Coverage promotion is explicit only |
 
 ### 5. Code Size Budget
 
@@ -193,6 +209,7 @@ net_added_lines:
 
 | Rule | Why |
 |---|---|
+| The landed tip passed `cargo xtask verify gate --rev <tip> --coverage` (GATE_OK) before landing | The gate runs CI's blocking steps and the coverage gate over a committed snapshot, so a landing is never the first run of a blocking check |
 | At least one approving review | Two-eyes on every merge |
 | All CI checks passing | CI gates (incl. `architecture_hardening_test`, `spec_budget_test`) are the non-negotiables |
 | Capability PRs show Tier 1 evidence and source every parity number | SPEC_0033 §6a cadence must be checkable at review |

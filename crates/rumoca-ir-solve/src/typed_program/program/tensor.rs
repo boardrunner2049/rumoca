@@ -367,10 +367,14 @@ impl<'program> TypedProgramBuilder<'program> {
         let operand_type = self.register_type(operand, provenance)?;
         let valid_element = match operator {
             SolveReductionOperator::All => operand_type.element_type() == SolveScalarType::Boolean,
-            SolveReductionOperator::Sum
-            | SolveReductionOperator::Product
-            | SolveReductionOperator::Minimum
-            | SolveReductionOperator::Maximum => operand_type.element_type().is_numeric(),
+            SolveReductionOperator::Sum | SolveReductionOperator::Product => {
+                operand_type.element_type().is_numeric()
+            }
+            // MLS §10.3.4 orders Boolean elements with `false < true`.
+            SolveReductionOperator::Minimum | SolveReductionOperator::Maximum => {
+                let element = operand_type.element_type();
+                element.is_numeric() || element == SolveScalarType::Boolean
+            }
         };
         if operand_type.dimensions().is_empty() || !valid_element {
             return Err(SolveProgramConstructionError::InvalidTensorAlgebra { provenance });

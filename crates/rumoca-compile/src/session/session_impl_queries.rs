@@ -353,6 +353,13 @@ impl Session {
             return false;
         }
 
+        // Each aggregate was resolved from its own root alone, so a reference
+        // from one root into another bound nothing there and left no edge in
+        // that root's dependency graph. Only a lone root's graph is the
+        // session's graph; with several, the strict closure must be derived
+        // from the merged planning tree, or it prunes the classes of the other
+        // roots a model reaches (TOOLBUG-105).
+        let single_source_set = source_set_ids.len() == 1;
         let mut merged_model_names = IndexSet::new();
         let mut merged_dependency_fingerprints = DependencyFingerprintCache::default();
         for source_set_id in source_set_ids {
@@ -376,10 +383,12 @@ impl Session {
         }
 
         self.query_state.resolved.model_names = merged_model_names.into_iter().collect();
-        self.query_state
-            .resolved
-            .dependency_fingerprints
-            .set_all_from_cache(&merged_dependency_fingerprints);
+        if single_source_set {
+            self.query_state
+                .resolved
+                .dependency_fingerprints
+                .set_all_from_cache(&merged_dependency_fingerprints);
+        }
         true
     }
 

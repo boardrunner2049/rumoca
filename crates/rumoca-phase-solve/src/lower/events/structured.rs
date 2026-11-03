@@ -21,11 +21,24 @@ pub(super) fn lower_discrete_value_owners<'dae>(
             lower_structured_discrete_value_owner(view, layout, clocks, rows, owner)?;
             continue;
         }
-        match first.activation() {
-            dae::DiscreteBranchActivation::Always => {
+        let tick = owner
+            .targets()
+            .iter()
+            .find_map(|target| clocks.variable_trigger(dae::VariableId::from(target)));
+        match (first.activation(), tick) {
+            (_, Some(_)) if owner.observed() => {
+                return Err(LowerError::contract(
+                    "an observed B.1c owner must not be clock-triggered",
+                    owner.provenance().span(),
+                ));
+            }
+            (_, Some(tick)) => {
+                lower_triggered_discrete_value_owner(view, layout, rows, owner, tick)?;
+            }
+            (dae::DiscreteBranchActivation::Always, None) => {
                 lower_unconditional_discrete_value_owner(view, layout, clocks, rows, owner)?;
             }
-            dae::DiscreteBranchActivation::When { .. } => {
+            (dae::DiscreteBranchActivation::When { .. }, _) => {
                 lower_conditional_discrete_value_owner(view, layout, clocks, rows, owner)?;
             }
         }
@@ -82,6 +95,14 @@ fn lower_unconditional_discrete_value_owner<'dae>(
         })
         .collect::<Vec<_>>();
     let total_outputs = owner_values.iter().map(|entry| entry.6).sum::<usize>();
+    // SPEC_0022 EXPR-012: an observed owner's rows are unclocked scalar rows
+    // refreshed at every output point.
+    if owner.observed() && owner_values.iter().any(|entry| entry.4.is_some()) {
+        return Err(LowerError::contract(
+            "an observed B.1c owner must not be clock-owned",
+            owner.provenance().span(),
+        ));
+    }
     // Family fusion is restored: a multi-variable owner keeps its single
     // program whenever no member observes another member on the tick. Where a
     // member *does* observe another, the members stay separate producers and
@@ -92,6 +113,7 @@ fn lower_unconditional_discrete_value_owner<'dae>(
                 .iter()
                 .map(|entry| SameTickExchangeMember {
                     targets: vec![entry.3.index()],
+                    entry_reads: BTreeSet::new(),
                     reads: if entry.5 {
                         BTreeSet::new()
                     } else {
@@ -124,8 +146,6 @@ fn lower_unconditional_discrete_value_owner<'dae>(
             let pre_mode = expression_pre_mode(view, value, sampled);
             for scalar in 0..scalar_count {
                 let target = variable_scalar_slot(layout, variable.index(), scalar, span)?;
-                rows.relation_memory_owners
-                    .claim_exact_expression(value, target);
                 outputs.push((variable, target, pre_mode));
             }
         }
@@ -166,10 +186,6 @@ fn lower_unconditional_discrete_value_owner<'dae>(
             let targets = (0..scalar_count)
                 .map(|scalar| variable_scalar_slot(layout, target.index(), scalar, span))
                 .collect::<Result<Vec<_>, _>>()?;
-            for &target in &targets {
-                rows.relation_memory_owners
-                    .claim_exact_expression(value, target);
-            }
             let start_row = rows.targets.len();
             rows.record_clocked_producer(
                 PendingClockedStep::ScalarRows {
@@ -207,11 +223,12 @@ fn lower_unconditional_discrete_value_owner<'dae>(
                 };
             let target = variable_scalar_slot(layout, target.index(), scalar, span)?;
             rows.claim_scalar_event_owner(variable, target, span)?;
-            rows.relation_memory_owners
-                .claim_exact_expression(value, target);
             let pre_mode = expression_pre_mode(view, value, sampled);
             if clock.is_none() && pre_mode == solve::DiscreteEventPreMode::FollowCurrent {
                 rows.push_root_refresh_candidate(program.clone(), span, target);
+            }
+            if owner.observed() {
+                rows.observed_rows.push(rows.targets.len());
             }
             rows.push(
                 program,
@@ -694,6 +711,7 @@ fn lower_conditional_discrete_value_owner<'dae>(
                     width: variable.scalar_count(),
                     pre_mode: branch.pre_mode,
                     span: branch.span,
+                    event_clock: None,
                 },
                 branch.assignment,
                 branch.clock,
@@ -707,6 +725,62 @@ fn lower_conditional_discrete_value_owner<'dae>(
         &mut lowered,
         solve::DiscreteRowRole::Equation,
     )
+}
+
+/// Lowers an always-active B.1c owner of an MLS §16.3 event clock: its
+/// partition is active only on the clock's ticks, so every target is a
+/// guarded update whose trigger and guard are the tick condition.
+fn lower_triggered_discrete_value_owner<'dae>(
+    view: dae::DaeView<'dae>,
+    layout: &LoweredLayout<'dae>,
+    rows: &mut DiscreteRows<'dae>,
+    owner: dae::DiscreteValueOwnerView<'dae>,
+    (event_clock, tick): (dae::ClockId<'dae>, dae::ConditionId<'dae>),
+) -> Result<(), LowerError> {
+    let branch = owner
+        .branches()
+        .get(0)
+        .expect("checked B.1c owner has a nonempty branch set");
+    let clock_activated = match branch.activation() {
+        dae::DiscreteBranchActivation::Always => true,
+        dae::DiscreteBranchActivation::When { trigger, guard } => {
+            condition_clock_owner(view, trigger).is_some()
+                && condition_clock_owner(view, guard).is_some()
+        }
+    };
+    if owner.branches().len() != 1 || !clock_activated {
+        return Err(LowerError::non_computable(
+            "an event-clock row is activated by a condition other than its clock",
+            owner.provenance().span(),
+        ));
+    }
+    let mut lowered = Vec::new();
+    for (target, (value, provenance)) in owner.targets().iter().zip(branch.values().iter()) {
+        let variable = dae::VariableId::from(target);
+        let span = provenance.span();
+        let pre_mode = merge_pre_mode(
+            expression_pre_mode(view, value, false),
+            condition_pre_mode(view, tick),
+        );
+        record_guarded_target(
+            &mut lowered,
+            GuardedTargetMetadata {
+                variable,
+                target_base: variable_scalar_slot(layout, target.index(), 0, span)?,
+                width: view
+                    .variable(variable)
+                    .expect("checked B.1c target resolves")
+                    .scalar_count(),
+                pre_mode,
+                span,
+                event_clock: Some(event_clock),
+            },
+            (tick, tick, value, condition_memory(layout, tick, span)?),
+            None,
+        )?;
+    }
+    rows.event_clock_targets.extend(lowered);
+    Ok(())
 }
 
 struct LoweredDiscreteValueBranch<'dae> {

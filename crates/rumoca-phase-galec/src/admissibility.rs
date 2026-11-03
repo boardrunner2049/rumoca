@@ -79,12 +79,14 @@ fn projection_errors<'dae>(
     let dynamic = view
         .clocks()
         .filter(|(_, clock)| {
-            matches!(clock.operation(), dae::ClockOperation::Triggered(_))
-                || matches!(
-                    clock.operation(),
-                    dae::ClockOperation::Periodic(schedule)
-                        if schedule.anchor() == rumoca_core::ClockPhaseAnchor::SimulationStart
-                )
+            matches!(
+                clock.operation(),
+                dae::ClockOperation::Triggered(_) | dae::ClockOperation::Shifted { .. }
+            ) || matches!(
+                clock.operation(),
+                dae::ClockOperation::Periodic(schedule)
+                    if schedule.anchor() == rumoca_core::ClockPhaseAnchor::SimulationStart
+            )
         })
         .count();
     if dynamic != 0 {
@@ -192,7 +194,9 @@ fn periodic_clocks(view: dae::DaeView<'_>) -> Vec<(u32, &rumoca_core::PeriodicCl
             {
                 Some((id.index(), schedule))
             }
-            dae::ClockOperation::Periodic(_) | dae::ClockOperation::Triggered(_) => None,
+            dae::ClockOperation::Periodic(_)
+            | dae::ClockOperation::Triggered(_)
+            | dae::ClockOperation::Shifted { .. } => None,
         })
         .collect()
 }

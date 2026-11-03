@@ -39,7 +39,49 @@ pub(crate) fn run_playground_smoke_check(root: &Path) -> Result<()> {
     stage_playground_vendor_assets(root)?;
     check_playground_js_syntax(root)?;
     check_playground_expected_sources(root)?;
+    run_web_unit_tests(root)?;
+    run_results_picker_smoke(root)?;
     run_single_threaded_wasm_smoke(root)
+}
+
+const WEB_UNIT_TEST_DIRS: [&str; 2] = ["packages/rumoca-web/tests", "packages/playground/tests"];
+
+/// Every `*.test.mjs` node unit test of the browser runtime and the
+/// playground, in a stable order.
+fn web_unit_test_files(root: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    for dir in WEB_UNIT_TEST_DIRS {
+        let entries = fs::read_dir(root.join(dir))
+            .with_context(|| format!("failed to read web test directory {dir}"))?;
+        for entry in entries {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".test.mjs") {
+                files.push(format!("{dir}/{name}"));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn run_web_unit_tests(root: &Path) -> Result<()> {
+    let files = web_unit_test_files(root)?;
+    if files.is_empty() {
+        bail!(
+            "no web unit tests found under {}",
+            WEB_UNIT_TEST_DIRS.join(", ")
+        );
+    }
+    let mut cmd = Command::new("node");
+    cmd.arg("--test").args(&files).current_dir(root);
+    run_status(cmd)
+}
+
+fn run_results_picker_smoke(root: &Path) -> Result<()> {
+    let mut cmd = Command::new("node");
+    cmd.arg("packages/playground/tests/results_picker_smoke.mjs")
+        .current_dir(root);
+    run_status(cmd)
 }
 
 fn check_playground_js_syntax(root: &Path) -> Result<()> {
@@ -56,6 +98,7 @@ fn check_playground_js_syntax(root: &Path) -> Result<()> {
         "packages/rumoca-web/runtime/rumoca_worker.js",
         "packages/rumoca-web/runtime/rumoca_runtime.js",
         "packages/rumoca-web/runtime/rumoca_interactive.js",
+        "packages/rumoca-web/runtime/rumoca_touch_controls.js",
         "packages/rumoca-web/runtime/modelica_language.js",
         "packages/rumoca-web/runtime/parse_worker.js",
         "packages/rumoca-web/runtime/rumoca_gpu.js",
@@ -185,4 +228,53 @@ fn ensure_any_file_contains(root: &Path, files: &[&str], needle: &str) -> Result
         "expected to find `{needle}` in one of: {}",
         files.join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+
+    /// Only `*.test.mjs` files are collected, from both directories, sorted.
+    #[test]
+    fn web_unit_tests_are_collected_from_both_directories_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "packages/playground/tests/b.test.mjs");
+        write(root.path(), "packages/playground/tests/smoke.mjs");
+        write(root.path(), "packages/rumoca-web/tests/a.test.mjs");
+        write(root.path(), "packages/rumoca-web/tests/helper.js");
+        assert_eq!(
+            web_unit_test_files(root.path()).unwrap(),
+            [
+                "packages/playground/tests/b.test.mjs",
+                "packages/rumoca-web/tests/a.test.mjs",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_web_test_directory_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "packages/rumoca-web/tests/a.test.mjs");
+        let err = web_unit_test_files(root.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("packages/playground/tests"),
+            "{err}"
+        );
+    }
+
+    /// An empty test set is refused before any runner starts.
+    #[test]
+    fn no_web_unit_tests_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("packages/rumoca-web/tests")).unwrap();
+        fs::create_dir_all(root.path().join("packages/playground/tests")).unwrap();
+        let err = run_web_unit_tests(root.path()).unwrap_err();
+        assert!(err.to_string().contains("no web unit tests found"), "{err}");
+    }
 }

@@ -249,20 +249,14 @@ impl TypeChecker {
         }
     }
 
-    /// The common type of the arrays `cat(k, A, B, ...)` joins; the leading
-    /// argument is the Integer dimension.
-    fn concatenation_element_type(
-        &self,
-        args: &[Expression],
-        type_table: &TypeTable,
-    ) -> Option<TypeId> {
-        args.get(1..)?.iter().try_fold(None, |common, arg| {
-            let ty = self.infer_expression_type(arg, type_table)?;
-            Some(Some(match common {
-                None => ty,
-                Some(common) => self.common_value_type(common, ty, type_table)?,
-            }))
-        })?
+    /// MLS §10.4.4: cat's first argument is the axis, not an element.
+    fn infer_cat_result_type(&self, args: &[Expression], type_table: &TypeTable) -> Option<TypeId> {
+        let mut operands = args.iter().skip(1);
+        let first = self.infer_expression_type(operands.next()?, type_table)?;
+        operands.try_fold(first, |common, argument| {
+            let next = self.infer_expression_type(argument, type_table)?;
+            self.common_value_type(common, next, type_table)
+        })
     }
 
     fn infer_builtin_result_type(
@@ -276,7 +270,8 @@ impl TypeChecker {
             BuiltinFunction::Initial
             | BuiltinFunction::Terminal
             | BuiltinFunction::Edge
-            | BuiltinFunction::Change => Some(type_table.boolean()),
+            | BuiltinFunction::Change
+            | BuiltinFunction::FirstTick => Some(type_table.boolean()),
             BuiltinFunction::Integer
             | BuiltinFunction::Ndims
             | BuiltinFunction::Size
@@ -308,7 +303,7 @@ impl TypeChecker {
             BuiltinFunction::Fill => args
                 .first()
                 .and_then(|arg| self.infer_expression_type(arg, type_table)),
-            BuiltinFunction::Cat => self.concatenation_element_type(args, type_table),
+            BuiltinFunction::Cat => self.infer_cat_result_type(args, type_table),
             BuiltinFunction::Cross => {
                 let [lhs, rhs] = args else {
                     return None;
