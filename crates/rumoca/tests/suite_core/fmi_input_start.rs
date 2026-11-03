@@ -3,10 +3,12 @@
 //!
 //! FMI requires every input to publish a start with `min <= start <= max`, and
 //! an importer may run a component without writing an input at all, so the
-//! exported component holds that start, moved into the declared range, until
-//! the importer's first write. GPU preparation and the bitcode simulator's
-//! `--free-inputs start` seed the same value. Headless simulation, which has
-//! no importer to write the input, still refuses the undriven input.
+//! exported component holds that start until the importer's first write. A
+//! language default start the declared range excludes is moved to the nearest
+//! bound; a start written outside the range is refused. GPU preparation and
+//! the bitcode simulator's `--free-inputs start` seed the same value. Headless
+//! simulation, which has no importer to write the input, still refuses the
+//! undriven input.
 
 use rumoca::Compiler;
 use rumoca_sim::SimOptions;
@@ -24,18 +26,18 @@ const INPUT_STARTS: [(&str, &[f64]); 6] = [
     ("s", &[3.0]),
 ];
 
-/// Inputs whose declared range excludes their start: the language default
-/// (`a`, `c`, `ki`), a declared start (`r`), and enumerations whose first
-/// literal bounds them below.
+/// Inputs whose declared range excludes their language default start (`a`,
+/// `c`, `r`, `ki`), a start declared inside the range (`p`), and enumerations
+/// whose first literal bounds them below.
 const RANGED_MODEL: &str = "RangedInputs";
 const RANGED_SOURCE: &str = include_str!("../fixtures/fmi/RangedInputs.mo");
 
 /// Every ranged input and the start it holds before an importer writes it:
-/// the type default or declared start, moved to the nearest declared bound.
+/// the declared start, else the type default moved to the nearest bound.
 const RANGED_STARTS: [(&str, &[f64]); 7] = [
     ("a", &[1.0]),
     ("c", &[-1.0]),
-    ("r", &[1.0, 4.0]),
+    ("r", &[1.0, 1.0]),
     ("p", &[5.0]),
     ("ki", &[3.0]),
     ("m", &[1.0]),
@@ -123,7 +125,7 @@ fn gpu_preparation_seeds_inputs_declared_without_start_like_fmi_export() {
 }
 
 #[test]
-fn an_input_start_outside_its_declared_range_moves_to_the_nearest_bound() {
+fn a_default_input_start_outside_its_declared_range_moves_to_the_nearest_bound() {
     let compiled = compile_model(RANGED_MODEL, RANGED_SOURCE);
     let component =
         rumoca_sim::lower_fmi_component(&compiled.dae).expect("export the ranged inputs");
@@ -195,7 +197,7 @@ fn fmi_descriptions_publish_input_starts_inside_their_declared_range() {
     for (name, start, min) in [
         ("a", "1.0", Some("1.0")),
         ("c", "-1.0", None),
-        ("r", "1.0 4.0", Some("1.0")),
+        ("r", "1.0 1.0", Some("1.0")),
         ("p", "5.0", Some("1.0")),
         ("ki", "3", Some("3")),
         // An enumeration's ordinals start at its first literal.
@@ -213,7 +215,7 @@ fn fmi_descriptions_publish_input_starts_inside_their_declared_range() {
     for (name, element) in [
         ("a", "<Real start=\"1.0\" min=\"1.0\" max=\"2.0\""),
         ("c", "<Real start=\"-1.0\" max=\"-1.0\""),
-        ("r[2]", "<Real start=\"4.0\" min=\"1.0\" max=\"4.0\""),
+        ("r[2]", "<Real start=\"1.0\" min=\"1.0\" max=\"4.0\""),
         ("ki", "<Integer start=\"3\" min=\"3\""),
         ("m", "<Integer start=\"1\" min=\"1\""),
         ("mh", "<Integer start=\"3\" min=\"1\""),
@@ -251,5 +253,41 @@ fn fmi3_description_publishes_the_default_start_of_every_input() {
         ("s", "3.0"),
     ] {
         assert_eq!(published_start(&xml, name), start, "start of `{name}`");
+    }
+}
+
+const OUT_OF_RANGE_MODEL: &str = "OutOfRangeInputStart";
+const OUT_OF_RANGE_SOURCE: &str = include_str!("../fixtures/fmi/OutOfRangeInputStart.mo");
+const OUT_OF_RANGE_MESSAGE: &str =
+    "the declared start 5 of input `a` lies outside its range [-inf, 2]";
+
+#[test]
+fn a_declared_input_start_outside_its_declared_range_is_refused() {
+    let compiled = compile_model(OUT_OF_RANGE_MODEL, OUT_OF_RANGE_SOURCE);
+    let error = rumoca_sim::lower_fmi_component(&compiled.dae)
+        .expect_err("FMI export refuses a written start outside [min, max]");
+    assert!(
+        format!("{error:#}").contains(OUT_OF_RANGE_MESSAGE),
+        "{error:#}"
+    );
+    // GPU preparation and `--free-inputs start` read the same rule.
+    let error = rumoca_sim::host_driven_input_starts(&compiled.dae)
+        .expect_err("the pre-write value of `a` is refused, not moved");
+    assert!(error.to_string().contains(OUT_OF_RANGE_MESSAGE), "{error}");
+    rumoca_sim::lower_dae_for_gpu_preparation(&compiled.dae, &SimOptions::default())
+        .expect_err("GPU preparation refuses the out-of-range start");
+    for target in ["fmi2", "fmi3"] {
+        let work = tempfile::tempdir().expect("FMI work directory");
+        let error = rumoca::compile_packaged_target(
+            &compiled,
+            OUT_OF_RANGE_MODEL,
+            target,
+            work.path().to_path_buf(),
+        )
+        .expect_err("export refuses the out-of-range start");
+        assert!(
+            format!("{error:#}").contains(OUT_OF_RANGE_MESSAGE),
+            "{target}: {error:#}"
+        );
     }
 }

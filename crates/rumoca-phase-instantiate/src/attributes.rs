@@ -46,6 +46,7 @@ pub(super) fn extract_component_attrs_and_binding(
     if should_promote_binding_to_start(comp, &attrs, binding_from_modification) && binding.is_some()
     {
         attrs.start = binding.clone();
+        attrs.start_is_default = false;
     }
 
     Ok(ComponentAttrsAndBinding {
@@ -534,6 +535,7 @@ pub(super) fn extract_attributes(
     let has_outer_state_select = outer_state_select.is_some();
     let mut attrs = ExtractedAttributes {
         start_is_explicit: start_from_mod_env.is_some(),
+        start_is_default: false,
         start: start_from_mod_env,
         fixed: extract_fixed_attribute(comp, comp_name, eval_ctx, imports)?,
         min: attr_from_mod_env("min"),
@@ -575,6 +577,7 @@ pub(super) fn extract_attributes(
     if attrs.start.is_none() && !matches!(comp.start, ast::Expression::Empty { .. }) {
         attrs.start = Some(comp.start.clone());
         attrs.start_is_explicit = comp.start_is_modification;
+        attrs.start_is_default = !comp.start_is_modification;
     }
 
     Ok(attrs)

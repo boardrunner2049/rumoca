@@ -151,6 +151,9 @@ pub use templates::{ClassTemplate, ClassTemplateCache};
 pub struct ExtractedAttributes {
     pub start: Option<ast::Expression>,
     pub start_is_explicit: bool,
+    /// `start` is the parser-materialized language default of a predefined
+    /// type (MLS §4.9), not a written start or a promoted binding.
+    pub start_is_default: bool,
     pub fixed: Option<Vec<bool>>,
     pub min: Option<ast::Expression>,
     pub max: Option<ast::Expression>,
@@ -1265,6 +1268,7 @@ fn build_instance_data(
         stream: args.stream,
         // Attributes
         start: args.attrs.start,
+        start_is_default: args.attrs.start_is_default,
         fixed: args.attrs.fixed,
         min: args.attrs.min,
         max: args.attrs.max,

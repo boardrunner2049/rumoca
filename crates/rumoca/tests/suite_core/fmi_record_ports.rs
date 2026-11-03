@@ -1,7 +1,10 @@
 //! Fields of a top-level `input` or `output` record component export with the
 //! component's causality (MLS §4.4.2.2: the prefix applies to every field), in
 //! FMI 2 and FMI 3 alike, and every output field is listed in
-//! `<ModelStructure>`. A record output of a nested component stays local.
+//! `<ModelStructure>`. A record output of a nested component stays local, a
+//! `parameter` field stays a parameter, and an input field (or scalar input)
+//! with a declaration equation publishes that equation's value as its start:
+//! the value it holds until the importer's first write.
 
 use rumoca::Compiler;
 use rumoca_ir_solve::fmi::FmiCausality;
@@ -9,15 +12,30 @@ use rumoca_ir_solve::fmi::FmiCausality;
 const MODEL: &str = "RecordPorts";
 const SOURCE: &str = include_str!("../fixtures/fmi/RecordPorts.mo");
 
-const CAUSALITIES: [(&str, FmiCausality); 7] = [
+const CAUSALITIES: [(&str, FmiCausality); 11] = [
     ("u.x", FmiCausality::Input),
     ("u.y", FmiCausality::Input),
+    ("w.a", FmiCausality::Input),
+    ("w.b", FmiCausality::Input),
+    ("v", FmiCausality::Input),
     ("r.x", FmiCausality::Output),
     ("r.y", FmiCausality::Output),
+    ("r.k", FmiCausality::Parameter),
     ("z", FmiCausality::Output),
     ("sub.q.x", FmiCausality::Local),
     ("sub.q.y", FmiCausality::Local),
 ];
+
+/// The `causality` attribute FMI 2 and FMI 3 publish for `causality`.
+fn exported_causality(causality: FmiCausality) -> &'static str {
+    match causality {
+        FmiCausality::Input => "input",
+        FmiCausality::Output => "output",
+        FmiCausality::Parameter => "parameter",
+        FmiCausality::Local => "local",
+        other => panic!("unexpected causality {other:?}"),
+    }
+}
 
 fn compile() -> rumoca::CompilationResult {
     Compiler::new()
@@ -65,17 +83,43 @@ fn record_port_fields_take_the_record_component_causality() {
 }
 
 #[test]
+fn a_bound_input_publishes_its_declaration_equation_value_as_start() {
+    let compiled = compile();
+    let component = rumoca_sim::lower_fmi_component(&compiled.dae).expect("export record ports");
+    for (name, start) in [("w.a", 0.0), ("w.b", 7.0), ("v", 3.0)] {
+        let variable = component
+            .variables()
+            .iter()
+            .find(|variable| variable.name() == name)
+            .unwrap_or_else(|| panic!("`{name}` is published"));
+        assert_eq!(variable.start(), Some(&[start][..]), "start of `{name}`");
+    }
+    let xml = exported_description("fmi3");
+    assert_eq!(
+        attribute(variable_tag(&xml, "Float64", "w.b"), "start"),
+        "7.0"
+    );
+    assert_eq!(
+        attribute(variable_tag(&xml, "Float64", "v"), "start"),
+        "3.0"
+    );
+}
+
+#[test]
 fn fmi3_description_lists_record_output_fields_as_outputs() {
     let xml = exported_description("fmi3");
     let mut outputs = Vec::new();
     for (name, causality) in CAUSALITIES {
         let tag = variable_tag(&xml, "Float64", name);
-        let expected = match causality {
-            FmiCausality::Input => "input",
-            FmiCausality::Output => "output",
-            _ => "local",
-        };
-        assert_eq!(attribute(tag, "causality"), expected, "{tag}");
+        assert_eq!(
+            attribute(tag, "causality"),
+            exported_causality(causality),
+            "{tag}"
+        );
+        if causality == FmiCausality::Parameter {
+            // Settable by the importer, as before it was a record field.
+            assert_eq!(attribute(tag, "variability"), "tunable", "{tag}");
+        }
         if causality == FmiCausality::Output {
             outputs.push(format!(
                 "<Output valueReference=\"{}\"",
@@ -113,17 +157,13 @@ fn fmi2_description_lists_record_output_fields_as_outputs() {
             )
         })
     {
-        let expected = [
-            ("u.", "input"),
-            ("r.", "output"),
-            ("z", "output"),
-            ("sub.", "local"),
-        ]
-        .into_iter()
-        .find(|(prefix, _)| name.starts_with(prefix))
-        .map(|(_, causality)| causality);
-        if let Some(expected) = expected {
-            assert_eq!(causality, expected, "causality of `{name}`");
+        let declaration = name.split_once('[').map_or(name, |(base, _)| base);
+        if let Some((_, expected)) = CAUSALITIES.iter().find(|(known, _)| *known == declaration) {
+            assert_eq!(
+                causality,
+                exported_causality(*expected),
+                "causality of `{name}`"
+            );
         }
         if causality == "output" {
             outputs.push(format!("<Unknown index=\"{index}\""));

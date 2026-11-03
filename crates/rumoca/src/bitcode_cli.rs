@@ -230,7 +230,8 @@ pub enum FreeInputs {
 ///
 /// The constant is the value an FMU exported from the same model holds before
 /// the importer's first write (`rumoca_sim::host_driven_input_starts`): the
-/// declared `start`, else the type's default start inside the declared range.
+/// declared `start` (refused when it lies outside the declared range), else the
+/// type's default start moved inside that range.
 /// One rule, so a trajectory held here is comparable with the FMU's.
 fn free_input_values(
     dae: &rumoca_compile::compile::Dae,

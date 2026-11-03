@@ -591,6 +591,10 @@ pub struct InstanceData {
     // Resolved attribute values (MLS §4.4)
     /// Start value attribute.
     pub start: Option<Expression>,
+    /// `start` is the predefined type's language default (MLS §4.9) that the
+    /// parser materializes on a declaration nothing gives a start to, not a
+    /// value written in the model.
+    pub start_is_default: bool,
     /// Fixed attribute, scalarized per component element (MLS §4.8, §4.8.6). A
     /// single value broadcasts over every element; an array carries one value
     /// per element.
@@ -702,6 +706,7 @@ impl Default for InstanceData {
             flow: false,
             stream: false,
             start: None,
+            start_is_default: false,
             fixed: None,
             min: None,
             max: None,

@@ -30,7 +30,8 @@ pub fn lower_dae_for_simulation(
 /// written on the declaration where the modeler chose it (`input Real
 /// throttle(start = 0)`, as every shipped model in `examples/interactive`
 /// does) and otherwise the predefined type's own attribute default (MLS §4.9),
-/// moved into the declaration's `min`/`max` range when that excludes it. The
+/// moved into the declaration's `min`/`max` range when that excludes it (a
+/// written start outside that range is refused, not moved). The
 /// rule is `rumoca_phase_solve::fmi::host_input_start_values`, shared with
 /// FMI export, so an input starts from the value its FMU publishes.
 ///
@@ -85,7 +86,8 @@ pub(super) fn host_driven_input_seeds(
 /// # Errors
 ///
 /// Fails when a declared `start`, `min` or `max` of an input does not evaluate
-/// to one numeric value per scalar.
+/// to one numeric value per scalar, or when a written `start` lies outside the
+/// input's `[min, max]`.
 pub fn host_driven_input_starts(
     model: &dae::Dae,
 ) -> Result<Vec<(String, f64)>, SimulationDiagnosticError> {
