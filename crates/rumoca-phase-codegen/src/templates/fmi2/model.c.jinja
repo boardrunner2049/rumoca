@@ -9,7 +9,7 @@
 static void initialize_values(ModelInstance* m) {
 {{- value_array("initial_y", "Y_LEN", fmi.initial_y) }}
 {{- value_array("initial_p", "P_LEN", fmi.initial_parameters) }}
-    m->assertions_initialized=false; m->assertion_failed=false; m->parameters_dirty=true; m->tolerance=0.0; m->rmc_cs_substep=0.0; rmc_release_text(m);{% if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %} memset(m->rmc_warned, 0, sizeof(m->rmc_warned));{% endif %}{{ workspace_reset(me_refresh) }}{{ event_reset(fmi) }}
+    m->assertions_initialized=false; m->assertion_failed=false; m->parameters_dirty=true; m->tolerance=0.0; m->rmc_cs_substep=0.0; m->rmc_quiet=false; rmc_release_text(m);{% if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %} memset(m->rmc_warned, 0, sizeof(m->rmc_warned));{% endif %}{{ workspace_reset(me_refresh) }}{{ event_reset(fmi) }}
     memcpy(m->y, initial_y, sizeof(m->y));
     memcpy(m->p, initial_p, sizeof(m->p));
     m->time = 0.0;
@@ -21,7 +21,7 @@ static void log_assertion(ModelInstance* m, const char* message) { if (m->callba
 {% if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %}
 static void log_warning(ModelInstance* m, const char* message) { if (m->callbacks.logger) m->callbacks.logger(m->callbacks.componentEnvironment, "Rumoca", fmi2Warning, "warning", "%s", message); }
 {% endif %}
-#define RMC_LOG(m, message) do { if ((m)->callbacks.logger) (m)->callbacks.logger((m)->callbacks.componentEnvironment, "Rumoca", fmi2Error, "error", "%s", (message)); } while (0)
+#define RMC_LOG(m, message) do { if ((m)->callbacks.logger && !(m)->rmc_quiet) (m)->callbacks.logger((m)->callbacks.componentEnvironment, "Rumoca", fmi2Error, "error", "%s", (message)); } while (0)
 #define RMC_LOG_AT(m, category, message) do { if ((m)->callbacks.logger) (m)->callbacks.logger((m)->callbacks.componentEnvironment, "Rumoca", fmi2Warning, (category), "%s", (message)); } while (0)
 {%- if me_refresh.switching %}
 #define RMC_INFO(m, category, message) do { if ((m)->callbacks.logger) (m)->callbacks.logger((m)->callbacks.componentEnvironment, "Rumoca", fmi2OK, (category), "%s", (message)); } while (0)

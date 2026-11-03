@@ -567,12 +567,20 @@ static inline bool rmc_linear_solve_component(const double* matrix, const double
      the importer defines none.
    - The next substep is h * min(max({{ plan.safety }} * err^({{ plan.exponent }}), {{ plan.min_factor }}), {{ plan.max_factor }})
      (Hairer, Norsett and Wanner, Solving ODEs I, section II.4).
+   - A failed evaluation at a trial stage of the substep (any stage after
+     the accepted start point: its algebraic refresh does not converge, a
+     derivative is not finite, or a pure call fails) rejects the substep like
+     an error estimate above tolerance and retries it {{ plan.min_factor }} times as
+     long, as rumoca-solver-rk45 retries a refused trial point; the trial's
+     diagnostics are not logged, since its point is discarded. A failed
+     assertion stays a failure, as does a failed evaluation at the accepted
+     start point, which returns Error.
    - A model retaining a state-manifold projection projects every accepted
      substep onto it (SPEC_0044 ME-PROJ-007); a correction that moves a state
      restarts the next substep from a fresh derivative.
    - A communication step whose substep underflows or which attempts more
-     than {{ plan.max_substeps }} substeps returns Discard; a failed derivative
-     evaluation returns Error. The caller rolls the state back either way.
+     than {{ plan.max_substeps }} substeps returns Discard. The caller rolls
+     the state back either way.
    Accuracy therefore follows the tolerance, not the importer's communication
    step size: a stiff mode takes as many substeps as its stability needs. */
 static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double start, double step) {
@@ -592,7 +600,7 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
     const double end = start + step;
     double t = start;
     double h = m->rmc_cs_substep > 0.0 ? fmin(m->rmc_cs_substep, step) : step;
-    bool start_derivative = false;
+    bool start_derivative = false, refused = false;
     for (unsigned long attempt = 0; t < end; ++attempt) {
         if (attempt >= {{ plan.max_substeps }}UL) { RMC_LOG(m, "Co-Simulation step exceeded its substep budget"); return {{ prefix }}Discard; }
         const bool last = h >= end - t;
@@ -612,8 +620,20 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
                 m->y[i] = y0[i] + h * sum;
             }
             m->time = s >= 4 && last ? end : t + c[s] * h;
-            if (rmc_me_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+            m->rmc_quiet = true;
+            {{ prefix }}Status stage = rmc_me_derivatives(m);
+            m->rmc_quiet = false;
+            if (stage != {{ prefix }}OK) { if (m->assertion_failed) return {{ prefix }}Error; refused = true; break; }
             for (size_t i = 0; i < n; ++i) k[s + 1][i] = m->derivative[i];
+        }
+        if (refused) {
+            /* A refused trial point rejects the substep; its start derivative
+               is still the accepted point's. */
+            refused = false;
+            for (size_t i = 0; i < n; ++i) m->y[i] = y0[i];
+            m->time = t;
+            h *= {{ plan.min_factor }};
+            continue;
         }
         double error = 0.0;
         for (size_t i = 0; i < n; ++i) {
