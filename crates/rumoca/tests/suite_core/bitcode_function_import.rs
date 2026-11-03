@@ -488,6 +488,54 @@ fn a_model_with_an_unconnected_input_runs_when_its_inputs_are_held() {
 }
 
 #[test]
+fn free_inputs_start_holds_each_input_at_the_start_its_fmu_publishes() {
+    // `--free-inputs start` read only literal Real/Integer/Boolean starts and
+    // otherwise held 0, so an enumeration input sat at ordinal 0 (no literal)
+    // while its FMU starts at its first literal or its declared start. It now
+    // reads the FMI export's rule: the declared start, else the type default,
+    // inside the declared range.
+    let work = tempdir().expect("temp dir");
+    let source = work.path().join("FreeStarts.mo");
+    fs::write(
+        &source,
+        "type Mode = enumeration(off, low, high);\n\
+         model FreeStarts\n  input Mode m(start = Mode.high);\n  input Mode n;\n  \
+         input Real a(min = 1, max = 2);\n  input Integer k(min = 3);\n  \
+         Real x(start = 0, fixed = true);\nequation\n  der(x) = a + k;\nend FreeStarts;\n",
+    )
+    .expect("write fixture");
+    let artifact = work.path().join("free_starts.rbc");
+    let compiled = rumoca(&[
+        "compile",
+        source.to_str().unwrap(),
+        "--emit-bitcode",
+        artifact.to_str().unwrap(),
+    ]);
+    assert!(
+        artifact.exists(),
+        "fixture must compile: {}",
+        text(&compiled)
+    );
+    let held = rumoca(&[
+        "compile-bitcode",
+        artifact.to_str().unwrap(),
+        "--simulate",
+        "--check",
+        "--t-end",
+        "0.1",
+        "--free-inputs",
+        "start",
+    ]);
+    assert!(held.status.success(), "{}", text(&held));
+    assert!(
+        text(&held)
+            .contains("holding 4 free input(s) constant at their start values: m=3, n=1, a=1, k=3"),
+        "{}",
+        text(&held)
+    );
+}
+
+#[test]
 fn check_reports_each_array_element_against_its_declared_bound() {
     // The solver reports `y[1]`, `y[2]`, ... while bounds are declared on
     // `y`, so `--check` never checked an array element. A scalar bound now

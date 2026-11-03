@@ -60,6 +60,7 @@ mod tests {
             flow: false,
             stream: false,
             start: None,
+            start_is_default: false,
             fixed: None,
             min: None,
             max: None,

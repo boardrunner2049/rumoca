@@ -98,7 +98,7 @@ static fmi2Status evaluate_derivatives(ModelInstance* m) {
     values Boolean, all held in the numeric storage run; String values live in
     the instance text table. -#}
 enum RmcColumn { RMC_COLUMN_TIME, RMC_COLUMN_Y, RMC_COLUMN_P, RMC_COLUMN_DERIVATIVE, RMC_COLUMN_TEXT };
-enum RmcKind { RMC_KIND_FLOAT64, RMC_KIND_INT32, RMC_KIND_BOOLEAN, RMC_KIND_STRING };
+enum RmcKind { RMC_KIND_FLOAT64, RMC_KIND_INT32, RMC_KIND_BOOLEAN, RMC_KIND_STRING, RMC_KIND_ENUMERATION };
 enum RmcAccess { RMC_ACCESS_FIXED, RMC_ACCESS_STATE, RMC_ACCESS_INPUT, RMC_ACCESS_PARAMETER, RMC_ACCESS_TUNABLE_PARAMETER };
 typedef struct { unsigned char column; unsigned char kind; unsigned char access; unsigned char marks_parameters; size_t index; } RmcValueReference;
 static const RmcValueReference rmc_value_references[] = {
@@ -119,8 +119,11 @@ static const RmcValueReference rmc_value_references[] = {
 };
 #define RMC_VALUE_REFERENCES (sizeof(rmc_value_references) / sizeof(rmc_value_references[0]))
 
+/* An enumeration ordinal is read and written through the Integer accessors. */
 static const RmcValueReference* rmc_reference(fmi2ValueReference vr, unsigned char kind) {
-    return vr < RMC_VALUE_REFERENCES && rmc_value_references[vr].kind == kind ? &rmc_value_references[vr] : NULL;
+    if (vr >= RMC_VALUE_REFERENCES) return NULL;
+    unsigned char have = rmc_value_references[vr].kind;
+    return have == kind || (kind == RMC_KIND_INT32 && have == RMC_KIND_ENUMERATION) ? &rmc_value_references[vr] : NULL;
 }
 /* One settled numeric value. */
 static fmi2Status rmc_get_numeric(ModelInstance* m, const RmcValueReference* ref, double* value) {
@@ -195,7 +198,7 @@ FMI_EXPORT fmi2Status fmi2Reset(fmi2Component c) { ModelInstance* m = c; if (!m)
 RMC_GET_NUMERIC(Real, fmi2Real, RMC_KIND_FLOAT64, value)
 RMC_SET_NUMERIC(Real, fmi2Real, RMC_KIND_FLOAT64, isfinite(value), value)
 RMC_GET_NUMERIC(Integer, fmi2Integer, RMC_KIND_INT32, (fmi2Integer)value)
-RMC_SET_NUMERIC(Integer, fmi2Integer, RMC_KIND_INT32, true, (double)value)
+RMC_SET_NUMERIC(Integer, fmi2Integer, RMC_KIND_INT32, ref->kind != RMC_KIND_ENUMERATION || value >= 1, (double)value)
 RMC_GET_NUMERIC(Boolean, fmi2Boolean, RMC_KIND_BOOLEAN, value != 0.0 ? fmi2True : fmi2False)
 RMC_SET_NUMERIC(Boolean, fmi2Boolean, RMC_KIND_BOOLEAN, true, value ? 1.0 : 0.0)
 FMI_EXPORT fmi2Status fmi2GetString(fmi2Component c, const fmi2ValueReference vr[], size_t n, fmi2String values[]) {

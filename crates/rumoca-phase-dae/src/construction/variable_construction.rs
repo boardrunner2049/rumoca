@@ -269,28 +269,7 @@ fn lower_variable_attributes<'dae>(
     variable: VariableSpec<'_, 'dae>,
 ) -> Result<dae::VariableAttributes<'dae>, dae::DaeConstructionError> {
     let binding = lower_variable_binding(construction, context, variable)?;
-    // A native table handle is folded to its opaque integer id by the binding
-    // above; its declared `start` is the same ExternalObject constructor call,
-    // which is not numeric, so no start attribute is materialized for it.
-    let is_native_table_handle = context.native_table_ids.contains_key(&variable.flat.name);
-    let start = if is_native_table_handle {
-        None
-    } else {
-        match variable.flat.start.as_ref() {
-            Some(start) => Some(lower_variable_attribute_expression(
-                construction,
-                context,
-                variable,
-                start,
-            )?),
-            None if needs_default_start(variable) => Some(default_start_expression(
-                construction,
-                variable.scalar_type,
-                variable.flat.source_span,
-            )?),
-            None => None,
-        }
-    };
+    let start = lower_variable_start(construction, context, variable)?;
     let min = lower_optional_variable_attribute(
         construction,
         context,
@@ -345,6 +324,46 @@ fn lower_variable_attributes<'dae>(
             && context.evaluable_parameters.contains(&variable.flat.name),
         origin: dae::VariableOrigin::Source,
     })
+}
+
+/// The declaration's `start`: written, else the language default start its
+/// role needs. The parser's language default (MLS §4.9) keeps its
+/// `DefaultStart` provenance, so consumers can tell it from a written start.
+fn lower_variable_start<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    context: VariableDefinitionContext<'_, 'dae>,
+    variable: VariableSpec<'_, 'dae>,
+) -> Result<Option<dae::ExprId<'dae>>, dae::DaeConstructionError> {
+    // A native table handle is folded to its opaque integer id by its
+    // binding; its declared `start` is the same ExternalObject constructor
+    // call, which is not numeric, so no start attribute is materialized for it.
+    if context.native_table_ids.contains_key(&variable.flat.name) {
+        return Ok(None);
+    }
+    let default = || {
+        variable.flat.start.is_none() && needs_default_start(variable)
+            || variable.flat.start_is_default && has_default_start(variable.scalar_type)
+    };
+    match variable.flat.start.as_ref() {
+        _ if default() => default_start_expression(
+            construction,
+            variable.scalar_type,
+            variable.flat.source_span,
+        )
+        .map(Some),
+        Some(start) => {
+            lower_variable_attribute_expression(construction, context, variable, start).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+/// The predefined types whose language default start the parser materializes.
+const fn has_default_start(scalar_type: dae::ScalarType) -> bool {
+    matches!(
+        scalar_type,
+        dae::ScalarType::Real | dae::ScalarType::Integer | dae::ScalarType::Boolean
+    )
 }
 
 /// Whether DAE construction must materialize the predefined type's `start`.
@@ -489,17 +508,25 @@ fn variable_causality(
     role: RuntimeVariableRole,
     model: &flat::Model,
 ) -> dae::VariableCausality {
+    // A field of a public top-level connector, or of a public top-level
+    // component that carries the `input`/`output` prefix itself (a record:
+    // the prefix applies to every field, MLS §4.4.2.2), is an interface port
+    // like a top-level scalar.
     let top_level_port = variable.component_ref.as_ref().is_some_and(|reference| {
         reference.parts().len() == 1
-            || reference
-                .parts()
-                .first()
-                .is_some_and(|root| model.top_level_connectors.contains(&root.ident))
+            || reference.parts().first().is_some_and(|root| {
+                model.top_level_connectors.contains(&root.ident)
+                    || model.top_level_input_components.contains(&root.ident)
+                    || model.top_level_output_components.contains(&root.ident)
+            })
     });
+    // A parameter (a `parameter` field of an output record, or an `output
+    // parameter`) stays a parameter the importer can set: an FMI output cannot
+    // have fixed or tunable variability.
     match (&variable.causality, role, top_level_port) {
+        (_, RuntimeVariableRole::Parameter, _) => dae::VariableCausality::Parameter,
         (Causality::Input(_), RuntimeVariableRole::Input, true) => dae::VariableCausality::Input,
         (Causality::Output(_), _, true) => dae::VariableCausality::Output,
-        (_, RuntimeVariableRole::Parameter, _) => dae::VariableCausality::Parameter,
         _ => dae::VariableCausality::Local,
     }
 }

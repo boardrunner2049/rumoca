@@ -451,10 +451,12 @@ static {{ prefix }}Status settle_assertion_event(ModelInstance* m) {
     };
 {%- endmacro %}
 
-{#- The FMI value type of one inventory entry: Real is Float64, Integer and
-    enumeration ordinals are Int32, Boolean is Boolean, String is String. -#}
+{#- The FMI value type of one inventory entry: Real is Float64, Integer is
+    Int32, Boolean is Boolean, String is String. An enumeration is accessed as
+    Int32 too but keeps its own kind, so a set can refuse an ordinal that
+    names no literal. -#}
 {%- macro rmc_kind(variable) -%}
-{%- if variable.value_kind == "Real" %}RMC_KIND_FLOAT64{% elif variable.value_kind in ["Integer", "Enumeration"] %}RMC_KIND_INT32{% elif variable.value_kind == "Boolean" %}RMC_KIND_BOOLEAN{% elif variable.value_kind == "String" %}RMC_KIND_STRING{% else %}{{ fail("unsupported-feature:fmi.c.value-kind " ~ variable.value_kind) }}{% endif -%}
+{%- if variable.value_kind == "Real" %}RMC_KIND_FLOAT64{% elif variable.value_kind == "Integer" %}RMC_KIND_INT32{% elif variable.value_kind == "Enumeration" %}RMC_KIND_ENUMERATION{% elif variable.value_kind == "Boolean" %}RMC_KIND_BOOLEAN{% elif variable.value_kind == "String" %}RMC_KIND_STRING{% else %}{{ fail("unsupported-feature:fmi.c.value-kind " ~ variable.value_kind) }}{% endif -%}
 {%- endmacro %}
 
 {#- Instance storage of the String texts: the current text of every String

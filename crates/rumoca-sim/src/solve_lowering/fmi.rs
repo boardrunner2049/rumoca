@@ -66,8 +66,9 @@ pub(crate) fn lower_runtime_fmi_artifact(
 /// Inputs are seeded from their checked `start` attributes, exactly as GPU
 /// preparation seeds them: an FMU importer writes every input before each
 /// evaluation, so an input with no other driver is not the failure it is for
-/// headless simulation. An input the checked declaration left without any
-/// `start` still fails.
+/// headless simulation. An input declared without a `start` is seeded with its
+/// predefined type's default start (MLS §4.9), the same value its
+/// `modelDescription.xml` publishes, since FMI requires a start on every input.
 #[cfg(feature = "fmi")]
 pub fn lower_fmi_component(model: &dae::Dae) -> Result<FmiComponent, SimulationDiagnosticError> {
     let host_driven_seeds = host_driven_input_seeds(model)?;

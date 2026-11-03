@@ -27,6 +27,17 @@ pub enum FmiLoweringError {
         message: String,
         span: Span,
     },
+    #[error(
+        "the declared start {start} of input `{variable}` lies outside its range \
+         [{minimum}, {maximum}]; FMI requires min <= start <= max"
+    )]
+    InputStartOutOfRange {
+        variable: String,
+        start: f64,
+        minimum: f64,
+        maximum: f64,
+        span: Span,
+    },
     #[error(transparent)]
     SolveModel(#[from] SolveModelLoweringError),
     #[error(transparent)]
@@ -39,9 +50,9 @@ impl FmiLoweringError {
     #[must_use]
     pub fn span(&self) -> Option<Span> {
         match self {
-            Self::UnsupportedScalarType { span, .. } | Self::NumericMetadata { span, .. } => {
-                Some(*span)
-            }
+            Self::UnsupportedScalarType { span, .. }
+            | Self::NumericMetadata { span, .. }
+            | Self::InputStartOutOfRange { span, .. } => Some(*span),
             Self::SolveModel(error) => error.source_span(),
             Self::Component(error) => error.span(),
             Self::Wire(_) => None,
@@ -146,11 +157,34 @@ fn lower_variable<'dae>(
     let role = solve_role(variable.role());
     let causality = fmi_causality(variable.causality());
     let value_kind = solve_value_kind(variable)?;
-    let start = match numeric_attribute(numeric, variable, variable.start())? {
-        Some(values) => values,
-        None => numeric_attribute(numeric, variable, variable.binding())?
-            .unwrap_or_else(|| vec![0.0; scalar_count]),
-    };
+    let minimum = published_minimum(numeric, variable)?;
+    let maximum = numeric_attribute(numeric, variable, variable.maximum())?;
+    // A host-written input publishes exactly the value it is seeded with
+    // before the importer's first write. An input whose declaration equation
+    // has a static value (`input Real g[3] = {0, 0, 9.81}`, or a bound field
+    // of an input record) holds that value until the importer writes it, so
+    // that value is its start. Any other declaration with neither a `start`
+    // nor a binding holds its type's default start.
+    let start = if let Some(binding) = static_input_binding(view, variable) {
+        numeric_attribute(numeric, variable, Some(binding))?
+    } else if is_host_written_input(variable) {
+        input_start(
+            view,
+            numeric,
+            variable,
+            minimum.as_deref(),
+            maximum.as_deref(),
+        )?
+    } else {
+        match numeric_attribute(numeric, variable, variable.start())? {
+            Some(values) => Some(values),
+            None => match numeric_attribute(numeric, variable, variable.binding())? {
+                Some(values) => Some(values),
+                None => unmodified_start(variable, minimum.as_deref(), maximum.as_deref()),
+            },
+        }
+    }
+    .unwrap_or_else(|| vec![0.0; scalar_count]);
     Ok(FmiVariableInput {
         name: variable.name().to_string(),
         scalar_names: (0..scalar_count)
@@ -160,8 +194,8 @@ fn lower_variable<'dae>(
         value_kind,
         dimensions: variable.value_type().dimensions().to_vec(),
         start,
-        minimum: numeric_attribute(numeric, variable, variable.minimum())?,
-        maximum: numeric_attribute(numeric, variable, variable.maximum())?,
+        minimum,
+        maximum,
         nominal: numeric_attribute(numeric, variable, variable.nominal())?,
         unit: variable.unit().map(str::to_owned),
         description: variable.description().map(str::to_owned),
@@ -270,6 +304,152 @@ fn numeric_attribute<'dae>(
         });
     }
     Ok(Some(values))
+}
+
+/// The lower bound a declaration publishes: its declared `min`, else, for an
+/// enumeration, its first literal (ordinal 1). Every enumeration value is a
+/// literal, and an enumeration exports as an ordinal-valued Int32/Integer
+/// whose own default minimum would otherwise admit ordinals that name none.
+fn published_minimum<'dae>(
+    numeric: &mut rumoca_eval_dae::NumericEvaluator<'dae>,
+    variable: dae::VariableView<'dae>,
+) -> Result<Option<Vec<f64>>, FmiLoweringError> {
+    let declared = numeric_attribute(numeric, variable, variable.minimum())?;
+    Ok(declared.or_else(|| {
+        (variable.value_type().scalar_type() == dae::ScalarType::Enumeration)
+            .then(|| vec![1.0; variable.scalar_count()])
+    }))
+}
+
+/// The declaration equation of an input when it has a static (constant or
+/// parameter) value: the value the input holds before the importer's first
+/// write.
+fn static_input_binding<'dae>(
+    view: dae::DaeView<'dae>,
+    variable: dae::VariableView<'dae>,
+) -> Option<dae::ExprId<'dae>> {
+    if variable.role() != dae::VariableRole::Input {
+        return None;
+    }
+    let binding = variable.binding()?;
+    let variability = view.expression(binding)?.variability();
+    matches!(
+        variability,
+        dae::ExpressionVariability::Constant | dae::ExpressionVariability::Parameter
+    )
+    .then_some(binding)
+}
+
+/// A top-level input with no binding: its value is whatever the host (an FMU
+/// importer, a GPU driver) writes, and its `start` is only the value it holds
+/// before the first write.
+fn is_host_written_input(variable: dae::VariableView<'_>) -> bool {
+    variable.role() == dae::VariableRole::Input && variable.binding().is_none()
+}
+
+/// The per-scalar start a declaration holds when nothing modifies it: its
+/// predefined type's default start (MLS §4.9: `0`, `false`, or the first
+/// enumeration literal), inside the declared range (see [`within_range`]).
+/// `String` and record declarations have no numeric start, so they have none.
+fn unmodified_start(
+    variable: dae::VariableView<'_>,
+    minimum: Option<&[f64]>,
+    maximum: Option<&[f64]>,
+) -> Option<Vec<f64>> {
+    let default = variable.value_type().scalar_type().default_start_value()?;
+    let mut values = vec![default; variable.scalar_count()];
+    within_range(&mut values, minimum, maximum);
+    Some(values)
+}
+
+/// One scalar's declared bound, when the declaration has one.
+fn bound(bounds: Option<&[f64]>, scalar: usize) -> Option<f64> {
+    bounds.and_then(|bounds| bounds.get(scalar)).copied()
+}
+
+/// Move every scalar that lies outside the declaration's own `min`/`max` to
+/// the nearest bound. FMI requires `min <= start <= max` on every variable.
+fn within_range(values: &mut [f64], minimum: Option<&[f64]>, maximum: Option<&[f64]>) {
+    for (scalar, value) in values.iter_mut().enumerate() {
+        if let Some(low) = bound(minimum, scalar).filter(|low| *value < *low) {
+            *value = low;
+        }
+        if let Some(high) = bound(maximum, scalar).filter(|high| *value > *high) {
+            *value = high;
+        }
+    }
+}
+
+/// The per-scalar value a host-written input holds before the host's first
+/// write: its `start`, which FMI requires to lie in its declared range.
+///
+/// A start the model does not write (the language default start of MLS §4.9,
+/// materialized with `DefaultStart` provenance, or none at all) is only the
+/// pre-write value the exporter picks, so it is moved to the nearest bound
+/// when the range excludes it: `input Real a(min = 1)` starts at 1. A start
+/// the model writes outside the range is a model error and is refused rather
+/// than silently replaced by a value the model never states.
+fn input_start<'dae>(
+    view: dae::DaeView<'dae>,
+    numeric: &mut rumoca_eval_dae::NumericEvaluator<'dae>,
+    variable: dae::VariableView<'dae>,
+    minimum: Option<&[f64]>,
+    maximum: Option<&[f64]>,
+) -> Result<Option<Vec<f64>>, FmiLoweringError> {
+    let Some(expression) = variable.start() else {
+        return Ok(unmodified_start(variable, minimum, maximum));
+    };
+    let Some(mut values) = numeric_attribute(numeric, variable, Some(expression))? else {
+        return Ok(None);
+    };
+    let provenance = view
+        .expression(expression)
+        .map(dae::ExpressionView::provenance);
+    let defaulted = provenance.is_some_and(|provenance| {
+        provenance.origin() == dae::DaeProvenanceOrigin::Generated(dae::DaeGeneration::DefaultStart)
+    });
+    let out_of_range = values.iter().enumerate().find(|&(scalar, value)| {
+        *value < bound(minimum, scalar).unwrap_or(f64::NEG_INFINITY)
+            || *value > bound(maximum, scalar).unwrap_or(f64::INFINITY)
+    });
+    if !defaulted && let Some((scalar, &start)) = out_of_range {
+        return Err(FmiLoweringError::InputStartOutOfRange {
+            variable: variable
+                .scalar_name(scalar)
+                .unwrap_or_else(|| variable.name().to_string()),
+            start,
+            minimum: bound(minimum, scalar).unwrap_or(f64::NEG_INFINITY),
+            maximum: bound(maximum, scalar).unwrap_or(f64::INFINITY),
+            span: provenance
+                .map_or_else(|| variable.declaration().span(), dae::DaeProvenance::span),
+        });
+    }
+    within_range(&mut values, minimum, maximum);
+    Ok(Some(values))
+}
+
+/// The per-scalar value an unbound top-level input holds before its host's
+/// first write (see [`input_start`]); the same value the FMI description
+/// publishes as its start. `None` for an input without a numeric start (a
+/// `String` input).
+///
+/// FMI export, GPU preparation and the bitcode simulator's `--free-inputs`
+/// all read the pre-write value of an input here, so one input starts from
+/// one value wherever it runs.
+pub fn host_input_start_values<'dae>(
+    view: dae::DaeView<'dae>,
+    variable: dae::VariableView<'dae>,
+) -> Result<Option<Vec<f64>>, FmiLoweringError> {
+    let mut numeric = rumoca_eval_dae::NumericEvaluator::new(view);
+    let minimum = published_minimum(&mut numeric, variable)?;
+    let maximum = numeric_attribute(&mut numeric, variable, variable.maximum())?;
+    input_start(
+        view,
+        &mut numeric,
+        variable,
+        minimum.as_deref(),
+        maximum.as_deref(),
+    )
 }
 
 /// Evaluate one numeric declaration attribute through the phase-owned DAE

@@ -210,6 +210,11 @@ pub struct Model {
     /// unlike sub-component inputs from type interfaces (MLS §4.4.2.2).
     #[serde(default)]
     pub top_level_input_components: IndexSet<String>,
+    /// Names of public top-level components declared with `output` causality.
+    /// The prefix applies to every field of such a component (MLS §4.4.2.2),
+    /// so `r.x` of `output R r` is an interface output like a scalar output.
+    #[serde(default)]
+    pub top_level_output_components: IndexSet<String>,
     /// Conservative scalar budget for VCG break-edge equations (MLS §9.4).
     /// Break edges are lowered to their declared `equalityConstraint` equations
     /// during connection generation. Balance accounting retains this metadata
@@ -791,6 +796,10 @@ pub struct Variable {
     // Resolved attributes
     /// Start value attribute.
     pub start: Option<Expression>,
+    /// `start` is the predefined type's language default (MLS §4.9), not a
+    /// value written in the model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_is_default: bool,
     /// Fixed attribute, scalarized per array element (MLS §4.8, §4.8.6). A
     /// single value broadcasts over every element; an array carries one value
     /// per element.
@@ -984,6 +993,7 @@ impl Variable {
             dims: Vec::new(),
             connected: false,
             start: None,
+            start_is_default: false,
             fixed: None,
             min: None,
             max: None,
