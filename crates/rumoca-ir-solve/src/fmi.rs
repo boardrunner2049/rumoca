@@ -48,7 +48,8 @@ mod time_events;
 
 pub use c_codegen::{FmiCCodegenError, FmiCCodegenView};
 pub use co_simulation::{
-    CoSimulationController, CoSimulationMethod, CoSimulationStepPlan, CoSimulationSubstep,
+    CoSimulationController, CoSimulationMethod, CoSimulationStepPlan, CoSimulationStiffMethod,
+    CoSimulationStiffness, CoSimulationSubstep,
 };
 pub use event_free::{FmiEventFreeCodegenView, FmiEventFreeError};
 pub use indicator_plan::{
