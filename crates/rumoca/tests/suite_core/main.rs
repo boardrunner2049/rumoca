@@ -96,6 +96,7 @@ mod fmi_me_host_divergence;
 mod fmi_parameter_folds;
 mod fmi_projection_descriptors;
 mod fmi_pure_call_families;
+mod fmi_record_ports;
 mod for_eq_array_test;
 mod for_loop_element_derivative_alias;
 mod formal_derivative_stages;

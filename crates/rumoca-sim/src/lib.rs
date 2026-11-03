@@ -96,7 +96,7 @@ pub use solve_lowering::{
     ObjectiveGradientProbe, ParameterJacobianProbe, SimulationDiagnosticError,
     SingularityDiagnosis, StateAndParameterJacobianProbe, SteadyStateSensitivityProbe,
     StructuralReport, TearingReport, UnmatchedEquationDiagnosis, UnmatchedUnknownDiagnosis,
-    diagnose_structural_singularity, eval_dae_at, jacobian_for_dae,
+    diagnose_structural_singularity, eval_dae_at, host_driven_input_starts, jacobian_for_dae,
     lower_correlated_for_simulation_with_overrides, lower_dae_for_gpu_preparation,
     lower_dae_for_simulation, lower_for_differentiation_with_overrides,
     lower_for_simulation_with_overrides, parameter_jacobian_for_dae,

@@ -6,6 +6,8 @@
 //! against the FMI 3 headers Rumoca vendors, so this runs without the pinned
 //! conformance tree. The driver reads every input before writing any, then
 //! writes `u = 1` during initialization and steps `der(x) = 1 + u` to t = 1.
+//! An enumeration input refuses an ordinal that names no literal and accepts
+//! one that does.
 
 use super::*;
 
@@ -57,6 +59,14 @@ int main(int argc, char** argv) {
     printf("start m %d\n", (int)integer);
     CHECK(fmi3GetFloat64(instance, &s, 1, &real[0], 1));
     printf("start s %g\n", real[0]);
+    /* An enumeration ordinal below the first literal names no literal. */
+    const fmi3Int32 no_literal = 0, second_literal = 2;
+    printf("set m 0 %s\n", fmi3SetInt32(instance, &m, 1, &no_literal, 1) == fmi3Error ? "refused" : "accepted");
+    CHECK(fmi3GetInt32(instance, &m, 1, &integer, 1));
+    printf("kept m %d\n", (int)integer);
+    CHECK(fmi3SetInt32(instance, &m, 1, &second_literal, 1));
+    CHECK(fmi3GetInt32(instance, &m, 1, &integer, 1));
+    printf("set m %d\n", (int)integer);
     const fmi3Float64 one = 1.0;
     CHECK(fmi3SetFloat64(instance, &u, 1, &one, 1));
     CHECK(fmi3ExitInitializationMode(instance));
@@ -162,6 +172,9 @@ fn generated_fmi3_component_holds_default_input_starts_until_written() {
         "start b 0",
         "start m 1",
         "start s 3",
+        "set m 0 refused",
+        "kept m 1",
+        "set m 2",
         "initial y 3",
     ] {
         assert!(stdout.lines().any(|seen| seen == line), "{line}\n{stdout}");

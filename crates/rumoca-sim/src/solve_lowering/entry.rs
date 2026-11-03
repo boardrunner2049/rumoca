@@ -29,9 +29,10 @@ pub fn lower_dae_for_simulation(
 /// first write, and MLS §4.4.2.1 names it: the input's `start` attribute —
 /// written on the declaration where the modeler chose it (`input Real
 /// throttle(start = 0)`, as every shipped model in `examples/interactive`
-/// does) and otherwise the predefined type's own attribute default. Either way
-/// it is read out of the checked DAE, not invented here, and an input the
-/// checked declaration left without any `start` still fails.
+/// does) and otherwise the predefined type's own attribute default (MLS §4.9),
+/// moved into the declaration's `min`/`max` range when that excludes it. The
+/// rule is `rumoca_phase_solve::fmi::host_input_start_values`, shared with
+/// FMI export, so an input starts from the value its FMU publishes.
 ///
 /// The seed travels the same override channel a runtime provider uses, so an
 /// input carrying a binding keeps its binding and headless simulation
@@ -74,8 +75,22 @@ pub(super) fn lower_dae_with_host_driven_inputs(
 pub(super) fn host_driven_input_seeds(
     model: &dae::Dae,
 ) -> Result<std::collections::HashMap<String, f64>, SimulationDiagnosticError> {
+    Ok(host_driven_input_starts(model)?.into_iter().collect())
+}
+
+/// The pre-write value of every unbound top-level input scalar, in declaration
+/// order: the value FMI export and GPU preparation seed it with, and the value
+/// a standalone run that holds free inputs constant holds it at.
+///
+/// # Errors
+///
+/// Fails when a declared `start`, `min` or `max` of an input does not evaluate
+/// to one numeric value per scalar.
+pub fn host_driven_input_starts(
+    model: &dae::Dae,
+) -> Result<Vec<(String, f64)>, SimulationDiagnosticError> {
     model.inspect(|view| {
-        let mut seeds = std::collections::HashMap::new();
+        let mut seeds = Vec::new();
         for (_, variable) in view
             .variables()
             .filter(|(_, variable)| variable.role() == dae::VariableRole::Input)
@@ -89,24 +104,15 @@ pub(super) fn host_driven_input_seeds(
 fn seed_host_driven_input<'dae>(
     view: dae::DaeView<'dae>,
     variable: dae::VariableView<'dae>,
-    seeds: &mut std::collections::HashMap<String, f64>,
+    seeds: &mut Vec<(String, f64)>,
 ) -> Result<(), SimulationDiagnosticError> {
     if variable.binding().is_some() {
         return Ok(());
     }
     // A String input has no numeric start, declared or default, and seeds
     // nothing: the host supplies it, and its default stays its own.
-    let values = match variable.start() {
-        Some(start) => {
-            rumoca_phase_solve::fmi::numeric_attribute_values(view, variable, Some(start))
-                .map_err(fmi_metadata_error)?
-        }
-        None => variable
-            .value_type()
-            .scalar_type()
-            .default_start_value()
-            .map(|value| vec![value]),
-    };
+    let values = rumoca_phase_solve::fmi::host_input_start_values(view, variable)
+        .map_err(fmi_metadata_error)?;
     let Some(values) = values else {
         return Ok(());
     };
@@ -137,7 +143,7 @@ fn seed_host_driven_input<'dae>(
                 )
             })?,
         };
-        seeds.insert(name, value);
+        seeds.push((name, value));
     }
     Ok(())
 }

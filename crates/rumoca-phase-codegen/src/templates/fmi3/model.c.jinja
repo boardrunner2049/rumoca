@@ -93,7 +93,7 @@ static fmi3Status evaluate_derivatives(ModelInstance* m) {
     enumeration values are Int32 and Boolean values Boolean, all held in the
     numeric storage run; String values live in the instance text table. -#}
 enum RmcColumn { RMC_COLUMN_TIME, RMC_COLUMN_Y, RMC_COLUMN_P, RMC_COLUMN_DERIVATIVE, RMC_COLUMN_TEXT, RMC_COLUMN_INDICATOR };
-enum RmcKind { RMC_KIND_FLOAT64, RMC_KIND_INT32, RMC_KIND_BOOLEAN, RMC_KIND_STRING };
+enum RmcKind { RMC_KIND_FLOAT64, RMC_KIND_INT32, RMC_KIND_BOOLEAN, RMC_KIND_STRING, RMC_KIND_ENUMERATION };
 enum RmcAccess { RMC_ACCESS_FIXED, RMC_ACCESS_STATE, RMC_ACCESS_INPUT, RMC_ACCESS_PARAMETER, RMC_ACCESS_TUNABLE_PARAMETER };
 typedef struct { unsigned char column; unsigned char kind; unsigned char access; unsigned char marks_parameters; size_t base; size_t count; } RmcValueReference;
 static const RmcValueReference rmc_value_references[] = {
@@ -112,8 +112,11 @@ static const RmcValueReference rmc_value_references[] = {
 {%- endfor %}
 };
 #define RMC_VALUE_REFERENCES (sizeof(rmc_value_references) / sizeof(rmc_value_references[0]))
+/* An enumeration ordinal is read and written through the Int32 accessors. */
 static const RmcValueReference* rmc_reference(fmi3ValueReference vr, unsigned char kind) {
-    return vr < RMC_VALUE_REFERENCES && rmc_value_references[vr].kind == kind ? &rmc_value_references[vr] : NULL;
+    if (vr >= RMC_VALUE_REFERENCES) return NULL;
+    unsigned char have = rmc_value_references[vr].kind;
+    return have == kind || (kind == RMC_KIND_INT32 && have == RMC_KIND_ENUMERATION) ? &rmc_value_references[vr] : NULL;
 }
 static fmi3Boolean rmc_can_set(const ModelInstance* m, const RmcValueReference* ref) {
     switch (ref->access) {
@@ -173,7 +176,10 @@ FMI_EXPORT fmi3Status fmi3Get##Name(fmi3Instance i, const fmi3ValueReference vr[
 FMI_EXPORT fmi3Status fmi3Set##Name(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, const Type values[], size_t nvalues) { \
     ModelInstance* m = i; size_t cursor = 0; \
     if (!m || (!vr && nvr) || (!values && nvalues) || !rmc_request(m, vr, nvr, nvalues, KIND, true)) return fmi3Error; \
-    for (size_t k = 0; k < nvalues; ++k) { Type value = values[k]; (void)value; if (!(VALID)) return fmi3Error; } \
+    for (size_t k = 0, checked = 0; k < nvr; ++k) { \
+        const RmcValueReference* ref = &rmc_value_references[vr[k]]; (void)ref; \
+        for (size_t j = 0; j < ref->count; ++j) { Type value = values[checked++]; (void)value; if (!(VALID)) return fmi3Error; } \
+    } \
     for (size_t k = 0; k < nvr; ++k) { \
         const RmcValueReference* ref = &rmc_value_references[vr[k]]; double* target = ref->column == RMC_COLUMN_Y ? m->y : m->p; \
         for (size_t j = 0; j < ref->count; ++j) { Type value = values[cursor++]; target[ref->base + j] = STORE; } \
@@ -184,7 +190,7 @@ FMI_EXPORT fmi3Status fmi3Set##Name(fmi3Instance i, const fmi3ValueReference vr[
 RMC_GET_NUMERIC(Float64, fmi3Float64, RMC_KIND_FLOAT64, value)
 RMC_SET_NUMERIC(Float64, fmi3Float64, RMC_KIND_FLOAT64, isfinite(value), value)
 RMC_GET_NUMERIC(Int32, fmi3Int32, RMC_KIND_INT32, (fmi3Int32)value)
-RMC_SET_NUMERIC(Int32, fmi3Int32, RMC_KIND_INT32, true, (double)value)
+RMC_SET_NUMERIC(Int32, fmi3Int32, RMC_KIND_INT32, ref->kind != RMC_KIND_ENUMERATION || value >= 1, (double)value)
 RMC_GET_NUMERIC(Boolean, fmi3Boolean, RMC_KIND_BOOLEAN, value != 0.0)
 RMC_SET_NUMERIC(Boolean, fmi3Boolean, RMC_KIND_BOOLEAN, true, value ? 1.0 : 0.0)
 FMI_EXPORT fmi3Status fmi3GetString(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, fmi3String values[], size_t nvalues) {

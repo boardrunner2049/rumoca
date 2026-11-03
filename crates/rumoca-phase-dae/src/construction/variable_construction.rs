@@ -489,12 +489,17 @@ fn variable_causality(
     role: RuntimeVariableRole,
     model: &flat::Model,
 ) -> dae::VariableCausality {
+    // A field of a public top-level connector, or of a public top-level
+    // component that carries the `input`/`output` prefix itself (a record:
+    // the prefix applies to every field, MLS §4.4.2.2), is an interface port
+    // like a top-level scalar.
     let top_level_port = variable.component_ref.as_ref().is_some_and(|reference| {
         reference.parts().len() == 1
-            || reference
-                .parts()
-                .first()
-                .is_some_and(|root| model.top_level_connectors.contains(&root.ident))
+            || reference.parts().first().is_some_and(|root| {
+                model.top_level_connectors.contains(&root.ident)
+                    || model.top_level_input_components.contains(&root.ident)
+                    || model.top_level_output_components.contains(&root.ident)
+            })
     });
     match (&variable.causality, role, top_level_port) {
         (Causality::Input(_), RuntimeVariableRole::Input, true) => dae::VariableCausality::Input,

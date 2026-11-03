@@ -18,7 +18,9 @@ pub use rumoca_phase_structural::{BlockReport, StructuralReport, TearingReport};
 pub use rumoca_solver::{EvalAtReport, EvalAtSlot, JacobianReport};
 
 pub use diagnostics::SimulationDiagnosticError;
-pub use entry::{lower_dae_for_gpu_preparation, lower_dae_for_simulation};
+pub use entry::{
+    host_driven_input_starts, lower_dae_for_gpu_preparation, lower_dae_for_simulation,
+};
 #[cfg(feature = "fmi")]
 pub use fmi::lower_fmi_component;
 pub use probe::{
