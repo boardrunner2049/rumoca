@@ -233,6 +233,13 @@ struct ActiveCallAssertion<'dae> {
     arguments: Vec<dae::ExprId<'dae>>,
 }
 
+/// Caller state set aside while a definition lowers in its owning context.
+struct SuspendedContext<'dae> {
+    context_id: u64,
+    context_stack: Vec<u64>,
+    activations: Vec<ActivationGuard<'dae>>,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct FunctionArgumentsFrame<'dae> {
     call: dae::ExprId<'dae>,
@@ -621,6 +628,61 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
     fn resume_context(&mut self, suspended: u64) {
         self.context_stack.push(self.context_id);
         self.context_id = suspended;
+    }
+
+    /// Enter the function context that owns an SSA definition.
+    ///
+    /// A function body definition executes whenever its call frame does, so
+    /// it is lowered under exactly the activation prefix that was live when
+    /// that frame opened. Guards pushed later belong to expressions inside the
+    /// frame, such as one arm of `if j == k then ... else ...`; lowering the
+    /// definition under them would make its value - which the caches below
+    /// publish for the whole frame - exist only on that arm, and every read
+    /// outside the arm would see a register the guarded op never wrote.
+    fn switch_context(&mut self, context: u64) -> SuspendedContext<'dae> {
+        let suspended = SuspendedContext {
+            context_id: self.context_id,
+            context_stack: std::mem::take(&mut self.context_stack),
+            activations: self.activation_path.split_off(
+                self.owning_frame_activation_base(context)
+                    .unwrap_or(self.activation_path.len())
+                    .min(self.activation_path.len()),
+            ),
+        };
+        let mut ancestors = Vec::new();
+        let mut current = context;
+        while current != 0 {
+            let frame = self
+                .context_frames
+                .get(&current)
+                .expect("non-root scalar context has a frame");
+            let parent = frame.parent();
+            ancestors.push(parent);
+            current = parent;
+        }
+        ancestors.reverse();
+        self.context_stack = ancestors;
+        self.context_id = context;
+        suspended
+    }
+
+    fn restore_context(&mut self, suspended: SuspendedContext<'dae>) {
+        self.context_id = suspended.context_id;
+        self.context_stack = suspended.context_stack;
+        self.activation_path.extend(suspended.activations);
+    }
+
+    /// Activation prefix length of the open call frame `context` names.
+    fn owning_frame_activation_base(&self, context: u64) -> Option<usize> {
+        let Some(ScalarContextFrame::Function { call, function, .. }) =
+            self.context_frames.get(&context)
+        else {
+            return None;
+        };
+        self.function_arguments
+            .iter()
+            .rfind(|frame| frame.call == *call && frame.function == *function)
+            .map(|frame| frame.activation_base)
     }
 
     fn function_fold_cache_key(

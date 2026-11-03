@@ -1207,30 +1207,6 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         Ok(dst_start)
     }
 
-    fn switch_context(&mut self, context: u64) -> (u64, Vec<u64>) {
-        let previous = (self.context_id, std::mem::take(&mut self.context_stack));
-        let mut ancestors = Vec::new();
-        let mut current = context;
-        while current != 0 {
-            let frame = self
-                .context_frames
-                .get(&current)
-                .expect("non-root scalar context has a frame");
-            let parent = frame.parent();
-            ancestors.push(parent);
-            current = parent;
-        }
-        ancestors.reverse();
-        self.context_stack = ancestors;
-        self.context_id = context;
-        previous
-    }
-
-    fn restore_context(&mut self, previous: (u64, Vec<u64>)) {
-        self.context_id = previous.0;
-        self.context_stack = previous.1;
-    }
-
     // SPEC_0021: Exception - exhaustive record-field dispatch over definition ownership forms.
     #[allow(clippy::excessive_nesting)]
     fn pack_function_definition_record_field(
