@@ -1349,8 +1349,10 @@ static {{ prefix }}Status {{ name }}(ModelInstance* m) {
    constants, so one pass reaches the runtime's repeated-sweep fixed point; a
    change is a change of bits. A state whose start reads a settable parameter
    is assigned from it while initializing only (MLS §8.6: a start is an
-   initial value). The parameter-determined discrete equations follow: they
-   read only parameters, so they settle with them.
+   initial value). An MLS §8.6 discrete initial definition (`pre(m) = e`)
+   follows the bindings and also runs while initializing only. The
+   parameter-determined discrete equations follow: they read only parameters,
+   so they settle with them.
    -1 error, 0 unchanged, 1 changed */
 static int rmc_apply_updates(ModelInstance* m, bool initializing) {
     (void)initializing;
@@ -1370,6 +1372,7 @@ static int rmc_apply_updates(ModelInstance* m, bool initializing) {
 {%- for index in fmi.update_order %}{% set program = solve.initialization.update_plan.programs[index] %}
 {%- set start = namespace(assigned=false) %}
 {%- for op in program.ops %}{% if op.kind == "StoreOutput" and targets[op.output_index].Y is defined %}{% set start.assigned = true %}{% endif %}{% endfor %}
+{%- if index in fmi.update_initial_only %}{% set start.assigned = true %}{% endif %}
     {% if start.assigned %}if (initializing) {% endif %}{
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
 {%- for op in program.ops %}

@@ -19,6 +19,16 @@
 //! hold that one value, so the order has no cycle to iterate. A component with
 //! no determined coordinate is underdetermined and one with two is
 //! over-determined; both are refused, never settled by a guessed start value.
+//!
+//! `pre(m) = m` relates a coordinate to itself: the discrete steady state of
+//! MLS §8.6 (its example `pre(xd) = xd`). In a component with a determined
+//! coordinate it is one more edge to the value that coordinate fixes. In a
+//! component without one whose only relations are such identities, `m` takes
+//! the value its equation-section owners give it at initialization (an
+//! equation, a connection, a `when initial()` assignment) and `pre(m)` must
+//! equal it. That value is not known before the initial event runs, so the
+//! definition is recorded as the identity `m := m`, the steady state the
+//! runtime iterates to (SPEC_0022 EQN-040): never a guessed start value.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -78,6 +88,13 @@ pub(super) fn settle_initial_relations(
             .collect::<Vec<_>>();
         let (source, value) = match sources.len() {
             1 => sources.remove(0),
+            0 if relations_are_identities(relations, &component) => {
+                for member in &component {
+                    settled.insert(member.clone());
+                }
+                define_steady_states(relations, &component, definitions)?;
+                continue;
+            }
             0 => {
                 return Err(unsupported(
                     format!(
@@ -116,6 +133,45 @@ pub(super) fn settle_initial_relations(
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Whether every initial relation that touches `component` is `pre(m) = m`.
+fn relations_are_identities(relations: &[InitialRelation<'_>], component: &[VarName]) -> bool {
+    relations
+        .iter()
+        .filter(|relation| component.contains(relation.lhs))
+        .all(|relation| relation.lhs == relation.rhs)
+}
+
+/// Record `m := m` for every `pre(m) = m` of `component`: the steady state
+/// whose value the initial event determines.
+fn define_steady_states(
+    relations: &[InitialRelation<'_>],
+    component: &[VarName],
+    definitions: &mut HashMap<VarName, InitialDiscreteValue>,
+) -> Result<(), ToDaeError> {
+    for relation in relations
+        .iter()
+        .filter(|relation| component.contains(relation.lhs))
+    {
+        if definitions.contains_key(relation.lhs) {
+            continue;
+        }
+        let identity = Expression::VarRef {
+            name: rumoca_core::Reference::from_var_name(relation.lhs.clone()),
+            subscripts: Vec::new(),
+            span: relation.span,
+        };
+        insert_initial_definition(
+            definitions,
+            relation.lhs,
+            InitialDiscreteValue {
+                value: identity,
+                span: relation.span,
+            },
+        )?;
     }
     Ok(())
 }

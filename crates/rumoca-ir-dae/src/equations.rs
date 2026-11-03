@@ -358,7 +358,7 @@ impl<'dae> InitializationEquations<'_, 'dae> {
 /// that projection and proves that the read cone excludes the target's own
 /// storage. A read of a derivative, `pre`, delay, or any discrete coordinate
 /// has no such ordering owner, so it fails here instead of producing a
-/// numerically plausible but unproven initial value.
+/// numerically plausible but unproven initial value. `m := m` is `pre(m) = m`.
 fn insert_initial_discrete_value<'dae>(
     source_map: &rumoca_core::SourceMap,
     storage: &mut Storage,
@@ -397,7 +397,7 @@ fn insert_initial_discrete_value<'dae>(
     if found.dimensions() != declared.dimensions() {
         return Err(DaeConstructionError::ShapeMismatch { span: owner.span() });
     }
-    expect_initialization_settled_reads(storage, value, owner)?;
+    expect_initialization_settled_reads(storage, value, target, owner)?;
     if storage
         .initial_discrete_value_by_variable
         .contains_key(&target)
@@ -430,6 +430,7 @@ fn insert_initial_discrete_value<'dae>(
 fn expect_initialization_settled_reads(
     storage: &Storage,
     value: ExprId<'_>,
+    target: u32,
     owner: DaeProvenance,
 ) -> Result<(), DaeConstructionError> {
     let mut pending = vec![value.index()];
@@ -439,19 +440,23 @@ fn expect_initialization_settled_reads(
             continue;
         }
         let node = &storage.expressions.nodes[expression as usize];
-        let settled = match node {
-            ExprNode::Coordinate(coordinate) => matches!(
-                coordinate,
-                Coordinate::Parameter(_)
-                    | Coordinate::Time
-                    | Coordinate::ClockInterval(_)
-                    | Coordinate::Input(_)
-                    | Coordinate::State(_)
-                    | Coordinate::Algebraic(_)
-            ),
-            ExprNode::Call { function, .. } => storage.function_is_pure(*function, owner)?,
-            _ => true,
-        };
+        let settled =
+            match node {
+                ExprNode::Coordinate(
+                    Coordinate::DiscreteReal(v) | Coordinate::DiscreteValue(v),
+                ) if expression == value.index() && *v == target => true,
+                ExprNode::Coordinate(coordinate) => matches!(
+                    coordinate,
+                    Coordinate::Parameter(_)
+                        | Coordinate::Time
+                        | Coordinate::ClockInterval(_)
+                        | Coordinate::Input(_)
+                        | Coordinate::State(_)
+                        | Coordinate::Algebraic(_)
+                ),
+                ExprNode::Call { function, .. } => storage.function_is_pure(*function, owner)?,
+                _ => true,
+            };
         if !settled {
             return Err(DaeConstructionError::InvalidExpressionForm { span: owner.span() });
         }

@@ -111,3 +111,80 @@ fn an_undetermined_relation_is_refused() {
 fn an_over_determined_relation_is_refused() {
     assert!(refusal("Overdetermined").contains("over-determines"));
 }
+
+/// The MLS §8.6 discrete steady state `pre(m) = m`: `v` and `w` are the same
+/// equation-defined Boolean, but only `pre(v)` is held at the value the
+/// initial event gives `v`; `pre(w)` keeps its start. `pre(s) = s` joins the
+/// alias of a `fixed = true` coordinate and takes its start, and `pre(c) = c`
+/// of a `when initial()` assignment holds the assigned value.
+const STEADY: &str = r#"
+model Steady
+  Boolean v = time >= 0;
+  Boolean w = time >= 0;
+  Boolean b(start = true, fixed = true);
+  Boolean s;
+  Integer c;
+  Integer k(start = 0, fixed = true);
+  Integer j(start = 0, fixed = true);
+  Integer n(start = 0, fixed = true);
+  Integer q(start = 0, fixed = true);
+  Integer e(start = 0, fixed = true);
+initial equation
+  pre(v) = v;
+  pre(s) = s;
+  pre(c) = c;
+equation
+  s = b;
+  when time > 0.5 then
+    b = false;
+  end when;
+  when change(v) then
+    n = pre(n) + 1;
+  end when;
+algorithm
+  when initial() then
+    c := 7;
+    k := if pre(v) then 1 else 2;
+    j := if pre(w) then 1 else 2;
+    q := if pre(s) then 1 else 2;
+    e := pre(c);
+  end when;
+end Steady;
+"#;
+
+fn simulate_steady() -> rumoca_sim::SimResult {
+    let compiled = Compiler::new()
+        .model("Steady")
+        .compile_str(STEADY, "Steady.mo")
+        .unwrap_or_else(|error| panic!("Steady compiles: {error:?}"));
+    simulate_dae_with_diagnostics(
+        &compiled.dae,
+        &SimOptions {
+            t_end: 1.0,
+            ..SimOptions::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("Steady simulates: {error}"))
+}
+
+#[test]
+fn a_steady_state_pre_reads_the_initialization_value() {
+    let result = simulate_steady();
+    let last = |name: &str| {
+        let index = result
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+            .unwrap_or_else(|| panic!("{name} is recorded"));
+        *result.data[index].last().expect("samples")
+    };
+    assert_eq!(last("k"), 1.0, "pre(v) = v = true at initialization");
+    assert_eq!(last("j"), 2.0, "pre(w) keeps its start, false");
+    assert_eq!(last("q"), 1.0, "pre(s) = s = b = true through the alias");
+    assert_eq!(last("e"), 7.0, "pre(c) = c, assigned 7 by `when initial()`");
+    assert_eq!(
+        last("n"),
+        0.0,
+        "v never changes, so `change(v)` never fires"
+    );
+}

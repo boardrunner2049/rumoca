@@ -13,6 +13,7 @@ mod chart_switching;
 mod co_simulation_step;
 mod declared_causality;
 mod derivative_kinks;
+mod initial_pre;
 mod input_start;
 mod integer_parameter;
 mod lifecycle;
