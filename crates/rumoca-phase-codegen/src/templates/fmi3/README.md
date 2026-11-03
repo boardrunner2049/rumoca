@@ -22,7 +22,10 @@ checked component state.
   (1e-6 when the importer defines none), ending exactly at the communication
   point. Accuracy follows the tolerance rather than the communication step
   size; a step that cannot meet it within the plan's substep budget is rolled
-  back and returns Discard. The FMI 2 target shares this rule.
+  back and returns Discard. A mode the explicit method finds stiff is
+  substepped with the L-stable Rosenbrock 2(3) pair of the plan's stiffness
+  switch until the explicit method could step it stably again. The FMI 2
+  target shares this rule.
 
 ## Unsupported
 

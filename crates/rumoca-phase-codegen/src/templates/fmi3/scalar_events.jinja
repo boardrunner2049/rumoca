@@ -864,6 +864,9 @@ static {{ prefix }}Status rmc_domains_changed(ModelInstance* m, bool* changed) {
 static {{ prefix }}Status rmc_cs_interval(ModelInstance* m, double t, double h, double* advanced) {
     double y0[Y_LEN];
     bool changed = false;
+    /* Every trial integration starts from the interval's state and stiffness
+       switch. */
+    const RmcCsMode mode0 = m->rmc_cs.mode;
     memcpy(y0, m->y, sizeof(m->y));
     {{ prefix }}Status integrated = {{ integrate }}(m, t, h);
     if (integrated != {{ prefix }}OK) return integrated == {{ prefix }}Discard ? {{ prefix }}Discard : {{ prefix }}Error;
@@ -874,11 +877,13 @@ static {{ prefix }}Status rmc_cs_interval(ModelInstance* m, double t, double h, 
     for (size_t iter = 0; iter < {{ plan.refinement_iteration_cap }} && hi - lo > tol; ++iter) {
         double mid = 0.5 * (lo + hi);
         memcpy(m->y, y0, sizeof(m->y));
+        m->rmc_cs.mode = mode0;
         if ({{ integrate }}(m, t, mid) != {{ prefix }}OK || rmc_domains_changed(m, &changed) != {{ prefix }}OK) return {{ prefix }}Error;
         if (changed) hi = mid; else lo = mid;
     }
     if (hi - lo > tol) { RMC_LOG(m, "state event location exceeded its refinement budget"); return {{ prefix }}Error; }
     memcpy(m->y, y0, sizeof(m->y));
+    m->rmc_cs.mode = mode0;
     bool enter = false;
     if ({{ integrate }}(m, t, hi) != {{ prefix }}OK || rmc_events_completed(m, &enter) != {{ prefix }}OK) return {{ prefix }}Error;
     bool reinit = false;

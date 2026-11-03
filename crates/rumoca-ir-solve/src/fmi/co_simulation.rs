@@ -15,6 +15,18 @@
 //! one of E. Hairer, S. P. Norsett and G. Wanner, "Solving Ordinary
 //! Differential Equations I: Nonstiff Problems", 2nd rev. ed., Springer 1993,
 //! section II.4 (equations II.4.12 and II.4.13), with the same constants.
+//!
+//! An explicit method on a stiff mode is held at its stability boundary by
+//! the controller, and the stiff component then carries a local error of the
+//! order of the tolerance that never decays; an algebraic variable with a
+//! large gain on that component (a node held by a small leakage conductance)
+//! amplifies it. The plan therefore detects stiffness with the test of
+//! Hairer, Norsett and Wanner, "Solving Ordinary Differential Equations II:
+//! Stiff and Differential-Algebraic Problems", 2nd rev. ed., Springer 1996,
+//! section IV.2 (the `h * |lambda|` estimate of their DOPRI5 code), and
+//! substeps a stiff mode with the L-stable Rosenbrock 2(3) pair of
+//! L. F. Shampine and M. W. Reichelt, "The MATLAB ODE Suite", SIAM Journal on
+//! Scientific Computing 18(1):1-22, 1997, section 3 (ode23s).
 
 use serde::Serialize;
 
@@ -35,6 +47,37 @@ pub enum CoSimulationSubstep {
     /// point; a step the controller cannot complete within its budget is
     /// discarded and rolled back.
     ErrorControlled,
+}
+
+/// The linearly implicit method a stiff mode is substepped with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum CoSimulationStiffMethod {
+    /// Shampine-Reichelt Rosenbrock 2(3): L-stable, second order, with a
+    /// third-order error estimate and the last stage the next substep's first.
+    /// Its Jacobian is a forward difference of the state derivatives
+    /// (including the time derivative), formed once per accepted point.
+    ShampineReichelt23,
+}
+
+/// When an error-controlled substep rule leaves and re-enters its explicit
+/// method.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct CoSimulationStiffness {
+    method: CoSimulationStiffMethod,
+    /// `|h * lambda|` bound of the explicit method's stability region on the
+    /// negative real axis: an accepted explicit substep whose estimate
+    /// `h * |f(y1) - f(y_s)| / |y1 - y_s|` (the last two stages) exceeds it is
+    /// stiff, and a stiff substep whose next size times the Jacobian's
+    /// infinity norm (a bound on its spectral radius) stays within it may
+    /// return to the explicit method.
+    stability_bound: f64,
+    /// Stiff explicit substeps, counted until `clear_after` non-stiff ones in
+    /// a row reset the count, that switch the component to the stiff method.
+    switch_after: u32,
+    clear_after: u32,
+    /// `-1 / (p + 1)` of the second-order stiff pair in the controller's
+    /// `factor = safety * err^exponent`.
+    exponent: f64,
 }
 
 /// The step-size controller of an error-controlled substep rule.
@@ -62,13 +105,16 @@ pub struct CoSimulationStepPlan {
     method: CoSimulationMethod,
     substep: CoSimulationSubstep,
     controller: CoSimulationController,
+    stiffness: CoSimulationStiffness,
 }
 
 impl CoSimulationStepPlan {
     /// The plan every component is constructed with. The accuracy of a
     /// communication step follows the component tolerance, not the importer's
     /// communication step size, so a stiff block the importer steps coarsely
-    /// takes as many substeps as its fastest mode needs.
+    /// takes as many substeps as its fastest mode needs, and a mode the
+    /// explicit method finds stiff is substepped by the L-stable stiff method
+    /// until its step size no longer exceeds the explicit stability bound.
     pub const STANDARD: Self = Self {
         method: CoSimulationMethod::DormandPrince54,
         substep: CoSimulationSubstep::ErrorControlled,
@@ -79,6 +125,13 @@ impl CoSimulationStepPlan {
             min_factor: 0.2,
             max_factor: 5.0,
             max_substeps: 100_000,
+        },
+        stiffness: CoSimulationStiffness {
+            method: CoSimulationStiffMethod::ShampineReichelt23,
+            stability_bound: 3.25,
+            switch_after: 15,
+            clear_after: 6,
+            exponent: -1.0 / 3.0,
         },
     };
 }
@@ -104,6 +157,13 @@ mod tests {
                     "min_factor": 0.2,
                     "max_factor": 5.0,
                     "max_substeps": 100_000,
+                },
+                "stiffness": {
+                    "method": "ShampineReichelt23",
+                    "stability_bound": 3.25,
+                    "switch_after": 15,
+                    "clear_after": 6,
+                    "exponent": -1.0 / 3.0,
                 },
             })
         );

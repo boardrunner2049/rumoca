@@ -22,6 +22,7 @@ mod projection;
 mod reported_models;
 mod residual_split_harness;
 mod state_events;
+mod stiff_floating_node;
 mod tensor_algebra;
 mod time_events;
 mod torn_tangent_harness;
