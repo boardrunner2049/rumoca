@@ -5,7 +5,7 @@
   modelName="{{ model_name | xml_escape }}"
   generationTool="Rumoca"
   instantiationToken="{{ artifact.identities.fmu }}">
-  <ModelExchange modelIdentifier="{{ model_identifier }}"{% if me_refresh.switching or fmi.scalar_events %} needsCompletedIntegratorStep="true"{% endif %} canGetAndSetFMUState="true"/>
+  <ModelExchange modelIdentifier="{{ model_identifier }}"{% if me_refresh.switching or fmi.scalar_events or me_refresh.manifold %} needsCompletedIntegratorStep="true"{% endif %} canGetAndSetFMUState="true"/>
   <CoSimulation modelIdentifier="{{ model_identifier }}" canHandleVariableCommunicationStepSize="true" canGetAndSetFMUState="true"/>
   <UnitDefinitions>
     <Unit name="s">

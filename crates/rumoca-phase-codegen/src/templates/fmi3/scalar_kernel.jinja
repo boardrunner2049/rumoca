@@ -554,7 +554,7 @@ static inline bool rmc_linear_solve_component(const double* matrix, const double
 {#- The substep integrator the plan selects, shared by the FMI 2 and FMI 3
     components: the tableau and controller of rumoca-solver-rk45, with the
     controller constants read from the plan. -#}
-{%- macro cs_integrator_function(fmi, solve, prefix) %}
+{%- macro cs_integrator_function(fmi, solve, prefix, manifold=none) %}
 {%- set plan = fmi.co_simulation.controller %}
 /* Co-Simulation step rule (Solve IR CoSimulationStepPlan): error-controlled
    Dormand-Prince 5(4) over one communication step [start, start + step].
@@ -567,6 +567,9 @@ static inline bool rmc_linear_solve_component(const double* matrix, const double
      the importer defines none.
    - The next substep is h * min(max({{ plan.safety }} * err^({{ plan.exponent }}), {{ plan.min_factor }}), {{ plan.max_factor }})
      (Hairer, Norsett and Wanner, Solving ODEs I, section II.4).
+   - A model retaining a state-manifold projection projects every accepted
+     substep onto it (SPEC_0044 ME-PROJ-007); a correction that moves a state
+     restarts the next substep from a fresh derivative.
    - A communication step whose substep underflows or which attempts more
      than {{ plan.max_substeps }} substeps returns Discard; a failed derivative
      evaluation returns Error. The caller rolls the state back either way.
@@ -628,6 +631,12 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
             for (size_t i = 0; i < n; ++i) k[0][i] = k[6][i];
             if (!last) m->rmc_cs_substep = h * factor;
             t = last ? end : t + h;
+{%- if manifold %}
+            bool projected = false;
+            m->time = t;
+            if (rmc_manifold_accept(m, &projected) != {{ prefix }}OK) return {{ prefix }}Error;
+            if (projected) start_derivative = false;
+{%- endif %}
         } else {
             for (size_t i = 0; i < n; ++i) m->y[i] = y0[i];
             m->time = t;

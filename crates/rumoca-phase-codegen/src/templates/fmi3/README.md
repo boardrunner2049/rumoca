@@ -46,8 +46,12 @@ assertions or reading outputs. An initialization residual runs the runtime's
 settled initialization (bindings and the initialization projection alternate
 until the bindings stop changing, each residual row evaluated after the
 algebraic refresh) through the shared projection kernel at the FMI tolerance.
-Initialization rows over declaration seeds, homotopy continuation, delay
-histories, and retained state-manifold rows are refused.
+Initialization rows over declaration seeds, homotopy continuation, and delay
+histories are refused. Retained state-manifold rows (the lower-order
+constraints index reduction keeps) are certified after initialization and
+projected at every accepted Co-Simulation substep and every Event-Mode update;
+a Model-Exchange completed step whose point needs the correction requests
+Event Mode (SPEC_0044 ME-PROJ-007).
 
 The current profile rejects general events, clocks, runtime event history,
 external calls/tables, and random operations. A derivative inside a matrix
@@ -75,6 +79,9 @@ functions), sharing `model.h`.
 - `packaged_fmi_tensor_products_and_transpose_match_independent_numpy_values`
   checks rectangular matrix/vector products and rank-three transpose against
   NumPy through both interfaces and FMI versions.
+- `suite_core` `fmi_state_manifold` runs the generated C of a floating star
+  with a retained state manifold against the native simulation (CS) and
+  checks the Model-Exchange Event-Mode correction.
 - `packaged_fmi_mass_matrix_derivatives_match_the_matrix_exponential` runs
   `J * der(w) = -w` (issue #363), including a pivoting inertia tensor, through
   both interfaces and FMI versions against the matrix exponential.

@@ -216,8 +216,8 @@ pub(super) fn stable_parameters(problem: &SolveProblem) -> Vec<bool> {
 }
 
 /// The initialization projection the C kernel runs: the runtime's
-/// `settle_initialization_system` without a homotopy sweep, delay history,
-/// or retained manifold rows, for residual rows evaluated on the settled
+/// `settle_initialization_system` without a homotopy sweep or delay history,
+/// for residual rows evaluated on the settled
 /// coordinates (the bindings and the algebraic refresh applied first, as the
 /// runtime does whenever a row reads a reconstructed algebraic). Rows over
 /// declaration seeds need single-row isolation and the forward-mode initial
@@ -235,9 +235,6 @@ fn validate_projection(problem: &SolveProblem) -> Result<(), &'static str> {
         } else {
             Err("C initialization projects blocks without residual rows")
         };
-    }
-    if init.manifold_row_count() > 0 {
-        return Err("C initialization cannot certify retained state-manifold rows");
     }
     if problem
         .solve_layout
@@ -258,7 +255,10 @@ fn validate_projection(problem: &SolveProblem) -> Result<(), &'static str> {
                 | InitializationRowRole::SurplusAlgebraicCheck
         )
     });
-    if !settled {
+    // Retained state-manifold rows read states and parameters only (Solve
+    // lowering keeps algebraics out of retained constraints), so the settled
+    // view gives them the values and tangent the stored coordinates do.
+    if !settled && rows != init.manifold_row_count() {
         return Err(
             "C initialization evaluates residual rows only on the settled algebraic refresh; rows over declaration seeds need row isolation and a forward initial Jacobian",
         );

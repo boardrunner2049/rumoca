@@ -24,7 +24,7 @@ use super::{
     scaled_residual_norm,
 };
 
-const MANIFOLD_PROJECTION_MAX_ITERS: usize = 16;
+use rumoca_eval_solve::projection_policy::MANIFOLD_PROJECTION_MAX_ITERS;
 
 /// Runtime view of lower-order constraints retained by structural index
 /// reduction.

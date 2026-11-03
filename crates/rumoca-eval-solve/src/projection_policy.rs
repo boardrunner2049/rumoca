@@ -27,6 +27,11 @@ pub const ALGEBRAIC_REFRESH_MAX_ITERS: usize = 32;
 /// Iteration budget of the affine refinement and of the unlimited projection.
 pub const ALGEBRAIC_PROJECTION_MAX_ITERS: usize = 32;
 
+/// Sweep budget of the state-manifold projection: every retained
+/// index-reduction constraint block takes one damped minimum-norm Newton
+/// update per sweep (SPEC_0044 ME-PROJ-007).
+pub const MANIFOLD_PROJECTION_MAX_ITERS: usize = 16;
+
 /// Largest fraction of its own magnitude (or declared scale) one unknown may
 /// move in one accepted dense block Newton step.
 pub const ALGEBRAIC_PROJECTION_TRUST_FRACTION: f64 = 0.25;
