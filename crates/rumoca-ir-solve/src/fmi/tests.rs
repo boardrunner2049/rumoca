@@ -2,6 +2,7 @@ use super::*;
 use crate::SolveVariableValueKind;
 
 mod c_profile_refusals;
+mod c_profile_time_events;
 mod parameter_profile;
 
 #[test]

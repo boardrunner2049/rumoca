@@ -637,6 +637,10 @@ fn events_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
     let action_plan = Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(
         Arc::new(problem.events.action_conditions.clone()),
     )?);
+    let dynamic_time_event_plan =
+        Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(
+            Arc::new(problem.events.dynamic_time_event_rhs.clone()),
+        )?);
     Ok(lazy_map(
         &[
             "root_conditions",
@@ -648,6 +652,7 @@ fn events_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
             "scheduled_time_events",
             "dynamic_time_event_names",
             "dynamic_time_event_rhs",
+            "dynamic_time_event_plan",
             "action_conditions",
             "action_plan",
             "actions",
@@ -666,6 +671,7 @@ fn events_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
                     e.action_conditions.clone(),
                 ))),
                 "action_plan" => Some(action_plan.clone()),
+                "dynamic_time_event_plan" => Some(dynamic_time_event_plan.clone()),
                 "root_relation_memory_targets" => {
                     Some(Value::from_serialize(&e.root_relation_memory_targets))
                 }

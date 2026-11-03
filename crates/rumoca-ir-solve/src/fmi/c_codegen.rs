@@ -25,7 +25,9 @@ enum Profile {
 /// retain their executable predicates and parameter-determined discrete
 /// equations without continuous FMI indicators;
 /// the admission proof permits no continuously changing predicate, relation
-/// memory, clock, scheduled event, or state-dependent discrete update.
+/// memory, clock, scheduled event, or state-dependent discrete update. Every
+/// other event partition runs the scalar event profile, with or without
+/// searched roots, including its time events.
 #[derive(Debug)]
 pub struct FmiCCodegenView {
     profile: Profile,
@@ -43,7 +45,24 @@ impl FmiCodegenView {
         let (update_order, update_levels) =
             super::parameter_updates::validate(&self.model.problem, &self.model.pure_calls)
                 .map_err(FmiCCodegenError)?;
-        if !self.event_indicators.sources().is_empty() {
+        if crate::solve_event_class(&self.model.problem).is_some()
+            && (!self.event_indicators.sources().is_empty()
+                || super::static_assertions::validate(&self.model).is_err())
+        {
+            // A partition that is not fixed between parameter changes (time
+            // events, relation memory, runtime or guarded updates) runs the
+            // event iteration even when no root is searched continuously.
+            if self
+                .event_indicators
+                .plan()
+                .entries()
+                .iter()
+                .any(|entry| !matches!(entry.reading(), super::IndicatorReading::RootValue { .. }))
+            {
+                return Err(FmiCCodegenError(
+                    "the C profile cannot render a state-dependent dynamic time-event indicator",
+                ));
+            }
             let events = super::scalar_events::validate(&self.model).map_err(FmiCCodegenError)?;
             return Ok(FmiCCodegenView {
                 profile: Profile::ScalarEvents(self, Box::new(events)),
