@@ -76,6 +76,7 @@ pub(super) fn lower_initialization<'dae>(
             projection_plan: plan.plan,
             update_rhs: updates.rows.into_scalar_block()?,
             update_targets: updates.targets,
+            steady_pre: updates.steady_pre,
         },
     )?)
 }

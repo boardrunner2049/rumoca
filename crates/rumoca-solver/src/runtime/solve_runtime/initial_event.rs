@@ -4,6 +4,8 @@ use crate::{
     timeline::bounded_event_right_limit_time,
 };
 
+use rumoca_ir_solve as solve;
+
 use super::{
     EventUpdateRowFilter, ProjectedEventUpdateInput, SeededConditionMemory, SolveRuntime,
     support::copy_runtime_values,
@@ -190,7 +192,7 @@ impl SolveRuntime {
         // updates activate, never whether the checked action tuple is
         // evaluated. Making this unconditional removes the historical
         // backend-profile choice that could erase a constant-false assertion.
-        let action = self.apply_initial_event_update(
+        let action = self.apply_steady_initial_event_update(
             InitialEventUpdate {
                 y,
                 p,
@@ -298,6 +300,88 @@ impl SolveRuntime {
         Ok(trace_values_match(&left_values, &right_values, tol))
     }
 
+    /// The initial event with every MLS §8.6 steady state `pre(m) = m` held.
+    ///
+    /// `m` takes the value its equation-section owners give it at the initial
+    /// event, so `pre(m)` cannot be seeded before the event runs. The event is
+    /// run from its entry, and while a steady `m` ends at a value other than
+    /// the one its `pre(m)` was seeded with, it runs again from the same entry
+    /// with that `pre(m)` (and `m` itself) seeded from the value it ended at:
+    /// a fixed-point iteration of the simultaneous initialization system,
+    /// which a model with no steady state skips. A run whose action stops the
+    /// simulation ends it; no fixed point within the iteration budget is an
+    /// error, never a guessed `pre` value.
+    fn apply_steady_initial_event_update<P>(
+        &self,
+        input: InitialEventUpdate<'_>,
+        project_algebraics: &mut P,
+    ) -> Result<EventActionOutcome, RuntimeSolveError>
+    where
+        P: FnMut(&mut [f64], &mut [f64], f64) -> Result<bool, RuntimeSolveError>,
+    {
+        let steady = self.steady_pre_sources();
+        if steady.is_empty() {
+            return self.apply_initial_event_update(input, project_algebraics);
+        }
+        let InitialEventUpdate {
+            y,
+            p,
+            t,
+            tol,
+            event_pre_y,
+            event_pre_p,
+            max_iters,
+            initial_event,
+        } = input;
+        let mut entry = (y.to_vec(), p.to_vec());
+        let mut pre = (event_pre_y.to_vec(), event_pre_p.to_vec());
+        for _ in 0..max_iters.max(1) {
+            y.copy_from_slice(&entry.0);
+            p.copy_from_slice(&entry.1);
+            let action = self.apply_initial_event_update(
+                InitialEventUpdate {
+                    y: &mut *y,
+                    p: &mut *p,
+                    t,
+                    tol,
+                    event_pre_y: &pre.0,
+                    event_pre_p: &pre.1,
+                    max_iters,
+                    initial_event,
+                },
+                project_algebraics,
+            )?;
+            if action != EventActionOutcome::Continue {
+                return Ok(action);
+            }
+            let mut moved = false;
+            for source in &steady {
+                let value = source.read(y, p)?;
+                moved |= source.write(&mut pre.0, &mut pre.1, value)?;
+                source.write(&mut entry.0, &mut entry.1, value)?;
+            }
+            if !moved {
+                return Ok(action);
+            }
+        }
+        Err(RuntimeSolveError::solve_ir(format!(
+            "the steady-state initial equations `pre(m) = m` reached no fixed point at t={t}"
+        )))
+    }
+
+    /// The current-value sources of the steady-state `pre` slots.
+    fn steady_pre_sources(&self) -> Vec<solve::PreParamSource> {
+        let steady = self.model.problem.initialization.steady_pre();
+        self.model
+            .problem
+            .solve_layout
+            .pre_param_bindings
+            .iter()
+            .filter(|binding| steady.contains(&binding.dest_p_index))
+            .map(|binding| binding.source.clone())
+            .collect()
+    }
+
     fn apply_initial_event_update<P>(
         &self,
         input: InitialEventUpdate<'_>,
@@ -356,5 +440,37 @@ impl SolveRuntime {
             },
             |y, p| project_algebraics(y, p, t),
         )
+    }
+}
+
+/// Read and seed one steady-state `pre` source slot.
+trait SteadySource {
+    fn read(&self, y: &[f64], p: &[f64]) -> Result<f64, RuntimeSolveError>;
+    /// Write `value`; whether the slot held other bits.
+    fn write(&self, y: &mut [f64], p: &mut [f64], value: f64) -> Result<bool, RuntimeSolveError>;
+}
+
+impl SteadySource for solve::PreParamSource {
+    fn read(&self, y: &[f64], p: &[f64]) -> Result<f64, RuntimeSolveError> {
+        let (values, index) = match *self {
+            solve::PreParamSource::Y { index } => (y, index),
+            solve::PreParamSource::P { index } => (p, index),
+        };
+        values.get(index).copied().ok_or_else(|| {
+            RuntimeSolveError::solve_ir(format!("steady-state pre source {index} is out of bounds"))
+        })
+    }
+
+    fn write(&self, y: &mut [f64], p: &mut [f64], value: f64) -> Result<bool, RuntimeSolveError> {
+        let (values, index) = match *self {
+            solve::PreParamSource::Y { index } => (y, index),
+            solve::PreParamSource::P { index } => (p, index),
+        };
+        let slot = values.get_mut(index).ok_or_else(|| {
+            RuntimeSolveError::solve_ir(format!("steady-state pre source {index} is out of bounds"))
+        })?;
+        let moved = slot.to_bits() != value.to_bits();
+        *slot = value;
+        Ok(moved)
     }
 }

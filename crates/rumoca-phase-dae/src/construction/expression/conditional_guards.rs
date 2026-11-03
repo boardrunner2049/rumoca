@@ -249,6 +249,17 @@ impl rumoca_core::ExpressionVisitor for ArmScan<'_> {
             }
             return;
         };
+        // An elementwise scalar function reads each operand at the operand's
+        // own position: `div(x, 128)` and `mod(x, 2)` read the same `x`, so
+        // only an operator that reads another value of an unknown (`der`,
+        // `pre`, a history or clock operator) or rearranges array elements
+        // marks a position.
+        if is_elementwise_scalar_function(*function) {
+            for argument in args {
+                self.visit_expression(argument);
+            }
+            return;
+        }
         operators.push(format!("{function:?}("));
         for argument in args {
             self.visit_expression(argument);
@@ -267,6 +278,39 @@ impl rumoca_core::ExpressionVisitor for ArmScan<'_> {
         self.calls_function = true;
         self.walk_function_call(name, args, is_constructor);
     }
+}
+
+/// A builtin that maps scalar operands to a scalar value elementwise, reading
+/// every operand's current value (MLS 3.7 §3.7.1, §3.7.3). `min`, `max`,
+/// `sum`, and `product` are excluded: with one array argument they reduce it.
+fn is_elementwise_scalar_function(function: rumoca_core::BuiltinFunction) -> bool {
+    use rumoca_core::BuiltinFunction as B;
+    matches!(
+        function,
+        B::Abs
+            | B::Sign
+            | B::Sqrt
+            | B::Div
+            | B::Mod
+            | B::Rem
+            | B::Floor
+            | B::Ceil
+            | B::Integer
+            | B::Sin
+            | B::Cos
+            | B::Tan
+            | B::Asin
+            | B::Acos
+            | B::Atan
+            | B::Atan2
+            | B::Sinh
+            | B::Cosh
+            | B::Tanh
+            | B::Exp
+            | B::Log
+            | B::Log10
+            | B::NoEvent
+    )
 }
 
 /// [`retains_parameter_guard`] over the Flat variabilities, before DAE

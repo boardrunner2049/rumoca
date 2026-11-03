@@ -680,6 +680,7 @@ fn representative_initialization_system() -> InitializationSolveSystem {
         update_targets: Vec::new(),
         manifold_row_count: 0,
         given_state_indices: Vec::new(),
+        steady_pre: Vec::new(),
     })
     .expect("initialization fixture has one checked owner per coordinate")
 }

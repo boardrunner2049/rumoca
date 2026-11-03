@@ -23,6 +23,8 @@ use crate::lower::scalar::ScalarCompiler;
 pub(super) struct InitialDiscreteUpdates {
     pub(super) rows: ScalarRows,
     pub(super) targets: Vec<solve::ScalarSlot>,
+    /// The `pre` slots of the steady states `pre(m) = m`.
+    pub(super) steady_pre: Vec<usize>,
 }
 
 /// Lower every MLS §8.6 discrete initial value into an initialization update row.
@@ -33,6 +35,11 @@ pub(super) struct InitialDiscreteUpdates {
 /// carried from the declared `start` value, which would make a `when` whose
 /// trigger reads `pre(v)` schedule against a value the initial algorithm has
 /// already replaced.
+///
+/// A steady state `pre(m) = m` (the definition `m := m`) writes no slot: the
+/// value of `m` is the one its equation-section owners settle at the initial
+/// event, so its `pre` slot is listed for the runtime to seed from that value
+/// instead.
 pub(super) fn lower_initial_discrete_values<'dae>(
     view: dae::DaeView<'dae>,
     layout: &LoweredLayout<'dae>,
@@ -40,6 +47,7 @@ pub(super) fn lower_initial_discrete_values<'dae>(
 ) -> Result<InitialDiscreteUpdates, LowerError> {
     let mut rows = ScalarRows::default();
     let mut targets = Vec::new();
+    let mut steady_pre = Vec::new();
     for definition in view.initial_discrete_values() {
         let span = definition.provenance().span();
         let variable = definition.target().index();
@@ -49,6 +57,10 @@ pub(super) fn lower_initial_discrete_values<'dae>(
             .map(|entry| entry.count)
             .ok_or_else(|| LowerError::contract("variable has no Solve layout entry", span))?;
         let pre_base = initial_pre_base(layout, variable, span)?;
+        if is_steady_state(view, definition) {
+            steady_pre.extend(pre_base..pre_base + scalar_count);
+            continue;
+        }
         // An array coordinate's definition is its whole aggregate; each scalar
         // writes its own lane and the matching lane of its `pre` storage.
         for scalar in 0..scalar_count {
@@ -79,7 +91,32 @@ pub(super) fn lower_initial_discrete_values<'dae>(
             }
         }
     }
-    Ok(InitialDiscreteUpdates { rows, targets })
+    Ok(InitialDiscreteUpdates {
+        rows,
+        targets,
+        steady_pre,
+    })
+}
+
+/// Whether a definition is the identity `m := m`: the MLS §8.6 steady state
+/// `pre(m) = m`, the one discrete read the DAE constructor admits.
+fn is_steady_state<'dae>(
+    view: dae::DaeView<'dae>,
+    definition: dae::InitialDiscreteValueView<'dae>,
+) -> bool {
+    let Some(expression) = view.expression(definition.value()) else {
+        return false;
+    };
+    let target = definition.target().index();
+    match expression.operation() {
+        dae::ExpressionOperation::Coordinate(dae::CoordinateView::DiscreteReal(id)) => {
+            id.index() == target
+        }
+        dae::ExpressionOperation::Coordinate(dae::CoordinateView::DiscreteValue(id)) => {
+            id.index() == target
+        }
+        _ => false,
+    }
 }
 
 /// The first parameter index of one discrete coordinate's `pre` storage.

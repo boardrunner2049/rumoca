@@ -402,7 +402,8 @@
     },
     "update_targets": [],
     "manifold_row_count": 0,
-    "given_state_indices": []
+    "given_state_indices": [],
+    "steady_pre": []
   },
   "discrete": {
     "event_iteration_plan": {

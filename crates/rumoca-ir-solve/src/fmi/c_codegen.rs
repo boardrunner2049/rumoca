@@ -35,6 +35,9 @@ pub struct FmiCCodegenView {
     update_order: Vec<usize>,
     /// The dependency levels of the parameter bindings.
     update_levels: usize,
+    /// The update programs that run while initializing only: the MLS §8.6
+    /// discrete initial definitions.
+    update_initial_only: Vec<usize>,
     /// The evaluation orders of the parameter-determined discrete rows.
     discrete_order: super::static_assertions::DiscreteOrder,
 }
@@ -42,7 +45,7 @@ pub struct FmiCCodegenView {
 impl FmiCodegenView {
     pub fn try_c(self) -> Result<FmiCCodegenView, FmiCCodegenError> {
         validate_variables(&self.metadata)?;
-        let (update_order, update_levels) =
+        let updates =
             super::parameter_updates::validate(&self.model.problem, &self.model.pure_calls)
                 .map_err(FmiCCodegenError)?;
         if crate::solve_event_class(&self.model.problem).is_some()
@@ -66,18 +69,27 @@ impl FmiCodegenView {
             let events = super::scalar_events::validate(&self.model).map_err(FmiCCodegenError)?;
             return Ok(FmiCCodegenView {
                 profile: Profile::ScalarEvents(self, Box::new(events)),
-                update_order,
-                update_levels,
+                update_order: updates.order,
+                update_levels: updates.levels,
+                update_initial_only: updates.initial_only,
                 discrete_order: super::static_assertions::DiscreteOrder::default(),
             });
+        }
+        // The steady states `pre(m) = m` are held by repeating the initial
+        // event, which only the scalar event profile runs.
+        if !self.model.problem.initialization.steady_pre().is_empty() {
+            return Err(FmiCCodegenError(
+                "a steady-state initial equation `pre(m) = m` needs the scalar event profile",
+            ));
         }
         if crate::solve_event_class(&self.model.problem).is_none() {
             return self
                 .try_event_free()
                 .map(|value| FmiCCodegenView {
                     profile: Profile::EventFree(value),
-                    update_order,
-                    update_levels,
+                    update_order: updates.order,
+                    update_levels: updates.levels,
+                    update_initial_only: updates.initial_only,
                     discrete_order: super::static_assertions::DiscreteOrder::default(),
                 })
                 .map_err(|_| FmiCCodegenError("event-free narrowing failed"));
@@ -86,8 +98,9 @@ impl FmiCodegenView {
             super::static_assertions::validate(&self.model).map_err(FmiCCodegenError)?;
         Ok(FmiCCodegenView {
             profile: Profile::StaticAssertions(self),
-            update_order,
-            update_levels,
+            update_order: updates.order,
+            update_levels: updates.levels,
+            update_initial_only: updates.initial_only,
             discrete_order,
         })
     }
@@ -97,13 +110,18 @@ impl TryFrom<FmiEventFreeCodegenView> for FmiCCodegenView {
     type Error = FmiCCodegenError;
     fn try_from(value: FmiEventFreeCodegenView) -> Result<Self, Self::Error> {
         validate_variables(&value.metadata)?;
-        let (update_order, update_levels) =
-            super::parameter_updates::validate(value.problem(), value.pure_calls())
-                .map_err(FmiCCodegenError)?;
+        let updates = super::parameter_updates::validate(value.problem(), value.pure_calls())
+            .map_err(FmiCCodegenError)?;
+        if !value.problem().initialization.steady_pre().is_empty() {
+            return Err(FmiCCodegenError(
+                "a steady-state initial equation `pre(m) = m` needs the scalar event profile",
+            ));
+        }
         Ok(Self {
             profile: Profile::EventFree(value),
-            update_order,
-            update_levels,
+            update_order: updates.order,
+            update_levels: updates.levels,
+            update_initial_only: updates.initial_only,
             discrete_order: super::static_assertions::DiscreteOrder::default(),
         })
     }
@@ -206,7 +224,7 @@ impl FmiCCodegenView {
 impl Serialize for FmiCCodegenView {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let metadata = self.metadata();
-        let mut entries = serializer.serialize_map(Some(13))?;
+        let mut entries = serializer.serialize_map(Some(14))?;
         entries.serialize_entry("initial_y", &self.model().initial_y)?;
         entries.serialize_entry("initial_parameters", &self.model().parameters)?;
         entries.serialize_entry(
@@ -242,6 +260,7 @@ impl Serialize for FmiCCodegenView {
             },
         )?;
         entries.serialize_entry("update_order", &self.update_order)?;
+        entries.serialize_entry("update_initial_only", &self.update_initial_only)?;
         entries.serialize_entry("discrete_equations", &self.discrete_order.equations)?;
         entries.serialize_entry("discrete_memories", &self.discrete_order.memories)?;
         entries.end()

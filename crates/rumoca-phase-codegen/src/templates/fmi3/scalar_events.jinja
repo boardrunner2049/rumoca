@@ -739,6 +739,43 @@ static {{ prefix }}Status rmc_events_initialize(ModelInstance* m) {
     return {{ prefix }}OK;
 }
 
+/* initial_event.rs apply_steady_initial_event_update: the initial event,
+   repeated from the same start with each MLS §8.6 steady state `pre(m) = m`
+   seeded from the value `m` settled at, until they agree. */
+static {{ prefix }}Status rmc_initial_iterate(ModelInstance* m) {
+{%- if ev.steady_lanes|length > 0 %}
+    static const size_t source[{{ ev.steady_lanes|length }}] = { {% for lane in ev.steady_lanes %}{{ ev.pre_bindings[lane].source }},{% endfor %} };
+    static const bool from_y[{{ ev.steady_lanes|length }}] = { {% for lane in ev.steady_lanes %}{{ "true" if ev.pre_bindings[lane].column == "y" else "false" }},{% endfor %} };
+    double* y0 = malloc(sizeof(m->y));
+    double* p0 = malloc(sizeof(m->p));
+    {{ prefix }}Status status = {{ prefix }}Error;
+    if (!y0 || !p0) { free(y0); free(p0); RMC_LOG(m, "the initial event start could not be saved"); return {{ prefix }}Error; }
+    memcpy(y0, m->y, sizeof(m->y));
+    memcpy(p0, m->p, sizeof(m->p));
+    for (size_t round = 0; round < {{ schedule.fixed_point_cap }}; ++round) {
+        memcpy(m->y, y0, sizeof(m->y));
+        memcpy(m->p, p0, sizeof(m->p));
+        status = rmc_event_iterate(m, false);
+        if (status != {{ prefix }}OK) break;
+        bool moved = false;
+        for (size_t k = 0; k < {{ ev.steady_lanes|length }}; ++k) {
+            double value = from_y[k] ? m->y[source[k]] : m->p[source[k]];
+            double* entry = from_y[k] ? &m->rmc_entry_y[source[k]] : &m->rmc_entry_p[source[k]];
+            moved |= memcmp(entry, &value, sizeof(double)) != 0;
+            *entry = value;
+            if (from_y[k]) y0[source[k]] = value; else p0[source[k]] = value;
+        }
+        if (!moved) { free(y0); free(p0); return {{ prefix }}OK; }
+        status = {{ prefix }}Error;
+    }
+    free(y0); free(p0);
+    if (status == {{ prefix }}Error) RMC_LOG(m, "the steady-state initial equations pre(m) = m reached no fixed point");
+    return status;
+{%- else %}
+    return rmc_event_iterate(m, false);
+{%- endif %}
+}
+
 /* Event Mode: the initial event after initialization, else the state event
    the completed step captured. Without a captured entry (a host-requested
    event), the entry is the current coordinate. */
@@ -771,7 +808,7 @@ static {{ prefix }}Status rmc_events_update(ModelInstance* m, bool* states_chang
         m->rmc_post_anchor = event_time;
         m->rmc_post_time = m->time;
     }
-    {{ prefix }}Status status = rmc_event_iterate(m, !initial);
+    {{ prefix }}Status status = initial ? rmc_initial_iterate(m) : rmc_event_iterate(m, true);
     m->time = event_time;
     if (initial) { rmc_clear_initial_flag(m); m->assertions_initialized = true; }
     *states_changed = memcmp(states, m->y, sizeof(states)) != 0;

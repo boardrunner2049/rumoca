@@ -24,6 +24,8 @@ pub struct InitializationSystemInput {
     pub update_targets: Vec<ScalarSlot>,
     pub manifold_row_count: usize,
     pub given_state_indices: Vec<usize>,
+    /// The `pre` slots of the MLS §8.6 steady states `pre(m) = m`.
+    pub steady_pre: Vec<usize>,
 }
 
 /// One simultaneous MLS §8.6 solve. Derived row targets and unknown inventories
@@ -37,6 +39,13 @@ pub struct InitializationSolveSystem {
     update_targets: Vec<ScalarSlot>,
     manifold_row_count: usize,
     given_state_indices: Vec<usize>,
+    /// The `pre` slots (parameter indices) of the discrete coordinates whose
+    /// initial equation is the MLS §8.6 steady state `pre(m) = m`. `m` takes
+    /// the value its equation-section owners give it at the initial event, so
+    /// no update row can assign it; the runtime instead repeats the initial
+    /// event from its entry with each such `pre(m)` seeded from the `m` the
+    /// previous run settled, until they agree.
+    steady_pre: Vec<usize>,
     #[serde(skip)]
     row_targets: Vec<Option<ScalarSlot>>,
     #[serde(skip)]
@@ -53,6 +62,8 @@ struct InitializationSystemWire {
     update_targets: Vec<ScalarSlot>,
     manifold_row_count: usize,
     given_state_indices: Vec<usize>,
+    #[serde(default)]
+    steady_pre: Vec<usize>,
 }
 
 impl<'de> Deserialize<'de> for InitializationSolveSystem {
@@ -66,6 +77,7 @@ impl<'de> Deserialize<'de> for InitializationSolveSystem {
             update_targets: wire.update_targets,
             manifold_row_count: wire.manifold_row_count,
             given_state_indices: wire.given_state_indices,
+            steady_pre: wire.steady_pre,
         })
         .map_err(serde::de::Error::custom)
     }
@@ -135,6 +147,14 @@ impl InitializationSolveSystem {
                 return Err(invalid("a given initial state cannot have another writer"));
             }
         }
+        let mut steady = BTreeSet::new();
+        for &index in &input.steady_pre {
+            if updated.contains(&crate::ProjectionUnknownKey::P(index)) || !steady.insert(index) {
+                return Err(invalid(
+                    "a steady-state pre slot cannot have another writer",
+                ));
+            }
+        }
         Ok(Self {
             residual: input.residual,
             row_roles: input.row_roles,
@@ -143,6 +163,7 @@ impl InitializationSolveSystem {
             update_targets: input.update_targets,
             manifold_row_count: input.manifold_row_count,
             given_state_indices: input.given_state_indices,
+            steady_pre: input.steady_pre,
             row_targets,
             projection_unknowns,
         })
@@ -175,6 +196,9 @@ impl InitializationSolveSystem {
     pub fn manifold_row_count(&self) -> usize {
         self.manifold_row_count
     }
+    pub fn steady_pre(&self) -> &[usize] {
+        &self.steady_pre
+    }
 
     /// Consume the checked owner before replacing any of its coupled inputs.
     pub fn into_input(self) -> InitializationSystemInput {
@@ -186,6 +210,7 @@ impl InitializationSolveSystem {
             update_targets: self.update_targets,
             manifold_row_count: self.manifold_row_count,
             given_state_indices: self.given_state_indices,
+            steady_pre: self.steady_pre,
         }
     }
 }

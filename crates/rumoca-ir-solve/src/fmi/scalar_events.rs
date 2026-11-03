@@ -28,6 +28,10 @@ pub(super) struct ScalarEventProfile {
     /// The pre bindings (indices into `pre_bindings`) an event pass advances
     /// and whose settlement ends the iteration.
     iteration_lanes: Vec<usize>,
+    /// The pre bindings (indices into `pre_bindings`) of the MLS §8.6 steady
+    /// states `pre(m) = m`, which the initial event seeds from the value `m`
+    /// settles at (initial_event.rs apply_steady_initial_event_update).
+    steady_lanes: Vec<usize>,
     /// Per discrete output: its parameter target.
     discrete_targets: Vec<usize>,
     /// Per discrete output: whether it is a condition memory, the rows
@@ -98,6 +102,21 @@ struct PreLane {
     /// `y` or `p`.
     column: &'static str,
     source: usize,
+}
+
+/// The pre bindings (indices into `pre_bindings`) of the steady-state `pre`
+/// slots, each of which must have one.
+fn steady_lanes(steady: &[usize], pre_bindings: &[PreLane]) -> Result<Vec<usize>, &'static str> {
+    let lanes = pre_bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, lane)| steady.contains(&lane.dest))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if lanes.len() != steady.len() {
+        return Err("a steady-state initial equation names a pre slot without a pre binding");
+    }
+    Ok(lanes)
 }
 
 /// Admit the scalar event profile, or say why the model needs more.
@@ -182,10 +201,12 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
         }
         iteration_lanes.extend(lanes);
     }
+    let steady_lanes = steady_lanes(problem.initialization.steady_pre(), &pre_bindings)?;
     Ok(ScalarEventProfile {
         roots,
         pre_bindings,
         iteration_lanes,
+        steady_lanes,
         condition_memory_rows: discrete
             .row_roles
             .iter()

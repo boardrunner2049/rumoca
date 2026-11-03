@@ -112,9 +112,31 @@ fn classify_initialized_coordinates(problem: &SolveProblem, variables: &mut [Fmi
     }
 }
 
-/// Admit the parameter bindings and return the order the generated component
-/// evaluates their programs in, with the number of dependency levels (the
-/// repeated sweeps the runtime needs to settle them).
+/// The admitted initialization updates: the order the generated component
+/// evaluates their programs in, the number of dependency levels of the
+/// parameter bindings, and the programs that run while initializing only.
+pub(super) struct UpdateOrder {
+    pub(super) order: Vec<usize>,
+    pub(super) levels: usize,
+    pub(super) initial_only: Vec<usize>,
+}
+
+/// What one initialization update target is.
+#[derive(Clone, Copy, PartialEq)]
+enum UpdateTarget {
+    /// A parameter binding's parameter.
+    Parameter(usize),
+    /// A state start assigned from settled parameters, which no binding reads.
+    StateStart,
+    /// A discrete coordinate or its `pre` slot an MLS §8.6 initial definition
+    /// (`pre(m) = e`) assigns.
+    Discrete(usize),
+}
+
+/// Admit the initialization updates and return the order the generated
+/// component evaluates their programs in, with the number of dependency
+/// levels of the parameter bindings (the repeated sweeps the runtime needs to
+/// settle them).
 ///
 /// The runtime applies the bindings as a Jacobi sweep repeated until no value
 /// changes (`eval_and_apply_update_rows`), whatever their issued order. Each
@@ -123,36 +145,36 @@ fn classify_initialized_coordinates(problem: &SolveProblem, variables: &mut [Fmi
 /// final values of its reads; evaluating the programs once in dependency
 /// order computes exactly those values, bit for bit. A binding that reads
 /// time, a continuous coordinate, an input, or anything in a cycle is refused.
+///
+/// An MLS §8.6 discrete initial definition follows the bindings and runs while
+/// initializing only: it determines the value the coordinate and its `pre`
+/// slot enter the initial event with, and the equation-section owner keeps
+/// every later instant. The DAE proved it reads no discrete or `pre` value, so
+/// the definitions are independent of one another; here each must read only
+/// settled parameters, inputs, and states (an algebraic or `time` read is
+/// refused, since the C initialization does not order it).
 pub(super) fn validate(
     problem: &SolveProblem,
     calls: &SolvePureCallTable,
-) -> Result<(Vec<usize>, usize), &'static str> {
+) -> Result<UpdateOrder, &'static str> {
     let init = &problem.initialization;
     validate_projection(problem)?;
+    let targets = init
+        .update_targets()
+        .iter()
+        .map(|slot| update_target(problem, slot))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut p = stable_parameters(problem);
-    let y = vec![false; problem.layout.y_scalars()];
-    // A parameter target is settled once its binding runs; a state target is a
-    // start assigned from settled parameters, which no binding reads.
-    let mut targets = Vec::with_capacity(init.update_targets().len());
-    for slot in init.update_targets() {
-        let target = match *slot {
-            ScalarSlot::P { index, .. }
-                if owns(problem, SolveVariableStorageRole::Parameter, slot) =>
-            {
-                Some(index)
-            }
-            ScalarSlot::Y { .. } if owns(problem, SolveVariableStorageRole::State, slot) => None,
-            _ => return Err("C initialization can only assign parameters and state starts"),
-        };
-        targets.push(target);
-    }
-    for target in targets.iter().flatten() {
-        p[*target] = false;
+    for target in &targets {
+        if let UpdateTarget::Parameter(index) = target {
+            p[*index] = false;
+        }
     }
     let programs = init.update_rhs().programs();
     let mut outputs = Vec::with_capacity(programs.len());
+    let mut discrete = Vec::new();
     let mut cursor = 0;
-    for program in programs {
+    for (program_index, program) in programs.iter().enumerate() {
         let count = crate::ScalarProgramBlock::program_output_count(program);
         let written = init
             .update_rhs()
@@ -163,22 +185,106 @@ pub(super) fn validate(
             .map(|output| targets.get(*output).copied())
             .collect::<Option<Vec<_>>>()
             .ok_or("missing parameter update target")?;
-        outputs.push(written.into_iter().flatten().collect());
+        let assigns_discrete = written
+            .iter()
+            .any(|target| matches!(target, UpdateTarget::Discrete(_)));
+        if assigns_discrete
+            && !written
+                .iter()
+                .all(|target| matches!(target, UpdateTarget::Discrete(_)))
+        {
+            return Err("an initialization update mixes discrete and parameter targets");
+        }
+        if assigns_discrete {
+            discrete.push(program_index);
+        }
+        outputs.push(
+            written
+                .into_iter()
+                .filter_map(|target| match target {
+                    UpdateTarget::Parameter(index) | UpdateTarget::Discrete(index) => Some(index),
+                    UpdateTarget::StateStart => None,
+                })
+                .collect(),
+        );
         cursor += count;
     }
     if cursor != targets.len() {
         return Err("missing parameter binding output");
     }
-    let candidates = (0..programs.len()).collect::<Vec<_>>();
+    let bindings = (0..programs.len())
+        .filter(|index| !discrete.contains(index))
+        .collect::<Vec<_>>();
     use super::static_assertions::scalar_dependencies::{OrderError, dependency_order};
-    dependency_order(calls, programs, &candidates, &outputs, &y, &mut p).map_err(
-        |error| match error {
-            OrderError::Unsupported => "unsupported parameter binding dependency operation",
-            OrderError::Unsettled => {
-                "parameter binding depends on unsettled or non-parameter values"
+    let refused = |error| match error {
+        OrderError::Unsupported => "unsupported parameter binding dependency operation",
+        OrderError::Unsettled => "parameter binding depends on unsettled or non-parameter values",
+    };
+    let y = vec![false; problem.layout.y_scalars()];
+    let (mut order, levels) =
+        dependency_order(calls, programs, &bindings, &outputs, &y, &mut p).map_err(refused)?;
+    if !discrete.is_empty() {
+        let (y, mut p) = initial_definition_reads(problem, p);
+        let (definitions, _) = dependency_order(calls, programs, &discrete, &outputs, &y, &mut p)
+            .map_err(|_| {
+            "a discrete initial definition reads a value the C initialization does not \
+                 settle before it (time or an algebraic)"
+        })?;
+        order.extend(definitions);
+    }
+    Ok(UpdateOrder {
+        order,
+        levels,
+        initial_only: discrete,
+    })
+}
+
+/// The kind of one initialization update target.
+fn update_target(problem: &SolveProblem, slot: &ScalarSlot) -> Result<UpdateTarget, &'static str> {
+    use SolveVariableStorageRole as Role;
+    match *slot {
+        ScalarSlot::P { index, .. } if owns(problem, Role::Parameter, slot) => {
+            Ok(UpdateTarget::Parameter(index))
+        }
+        ScalarSlot::Y { .. } if owns(problem, Role::State, slot) => Ok(UpdateTarget::StateStart),
+        ScalarSlot::P { index, .. }
+            if owns(problem, Role::DiscreteReal, slot)
+                || owns(problem, Role::DiscreteValue, slot)
+                || problem
+                    .solve_layout
+                    .pre_param_bindings
+                    .iter()
+                    .any(|binding| binding.dest_p_index == index) =>
+        {
+            Ok(UpdateTarget::Discrete(index))
+        }
+        _ => Err("C initialization can only assign parameters, state starts, and discrete values"),
+    }
+}
+
+/// The values settled when the discrete initial definitions run: every
+/// parameter (bindings included, from `p`), and the inputs and states.
+fn initial_definition_reads(problem: &SolveProblem, mut p: Vec<bool>) -> (Vec<bool>, Vec<bool>) {
+    let mut y = vec![false; problem.layout.y_scalars()];
+    for run in &problem.solve_layout.variable_storage_runs {
+        let settled = match run.base {
+            ScalarSlot::Y { index, .. } => matches!(
+                run.role,
+                SolveVariableStorageRole::State | SolveVariableStorageRole::ExternalInput
+            )
+            .then_some((&mut y, index)),
+            ScalarSlot::P { index, .. } => {
+                (run.role == SolveVariableStorageRole::ExternalInput).then_some((&mut p, index))
             }
-        },
-    )
+            _ => None,
+        };
+        if let Some((values, base)) = settled
+            && let Some(range) = values.get_mut(base..base + run.scalar_count)
+        {
+            range.fill(true);
+        }
+    }
+    (y, p)
 }
 
 /// Whether `slot` lies in a storage run of `role`.

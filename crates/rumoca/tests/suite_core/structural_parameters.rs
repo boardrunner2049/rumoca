@@ -87,6 +87,20 @@ package Structural
       der(x[i]) = 0;
     end for;
   end UnevaluatedRange;
+  model ElementwiseArms
+    parameter Boolean msbFirst = true;
+    Integer shift = 128;
+    Boolean bit;
+  equation
+    bit = if msbFirst then div(shift, 128) <> 0 else mod(shift, 2) <> 0;
+  end ElementwiseArms;
+  model HistoryArm
+    parameter Boolean b = true;
+    Integer s = if time < 0.5 then 1 else 2;
+    Integer y;
+  equation
+    y = if b then pre(s) else s;
+  end HistoryArm;
 end Structural;
 "#;
 
@@ -195,4 +209,35 @@ fn a_for_range_reading_an_evaluate_false_parameter_is_refused() {
 #[test]
 fn a_size_of_an_input_array_binds_a_structural_parameter() {
     assert_eq!(evaluable(&compile("Structural.InputExtent")), ["f.n"]);
+}
+
+/// `div` and `mod` read `shift` where it is: the arms are structurally equal,
+/// so the guard stays a run-time branch and `msbFirst` settable (SPEC_0040
+/// DAE-C22). An arm reading `pre(s)` instead of `s` differs in structure.
+#[test]
+fn elementwise_functions_do_not_make_a_guard_structural() {
+    assert!(evaluable(&compile("Structural.ElementwiseArms")).is_empty());
+    assert_eq!(evaluable(&compile("Structural.HistoryArm")), ["b"]);
+    let bit = |overrides: &[(&str, f64)]| {
+        let result = simulate_dae_with_diagnostics(
+            &compile("Structural.ElementwiseArms"),
+            &SimOptions {
+                t_end: 1.0,
+                param_overrides: overrides
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), *value))
+                    .collect(),
+                ..SimOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("ElementwiseArms simulates: {error}"));
+        let index = result
+            .names
+            .iter()
+            .position(|name| name == "bit")
+            .expect("bit is recorded");
+        *result.data[index].last().expect("samples")
+    };
+    assert_eq!(bit(&[]), 1.0, "div(128, 128) <> 0");
+    assert_eq!(bit(&[("msbFirst", 0.0)]), 0.0, "mod(128, 2) <> 0");
 }
