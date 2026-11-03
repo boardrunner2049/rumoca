@@ -22,6 +22,7 @@
 
 mod alias_quotient;
 mod auxiliary_blocks;
+mod blocked_demotion;
 mod builtin_profiles;
 mod candidate_choice;
 mod holonomic_attempt;
@@ -66,11 +67,11 @@ mod variables;
 use rumoca_ir_dae as dae;
 use std::collections::BTreeSet;
 
+use self::blocked_demotion::BlockedDemotion;
 #[cfg(test)]
 use self::constraints::holonomic_constraints;
 use self::constraints::{
-    DiscardedInitialValue, direct_state_constraints, discarded_stated_initial_value,
-    index_reduction_constraints,
+    direct_state_constraints, discarded_stated_initial_value, index_reduction_constraints,
 };
 use self::initial_pins::{stated_initial_variables, transferred_initial_values};
 use self::observation::{
@@ -736,7 +737,7 @@ fn reduce_for_solve_with_observer<'source>(
 /// original singularity.
 fn finalize_holonomic_outcome(
     holonomic: HolonomicRound,
-    outer_blocked: Option<DiscardedInitialValue>,
+    outer_blocked: Option<BlockedDemotion>,
     singular: StructuralError,
     observer: &mut impl ReductionObserver,
 ) -> Result<PreparedDae<'static>, StructuralError> {
@@ -751,19 +752,14 @@ fn finalize_holonomic_outcome(
             observer,
         ),
         // The only reduction left was one that would have discarded a stated
-        // initial condition. Report that, not the singularity it hides behind:
-        // a bare `ES010` would send a modeller looking for a missing equation.
+        // initial condition or demoted a reinitialized state. Report that, not
+        // the singularity it hides behind: a bare `ES010` would send a
+        // modeller looking for a missing equation.
         (None, Some(blocked)) => {
             observer.observe(ReductionEvent::Stopped {
-                outcome: StoppedOutcome::DiscardsInitial {
-                    variable: &blocked.variable,
-                    span: blocked.span,
-                },
+                outcome: blocked.stopped_outcome(),
             });
-            Err(StructuralError::DroppedStatedInitialValue {
-                variable: blocked.variable,
-                span: blocked.span,
-            })
+            Err(blocked.into_error())
         }
         (None, None) => {
             observer.observe(ReductionEvent::Stopped {
@@ -894,7 +890,7 @@ struct DemotionRound {
     /// demotions left would have discarded. That refusal is the reason the
     /// system stops reducing here, so it is what the phase reports rather than
     /// the singularity it hides behind.
-    blocked: Option<DiscardedInitialValue>,
+    blocked: Option<BlockedDemotion>,
 }
 
 #[derive(Clone, Copy)]
@@ -988,7 +984,7 @@ enum DirectAttempt {
         step: DemotionStep,
     },
     /// A candidate this round would take, but it discards a stated initial value.
-    Blocked(DiscardedInitialValue),
+    Blocked(BlockedDemotion),
     /// A candidate this round never takes.
     Rejected,
 }
@@ -1000,7 +996,7 @@ fn discarded_initial_after_attempt(
     lane: Lane,
     identity: Identity<'_>,
     observer: &mut impl ReductionObserver,
-) -> Result<Option<DiscardedInitialValue>, StructuralError> {
+) -> Result<Option<BlockedDemotion>, StructuralError> {
     match model.inspect(|source| {
         rebuilt.inspect(|view| discarded_stated_initial_value(source, view, stated))
     }) {
@@ -1037,6 +1033,16 @@ fn attempt_direct_candidate(
             outcome: AttemptOutcome::WouldInvalidateManifold,
         });
         return Ok(DirectAttempt::Rejected);
+    }
+    if let Some(blocked) =
+        source.inspect(|view, _| BlockedDemotion::reinitialized(view, candidate.state))
+    {
+        observer.observe(ReductionEvent::Attempt {
+            lane: Lane::Direct,
+            identity,
+            outcome: blocked.attempt_outcome(),
+        });
+        return Ok(DirectAttempt::Blocked(blocked));
     }
     reconstruct_direct_candidate(
         source,
@@ -1114,10 +1120,7 @@ fn reconstruct_direct_candidate(
         observer.observe(ReductionEvent::Attempt {
             lane: Lane::Direct,
             identity,
-            outcome: AttemptOutcome::WouldDiscardInitial {
-                variable: &discarded.variable,
-                span: discarded.span,
-            },
+            outcome: discarded.attempt_outcome(),
         });
         return Ok(DirectAttempt::Blocked(discarded));
     }
@@ -1309,7 +1312,7 @@ struct HolonomicRound {
         PreparedStructuralAnalysis,
     )>,
     /// A stated initial value the matching reductions would have discarded.
-    blocked: Option<DiscardedInitialValue>,
+    blocked: Option<BlockedDemotion>,
 }
 
 /// One accepted holonomic replacement. A singular intermediate remains
@@ -1336,7 +1339,7 @@ enum HolonomicStep {
 struct HolonomicPass {
     step: Option<HolonomicStep>,
     held: Option<(HolonomicConstraint, usize, HolonomicStep)>,
-    blocked: Option<DiscardedInitialValue>,
+    blocked: Option<BlockedDemotion>,
 }
 
 struct HolonomicReductionState {
@@ -1347,7 +1350,7 @@ struct HolonomicReductionState {
     round_number: u32,
     direct_round_number: u32,
     differentiated_owners: BTreeSet<HolonomicOwnerKey>,
-    blocked: Option<DiscardedInitialValue>,
+    blocked: Option<BlockedDemotion>,
 }
 
 impl HolonomicReductionState {

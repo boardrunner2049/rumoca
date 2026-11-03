@@ -97,6 +97,22 @@ pub const ES015_CONSTANT_CALL_EVALUATION: &str = "ES015";
 /// * **owner** `crate::dae_transform::loop_guards::unlocalizable_loop_guards`;
 /// * **evidence** `suite_core::loop_guarded_smooth_relations`.
 pub const ES016_UNLOCALIZABLE_LOOP_RELATION: &str = "ES016";
+/// [`crate::StructuralError::DemotedReinitializedState`]: the only available
+/// index reduction would demote a state a `reinit` targets, which MLS 3.6
+/// §8.3.6 makes an implicit `stateSelect = StateSelect.always` (SPEC_0022
+/// EQN-032).
+///
+/// SPEC_0008 acceptance contract:
+///
+/// * **rejects** a model whose index reduction finds no demotion except of a
+///   reinitialized state, e.g. a `reinit(L.i, 0)` on an inductor whose current
+///   an unconnected top-level pin pins to zero;
+/// * **accepts**, and must keep accepting: a reinitialized state the reduction
+///   never needs to demote, and one whose redundant twin (a non-reinitialized
+///   state in the same constraint) can be demoted instead;
+/// * **owner** `crate::dae_transform::blocked_demotion::BlockedDemotion::reinitialized`;
+/// * **evidence** `rumoca` `suite_core::reinitialized_state_selection`.
+pub const ES017_DEMOTED_REINITIALIZED_STATE: &str = "ES017";
 
 /// Every structural diagnostic code, in numeric order.
 ///
@@ -113,6 +129,7 @@ pub const STRUCTURAL_DIAGNOSTIC_CODES: &[&str] = &[
     ES014_CONTRACT_VIOLATION,
     ES015_CONSTANT_CALL_EVALUATION,
     ES016_UNLOCALIZABLE_LOOP_RELATION,
+    ES017_DEMOTED_REINITIALIZED_STATE,
 ];
 
 #[cfg(test)]
@@ -147,6 +164,10 @@ mod tests {
             },
             StructuralError::EmptySystem,
             StructuralError::DroppedStatedInitialValue {
+                variable: "x".to_string(),
+                span: structural_code_test_span(),
+            },
+            StructuralError::DemotedReinitializedState {
                 variable: "x".to_string(),
                 span: structural_code_test_span(),
             },
@@ -228,9 +249,9 @@ mod tests {
             .collect();
         let unique: BTreeSet<&&str> = codes.iter().collect();
 
-        // Eight variants, six codes: all checked-contract failures share ES014.
-        assert_eq!(codes.len(), 8);
-        assert_eq!(unique.len(), 6, "unexpected code aliasing: {codes:?}");
+        // Nine variants, seven codes: all checked-contract failures share ES014.
+        assert_eq!(codes.len(), 9);
+        assert_eq!(unique.len(), 7, "unexpected code aliasing: {codes:?}");
     }
 
     #[test]
@@ -244,6 +265,7 @@ mod tests {
         assert_eq!(ES014_CONTRACT_VIOLATION, "ES014");
         assert_eq!(ES015_CONSTANT_CALL_EVALUATION, "ES015");
         assert_eq!(ES016_UNLOCALIZABLE_LOOP_RELATION, "ES016");
+        assert_eq!(ES017_DEMOTED_REINITIALIZED_STATE, "ES017");
     }
 
     #[test]

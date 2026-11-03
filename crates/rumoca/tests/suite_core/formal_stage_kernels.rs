@@ -260,21 +260,35 @@ fn loop_tensor_bodies_preserve_binder_prefix_and_row_major_axes() {
     });
 }
 
+/// A call inside a loop body asserts once per element (MLS 3.7 section
+/// 8.3.7). The map publishes the elements; a fold over the same domain
+/// carries the assertion outcome, so it holds exactly when every element's
+/// predicate holds, and is neither refused nor discarded.
 #[test]
-fn map_scoped_assertions_are_refused_instead_of_discarded() {
+fn map_scoped_assertions_are_carried_by_a_fold_over_the_map_domain() {
     let source = compile(
         "function positive input Real u; output Real y; algorithm assert(u>0, \"positive\"); y:=u*u; end positive; model LoopAssertion Real x[3]; equation for i in 1:3 loop der(x[i])=positive(x[i]); end for; end LoopAssertion;",
         "LoopAssertion",
     );
     let formal = construct_formal_derivatives(&source).unwrap();
     formal.inspect(|formal| {
-        let Err(rumoca_ir_solve::SolveProgramConstructionError::InvalidCallInterface {
-            provenance,
-        }) = lower_formal_derivative_stages(formal)
-        else {
-            panic!("map assertion execution needs a checked region owner");
-        };
-        assert_ne!(provenance, rumoca_core::Span::DUMMY);
+        let kernels = lower_formal_derivative_stages(formal)
+            .expect("map-scoped assertions lower through a carrying fold");
+        for x in [[1., 2., 3.], [1., -2., 3.]] {
+            let (residuals, directions, assertions) =
+                evaluate(&kernels, |source, i| match source {
+                    Some(("x", 0)) => (x[i], 1.),
+                    Some(("x", 1)) => (5., 3.),
+                    other => panic!("{other:?}"),
+                });
+            let expected: Vec<f64> = x.iter().map(|x| 5. - x * x).collect();
+            assert_eq!(residuals, expected);
+            let tangents: Vec<f64> = x.iter().map(|x| 3. - 2. * x).collect();
+            assert_eq!(directions, tangents);
+            assert_eq!(assertions, [x.iter().all(|x| *x > 0.)]);
+        }
+        let assertion = &kernels.stages()[1].equations()[0].assertions()[0];
+        assert_ne!(assertion.provenance().span(), rumoca_core::Span::DUMMY);
     });
 }
 

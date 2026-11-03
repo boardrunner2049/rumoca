@@ -1550,11 +1550,10 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         domain: rumoca_core::StructuredIndexDomain,
         at: rumoca_core::Span,
     ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
-        if !self.pending_predicates([body]).is_empty() {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: at,
-            });
-        }
+        // The map publishes the elements; the assertion slots of the calls its
+        // body reaches are carried out by a fold over the same domain.
+        let pending = self.pending_predicates([body]);
+        let assertion_domain = (!pending.is_empty()).then(|| domain.clone());
         let body_types = lower_value_type_leaves(
             self.view,
             self.view
@@ -1589,6 +1588,9 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 lowerer.builder.store(output, value, at)
             },
         )?;
+        if let Some(domain) = assertion_domain {
+            self.comprehension_assertions(body, domain_id, domain, pending, at)?;
+        }
         Ok(result)
     }
 

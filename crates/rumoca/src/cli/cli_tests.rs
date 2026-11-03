@@ -783,3 +783,34 @@ fn the_solver_flag_offers_exactly_the_solvers_the_tree_runs() {
         assert_eq!(rumoca_core::canonical_solver_name(label), Ok(label));
     }
 }
+
+/// MLS 3.6 section 18.4: `experiment(Tolerance)` is the default relative
+/// integration tolerance. A direct `sim` run uses it unless `--rtol` names
+/// another, and it leaves the absolute tolerance at the backend default.
+#[test]
+fn simulate_to_value_takes_the_experiment_tolerance_as_rtol() {
+    let source = "model Decay\n  Real x(start = 1, fixed = true);\nequation\n  \
+                  der(x) = -x;\n  annotation(experiment(StopTime = 0.1, Tolerance = 1e-9));\n\
+                  end Decay;\n";
+    let requested = |argv: &[&str]| {
+        let cli = Cli::try_parse_from(argv).expect("parse direct sim");
+        let Commands::Sim(args) = cli.command else {
+            panic!("expected the sim command");
+        };
+        let value = simulate_to_value(&args, source).expect("Decay simulates");
+        let requested = &value["payload"]["simDetails"]["requested"];
+        (
+            requested["rtol"].as_f64().expect("rtol is reported"),
+            requested["atol"].as_f64().expect("atol is reported"),
+        )
+    };
+    let default_atol = SimOptions::default().atol;
+    assert_eq!(
+        requested(&["rumoca", "sim", "Decay.mo"]),
+        (1e-9, default_atol)
+    );
+    assert_eq!(
+        requested(&["rumoca", "sim", "Decay.mo", "--rtol", "1e-4"]),
+        (1e-4, default_atol)
+    );
+}

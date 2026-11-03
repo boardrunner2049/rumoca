@@ -117,6 +117,9 @@ pub(super) enum AttemptOutcome<'a> {
     /// The rebuilt system no longer states an MLS 3.6 section 8.6 initial
     /// value the source system stated; never accepted.
     WouldDiscardInitial { variable: &'a str, span: Span },
+    /// A `reinit` targets the state the candidate demotes, and MLS 3.6
+    /// section 8.3.6 requires it to remain a state; never accepted.
+    WouldDemoteReinitialized { variable: &'a str, span: Span },
     /// Demotion would invalidate a retained state-manifold projection row.
     WouldInvalidateManifold,
     /// Holonomic reconstruction produced no residual scalar containing a
@@ -133,6 +136,7 @@ pub(super) enum StoppedOutcome<'a> {
     Failure { error: &'a StructuralError },
     Singular { error: &'a StructuralError },
     DiscardsInitial { variable: &'a str, span: Span },
+    DemotesReinitialized { variable: &'a str, span: Span },
 }
 
 /// One fact the reducer already computed, borrowed for the duration of one
@@ -360,6 +364,7 @@ pub enum ReductionOutcome {
     CannotReduce { bound: usize },
     NonSingularFailure { error: StructuralError },
     WouldDiscardInitial { variable: String, span: Span },
+    WouldDemoteReinitialized { variable: String, span: Span },
     WouldInvalidateManifold,
     WouldCreateVacuousResidual,
 }
@@ -379,6 +384,12 @@ impl From<AttemptOutcome<'_>> for ReductionOutcome {
                 variable: variable.to_string(),
                 span,
             },
+            AttemptOutcome::WouldDemoteReinitialized { variable, span } => {
+                Self::WouldDemoteReinitialized {
+                    variable: variable.to_string(),
+                    span,
+                }
+            }
             AttemptOutcome::WouldInvalidateManifold => Self::WouldInvalidateManifold,
             AttemptOutcome::WouldCreateVacuousResidual => Self::WouldCreateVacuousResidual,
         }
@@ -393,6 +404,7 @@ pub enum ReductionStop {
     Failure { error: StructuralError },
     Singular { residue: usize },
     DiscardsInitial { variable: String, span: Span },
+    DemotesReinitialized { variable: String, span: Span },
 }
 
 impl From<StoppedOutcome<'_>> for ReductionStop {
@@ -408,6 +420,10 @@ impl From<StoppedOutcome<'_>> for ReductionStop {
                     .expect("Stopped::Singular only fires for a Singular structural error"),
             },
             StoppedOutcome::DiscardsInitial { variable, span } => Self::DiscardsInitial {
+                variable: variable.to_string(),
+                span,
+            },
+            StoppedOutcome::DemotesReinitialized { variable, span } => Self::DemotesReinitialized {
                 variable: variable.to_string(),
                 span,
             },

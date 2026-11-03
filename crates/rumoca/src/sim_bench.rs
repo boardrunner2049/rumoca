@@ -56,7 +56,8 @@ pub struct SimBenchArgs {
     #[arg(long)]
     pub(crate) atol: Option<f64>,
 
-    /// Relative solver tolerance (overrides the backend default).
+    /// Relative solver tolerance (overrides the model's `experiment(Tolerance=…)`
+    /// and the backend default).
     #[arg(long)]
     pub(crate) rtol: Option<f64>,
 
@@ -122,6 +123,18 @@ impl BenchWindow {
                 result.experiment_stop_time,
             ),
             Self::Configured { t_end } => (0.0, t_end),
+        }
+    }
+
+    /// The relative tolerance: `--rtol` (or the scenario's) if given; a direct
+    /// run otherwise takes the model's `experiment(Tolerance)` as `rumoca sim`
+    /// does.
+    fn rtol(&self, rtol: Option<f64>, result: &crate::DaeCompilationResult) -> Option<f64> {
+        match self {
+            Self::Experiment { .. } => {
+                crate::cli::sim_defaults::direct_sim_rtol(rtol, result.experiment_tolerance)
+            }
+            Self::Configured { .. } => rtol,
         }
     }
 }
@@ -193,7 +206,7 @@ pub(crate) fn run_sim_bench(args: SimBenchArgs) -> Result<()> {
     if let Some(atol) = bench.atol {
         opts.atol = atol;
     }
-    if let Some(rtol) = bench.rtol {
+    if let Some(rtol) = bench.window.rtol(bench.rtol, &result) {
         opts.rtol = rtol;
     }
 
