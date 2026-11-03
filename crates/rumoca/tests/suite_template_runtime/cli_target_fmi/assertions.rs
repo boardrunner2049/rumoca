@@ -26,8 +26,12 @@ fn packaged_fmi_parameter_assertions_preserve_validation_and_free_fall() {
     }
 }
 
+/// A predicate that changes with time, a state, or an input is outside the
+/// static assertion profile; the event-iteration profile exports it and
+/// checks it at every settled evaluation (`time_events.rs` runs one to its
+/// failure).
 #[test]
-fn packaged_fmi_static_assertion_profile_refuses_continuously_changing_predicates() {
+fn packaged_fmi_monitors_continuously_changing_predicates_in_the_event_profile() {
     for argument in ["time", "x", "u"] {
         let source = format!(
             r#"
@@ -50,21 +54,24 @@ end ChangingAssertion;
             .model("ChangingAssertion")
             .compile_str(&source, "ChangingAssertion.mo")
             .expect("compile changing assertion");
-        let work = tempdir().expect("negative admission work directory");
+        let work = tempdir().expect("changing assertion work directory");
         for target in ["fmi2", "fmi3"] {
-            let error = rumoca::compile_packaged_target(
+            rumoca::compile_packaged_target(
                 &compiled,
                 "ChangingAssertion",
                 target,
                 work.path().join(target),
             )
-            .expect_err("a changing predicate requires general event support");
-            let diagnostic = format!("{error:#}");
+            .unwrap_or_else(|error| panic!("{target}/{argument}: {error:#}"));
+            let model = fs::read_to_string(
+                work.path()
+                    .join(target)
+                    .join("ChangingAssertion/sources/model.c"),
+            )
+            .expect("read the generated component");
             assert!(
-                diagnostic.contains("assertion depends on")
-                    || diagnostic
-                        .contains("continuous event indicators require general event support"),
-                "{target}/{argument}: {diagnostic}"
+                model.contains("rmc_event_iterate"),
+                "{target}/{argument}: the event-iteration profile owns the predicate"
             );
         }
     }

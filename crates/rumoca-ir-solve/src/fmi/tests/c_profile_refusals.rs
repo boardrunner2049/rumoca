@@ -131,8 +131,10 @@ fn one_discrete_row(model: &mut SolveModel, role: DiscreteRowRole) {
 
 #[test]
 fn event_edge_actions_are_refused() {
+    // Not parameter-determined, so the event-iteration profile owns the
+    // refusal: it executes discrete equations and condition memories only.
     assert_refused(
-        "the C profile cannot execute event-edge discrete actions",
+        "the C profile executes only discrete equations and condition memories",
         |model| {
             static_partition(model);
             one_discrete_row(model, DiscreteRowRole::EventAction);
@@ -155,24 +157,31 @@ fn clocked_previous_history_is_refused() {
     );
 }
 
+/// A pre() value the continuous kernel reads is not parameter-determined, so
+/// the static profile does not own it; the event-iteration profile keeps every
+/// pre lane committed at each event and admits it.
 #[test]
-fn a_pre_value_read_by_the_continuous_kernel_is_refused() {
-    assert_refused(
-        "the continuous kernel reads a condition memory or a pre() value",
-        |model| {
-            static_partition(model);
-            model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {
-                dest_p_index: 0,
-                source: PreParamSource::P { index: 1 },
-                clock_schedule: None,
-            }];
-            model.problem.continuous.residual =
-                ComputeBlock::from_scalar_program_block(rows(vec![vec![
-                    LinearOp::LoadP { dst: 0, index: 0 },
-                    LinearOp::StoreOutput { src: 0 },
-                ]]));
-        },
-    );
+fn a_pre_value_read_by_the_continuous_kernel_runs_the_event_iteration() {
+    let (mut model, input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = crate::SolveDelayPartition::default();
+    static_partition(&mut model);
+    model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {
+        dest_p_index: 0,
+        source: PreParamSource::P { index: 1 },
+        clock_schedule: None,
+    }];
+    model.problem.continuous.residual = ComputeBlock::from_scalar_program_block(rows(vec![vec![
+        LinearOp::LoadP { dst: 0, index: 0 },
+        LinearOp::StoreOutput { src: 0 },
+    ]]));
+    assert!(super::super::static_assertions::validate(&model).is_err());
+    let view = FmiComponent::construct(model, vec![input])
+        .expect("the fixture is a checked component")
+        .into_codegen_view()
+        .try_c()
+        .expect("the event-iteration profile admits a committed pre() read");
+    let view = serde_json::to_value(&view).expect("the C view serializes");
+    assert_eq!(view["scalar_events"]["pre_bindings"][0]["dest"], 0);
 }
 
 #[test]
