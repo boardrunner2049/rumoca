@@ -26,7 +26,7 @@ mod value;
 #[cfg(test)]
 use debug_tracing::expand_trace_filter;
 pub(crate) use debug_tracing::{init_debug_tracing, trace_requests_viewer};
-use sim_defaults::{direct_sim_rtol, direct_sim_window, sim_window};
+use sim_defaults::{direct_sim_tolerances, direct_sim_window, sim_window};
 
 pub use compile_selectors::{CompilePhase, EmissionPolicyArg, InlinePolicyArg, ScalarizePolicyArg};
 
@@ -528,8 +528,8 @@ pub struct SimCommandArgs {
     #[arg(long)]
     pub dt: Option<f64>,
 
-    /// Absolute solver tolerance (overrides the backend default; the model's
-    /// `experiment(Tolerance=…)` is a relative tolerance). Pair with --rtol to match a host's tolerance
+    /// Absolute solver tolerance (overrides the model's `experiment(Tolerance=…)`
+    /// and the backend default). Pair with --rtol to match a host's tolerance
     /// policy exactly (e.g. lunica's 1e-4 atol/rtol).
     #[arg(long)]
     pub atol: Option<f64>,
@@ -1499,13 +1499,14 @@ fn run_direct_simulation(args: SimCommandArgs) -> Result<()> {
     }
     let workspace_root = discover_workspace_root_for_model_file(&input.model_file);
     let solver = simulate_solver_or_auto(args.solver, result.experiment_solver.as_deref())?;
+    let (atol, rtol) = direct_sim_tolerances(args.atol, args.rtol, result.experiment_tolerance);
     run_simulation(SimulationRun {
         dae: result.dae.as_ref(),
         model: &model,
         window: sim_window(&args, &result),
         dt: args.dt,
-        atol: args.atol,
-        rtol: direct_sim_rtol(args.rtol, result.experiment_tolerance),
+        atol,
+        rtol,
         solver_mode: solver.into(),
         solver_label: solver.as_label(),
         output: args.output.as_deref(),

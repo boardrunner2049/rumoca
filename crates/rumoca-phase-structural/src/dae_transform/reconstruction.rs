@@ -31,7 +31,7 @@ use super::declarations::{rebuild_domains, rebuild_types, reserve_conditions};
 use super::expressions::{ExpressionRebuilder, RebuiltBaseIdentities, RebuiltIdentities};
 use super::functions::rebuild_functions;
 use super::runtime_quotients::{QuotientExpressionContext, RuntimeQuotientReplayPlan};
-use super::semantic_owners::{RebuiltOwnerIdentities, rebuild_semantic_owners};
+use super::semantic_owners::{DemotedReinit, RebuiltOwnerIdentities, rebuild_semantic_owners};
 use super::source::ReductionSource;
 use super::temporal::{rebuild_clocks, rebuild_delay_coordinates, rebuild_temporal_coordinates};
 use super::variables::{
@@ -81,6 +81,7 @@ pub(super) fn rebuild_derivative_aliases(
                             domains: context.domains,
                             conditions: context.conditions,
                             clocks: context.clocks,
+                            demoted_reinit: DemotedReinit::Refuse,
                         },
                         &[],
                         quotients,
@@ -143,6 +144,7 @@ pub(super) fn rebuild_requested_states(
                                 domains: context.domains,
                                 conditions: context.conditions,
                                 clocks: context.clocks,
+                                demoted_reinit: DemotedReinit::Refuse,
                             },
                             &[],
                             quotients,
@@ -214,6 +216,7 @@ pub(super) fn rebuild_holonomic_constraint(
                             domains: context.domains,
                             conditions: context.conditions,
                             clocks: context.clocks,
+                            demoted_reinit: DemotedReinit::Refuse,
                         },
                         &[super::semantic_owners::EquationReplacement {
                             owner_ordinal: constraint.owner_ordinal,
@@ -271,6 +274,31 @@ pub(super) fn rebuild_with_state_demotion_and_manifold(
     candidate: DirectStateConstraint,
     prior_manifold: &[ManifoldConstraint],
 ) -> Result<(dae::Dae, Vec<ManifoldConstraint>), StructuralError> {
+    rebuild_demotion(analysis, candidate, prior_manifold, DemotedReinit::Refuse)
+}
+
+/// Rebuild a demotion of a `reinit` target only to learn whether it would
+/// reduce the system. The rebuilt system leaves that `reinit` out, so it is
+/// never a reduction result: MLS 3.6 section 8.3.6 keeps the target a state.
+pub(super) fn probe_reinitialized_demotion(
+    analysis: &ReductionSource<'_>,
+    candidate: DirectStateConstraint,
+    prior_manifold: &[ManifoldConstraint],
+) -> Result<(dae::Dae, Vec<ManifoldConstraint>), StructuralError> {
+    rebuild_demotion(
+        analysis,
+        candidate,
+        prior_manifold,
+        DemotedReinit::OmitForProbe,
+    )
+}
+
+fn rebuild_demotion(
+    analysis: &ReductionSource<'_>,
+    candidate: DirectStateConstraint,
+    prior_manifold: &[ManifoldConstraint],
+    demoted_reinit: DemotedReinit,
+) -> Result<(dae::Dae, Vec<ManifoldConstraint>), StructuralError> {
     let model = analysis.model();
     let mut manifold = Vec::with_capacity(prior_manifold.len());
     let rebuilt = analysis.inspect(|source, facts| {
@@ -313,6 +341,7 @@ pub(super) fn rebuild_with_state_demotion_and_manifold(
                             domains: context.domains,
                             conditions: context.conditions,
                             clocks: context.clocks,
+                            demoted_reinit,
                         },
                         replacement.as_slice(),
                         quotients,

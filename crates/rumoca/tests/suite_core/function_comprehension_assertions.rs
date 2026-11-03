@@ -9,6 +9,9 @@
 //! FIRE library's `quaternionToRotationMatrix`, whose
 //! `quaternionRotationElement` checks its row and column.
 
+use std::path::Path;
+use std::process::Command;
+
 use rumoca::Compiler;
 use rumoca_sim::{SimOptions, SimResult, simulate_dae_with_diagnostics};
 
@@ -112,5 +115,153 @@ fn asserting_calls_in_a_loop_comprehension_export_to_fmi3() {
     assert!(
         files.iter().any(|file| file.path == "sources/model.c"),
         "the fmi3 export renders its C model"
+    );
+}
+
+/// A C FMI 3 Co-Simulation driver for the growing variant (`der(x) = x`,
+/// limit 4): every step checks `m[i,j] = i*j*x`, and the first failing step
+/// must report element 3,1, the first of the two elements that cross the
+/// limit together when `3*x` reaches 4 (t = ln(4/3) = 0.2877).
+const CS_DRIVER: &str = r#"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fmi3Functions.h"
+
+static char first_error[512];
+
+static void logger(fmi3InstanceEnvironment env, fmi3Status status, fmi3String category,
+                   fmi3String message) {
+    (void)env; (void)category;
+    if (status >= fmi3Error && first_error[0] == '\0') {
+        strncpy(first_error, message, sizeof first_error - 1);
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) return 90;
+    fmi3Instance cs = fmi3InstantiateCoSimulation(
+        "cs", argv[1], NULL, fmi3False, fmi3True, fmi3False, fmi3False, NULL, 0, NULL,
+        logger, NULL);
+    if (!cs) return 91;
+    if (fmi3EnterInitializationMode(cs, fmi3False, 0.0, 0.0, fmi3True, 1.0) != fmi3OK) return 92;
+    if (fmi3ExitInitializationMode(cs) != fmi3OK) return 93;
+    const fmi3ValueReference x_vr = (fmi3ValueReference)atoi(argv[2]);
+    const fmi3ValueReference m_vr = (fmi3ValueReference)atoi(argv[3]);
+    double t = 0.0;
+    for (int k = 0; k < 100; ++k) {
+        fmi3Boolean event_needed, terminate, early_return;
+        fmi3Float64 last;
+        if (fmi3DoStep(cs, t, 0.01, fmi3True, &event_needed, &terminate, &early_return,
+                       &last) != fmi3OK) {
+            printf("failed %.6f %s\n", t, first_error);
+            return 0;
+        }
+        t += 0.01;
+        double x, m[6];
+        if (fmi3GetFloat64(cs, &x_vr, 1, &x, 1) != fmi3OK) return 94;
+        if (fmi3GetFloat64(cs, &m_vr, 1, m, 6) != fmi3OK) return 95;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 2; ++j)
+                if (fabs(m[2 * i + j] - (i + 1) * (j + 1) * x) > 1e-9 * fabs(x)) return 96;
+        if (fabs(x - exp(t)) > 1e-4 * exp(t)) return 97;
+    }
+    printf("completed\n");
+    return 0;
+}
+"#;
+
+fn description_attribute<'a>(description: &'a str, anchor: &str, attribute: &str) -> &'a str {
+    let start = description
+        .find(anchor)
+        .unwrap_or_else(|| panic!("modelDescription.xml names {anchor}"));
+    let tail = &description[start..];
+    let key = format!("{attribute}=\"");
+    let value = &tail[tail.find(&key).expect("attribute is present") + key.len()..];
+    &value[..value.find('"').expect("attribute is closed")]
+}
+
+#[test]
+fn the_generated_c_component_raises_the_first_failing_element() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let source = SOURCE
+        .replace("LIMIT", "4")
+        .replace("der(x) = -x;", "der(x) = x;");
+    let compiled = Compiler::new()
+        .model("Elements")
+        .compile_str(&source, "Elements.mo")
+        .unwrap_or_else(|error| panic!("Elements compiles: {error:?}"));
+    let files = rumoca::render_target_files(&compiled, "Elements", "fmi3", None)
+        .unwrap_or_else(|error| panic!("Elements exports to fmi3: {error:#}"));
+    let work = tempfile::tempdir().expect("C harness work directory");
+    let mut sources = Vec::new();
+    let mut description = String::new();
+    for file in &files {
+        let path = work.path().join(&file.path);
+        std::fs::create_dir_all(path.parent().expect("rendered files have a parent"))
+            .expect("create rendered directory");
+        std::fs::write(&path, &file.content).expect("write rendered file");
+        if file.path.starts_with("sources/") && file.path.ends_with(".c") {
+            sources.push(path);
+        } else if file.path == "modelDescription.xml" {
+            description = file.content.clone();
+        }
+    }
+    let token = description_attribute(&description, "<fmiModelDescription", "instantiationToken");
+    let x_vr = description_attribute(&description, "name=\"x\"", "valueReference");
+    let m_vr = description_attribute(&description, "name=\"m\"", "valueReference");
+    let driver = work.path().join("driver.c");
+    std::fs::write(&driver, CS_DRIVER).expect("write the C driver");
+    let headers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rumoca-phase-codegen/src/templates/fmi-ls-wasm/fmi3-headers");
+    let executable = work.path().join("elements_cs");
+    let build = Command::new("cc")
+        .args([
+            "-std=c11",
+            "-O1",
+            "-ffp-contract=off",
+            "-DFMI3_OVERRIDE_FUNCTION_PREFIX=1",
+        ])
+        .arg("-I")
+        .arg(work.path().join("sources"))
+        .arg("-I")
+        .arg(&headers)
+        .args(&sources)
+        .arg(&driver)
+        .args(["-lm", "-o"])
+        .arg(&executable)
+        .output()
+        .expect("run cc");
+    assert!(
+        build.status.success(),
+        "the generated C compiles: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&executable)
+        .args([token, x_vr, m_vr])
+        .output()
+        .expect("run the C driver");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "driver status {:?}: {stdout}",
+        run.status.code()
+    );
+    let failed = stdout
+        .strip_prefix("failed ")
+        .unwrap_or_else(|| panic!("the component raises the assertion: {stdout}"));
+    let (time, message) = failed.trim().split_once(' ').expect("time and message");
+    let time: f64 = time.parse().expect("failure time");
+    assert!(
+        (time - 0.28).abs() < 1e-9,
+        "the step containing t = ln(4/3) = 0.2877 fails, not {time}"
+    );
+    assert!(
+        message.contains("element 3,1 too large"),
+        "the first failing element's message: {message}"
     );
 }

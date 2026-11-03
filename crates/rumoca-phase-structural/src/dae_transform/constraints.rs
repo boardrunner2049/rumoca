@@ -562,6 +562,7 @@ pub(super) fn discarded_stated_initial_value(
                 variable: name,
                 span,
                 reason: BlockedReason::StatedInitialValue,
+                probe: None,
             });
         }
     }

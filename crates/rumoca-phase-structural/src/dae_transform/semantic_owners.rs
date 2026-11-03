@@ -11,6 +11,7 @@
 use rumoca_ir_dae as dae;
 
 use super::declarations::RebuiltDomain;
+pub(super) use super::event_owners::DemotedReinit;
 use super::event_owners::{define_conditions, rebuild_events, rebuild_relations, rebuild_roots};
 use super::runtime_quotients::RuntimeQuotientReplayPlan;
 use super::temporal::RebuiltClock;
@@ -21,6 +22,7 @@ pub(super) struct RebuiltOwnerIdentities<'borrow, 'target> {
     pub(super) domains: &'borrow [RebuiltDomain<'target>],
     pub(super) conditions: &'borrow [dae::ConditionId<'target>],
     pub(super) clocks: &'borrow [RebuiltClock<'target>],
+    pub(super) demoted_reinit: DemotedReinit,
 }
 
 pub(super) struct EquationReplacement<'target> {
@@ -74,6 +76,7 @@ pub(super) fn rebuild_semantic_owners<'target>(
         expressions,
         identities.variables,
         identities.conditions,
+        identities.demoted_reinit,
     )?;
     rebuild_discrete_value_owners(
         source,

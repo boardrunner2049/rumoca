@@ -67,7 +67,7 @@ mod variables;
 use rumoca_ir_dae as dae;
 use std::collections::BTreeSet;
 
-use self::blocked_demotion::BlockedDemotion;
+use self::blocked_demotion::{BlockedDemotion, BlockedReason};
 #[cfg(test)]
 use self::constraints::holonomic_constraints;
 use self::constraints::{
@@ -81,7 +81,8 @@ use self::observation::{
 #[cfg(test)]
 use self::reconstruction::rebuild_with_state_demotion;
 use self::reconstruction::{
-    rebuild_holonomic_constraint, rebuild_with_state_demotion_and_manifold,
+    probe_reinitialized_demotion, rebuild_holonomic_constraint,
+    rebuild_with_state_demotion_and_manifold,
 };
 use self::source::ReductionSource;
 use crate::{
@@ -741,6 +742,14 @@ fn finalize_holonomic_outcome(
     singular: StructuralError,
     observer: &mut impl ReductionObserver,
 ) -> Result<PreparedDae<'static>, StructuralError> {
+    if let Some((dae, manifold, _)) = &holonomic.step
+        && let Some(coupled) = BlockedDemotion::reinitialized_in_manifold(dae, manifold)
+    {
+        observer.observe(ReductionEvent::Stopped {
+            outcome: coupled.stopped_outcome(),
+        });
+        return Err(coupled.into_error());
+    }
     match (holonomic.step, outer_blocked.or(holonomic.blocked)) {
         (Some((dae, manifold, structural)), _) => transformed_with_observer(
             dae,
@@ -756,6 +765,12 @@ fn finalize_holonomic_outcome(
         // the singularity it hides behind: a bare `ES010` would send a
         // modeller looking for a missing equation.
         (None, Some(blocked)) => {
+            if let Some(error) = blocked.probe_failure() {
+                observer.observe(ReductionEvent::Stopped {
+                    outcome: StoppedOutcome::Singular { error: &error },
+                });
+                return Err(error);
+            }
             observer.observe(ReductionEvent::Stopped {
                 outcome: blocked.stopped_outcome(),
             });
@@ -1034,50 +1049,90 @@ fn attempt_direct_candidate(
         });
         return Ok(DirectAttempt::Rejected);
     }
-    if let Some(blocked) =
-        source.inspect(|view, _| BlockedDemotion::reinitialized(view, candidate.state))
-    {
-        observer.observe(ReductionEvent::Attempt {
-            lane: Lane::Direct,
-            identity,
-            outcome: blocked.attempt_outcome(),
-        });
-        return Ok(DirectAttempt::Blocked(blocked));
-    }
+    // A `reinit` target must stay a state (MLS 3.6 section 8.3.6). Its
+    // demotion is still probed, without that `reinit`, so that it is refused
+    // only when the round would otherwise take it, like a discarded initial
+    // value; a candidate that does not reduce the system stays rejected.
+    let reinitialized =
+        source.inspect(|view, _| BlockedDemotion::reinitialized(view, candidate.state));
     reconstruct_direct_candidate(
         source,
-        residue,
-        stated,
-        candidate,
-        prior_manifold,
+        DirectProbe {
+            residue,
+            stated,
+            candidate,
+            prior_manifold,
+            reinitialized,
+        },
         reuse,
         observer,
     )
 }
 
+/// One direct candidate's reconstruction inputs.
+struct DirectProbe<'a> {
+    residue: usize,
+    stated: &'a [u32],
+    candidate: &'a DirectStateConstraint,
+    prior_manifold: &'a [ManifoldConstraint],
+    /// The refusal a taken demotion meets because a `reinit` targets it.
+    reinitialized: Option<BlockedDemotion>,
+}
+
+/// The source-stated refusal a demotion the round would take meets, if any:
+/// a discarded `fixed = true` start, else a demoted `reinit` target.
+fn blocked_taken_demotion(
+    model: &dae::Dae,
+    rebuilt: &dae::Dae,
+    probe: &mut DirectProbe<'_>,
+    identity: Identity<'_>,
+    observer: &mut impl ReductionObserver,
+) -> Result<Option<BlockedDemotion>, StructuralError> {
+    let discarded = discarded_initial_after_attempt(
+        model,
+        rebuilt,
+        probe.stated,
+        Lane::Direct,
+        identity,
+        observer,
+    )?;
+    let Some(blocked) = discarded.or_else(|| probe.reinitialized.take()) else {
+        return Ok(None);
+    };
+    observer.observe(ReductionEvent::Attempt {
+        lane: Lane::Direct,
+        identity,
+        outcome: blocked.attempt_outcome(),
+    });
+    Ok(Some(blocked))
+}
+
 fn reconstruct_direct_candidate(
     source: &ReductionSource<'_>,
-    residue: usize,
-    stated: &[u32],
-    candidate: &DirectStateConstraint,
-    prior_manifold: &[ManifoldConstraint],
+    mut probe: DirectProbe<'_>,
     reuse: Option<&crate::incidence::ReusableIncidence>,
     observer: &mut impl ReductionObserver,
 ) -> Result<DirectAttempt, StructuralError> {
+    let (residue, candidate, prior_manifold) =
+        (probe.residue, probe.candidate, probe.prior_manifold);
     let model = source.model();
     let identity = Identity::Direct(DirectIdentity::from(candidate));
-    let (rebuilt, manifold) =
-        match rebuild_with_state_demotion_and_manifold(source, *candidate, prior_manifold) {
-            Ok(rebuilt) => rebuilt,
-            Err(error) => {
-                observer.observe(ReductionEvent::Attempt {
-                    lane: Lane::Direct,
-                    identity,
-                    outcome: AttemptOutcome::NonSingularFailure { error: &error },
-                });
-                return Err(error);
-            }
-        };
+    let rebuild = if probe.reinitialized.is_some() {
+        probe_reinitialized_demotion
+    } else {
+        rebuild_with_state_demotion_and_manifold
+    };
+    let (rebuilt, manifold) = match rebuild(source, *candidate, prior_manifold) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            observer.observe(ReductionEvent::Attempt {
+                lane: Lane::Direct,
+                identity,
+                outcome: AttemptOutcome::NonSingularFailure { error: &error },
+            });
+            return Err(error);
+        }
+    };
     if let Some(outcome) = direct_reconstruction_rejection(model, &rebuilt, &manifold) {
         observer.observe(ReductionEvent::Attempt {
             lane: Lane::Direct,
@@ -1114,15 +1169,13 @@ fn reconstruct_direct_candidate(
             }
         },
     };
-    let discarded =
-        discarded_initial_after_attempt(model, &rebuilt, stated, Lane::Direct, identity, observer)?;
-    if let Some(discarded) = discarded {
-        observer.observe(ReductionEvent::Attempt {
-            lane: Lane::Direct,
-            identity,
-            outcome: discarded.attempt_outcome(),
-        });
-        return Ok(DirectAttempt::Blocked(discarded));
+    if let Some(blocked) = blocked_taken_demotion(model, &rebuilt, &mut probe, identity, observer)?
+    {
+        let blocked = match blocked.reason {
+            BlockedReason::Reinitialized => blocked.with_probe(rebuilt),
+            BlockedReason::StatedInitialValue => blocked,
+        };
+        return Ok(DirectAttempt::Blocked(blocked));
     }
     let Some(next) = next else {
         observer.observe(ReductionEvent::Attempt {

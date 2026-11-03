@@ -3,7 +3,7 @@
 use rumoca_ir_dae as dae;
 
 use super::{
-    DifferentiationFacts, PreparedRebuild, RebuildRequest, RebuiltOwnerIdentities,
+    DemotedReinit, DifferentiationFacts, PreparedRebuild, RebuildRequest, RebuiltOwnerIdentities,
     construction_failure, define_variables, prepare_rebuild, rebuild_semantic_owners,
 };
 use crate::StructuralError;
@@ -49,6 +49,7 @@ pub(in crate::dae_transform) fn rebuild_loop_guards(
                             domains: context.domains,
                             conditions: context.conditions,
                             clocks: context.clocks,
+                            demoted_reinit: DemotedReinit::Refuse,
                         },
                         &[],
                         quotients,

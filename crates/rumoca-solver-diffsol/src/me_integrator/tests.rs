@@ -113,6 +113,65 @@ fn native_bdf_endpoint_matches_its_continuous_extension() {
 }
 
 #[test]
+fn accepted_bdf_extension_survives_a_tiny_hard_stop_shrink() {
+    // After accepting a step, Diffsol shrinks the next step onto `tstop` by
+    // rescaling the difference table. At a high order and a factor of ~1e-4
+    // that rescaled table cannot reproduce the accepted step's left endpoint
+    // (FIRE Examples.SwitchedThreePhaseCoast at Tolerance=1e-8: a 6e-6
+    // disagreement). Interpolation inside the accepted step reads the table
+    // as it was accepted, so the left endpoint is the previous state again.
+    let problem = OdeBuilder::<FaerMat<f64>>::new()
+        .t0(0.0)
+        .h0(1e-4)
+        .rtol(1e-10)
+        .atol([1e-10, 1e-10])
+        .rhs_implicit(
+            |x, _p, _t, out| {
+                out[0] = x[1];
+                out[1] = -400.0 * x[0];
+            },
+            |_x, _p, _t, v, out| {
+                out[0] = v[1];
+                out[1] = -400.0 * v[0];
+            },
+        )
+        .init(
+            |_p, _t, out| {
+                out[0] = 1.0;
+                out[1] = 0.0;
+            },
+            2,
+        )
+        .build()
+        .unwrap();
+    let mut method = problem.bdf::<FaerLU<f64>>().unwrap();
+    while method.order() < 4 {
+        method.step().unwrap();
+    }
+    let previous_t = method.state().t;
+    let previous_y = method.state().y.as_slice().to_vec();
+    let h = method.state().h;
+    method.set_stop_time(previous_t + h * (1.0 + 1e-4)).unwrap();
+    method.step().unwrap();
+    let accepted_t = method.state().t;
+    assert!(
+        method.state().h < 1e-2 * (accepted_t - previous_t),
+        "the hard stop must shrink the next step for this check to bite"
+    );
+    let left = method.interpolate(previous_t).unwrap();
+    for (sampled, expected) in left.as_slice().iter().zip(&previous_y) {
+        assert!(
+            (sampled - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+            "left endpoint {previous_t}: state={expected}, interpolated={sampled}"
+        );
+    }
+    let right = method.interpolate(accepted_t).unwrap();
+    for (sampled, expected) in right.as_slice().iter().zip(method.state().y.as_slice()) {
+        assert!((sampled - expected).abs() <= 1e-12 * expected.abs().max(1.0));
+    }
+}
+
+#[test]
 fn shortened_bdf_step_preserves_the_stiff_voltage_solution() {
     use diffsol::{
         BacktrackingLineSearch, Bdf, BdfState, FaerSparseLU, FaerSparseMat, NewtonNonlinearSolver,

@@ -48,6 +48,7 @@ pub(in crate::dae_transform) fn rebuild_state_candidate(
                                 domains: context.domains,
                                 conditions: context.conditions,
                                 clocks: context.clocks,
+                                demoted_reinit: DemotedReinit::Refuse,
                             },
                             &[],
                             quotients,
