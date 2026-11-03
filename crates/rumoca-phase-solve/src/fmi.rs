@@ -146,10 +146,15 @@ fn lower_variable<'dae>(
     let role = solve_role(variable.role());
     let causality = fmi_causality(variable.causality());
     let value_kind = solve_value_kind(variable)?;
+    // With neither a `start` nor a binding, the declaration's start is its
+    // predefined type's default (MLS §4.9) — the same value an undriven
+    // host-written input is seeded with before the importer's first write.
     let start = match numeric_attribute(numeric, variable, variable.start())? {
         Some(values) => values,
-        None => numeric_attribute(numeric, variable, variable.binding())?
-            .unwrap_or_else(|| vec![0.0; scalar_count]),
+        None => numeric_attribute(numeric, variable, variable.binding())?.unwrap_or_else(|| {
+            let default = variable.value_type().scalar_type().default_start_value();
+            vec![default.unwrap_or(0.0); scalar_count]
+        }),
     };
     Ok(FmiVariableInput {
         name: variable.name().to_string(),

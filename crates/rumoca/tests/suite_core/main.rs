@@ -91,6 +91,7 @@ mod fire_library_constructs;
 mod fixed_array_element_initialization;
 mod floating_star_index_reduction;
 mod fluid_function_data;
+mod fmi_input_start;
 mod fmi_me_host_divergence;
 mod fmi_parameter_folds;
 mod fmi_projection_descriptors;

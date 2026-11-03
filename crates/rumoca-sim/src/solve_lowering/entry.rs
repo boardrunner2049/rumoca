@@ -46,8 +46,8 @@ pub fn lower_dae_for_gpu_preparation(
 /// Lower for a host that writes every input before each evaluation.
 ///
 /// GPU preparation and FMI export share this: both hand the kernel to a driver
-/// that owns the input values, so the pre-write value is the checked `start`
-/// attribute rather than a refusal.
+/// that owns the input values, so the pre-write value is the input's `start`
+/// (declared, else its type's default) rather than a refusal.
 pub(super) fn lower_dae_with_host_driven_inputs(
     model: &dae::Dae,
     opts: &SimOptions,
@@ -65,9 +65,12 @@ pub(super) fn lower_dae_with_host_driven_inputs(
 /// Pre-write value of every host-driven input scalar, by scalar name.
 ///
 /// Inputs that carry a binding are left out: the binding is already a checked
-/// default the runtime vectors evaluate. Inputs the checked DAE gave no `start`
-/// are left out too, so they still fail in `runtime_vectors` naming the input,
-/// rather than being seeded with a value this function would have to invent.
+/// default the runtime vectors evaluate. Every other input is seeded with its
+/// `start`: the declared one, or, when the declaration has none, the start its
+/// predefined type defines (MLS §4.9: `0`, `false`, or the first enumeration
+/// literal). That value is not invented here: it is the declaration's start,
+/// and FMI requires every input to publish one. Only headless simulation,
+/// which has no host to write the input, refuses an undriven input.
 pub(super) fn host_driven_input_seeds(
     model: &dae::Dae,
 ) -> Result<std::collections::HashMap<String, f64>, SimulationDiagnosticError> {
@@ -91,15 +94,20 @@ fn seed_host_driven_input<'dae>(
     if variable.binding().is_some() {
         return Ok(());
     }
-    let Some(start) = variable.start() else {
-        return Ok(());
+    // A String input has no numeric start, declared or default, and seeds
+    // nothing: the host supplies it, and its default stays its own.
+    let values = match variable.start() {
+        Some(start) => {
+            rumoca_phase_solve::fmi::numeric_attribute_values(view, variable, Some(start))
+                .map_err(fmi_metadata_error)?
+        }
+        None => variable
+            .value_type()
+            .scalar_type()
+            .default_start_value()
+            .map(|value| vec![value]),
     };
-    // A start with no numeric value (a Boolean or String input) seeds
-    // nothing: the host supplies the input, and its default stays its own.
-    let Some(values) =
-        rumoca_phase_solve::fmi::numeric_attribute_values(view, variable, Some(start))
-            .map_err(fmi_metadata_error)?
-    else {
+    let Some(values) = values else {
         return Ok(());
     };
     for scalar in 0..variable.scalar_count() {

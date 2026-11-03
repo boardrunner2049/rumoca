@@ -38,6 +38,20 @@ impl ScalarType {
     pub(crate) fn is_numeric(self) -> bool {
         matches!(self, Self::Real | Self::Integer)
     }
+
+    /// The numeric value of the `start` attribute a declaration of this
+    /// predefined type has when nothing modifies it (MLS §4.9): `0` for `Real`
+    /// and `Integer`, `false` (0) for `Boolean`, and an enumeration's first
+    /// literal, whose checked ordinal is 1. `String` and record declarations
+    /// have no numeric start, so they have no value here.
+    #[must_use]
+    pub const fn default_start_value(self) -> Option<f64> {
+        match self {
+            Self::Real | Self::Integer | Self::Boolean => Some(0.0),
+            Self::Enumeration => Some(1.0),
+            Self::String | Self::Record => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
