@@ -2,7 +2,11 @@
 //! events (static instants, dynamic deadlines), holds relation memory across
 //! events without any continuously searched root, runs the `initial()` event,
 //! treats a changed discrete input as an event, and checks a continuously
-//! changing assertion at every settled evaluation.
+//! changing assertion at every settled evaluation. After a time event every
+//! read at its instant takes the right limit; the `when` bodies active at one
+//! instant settle together, also when a state root coincides with a time
+//! event; a body that moves its own deadline still runs whole; and an input
+//! written in Continuous-Time Mode across a relation requests a step event.
 //!
 //! A C harness compiled against the packaged `model.c` and the vendored FMI 3
 //! headers drives both interfaces directly; it needs only a C compiler, not
@@ -66,11 +70,51 @@ equation
     hits = pre(hits) + 1;
   end when;
 end InputRelation;
+
+model StrictTime
+  Real x(start = 0.0, fixed = true);
+  Real y;
+  Integer n(start = 0, fixed = true);
+equation
+  y = if time > 0.5 then 1 else 0;
+  der(x) = if time > 0.5 then 1.0 else -1.0;
+  when time > 0.5 then
+    n = pre(n) + 1;
+  end when;
+end StrictTime;
+
+model SameInstant
+  Real x(start = 0.0, fixed = true);
+  discrete Real a(start = 0.0, fixed = true);
+  discrete Real b(start = 0.0, fixed = true);
+equation
+  der(x) = 1.0;
+  when time >= 0.3 then
+    b = 1.0;
+  end when;
+  when x > 0.3 - 3e-15 then
+    a = b + 10.0;
+  end when;
+end SameInstant;
+
+model Deadline
+  discrete Real T(start = 0.3, fixed = true);
+  Integer n(start = 0, fixed = true);
+  Real x(start = 0.0, fixed = true);
+equation
+  der(x) = 1.0;
+  when time >= T then
+    T = pre(T) + 0.25;
+    n = pre(n) + 1;
+    reinit(x, 0.0);
+  end when;
+end Deadline;
 "#;
 
-/// The harness prints `name time value` lines. `X`, `LATE`, `COUNT`,
-/// `STARTED`, `REQUEST`, `SEEN`, `GAP`, `CONTACT` and `HITS` are value references the test passes as
-/// defines; `MODEL` selects the scenario.
+/// The harness prints `name time value` lines. `X`, `Y`, `N`, `A`, `B`,
+/// `LATE`, `COUNT`, `STARTED`, `REQUEST`, `SEEN`, `GAP`, `CONTACT` and `HITS`
+/// are value references the test passes as defines; `MODEL` selects the
+/// scenario.
 const HARNESS: &str = r#"#include "model.c"
 #include <stdio.h>
 
@@ -155,6 +199,49 @@ int main(void) {
         me_update(i);
         printf("me %d contact %d hits %d\n", k, get_b(i, CONTACT), get_i(i, HITS));
     }
+    /* No indicator watches the input, so a write in Continuous-Time Mode
+       that crosses the relation is a step event at the completed step. */
+    const double away = 2.0;
+    fmi3Boolean enter = fmi3False, term = fmi3False;
+    if (fmi3EnterContinuousTimeMode(i) != fmi3OK || fmi3SetTime(i, 0.1) != fmi3OK || fmi3CompletedIntegratorStep(i, fmi3True, &enter, &term) != fmi3OK) return 13;
+    printf("me ct quiet enter %d\n", (int)enter);
+    if (fmi3SetFloat64(i, &vr, 1, &away, 1) != fmi3OK || fmi3SetTime(i, 0.2) != fmi3OK || fmi3CompletedIntegratorStep(i, fmi3True, &enter, &term) != fmi3OK) return 13;
+    printf("me ct crossed enter %d contact %d\n", (int)enter, get_b(i, CONTACT));
+    if (fmi3EnterEventMode(i) != fmi3OK) return 13;
+    me_update(i);
+    printf("me ct event contact %d hits %d\n", get_b(i, CONTACT), get_i(i, HITS));
+#elif MODEL == 5
+    /* Reads at a time event's instant after Event Mode take its right
+       limit: y, der(x), and n agree there. */
+    fmi3Instance i = cs();
+    for (int k = 0; k < 4; ++k) { step(i, 0.25 * k, 0.25); printf("cs %.17g x %.17g y %.17g n %d\n", 0.25 * (k + 1), get_f(i, X), get_f(i, Y), get_i(i, N)); }
+    fmi3FreeInstance(i);
+    i = fmi3InstantiateModelExchange("h", TOKEN, NULL, fmi3False, fmi3False, NULL, quiet);
+    if (!i || fmi3EnterInitializationMode(i, fmi3True, 1e-10, 0.0, fmi3True, 1.0) != fmi3OK || fmi3ExitInitializationMode(i) != fmi3OK) return 2;
+    double t = 0.0, next = me_update(i), x = 0.0, dx = 0.0;
+    if (fmi3EnterContinuousTimeMode(i) != fmi3OK) return 6;
+    while (t < 1.0) {
+        double h = fmin(0.01, fmin(next, 1.0) - t);
+        if (fmi3GetContinuousStateDerivatives(i, &dx, 1) != fmi3OK) return 7;
+        t = fabs(t + h - next) < 1e-12 ? next : t + h; x += h * dx;
+        fmi3Boolean enter, term;
+        if (fmi3SetTime(i, t) != fmi3OK || fmi3SetContinuousStates(i, &x, 1) != fmi3OK || fmi3CompletedIntegratorStep(i, fmi3True, &enter, &term) != fmi3OK) return 8;
+        if (t == next) {
+            if (fmi3GetContinuousStateDerivatives(i, &dx, 1) != fmi3OK) return 7;
+            printf("me before %.17g der %.17g y %.17g\n", t, dx, get_f(i, Y));
+            if (fmi3EnterEventMode(i) != fmi3OK) return 9;
+            next = me_update(i);
+            if (fmi3EnterContinuousTimeMode(i) != fmi3OK || fmi3GetContinuousStateDerivatives(i, &dx, 1) != fmi3OK) return 10;
+            printf("me after %.17g der %.17g y %.17g n %d\n", t, dx, get_f(i, Y), get_i(i, N));
+        }
+    }
+    printf("me end %.17g x %.17g\n", t, x);
+#elif MODEL == 6
+    fmi3Instance i = cs();
+    for (int k = 0; k < 4; ++k) { step(i, 0.1 * k, 0.1); printf("cs %d a %.17g b %.17g\n", k + 1, get_f(i, A), get_f(i, B)); }
+#elif MODEL == 7
+    fmi3Instance i = cs();
+    for (int k = 0; k < 20; ++k) { step(i, 0.05 * k, 0.05); printf("cs %d n %d x %.17g\n", k + 1, get_i(i, N), get_f(i, X)); }
 #else
     fmi3Instance i = cs();
     step(i, 0.0, 0.1);
@@ -172,11 +259,7 @@ int main(void) {
 
 #[test]
 fn generated_c_component_executes_time_events_and_input_events() {
-    let tools = [("cc", command_is_available("cc"))];
-    if !super::super::template_runtime_policy::prerequisites_are_available(
-        "FMI C time-event harness",
-        &tools,
-    ) {
+    if !harness_tools_available() {
         return;
     }
     let time_switch = run_harness("TimeSwitch", 0);
@@ -224,6 +307,70 @@ fn generated_c_component_executes_time_events_and_input_events() {
             assert!(relation.contains(&line), "missing `{line}` in:\n{relation}");
         }
     }
+    // An input written in Continuous-Time Mode: nothing until it crosses the
+    // relation, then a step event whose iteration moves the relation.
+    for line in [
+        "me ct quiet enter 0",
+        "me ct crossed enter 1 contact 1",
+        "me ct event contact 0 hits 2",
+    ] {
+        assert!(relation.contains(line), "missing `{line}` in:\n{relation}");
+    }
+}
+
+/// After a time event at 0.5, a read at 0.5 is the right limit: `time > 0.5`
+/// holds there for `y` and `der(x)` as it does for the counter.
+#[test]
+fn reads_at_a_time_event_instant_take_its_right_limit() {
+    if !harness_tools_available() {
+        return;
+    }
+    let output = run_harness("StrictTime", 5);
+    let at_event = find_line(&output, "cs 0.5 x ");
+    assert!(at_event.ends_with("y 1 n 1"), "{at_event}");
+    let end = find_line(&output, "cs 1 x ");
+    assert_close(field(&end, 3), 0.0, 1e-9, &end);
+    let before = find_line(&output, "me before 0.5 ");
+    assert_close(field(&before, 4), -1.0, 0.0, &before);
+    let after = find_line(&output, "me after 0.5 ");
+    assert!(after.ends_with("der 1 y 1 n 1"), "{after}");
+    let me_end = find_line(&output, "me end 1 x ");
+    assert_close(field(&me_end, 4), 0.0, 1e-9, &me_end);
+}
+
+/// The `when` bodies active at one instant settle together (MLS 8.5): `a`
+/// reads the `b` assigned at the same instant, also when the state root of
+/// `a` lies 3e-15 s before the time event of `b`. A body that moves its own
+/// deadline still runs whole at each deadline.
+#[test]
+fn simultaneous_when_bodies_settle_together() {
+    if !harness_tools_available() {
+        return;
+    }
+    let same = run_harness("SameInstant", 6);
+    assert!(same.contains("cs 2 a 0 b 0"), "{same}");
+    assert!(same.contains("cs 3 a 11 b 1"), "{same}");
+    assert!(same.contains("cs 4 a 11 b 1"), "{same}");
+    let deadline = run_harness("Deadline", 7);
+    for (k, n, x) in [
+        (5, 0, 0.25),
+        (6, 1, 0.0),
+        (7, 1, 0.05),
+        (12, 2, 0.05),
+        (20, 3, 0.2),
+    ] {
+        let line = find_line(&deadline, &format!("cs {k} n "));
+        assert_eq!(field(&line, 3), f64::from(n), "{line}");
+        assert_close(field(&line, 5), x, 1e-9, &line);
+    }
+}
+
+fn harness_tools_available() -> bool {
+    let tools = [("cc", command_is_available("cc"))];
+    super::super::template_runtime_policy::prerequisites_are_available(
+        "FMI C time-event harness",
+        &tools,
+    )
 }
 
 fn find_line(output: &str, prefix: &str) -> String {
@@ -273,6 +420,10 @@ fn run_harness(model: &str, scenario: u32) -> String {
         .arg(format!("-DTOKEN=\"{token}\""));
     for (define, name) in [
         ("X", "x"),
+        ("Y", "y"),
+        ("N", "n"),
+        ("A", "a"),
+        ("B", "b"),
         ("LATE", "late"),
         ("COUNT", "count"),
         ("STARTED", "started"),

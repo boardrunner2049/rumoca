@@ -38,6 +38,11 @@ pub(super) struct ScalarEventProfile {
     runtime_targets: Vec<Slot>,
     /// Per guarded-assignment output, in program order: its target.
     guarded_targets: Vec<Slot>,
+    /// Per guarded-assignment program, in issued order: its output count.
+    /// Each program's outputs reach the pass's working state before the next
+    /// program runs (discrete_rows.rs collect_guarded_discrete_row_values,
+    /// SOLVE-C58).
+    guarded_program_outputs: Vec<usize>,
     post_commit_targets: Vec<Slot>,
     /// The parameters actions read at their event-entry value.
     condition_memories: Vec<usize>,
@@ -136,6 +141,7 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
     {
         return Err("the C profile executes only discrete rows whose pre follows the current pass");
     }
+    let (guarded_targets, guarded_program_outputs) = guarded_targets(discrete)?;
     let layout = &problem.solve_layout;
     let pre_bindings = layout
         .pre_param_bindings
@@ -187,7 +193,8 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
             .collect(),
         discrete_targets,
         runtime_targets: slots(&discrete.runtime_assignment_targets)?,
-        guarded_targets: guarded_targets(discrete)?,
+        guarded_targets,
+        guarded_program_outputs,
         post_commit_targets: slots(&discrete.post_commit_assignment_targets)?,
         condition_memories: events.condition_memory_parameter_indices.clone(),
         schedule: discrete.event_iteration_plan.schedule.clone(),
@@ -260,10 +267,15 @@ fn scalar_event_root(
 }
 
 /// The guarded assignments' targets, expanded from their compact ranges in
-/// program and range order; an owner under a clock is refused.
-fn guarded_targets(discrete: &crate::DiscreteSolveSystem) -> Result<Vec<Slot>, &'static str> {
+/// program and range order, and each program's output count; an owner under
+/// a clock is refused.
+fn guarded_targets(
+    discrete: &crate::DiscreteSolveSystem,
+) -> Result<(Vec<Slot>, Vec<usize>), &'static str> {
     let mut targets = Vec::new();
+    let mut counts = Vec::new();
     for program in &discrete.guarded_assignments {
+        let first = targets.len();
         if program.clock_owner().is_some() {
             return Err("the C profile cannot execute clocked guarded assignments");
         }
@@ -282,6 +294,7 @@ fn guarded_targets(discrete: &crate::DiscreteSolveSystem) -> Result<Vec<Slot>, &
                 index: base + offset,
             }));
         }
+        counts.push(targets.len() - first);
     }
-    Ok(targets)
+    Ok((targets, counts))
 }

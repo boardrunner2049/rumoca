@@ -10,11 +10,11 @@
 {%- from "fmi-c-kernel.jinja" import scalar_op %}
 
 {%- macro event_fields(fmi) -%}
-{%- if fmi.scalar_events %} bool rmc_domain[{{ [fmi.event_indicator_roots|length, 1]|max }}]; bool rmc_domain_valid; double rmc_indicator[{{ [fmi.event_indicator_roots|length, 1]|max }}]; double rmc_entry_y[Y_LEN]; double rmc_entry_p[P_LEN]; bool rmc_entry_captured; bool rmc_initial_event; double rmc_scan; size_t rmc_override_root[{{ [fmi.scalar_events.roots|length, 1]|max }}]; double rmc_override_value[{{ [fmi.scalar_events.roots|length, 1]|max }}]; size_t rmc_override_count; double rmc_next_time; bool rmc_next_defined; bool rmc_next_right;{% endif -%}
+{%- if fmi.scalar_events %} bool rmc_domain[{{ [fmi.event_indicator_roots|length, 1]|max }}]; bool rmc_domain_valid; double rmc_indicator[{{ [fmi.event_indicator_roots|length, 1]|max }}]; double rmc_entry_y[Y_LEN]; double rmc_entry_p[P_LEN]; bool rmc_entry_captured; bool rmc_initial_event; double rmc_scan; size_t rmc_override_root[{{ [fmi.scalar_events.roots|length, 1]|max }}]; double rmc_override_value[{{ [fmi.scalar_events.roots|length, 1]|max }}]; size_t rmc_override_count; double rmc_next_time; bool rmc_next_defined; bool rmc_next_right; double rmc_post_time; double rmc_post_anchor; bool rmc_post_defined;{% endif -%}
 {%- endmacro %}
 
 {%- macro event_reset(fmi) -%}
-{%- if fmi.scalar_events %} m->rmc_domain_valid=false; m->rmc_entry_captured=false; m->rmc_initial_event=false; m->rmc_override_count=0; m->rmc_scan=0.0; m->rmc_next_defined=false; m->rmc_next_right=false; m->rmc_next_time=INFINITY;{% endif -%}
+{%- if fmi.scalar_events %} m->rmc_domain_valid=false; m->rmc_entry_captured=false; m->rmc_initial_event=false; m->rmc_override_count=0; m->rmc_scan=0.0; m->rmc_next_defined=false; m->rmc_next_right=false; m->rmc_next_time=INFINITY; m->rmc_post_defined=false; m->rmc_post_time=0.0; m->rmc_post_anchor=0.0;{% endif -%}
 {%- endmacro %}
 
 {#- One named change step of a pass; `flag` accumulates whether it changed the
@@ -76,13 +76,26 @@ static void rmc_set_initial_flag(ModelInstance* m, double value) {
 {%- endif %}
 }
 static void rmc_clear_initial_flag(ModelInstance* m) { rmc_set_initial_flag(m, 0.0); }
-/* component.rs continuous_eval_time: a continuous read at an announced time
-   event, before Event Mode handles it, takes the instant's left limit. The
-   caller restores the returned time. */
-static double rmc_left_limit_enter(ModelInstance* m) {
-    double saved = m->time, left = nextafter(m->rmc_next_time, -INFINITY);
-    if (m->rmc_next_defined && m->rmc_next_right && m->time > left && rmc_time_match(m->time, m->rmc_next_time)) m->time = left;
+/* component.rs public_time_eval_time: after a time event observed at its
+   right limit, every read at the event instant takes that right limit, so a
+   time relation reads its post-event side together with the post-event
+   discrete values, until integration moves on (CompletedIntegratorStep, or
+   a later time). The caller restores the returned time. */
+static double rmc_public_time_enter(ModelInstance* m) {
+    double saved = m->time;
+    if (m->rmc_post_defined && rmc_time_match(m->time, m->rmc_post_anchor)) m->time = m->rmc_post_time;
     return saved;
+}
+/* component.rs continuous_eval_time: a derivative or indicator read at an
+   announced time event, before Event Mode handles it, takes the instant's
+   left limit; any other read takes the public evaluation time. */
+static double rmc_continuous_time_enter(ModelInstance* m) {
+    double saved = m->time, left = nextafter(m->rmc_next_time, -INFINITY);
+    if (m->rmc_next_defined && m->rmc_next_right && m->time > left && rmc_time_match(m->time, m->rmc_next_time)) {
+        m->time = left;
+        return saved;
+    }
+    return rmc_public_time_enter(m);
 }
 /* One candidate instant strictly after `after`: tolerance-coincident
    candidates are one instant, reached at the latest of them
@@ -97,55 +110,16 @@ static void rmc_offer(RmcNextStop* next, double candidate, double after, bool ri
         next->time = candidate; next->defined = true; next->right = right;
     }
 }
-{%- if te.periodic|length > 0 %}
-static const size_t rmc_periodic_root[{{ te.periodic|length }}] = { {% for r in te.periodic %}{{ r.root }},{% endfor %} };
-static const double rmc_periodic_period[{{ te.periodic|length }}] = { {% for r in te.periodic %}{{ r.period }},{% endfor %} };
-static const double rmc_periodic_phase[{{ te.periodic|length }}] = { {% for r in te.periodic %}{{ r.phase }},{% endfor %} };
-static const long rmc_periodic_memory[{{ te.periodic|length }}] = { {% for r in te.periodic %}{{ r.memory if r.memory is not none else -1 }},{% endfor %} };
-/* timeline.rs scheduled_root_matches_time: `t` is a tick of the schedule. */
-static bool rmc_periodic_tick(size_t k, double t) {
-    double tick = round((t - rmc_periodic_phase[k]) / rmc_periodic_period[k]);
-    return isfinite(tick) && tick >= 0.0 && rmc_time_match(rmc_periodic_phase[k] + tick * rmc_periodic_period[k], t);
-}
-{%- endif %}
-/* component.rs seed_scheduled_root_relation_overrides: a sample tick arms its
-   root's post side. */
-static void rmc_seed_periodic_overrides(ModelInstance* m, double t) {
-    (void)m; (void)t;
-{%- if te.periodic|length > 0 %}
-    for (size_t k = 0; k < {{ te.periodic|length }}; ++k) {
-        if (!rmc_periodic_tick(k, t) || rmc_root_overridden(m, rmc_periodic_root[k])) continue;
-        m->rmc_override_root[m->rmc_override_count] = rmc_periodic_root[k];
-        m->rmc_override_value[m->rmc_override_count] = 1.0;
-        ++m->rmc_override_count;
-    }
-{%- endif %}
-}
-/* pre_params.rs clear_scheduled_root_relation_memory: a sample is true only
-   at its tick. */
-static void rmc_clear_periodic_memory(ModelInstance* m, double t) {
-    (void)m; (void)t;
-{%- if te.periodic|length > 0 %}
-    for (size_t k = 0; k < {{ te.periodic|length }}; ++k)
-        if (rmc_periodic_memory[k] >= 0 && rmc_periodic_tick(k, t)) m->p[rmc_periodic_memory[k]] = 0.0;
-{%- endif %}
-}
 /* The next time event strictly after `after`, stored as the instance's
-   announced stop: static instants, sample ticks, the parameter of each
-   direct time root, named deadlines, and the dynamic deadline rows at the
-   settled coordinate. */
+   announced stop: static instants, the parameter of each direct time root,
+   named deadlines, and the dynamic deadline rows at the settled
+   coordinate. */
 static {{ prefix }}Status rmc_next_time_event(ModelInstance* m, double after) {
     RmcNextStop next = { INFINITY, false, false };
     (void)after; (void)rmc_offer;
 {%- if te.instants|length > 0 %}
     static const double instants[{{ te.instants|length }}] = { {% for t in te.instants %}{{ t }},{% endfor %} };
     for (size_t k = 0; k < {{ te.instants|length }}; ++k) rmc_offer(&next, instants[k], after, true);
-{%- endif %}
-{%- if te.periodic|length > 0 %}
-    for (size_t k = 0; k < {{ te.periodic|length }}; ++k) {
-        double tick = fmax(0.0, floor((after - rmc_periodic_phase[k]) / rmc_periodic_period[k]));
-        for (int guard = 0; guard < 3; ++guard, tick += 1.0) rmc_offer(&next, rmc_periodic_phase[k] + tick * rmc_periodic_period[k], after, false);
-    }
 {%- endif %}
 {%- for index in te.announced + te.named_deadlines %}
     rmc_offer(&next, m->p[{{ index }}], after, true);
@@ -191,6 +165,10 @@ static const signed char rmc_root_zero[{{ [nroots, 1]|max }}] = { {% for root in
 /* Relation-memory parameter per root, or -1. */
 static const long rmc_root_memory[{{ [nroots, 1]|max }}] = { {% for root in ev.roots %}{{ root.memory if root.memory is not none else -1 }},{% else %}-1{% endfor %} };
 static const bool rmc_root_algebraic[{{ [nroots, 1]|max }}] = { {% for root in ev.roots %}{{ "true" if root.algebraic_dependent else "false" }},{% else %}false{% endfor %} };
+/* Roots that read only parameters, inputs, and statically fixed coordinates
+   (RootSearchRole::Static): never searched, evaluated in Event Mode. */
+static const bool rmc_root_static[{{ [nroots, 1]|max }}] = { {% for root in ev.roots %}{{ "true" if root.role == "static" else "false" }},{% else %}false{% endfor %} };
+{{ time_events(solve, ev.time_events, prefix) }}
 
 /* All root rows at the current coordinate, as Event Mode reads them. */
 static {{ prefix }}Status rmc_eval_roots(ModelInstance* m, double* roots) {
@@ -228,7 +206,11 @@ static bool rmc_root_overridden(const ModelInstance* m, size_t root) {
    coordinate, an exact zero reported on its domain's side. */
 static {{ prefix }}Status rmc_event_indicators(ModelInstance* m, double* z) {
     double roots[{{ [nroots, 1]|max }}];
-    if (settle_values(m) != {{ prefix }}OK || rmc_eval_roots(m, roots) != {{ prefix }}OK) return {{ prefix }}Error;
+    double saved = rmc_continuous_time_enter(m);
+    {{ prefix }}Status status = settle_values(m);
+    if (status == {{ prefix }}OK) status = rmc_eval_roots(m, roots);
+    m->time = saved;
+    if (status != {{ prefix }}OK) return {{ prefix }}Error;
     for (size_t k = 0; k < RMC_EVENT_INDICATORS; ++k) {
         size_t root = rmc_indicator_root[k];
         double value = roots[root];
@@ -241,11 +223,40 @@ static {{ prefix }}Status rmc_event_indicators(ModelInstance* m, double* z) {
     return {{ prefix }}OK;
 }
 
+/* A static root's relation memory goes stale only when the host writes an
+   input it reads in Continuous-Time Mode: no indicator can see that, so the
+   completed step requests the event (an FMI step event) and its iteration
+   moves the relation to its new side. */
+static {{ prefix }}Status rmc_static_relations_stale(ModelInstance* m, bool* stale) {
+    double roots[{{ [nroots, 1]|max }}];
+    bool any = false;
+    *stale = false;
+    for (size_t root = 0; root < RMC_ROOTS; ++root) any |= rmc_root_static[root] && rmc_root_memory[root] >= 0;
+    if (!any) return {{ prefix }}OK;
+    double saved = rmc_continuous_time_enter(m);
+    {{ prefix }}Status status = settle_values(m);
+    if (status == {{ prefix }}OK) status = rmc_eval_roots(m, roots);
+    m->time = saved;
+    if (status != {{ prefix }}OK) return {{ prefix }}Error;
+    for (size_t root = 0; root < RMC_ROOTS && !*stale; ++root) {
+        long memory = rmc_root_memory[root];
+        double value = rmc_orient_root(roots[root], rmc_root_zero[root]);
+        *stale = rmc_root_static[root] && memory >= 0 && value != 0.0 && rmc_memory_value(value) != m->p[memory];
+    }
+    return {{ prefix }}OK;
+}
+
 /* component.rs complete_indicator_domains: a changed domain captures the
-   event entry and arms each crossed root's post-event relation side. */
+   event entry and arms each crossed root's post-event relation side. A
+   completed step leaves the event instant, so reads stop taking its right
+   limit (kernel.rs completed_integrator_step). */
 static {{ prefix }}Status rmc_events_completed(ModelInstance* m, bool* enter) {
     double z[{{ [nind, 1]|max }}];
+    bool stale = false;
     *enter = false;
+    m->rmc_post_defined = false;
+    if (rmc_static_relations_stale(m, &stale) != {{ prefix }}OK) return {{ prefix }}Error;
+    *enter = stale;
     if (RMC_EVENT_INDICATORS == 0) return {{ prefix }}OK;
     if (rmc_event_indicators(m, z) != {{ prefix }}OK) return {{ prefix }}Error;
     if (!m->rmc_domain_valid) {
@@ -326,12 +337,56 @@ static {{ prefix }}Status rmc_event_projection(ModelInstance* m, bool* changed) 
     return {{ prefix }}OK;
 }
 
+
+{%- set nguard = ev.guarded_targets|length %}
+{%- if nguard > 0 %}
+/* guarded_assignments.rs apply_guarded_assignment_outputs: one guarded
+   program's outputs reach the working state, an overridden relation memory
+   keeping the located side. */
+static void rmc_guarded_apply(ModelInstance* m, const size_t* index, const bool* in_y, double* values, size_t first, size_t count, bool* changed) {
+    for (size_t g = first; g < first + count; ++g) {
+        for (size_t k = 0; k < m->rmc_override_count; ++k) {
+            long memory = rmc_root_memory[m->rmc_override_root[k]];
+            if (memory >= 0 && !in_y[g] && (long)index[g] == memory) values[g] = m->rmc_override_value[k];
+        }
+        double* slot = in_y[g] ? &m->y[index[g]] : &m->p[index[g]];
+        *changed |= memcmp(slot, &values[g], sizeof(double)) != 0;
+        *slot = values[g];
+    }
+}
+/* discrete_rows.rs collect_guarded_discrete_row_values (SOLVE-C58, MLS 8.5):
+   the equations active at one instant are solved simultaneously. The guarded
+   programs run in issued order over a working state that carries each
+   program's outputs forward, so a `when` body reading a variable another
+   body assigns at the same instant sees the new value. Each program's
+   activation (its arms' conditions) reads `view`, the pass's snapshot: the
+   programs one `when` clause was split into fire together, also when the
+   body moves the clause's own condition (`when time >= T then T = pre(T) +
+   d; n = pre(n) + 1; reinit(x, 0); end when`). */
+static {{ prefix }}Status rmc_guarded_programs(ModelInstance* m, ModelInstance* view, const size_t* gindex, const bool* gin_y, double* gvalues, bool* changed) {
+    (void)view;
+{%- set gp = namespace(offset=0) %}
+{%- if solve.discrete.guarded_assignment_plan.programs|length != ev.guarded_program_outputs|length %}{{ fail("unsupported-feature:fmi.c.guarded-program-count") }}{% endif %}
+{%- for program in solve.discrete.guarded_assignment_plan.programs %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "gvalues", prefix ~ "Error", condition_view="view") }}
+{%- endfor %}
+    }
+    rmc_guarded_apply(m, gindex, gin_y, gvalues, {{ gp.offset }}, {{ ev.guarded_program_outputs[loop.index0] }}, changed);
+{%- set gp.offset = gp.offset + ev.guarded_program_outputs[loop.index0] %}
+{%- endfor %}
+{%- if gp.offset != nguard %}{{ fail("unsupported-feature:fmi.c.guarded-output-count") }}{% endif %}
+    return {{ prefix }}OK;
+}
+{%- endif %}
+
 /* discrete_rows.rs apply_discrete_rows_for_pre_snapshot: every row reads the
    pass's snapshot, a row writing an overridden relation memory keeps the
    located side, and a change is a change of bits. */
 static {{ prefix }}Status rmc_discrete_owners(ModelInstance* m, bool* changed, bool memories_only) {
     (void)m; (void)changed; (void)memories_only;
-{%- set nguard = ev.guarded_targets|length %}
 {%- if ndisc > 0 %}
     static const size_t targets[{{ ndisc }}] = { {% for target in ev.discrete_targets %}{{ target }},{% endfor %} };
     static const bool memory_row[{{ ndisc }}] = { {% for row in ev.condition_memory_rows %}{{ "true" if row else "false" }},{% endfor %} };
@@ -346,21 +401,18 @@ static {{ prefix }}Status rmc_discrete_owners(ModelInstance* m, bool* changed, b
 {%- endfor %}
 {%- endif %}
 {%- if nguard > 0 %}
-    /* guarded_assignments.rs: every guarded owner reads the same snapshot as
-       the rows; a target that is an overridden relation memory keeps the
-       located side. Clock-free owners run in every pass. */
     static const size_t gindex[{{ nguard }}] = { {% for slot in ev.guarded_targets %}{{ slot.index }},{% endfor %} };
     static const bool gin_y[{{ nguard }}] = { {% for slot in ev.guarded_targets %}{{ "true" if slot.column == "y" else "false" }},{% endfor %} };
     double gvalues[{{ nguard }}];
     if (!memories_only) {
-{%- for program in solve.discrete.guarded_assignment_plan.programs %}
-    {
-    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
-{%- for op in program.ops %}
-{{ scalar_op(op, "gvalues", prefix ~ "Error") }}
-{%- endfor %}
-    }
-{%- endfor %}
+        /* The rows above already read the snapshot; the guarded programs'
+           activations read a copy of it while their outputs reach `m`. */
+        ModelInstance* view = malloc(sizeof(*m));
+        if (!view) { RMC_LOG(m, "the guarded-assignment snapshot could not be allocated"); return {{ prefix }}Error; }
+        memcpy(view, m, sizeof(*m));
+        {{ prefix }}Status guarded = rmc_guarded_programs(m, view, gindex, gin_y, gvalues, changed);
+        free(view);
+        if (guarded != {{ prefix }}OK) return guarded;
     }
 {%- endif %}
 {%- if ndisc > 0 %}
@@ -373,20 +425,6 @@ static {{ prefix }}Status rmc_discrete_owners(ModelInstance* m, bool* changed, b
         if (memories_only && !memory_row[d]) continue;
         *changed |= memcmp(&m->p[targets[d]], &values[d], sizeof(double)) != 0;
         m->p[targets[d]] = values[d];
-    }
-{%- endif %}
-{%- if nguard > 0 %}
-    if (!memories_only) {
-        for (size_t k = 0; k < m->rmc_override_count; ++k) {
-            long memory = rmc_root_memory[m->rmc_override_root[k]];
-            if (memory < 0) continue;
-            for (size_t g = 0; g < {{ nguard }}; ++g) if (!gin_y[g] && (long)gindex[g] == memory) gvalues[g] = m->rmc_override_value[k];
-        }
-        for (size_t g = 0; g < {{ nguard }}; ++g) {
-            double* slot = gin_y[g] ? &m->y[gindex[g]] : &m->p[gindex[g]];
-            *changed |= memcmp(slot, &gvalues[g], sizeof(double)) != 0;
-            *slot = gvalues[g];
-        }
     }
 {%- endif %}
     return {{ prefix }}OK;
@@ -675,7 +713,6 @@ static {{ prefix }}Status rmc_event_iterate(ModelInstance* m, bool canonicalize)
     return {{ prefix }}Error;
 }
 
-{{ time_events(solve, ev.time_events, prefix) }}
 
 /* component.rs exit_initialization_mode_inner and discrete_rows.rs
    seed_condition_memory_for_initialization: relation memory from the settled
@@ -713,22 +750,29 @@ static {{ prefix }}Status rmc_events_update(ModelInstance* m, bool* states_chang
     double event_time = m->time;
     double states[STATE_LEN];
     memcpy(states, m->y, sizeof(states));
+    /* Any other event at an instant whose time event was already observed at
+       its right limit reads that right limit too (public_time_eval_time). */
+    (void)rmc_public_time_enter(m);
     if (!m->rmc_entry_captured) {
-        if (settle_values(m) != {{ prefix }}OK) return {{ prefix }}Error;
+        if (settle_values(m) != {{ prefix }}OK) { m->time = event_time; return {{ prefix }}Error; }
         memcpy(m->rmc_entry_y, m->y, sizeof(m->y));
         memcpy(m->rmc_entry_p, m->p, sizeof(m->p));
         m->rmc_override_count = 0;
     }
     /* event_boundary.rs process_runtime_event_boundary: a scheduled stop that
        follows the current values is observed at its right limit, so every
-       time relation takes its post-event side; a sample tick arms its root. */
-    if (timed) rmc_seed_periodic_overrides(m, event_time);
-    /* The right limit of the announced instant itself: an importer that
-       reaches it within the matching tolerance still crosses it. */
-    if (timed && m->rmc_next_right) m->time = nextafter(fmax(event_time, m->rmc_next_time), INFINITY);
+       time relation takes its post-event side. The right limit of the
+       announced instant itself: an importer that reaches it within the
+       matching tolerance, or a located root coincident with it, still crosses
+       it (coincides_with_time_event). */
+    if (timed && m->rmc_next_right) {
+        m->time = nextafter(fmax(event_time, m->rmc_next_time), INFINITY);
+        m->rmc_post_defined = true;
+        m->rmc_post_anchor = event_time;
+        m->rmc_post_time = m->time;
+    }
     {{ prefix }}Status status = rmc_event_iterate(m, !initial);
     m->time = event_time;
-    if (timed) rmc_clear_periodic_memory(m, event_time);
     if (initial) { rmc_clear_initial_flag(m); m->assertions_initialized = true; }
     *states_changed = memcmp(states, m->y, sizeof(states)) != 0;
     m->rmc_entry_captured = false;

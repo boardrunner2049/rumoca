@@ -84,9 +84,11 @@ static fmi3Status evaluate_derivatives(ModelInstance* m) {
 }
 {%- endif %}
 {%- if fmi.scalar_events %}
-/* Model Exchange reads at an announced time event take its left limit. */
-static fmi3Status rmc_me_derivatives(ModelInstance* m) { double saved = rmc_left_limit_enter(m); fmi3Status status = evaluate_derivatives(m); m->time = saved; return status; }
-static fmi3Status rmc_me_indicators(ModelInstance* m, double* z) { double saved = rmc_left_limit_enter(m); fmi3Status status = rmc_event_indicators(m, z); m->time = saved; return status; }
+/* Derivative reads (Model Exchange, and every Co-Simulation integrator
+   stage) take the continuous evaluation time: the left limit of an announced
+   time event before Event Mode handles it, its right limit after. */
+static fmi3Status rmc_me_derivatives(ModelInstance* m) { double saved = rmc_continuous_time_enter(m); fmi3Status status = evaluate_derivatives(m); m->time = saved; return status; }
+#define rmc_me_indicators rmc_event_indicators
 {%- else %}
 #define rmc_me_derivatives evaluate_derivatives
 {%- endif %}
@@ -152,10 +154,9 @@ static bool rmc_request(const ModelInstance* m, const fmi3ValueReference vr[], s
     return total == nvalues;
 }
 /* The settled numeric storage one reference reads; NULL on a failed refresh. */
-static const double* rmc_numeric_source(ModelInstance* m, const RmcValueReference* ref) {
+static const double* rmc_settled_source(ModelInstance* m, const RmcValueReference* ref) {
     if (settle_values(m) != fmi3OK) return NULL;
     switch (ref->column) {
-    case RMC_COLUMN_TIME: return &m->time;
     case RMC_COLUMN_Y: return m->y;
     case RMC_COLUMN_P: return m->p;
     case RMC_COLUMN_DERIVATIVE: return evaluate_derivatives(m) == fmi3OK ? m->derivative : NULL;
@@ -164,6 +165,20 @@ static const double* rmc_numeric_source(ModelInstance* m, const RmcValueReferenc
 {%- endif %}
     default: return NULL;
     }
+}
+/* Reads at the evaluation time of the current instant: a time event's right
+   limit once it was observed there (component.rs public_time_eval_time). */
+static const double* rmc_numeric_source(ModelInstance* m, const RmcValueReference* ref) {
+    if (ref->column == RMC_COLUMN_TIME) return &m->time;
+{%- if fmi.scalar_events %}
+    bool continuous = ref->column == RMC_COLUMN_DERIVATIVE || ref->column == RMC_COLUMN_INDICATOR;
+    double saved = continuous ? rmc_continuous_time_enter(m) : rmc_public_time_enter(m);
+    const double* source = rmc_settled_source(m, ref);
+    m->time = saved;
+    return source;
+{%- else %}
+    return rmc_settled_source(m, ref);
+{%- endif %}
 }
 #define RMC_GET_NUMERIC(Name, Type, KIND, CONVERT) \
 FMI_EXPORT fmi3Status fmi3Get##Name(fmi3Instance i, const fmi3ValueReference vr[], size_t nvr, Type values[], size_t nvalues) { \
@@ -181,7 +196,11 @@ FMI_EXPORT fmi3Status fmi3Get##Name(fmi3Instance i, const fmi3ValueReference vr[
    `change()` or relation on the input sees its pre-event value. */
 static void rmc_input_changing(ModelInstance* m) {
 {%- if fmi.scalar_events %}
-    if (m->rmc_entry_captured || m->rmc_initial_event || !(m->state == MODEL_EVENT || m->state == MODEL_STEP) || settle_values(m) != fmi3OK) return;
+    if (m->rmc_entry_captured || m->rmc_initial_event || !(m->state == MODEL_EVENT || m->state == MODEL_STEP)) return;
+    double saved = rmc_public_time_enter(m);
+    fmi3Status settled = settle_values(m);
+    m->time = saved;
+    if (settled != fmi3OK) return;
     memcpy(m->rmc_entry_y, m->y, sizeof(m->y));
     memcpy(m->rmc_entry_p, m->p, sizeof(m->p));
     m->rmc_override_count = 0;

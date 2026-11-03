@@ -105,26 +105,33 @@ fn a_direct_time_root_with_relation_memory_is_announced_not_searched() {
     assert_eq!(view["event_indicator_roots"], serde_json::json!([]));
 }
 
+/// No Solve lowering produces a periodic sample root (`sample()` lowers to a
+/// clock partition), so the C profile has no executed path for one and
+/// refuses it by name instead of rendering untested tick handling.
 #[test]
-fn a_periodic_sample_root_arms_its_relation_memory() {
-    let view = admitted(|model| {
-        let events = &mut model.problem.events;
-        events.root_conditions = rows(vec![load_p(0)]);
-        events.root_relation_memory_targets = vec![Some(ScalarSlot::P {
-            index: 1,
-            byte_offset: 8,
-        })];
-        events.root_zero_domains = vec![RootZeroDomain::Previous];
-        events.root_relation_refresh_roles = vec![RootRelationRefreshRole::Frozen];
-        events.scheduled_root_conditions = vec![ScheduledRootCondition {
-            root_index: 0,
-            period_seconds: 0.25,
-            phase_seconds: 0.0,
-        }];
-    });
-    let periodic = &time_events(&view)["periodic"][0];
-    assert_eq!(periodic["period"], 0.25);
-    assert_eq!(periodic["memory"], 1);
+fn a_periodic_sample_root_is_refused() {
+    let (mut model, input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    let events = &mut model.problem.events;
+    events.root_conditions = rows(vec![load_p(0)]);
+    events.root_relation_memory_targets = vec![Some(ScalarSlot::P {
+        index: 1,
+        byte_offset: 8,
+    })];
+    events.root_zero_domains = vec![RootZeroDomain::Previous];
+    events.root_relation_refresh_roles = vec![RootRelationRefreshRole::Frozen];
+    events.scheduled_root_conditions = vec![ScheduledRootCondition {
+        root_index: 0,
+        period_seconds: 0.25,
+        phase_seconds: 0.0,
+    }];
+    let refused = FmiComponent::construct(model, vec![input])
+        .expect("the fixture is a checked component")
+        .into_codegen_view()
+        .try_c()
+        .expect_err("the C profile refuses a periodic sample root")
+        .to_string();
+    assert!(refused.contains("periodic sample roots"), "{refused}");
 }
 
 #[test]

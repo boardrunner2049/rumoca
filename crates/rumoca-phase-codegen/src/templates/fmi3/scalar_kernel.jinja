@@ -62,7 +62,11 @@
 {%- else %}{{ output }}[{{ targets[index].P.index }}]{% endif -%}
 {%- endmacro %}
 
-{%- macro scalar_op(op, output="m->derivative", error_status="fmi3Error", targets=none) %}
+{#- `condition_view`, when given, names an instance pointer the arm
+    conditions of a top-level function conditional read instead of `m`: a
+    guarded assignment's activation reads the pass snapshot while its result
+    reads the working state. #}
+{%- macro scalar_op(op, output="m->derivative", error_status="fmi3Error", targets=none, condition_view=none) %}
 {%- if op.kind == "Const" %}    r[{{ op.dst }}] = {{ scalar_const(op) }};
 {%- elif op.kind == "LoadFoldCarried" %}    r[{{ op.dst }}] = ff_carried[{{ op.index }}];
 {%- elif op.kind == "LoadFoldCapture" %}    r[{{ op.dst }}] = ff_captures[{{ op.index }}];
@@ -206,6 +210,9 @@
             double fc_cond[1];
             {
                 double r[{{ arm.condition.register_count if arm.condition.register_count > 0 else 1 }}];
+{%- if condition_view is not none %}
+                ModelInstance* const m = {{ condition_view }}; (void)m;
+{%- endif %}
 {%- for region_op in arm.condition.ops %}
 {{ scalar_op(region_op, "fc_cond", error_status) }}
 {%- endfor %}
@@ -589,7 +596,7 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
         for (size_t i = 0; i < n; ++i) y0[i] = m->y[i];
         if (!start_derivative) {
             m->time = t;
-            if (evaluate_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+            if (rmc_me_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
             for (size_t i = 0; i < n; ++i) k[0][i] = m->derivative[i];
             start_derivative = true;
         }
@@ -600,7 +607,7 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
                 m->y[i] = y0[i] + h * sum;
             }
             m->time = s >= 4 && last ? end : t + c[s] * h;
-            if (evaluate_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+            if (rmc_me_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
             for (size_t i = 0; i < n; ++i) k[s + 1][i] = m->derivative[i];
         }
         double error = 0.0;
