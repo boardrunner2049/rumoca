@@ -59,6 +59,7 @@ pub(in crate::dae_transform) fn rebuild_formal(
                         domains: context.domains,
                         conditions: context.conditions,
                         clocks: context.clocks,
+                        demoted_reinit: DemotedReinit::Refuse,
                     },
                     &[],
                     quotients,

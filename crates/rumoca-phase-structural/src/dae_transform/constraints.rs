@@ -34,13 +34,14 @@ use materialization::{
     can_materialize_holonomic_value, can_materialize_holonomic_value_in_context,
 };
 
-use rumoca_core::{Span, StateSelect};
+use rumoca_core::StateSelect;
 use rumoca_eval_dae::FunctionCallContext;
 use rumoca_ir_dae as dae;
 
 use crate::CausalDefinitions;
 use crate::residual_normalization::equation_sides;
 
+use super::blocked_demotion::{BlockedDemotion, BlockedReason};
 use super::builtin_profiles::{
     is_differentiable_binary, is_differentiable_builtin, is_differentiable_power,
 };
@@ -399,15 +400,6 @@ pub(super) struct StateDemotionCandidates {
     pub(super) conditional: Vec<DirectStateConstraint>,
 }
 
-/// One stated initial value a rebuilt system no longer states.
-#[derive(Clone)]
-pub(super) struct DiscardedInitialValue {
-    /// The pinned variable, named as the model declares it.
-    pub(super) variable: String,
-    /// That variable's declaration.
-    pub(super) span: Span,
-}
-
 pub(super) fn direct_state_constraints(
     view: dae::DaeView<'_>,
     facts: &DifferentiationFacts,
@@ -535,7 +527,7 @@ pub(super) fn discarded_stated_initial_value(
     source: dae::DaeView<'_>,
     rebuilt: dae::DaeView<'_>,
     stated: &[u32],
-) -> Result<Option<DiscardedInitialValue>, StructuralError> {
+) -> Result<Option<BlockedDemotion>, StructuralError> {
     if stated.is_empty() {
         return Ok(None);
     }
@@ -566,9 +558,11 @@ pub(super) fn discarded_stated_initial_value(
             return Err(renumbered(variable));
         }
         if !kept.contains(&variable) && discarded.is_none() {
-            discarded = Some(DiscardedInitialValue {
+            discarded = Some(BlockedDemotion {
                 variable: name,
                 span,
+                reason: BlockedReason::StatedInitialValue,
+                probe: None,
             });
         }
     }

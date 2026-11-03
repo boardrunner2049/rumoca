@@ -22,8 +22,9 @@ use super::{
     CompilationResult, CompileArgs, CompilePhase, EarlyIrArtifact, SimCommandArgs, SimOptions,
     SimulationRequestSummary, SimulationRunMetrics, TemplateIr,
     compile_str_dae_with_inferred_model, compile_str_early_ir_with_inferred_model,
-    compile_str_with_inferred_model, direct_sim_window, render_early_ir_as_modelica_flat,
-    render_ir_as_modelica, simulate_solver_or_auto, simulation_failure_error, target_manifest,
+    compile_str_with_inferred_model, direct_sim_tolerances, direct_sim_window,
+    render_early_ir_as_modelica_flat, render_ir_as_modelica, simulate_solver_or_auto,
+    simulation_failure_error, target_manifest,
 };
 
 /// Compile `source` (inline Modelica text) according to `args` and return the
@@ -169,10 +170,11 @@ pub fn simulate_to_value(args: &SimCommandArgs, source: &str) -> Result<Value> {
         diffsol_method: rumoca_sim::DiffsolMethod::Bdf,
         ..SimOptions::default()
     };
-    if let Some(atol) = args.atol {
+    let (atol, rtol) = direct_sim_tolerances(args.atol, args.rtol, result.experiment_tolerance);
+    if let Some(atol) = atol {
         opts.atol = atol;
     }
-    if let Some(rtol) = args.rtol {
+    if let Some(rtol) = rtol {
         opts.rtol = rtol;
     }
 

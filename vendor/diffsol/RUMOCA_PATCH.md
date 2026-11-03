@@ -81,6 +81,23 @@ with persistent failures. Upstream commit
 `crates/diffsol/src/ode_solver/bdf.rs`. A per-step convergence-failure budget is
 also the documented [CVODE recovery contract](https://sundials.readthedocs.io/en/v7.5.0/cvode/Usage/).
 
+The fifth correction keeps the accepted step's continuous extension. After
+accepting a step, Diffsol picks the next order and step size and rescales the
+difference table before returning; a hard stop can shrink the next step by an
+arbitrary factor. The rescaled table represents the same polynomial only in
+exact arithmetic: evaluated back at the accepted step's left endpoint, a
+factor of about 1e-4 at order 5 amplifies roundoff by roughly `factor^-order`.
+`interpolate` and `interpolate_dy` therefore read a copy of the table taken
+right after acceptance, while it still describes the step that ends at the
+current time; any state replacement or modification invalidates the copy.
+Stepping is unchanged. FIRE `Examples.SwitchedThreePhaseCoast` at its declared
+`Tolerance=1e-8` failed the host's accepted-interval endpoint check with a
+6.2e-6 disagreement after a step of 1.2e-5 was followed by a 6.8e-9 shrink onto
+an output time. The direct dependency regression is
+`me_integrator/tests.rs::accepted_bdf_extension_survives_a_tiny_hard_stop_shrink`;
+without the copy it interpolates the left endpoint 1.8e-10 away from the
+accepted state at a tolerance of 1e-10.
+
 The workspace patch makes local, CI, native, and Wasm builds use the same
 corrected source. A registry-published Rumoca crate cannot rely on a workspace
 `[patch]`: registry publication still requires an upstream release containing

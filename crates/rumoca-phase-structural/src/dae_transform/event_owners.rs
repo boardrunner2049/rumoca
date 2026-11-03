@@ -159,12 +159,25 @@ pub(super) fn rebuild_roots<'target>(
     Ok(())
 }
 
+/// What a rebuild does with a `reinit` whose target it no longer keeps as a
+/// state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DemotedReinit {
+    /// The rebuild is a candidate result: MLS 3.6 section 8.3.6 requires a
+    /// `reinit` target to be a state, so the construction is refused.
+    Refuse,
+    /// The rebuild only probes whether the demotion would reduce the system;
+    /// that `reinit` is left out, and the probe is never accepted as a result.
+    OmitForProbe,
+}
+
 pub(super) fn rebuild_events<'target>(
     source: dae::DaeView<'_>,
     target: &mut dae::DaeConstruction<'target>,
     expressions: &[dae::ExprId<'target>],
     variables: &[ReservedVariable<'target>],
     conditions: &[dae::ConditionId<'target>],
+    demoted_reinit: DemotedReinit,
 ) -> Result<(), dae::DaeConstructionError> {
     for index in 0..source.time_event_count() {
         let id = source
@@ -182,25 +195,56 @@ pub(super) fn rebuild_events<'target>(
         })?;
     }
     for index in 0..source.event_action_count() {
-        rebuild_event_action(source, target, expressions, variables, conditions, index)?;
+        rebuild_event_action(
+            source,
+            target,
+            RebuiltEventIdentities {
+                expressions,
+                variables,
+                conditions,
+                demoted_reinit,
+            },
+            index,
+        )?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RebuiltEventIdentities<'borrow, 'target> {
+    expressions: &'borrow [dae::ExprId<'target>],
+    variables: &'borrow [ReservedVariable<'target>],
+    conditions: &'borrow [dae::ConditionId<'target>],
+    demoted_reinit: DemotedReinit,
 }
 
 fn rebuild_event_action<'target>(
     source: dae::DaeView<'_>,
     target: &mut dae::DaeConstruction<'target>,
-    expressions: &[dae::ExprId<'target>],
-    variables: &[ReservedVariable<'target>],
-    conditions: &[dae::ConditionId<'target>],
+    identities: RebuiltEventIdentities<'_, 'target>,
     index: usize,
 ) -> Result<(), dae::DaeConstructionError> {
+    let RebuiltEventIdentities {
+        expressions,
+        variables,
+        conditions,
+        demoted_reinit,
+    } = identities;
     let id = source
         .event_action_id(index)
         .expect("finalized event-action ordinal resolves");
     let action = source
         .event_action(id)
         .expect("finalized event-action identity resolves");
+    if demoted_reinit == DemotedReinit::OmitForProbe
+        && let dae::EventActionOperation::Reinitialize { state, .. } = action.operation()
+        && !matches!(
+            variables[state.index() as usize].identity,
+            TargetVariable::State(_)
+        )
+    {
+        return Ok(());
+    }
     let trigger = conditions[action.trigger().index() as usize];
     let guard = conditions[action.guard().index() as usize];
     target.events(|events| match action.operation() {

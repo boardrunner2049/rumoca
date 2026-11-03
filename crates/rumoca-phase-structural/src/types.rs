@@ -167,6 +167,15 @@ pub enum StructuralError {
         "index reduction would discard the stated initial value of `{variable}`: MLS 3.6 section 8.6 adds `{variable} = {variable}.start` to the initialization equations for a `fixed = true` variable, and demoting `{variable}` leaves no equation that states it"
     )]
     DroppedStatedInitialValue { variable: String, span: Span },
+    /// The only index reduction available demoted a state a `reinit` targets.
+    /// MLS 3.6 §8.3.6 makes a reinitialized variable an implicit
+    /// `stateSelect = StateSelect.always` (SPEC_0022 EQN-032), so the model
+    /// itself leaves that variable no freedom to be the state the `reinit`
+    /// requires: an equation fixes it algebraically.
+    #[error(
+        "index reduction would demote `{variable}`, which a `reinit` requires to remain a state: MLS 3.6 section 8.3.6 makes a reinitialized variable `stateSelect = StateSelect.always`, but the model's equations determine `{variable}` algebraically"
+    )]
+    DemotedReinitializedState { variable: String, span: Span },
     /// Two coordinates the system proves equal — up to sign and a time-invariant
     /// displacement — each carry a `fixed = true` start, and the two starts do
     /// not state the same value. MLS 3.6 §8.6 adds both as initialization
@@ -208,6 +217,7 @@ impl StructuralError {
             Self::Singular { .. } => codes::ES010_SINGULAR_SYSTEM,
             Self::EmptySystem => codes::ES011_EMPTY_SYSTEM,
             Self::DroppedStatedInitialValue { .. } => codes::ES012_DROPPED_STATED_INITIAL_VALUE,
+            Self::DemotedReinitializedState { .. } => codes::ES017_DEMOTED_REINITIALIZED_STATE,
             Self::ConflictingStatedInitialValues { .. } => {
                 codes::ES013_CONFLICTING_STATED_INITIAL_VALUES
             }
@@ -226,6 +236,7 @@ impl StructuralError {
                 ..
             } => unmatched_unknown_spans.first().copied(),
             Self::DroppedStatedInitialValue { span, .. }
+            | Self::DemotedReinitializedState { span, .. }
             | Self::ConflictingStatedInitialValues { span, .. }
             | Self::ConstantCallEvaluation { span, .. }
             | Self::Projection { span, .. }
@@ -236,6 +247,7 @@ impl StructuralError {
             }
             Self::EmptySystem
             | Self::DroppedStatedInitialValue { .. }
+            | Self::DemotedReinitializedState { .. }
             | Self::ConflictingStatedInitialValues { .. }
             | Self::ConstantCallEvaluation { .. }
             | Self::Projection { .. }
@@ -253,6 +265,9 @@ impl PhaseError for StructuralError {
             }
             Self::ConflictingStatedInitialValues { .. } => {
                 "this stated initial value contradicts the one below"
+            }
+            Self::DemotedReinitializedState { .. } => {
+                "this reinitialized variable cannot remain a state"
             }
             Self::ConstantCallEvaluation { .. } => "this constant call fails whenever it runs",
             _ => "structural analysis failed here",

@@ -52,11 +52,13 @@ pub struct SimBenchArgs {
     #[arg(long)]
     pub(crate) dt: Option<f64>,
 
-    /// Absolute solver tolerance (overrides the backend default).
+    /// Absolute solver tolerance (overrides the model's `experiment(Tolerance=…)`
+    /// and the backend default).
     #[arg(long)]
     pub(crate) atol: Option<f64>,
 
-    /// Relative solver tolerance (overrides the backend default).
+    /// Relative solver tolerance (overrides the model's `experiment(Tolerance=…)`
+    /// and the backend default).
     #[arg(long)]
     pub(crate) rtol: Option<f64>,
 
@@ -122,6 +124,24 @@ impl BenchWindow {
                 result.experiment_stop_time,
             ),
             Self::Configured { t_end } => (0.0, t_end),
+        }
+    }
+
+    /// The `(atol, rtol)`: each flag (or the scenario's) if given; a direct run
+    /// otherwise takes the model's `experiment(Tolerance)` as `rumoca sim` does.
+    fn tolerances(
+        &self,
+        atol: Option<f64>,
+        rtol: Option<f64>,
+        result: &crate::DaeCompilationResult,
+    ) -> (Option<f64>, Option<f64>) {
+        match self {
+            Self::Experiment { .. } => crate::cli::sim_defaults::direct_sim_tolerances(
+                atol,
+                rtol,
+                result.experiment_tolerance,
+            ),
+            Self::Configured { .. } => (atol, rtol),
         }
     }
 }
@@ -190,10 +210,11 @@ pub(crate) fn run_sim_bench(args: SimBenchArgs) -> Result<()> {
         solver_mode: bench.solver_mode,
         ..SimOptions::default()
     };
-    if let Some(atol) = bench.atol {
+    let (atol, rtol) = bench.window.tolerances(bench.atol, bench.rtol, &result);
+    if let Some(atol) = atol {
         opts.atol = atol;
     }
-    if let Some(rtol) = bench.rtol {
+    if let Some(rtol) = rtol {
         opts.rtol = rtol;
     }
 

@@ -14,7 +14,7 @@ pub(super) struct PassChoice {
     /// The last residue-holding candidate.
     pub(super) held: Option<(usize, DirectStateConstraint, usize, DemotionStep)>,
     /// The first candidate refused for a discarded initial value.
-    pub(super) blocked: Option<(usize, DiscardedInitialValue)>,
+    pub(super) blocked: Option<(usize, BlockedDemotion)>,
 }
 
 impl PassChoice {

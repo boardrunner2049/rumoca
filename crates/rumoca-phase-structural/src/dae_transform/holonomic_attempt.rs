@@ -19,7 +19,7 @@ pub(super) enum HolonomicAttempt {
         residue: usize,
         step: Box<HolonomicStep>,
     },
-    Blocked(DiscardedInitialValue),
+    Blocked(BlockedDemotion),
     Rejected,
 }
 
@@ -148,15 +148,12 @@ pub(super) fn structured_replacement_is_active<'dae>(
 pub(super) fn observe_discarded_holonomic_initial(
     observer: &mut impl ReductionObserver,
     identity: Identity,
-    discarded: &DiscardedInitialValue,
+    discarded: &BlockedDemotion,
 ) {
     observer.observe(ReductionEvent::Attempt {
         lane: Lane::Holonomic,
         identity,
-        outcome: AttemptOutcome::WouldDiscardInitial {
-            variable: &discarded.variable,
-            span: discarded.span,
-        },
+        outcome: discarded.attempt_outcome(),
     });
 }
 

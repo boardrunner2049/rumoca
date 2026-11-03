@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::ode_solver_error;
 use crate::{
     matrix::MatrixRef, nonlinear_solver::root::RootFinder, op::bdf::BdfCallable, scalar::scale,
-    AugmentedOdeEquations, BdfState, DenseMatrix, JacobianUpdate, MatrixViewMut, NonLinearOp,
+    AugmentedOdeEquations, BdfState, DenseMatrix, IndexType, JacobianUpdate, MatrixViewMut, NonLinearOp,
     NonLinearSolver, OdeEquationsImplicit, OdeEquationsImplicitAdjoint, OdeEquationsImplicitSens,
     OdeSolverMethod, OdeSolverProblem, OdeSolverState, OdeSolverStopReason, Op, Scalar,
     SensEquations, Vector, VectorRef, VectorView, VectorViewMut,
@@ -64,6 +64,7 @@ where
     }
     fn state_and_augmented_eqn_mut(&mut self) -> Option<(StateRefMut<'_, Eqn::V>, &mut AugEqn)> {
         self.is_state_modified = true;
+        self.accepted.valid = false;
         let state = self.state.as_mut();
         let augmented_eqn = self.s_op.as_mut().map(|op| &mut op.eqn)?;
         Some((state, augmented_eqn))
@@ -157,6 +158,42 @@ pub struct Bdf<
     is_state_modified: bool,
     jacobian_update: JacobianUpdate<Eqn::T>,
     config: BdfConfig<Eqn::T>,
+    accepted: AcceptedExtension<M>,
+}
+
+/// The continuous extension of the last accepted step (rumoca patch).
+///
+/// After accepting a step, `step` may change the order and rescale the
+/// difference table for the *next* step, including the arbitrary shrink that
+/// lands a step on `tstop`. That rescaling preserves the polynomial only in
+/// exact arithmetic: evaluating a table rescaled by a factor of 1e-4 at the
+/// accepted step's left endpoint multiplies roundoff by about `factor^-order`.
+/// Interpolation inside the accepted step therefore reads this copy of the
+/// table taken right after the step was accepted, before any adaptation.
+#[derive(Clone)]
+struct AcceptedExtension<M: DenseMatrix> {
+    diff: M,
+    t: M::T,
+    h: M::T,
+    order: usize,
+    valid: bool,
+}
+
+impl<M: DenseMatrix> AcceptedExtension<M> {
+    fn empty(nstates: IndexType, ncols: IndexType, ctx: M::C) -> Self {
+        Self {
+            diff: M::zeros(nstates, ncols, ctx),
+            t: M::T::zero(),
+            h: M::T::zero(),
+            order: 0,
+            valid: false,
+        }
+    }
+
+    /// The retained `(diff, t, h, order)` when it describes the step ending at `t`.
+    fn at(&self, t: M::T) -> Option<(&M, M::T, M::T, usize)> {
+        (self.valid && self.t == t).then_some((&self.diff, self.t, self.h, self.order))
+    }
 }
 
 impl<M, Eqn, Nls, AugmentedEqn> Clone for Bdf<'_, Eqn, Nls, M, AugmentedEqn>
@@ -211,6 +248,7 @@ where
             is_state_modified: self.is_state_modified,
             jacobian_update: self.jacobian_update.clone(),
             config: self.config.clone(),
+            accepted: self.accepted.clone(),
         }
     }
 }
@@ -336,6 +374,8 @@ where
         // init U matrix
         let u = Self::_compute_r(state.order, Eqn::T::one(), ctx.clone());
         let is_state_modified = false;
+        let accepted =
+            AcceptedExtension::empty(nstates, BdfState::<Eqn::V, M>::MAX_ORDER + 3, ctx.clone());
 
         Ok(Self {
             convergence,
@@ -365,6 +405,7 @@ where
             is_state_modified,
             jacobian_update: JacobianUpdate::new(&problem.ode_options),
             config,
+            accepted,
         })
     }
 
@@ -751,6 +792,7 @@ where
         self.u = Self::_compute_r(1, Eqn::T::one(), self.problem().eqn.context().clone());
 
         self.is_state_modified = false;
+        self.accepted.valid = false;
     }
 
     //interpolate solution at time values t* where t-h < t* < t
@@ -1036,6 +1078,7 @@ where
         );
         let old_order = self.state.order;
         self.state = state;
+        self.accepted.valid = false;
 
         if let Some(op) = self.op.as_mut() {
             op.set_c(self.state.h, self.alpha[self.state.order]);
@@ -1081,7 +1124,11 @@ where
         if (is_forward && t > state.t) || (!is_forward && t < state.t) {
             return Err(ode_solver_error!(InterpolationTimeAfterCurrentTime));
         }
-        Self::interpolate_from_diff(t, &state.diff, state.t, state.h, state.order, y);
+        let (diff, t1, h, order) = self
+            .accepted
+            .at(state.t)
+            .unwrap_or((&state.diff, state.t, state.h, state.order));
+        Self::interpolate_from_diff(t, diff, t1, h, order, y);
         Ok(())
     }
 
@@ -1107,7 +1154,11 @@ where
         if (is_forward && t > state.t) || (!is_forward && t < state.t) {
             return Err(ode_solver_error!(InterpolationTimeAfterCurrentTime));
         }
-        Self::interpolate_derivative_from_diff(t, &state.diff, state.t, state.h, state.order, dy);
+        let (diff, t1, h, order) = self
+            .accepted
+            .at(state.t)
+            .unwrap_or((&state.diff, state.t, state.h, state.order));
+        Self::interpolate_derivative_from_diff(t, diff, t1, h, order, dy);
         Ok(())
     }
 
@@ -1202,6 +1253,7 @@ where
 
     fn state_mut(&mut self) -> StateRefMut<'_, Eqn::V> {
         self.is_state_modified = true;
+        self.accepted.valid = false;
         self.state.as_mut()
     }
 
@@ -1238,6 +1290,7 @@ where
         }
         state.t = t;
         self.is_state_modified = true;
+        self.accepted.valid = false;
         Ok(())
     }
 
@@ -1459,6 +1512,17 @@ where
             state.t = self.t_predict;
             state.dy.copy_from_view(&state.diff.column(1));
             state.dy *= scale(Eqn::T::one() / state.h);
+            if self.accepted.diff.nrows() == state.diff.nrows()
+                && self.accepted.diff.ncols() == state.diff.ncols()
+            {
+                self.accepted.diff.copy_from(&state.diff);
+            } else {
+                self.accepted.diff = state.diff.clone();
+            }
+            self.accepted.t = state.t;
+            self.accepted.h = state.h;
+            self.accepted.order = state.order;
+            self.accepted.valid = true;
         }
 
         // update statistics
