@@ -562,7 +562,8 @@
       "output_indices": []
     },
     "clock_partition_intermediate_targets": [],
-    "clock_partition_intermediate_clocks": []
+    "clock_partition_intermediate_clocks": [],
+    "clock_partition_refresh_clocks": []
   },
   "events": {
     "root_conditions": {

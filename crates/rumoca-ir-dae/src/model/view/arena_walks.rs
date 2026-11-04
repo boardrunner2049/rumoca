@@ -175,8 +175,18 @@ fn clock_view(entry: &ClockEntry) -> ClockView<'_> {
             condition: ConditionId::from_raw(*condition),
         },
     };
+    let sample_event = entry.sample_event.map(|event| match event {
+        crate::clocks::SampleEventEntry::Fixed => crate::clocks::SampleEvent::Fixed,
+        crate::clocks::SampleEventEntry::Tunable { start, interval } => {
+            crate::clocks::SampleEvent::Tunable {
+                start: crate::ParameterId::from_raw(start),
+                interval: crate::ParameterId::from_raw(interval),
+            }
+        }
+    });
     ClockView {
         operation,
+        sample_event,
         provenance: entry.provenance,
     }
 }

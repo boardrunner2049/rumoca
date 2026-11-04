@@ -78,7 +78,7 @@ use event_conditions::{
 };
 use expression_events::analyze_expression_events;
 pub(super) use expression_events::{
-    DynamicTimeEventOperand, ExpressionEventPlan, ExpressionEventPlans,
+    DynamicTimeEventOperand, ExpressionEventPlan, ExpressionEventPlans, ParametricSampleOccurrence,
 };
 use expression_semi_linear::analyze_semi_linear_rules;
 pub(super) use expression_semi_linear::{SemiLinearRowFilter, SemiLinearRules};
@@ -687,16 +687,17 @@ fn analyze_model_owners(
         connection_ranks: &discrete_connection_ranks,
         aggregate_connections: &aggregate_discrete_connections,
     })?;
+    let (folded, structural_selections) =
+        folded_guards::folded_guard_parameters(flat, function_shapes.model_values(), &evaluable);
+    evaluable.extend(folded);
     let (expression_events, sample_alias_schedules) = analyze_expression_event_ownership(
         flat,
         &roles,
         &constants,
+        &evaluable,
         &discrete_connection_ranks,
         &aggregate_discrete_connections,
     )?;
-    let (folded, structural_selections) =
-        folded_guards::folded_guard_parameters(flat, function_shapes.model_values(), &evaluable);
-    evaluable.extend(folded);
     function_shapes.set_evaluable_parameters(&evaluable);
     Ok(Analysis {
         constants,
@@ -984,6 +985,7 @@ fn analyze_expression_event_ownership(
     flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
     constants: &EvalContext,
+    evaluable: &HashSet<VarName>,
     connection_ranks: &HashMap<VarName, usize>,
     aggregate_connections: &AggregateDiscreteConnections,
 ) -> Result<
@@ -993,7 +995,7 @@ fn analyze_expression_event_ownership(
     ),
     ToDaeError,
 > {
-    let events = analyze_expression_events(flat, roles, constants)?;
+    let events = analyze_expression_events(flat, roles, constants, evaluable)?;
     let aliases = analyze_sample_aliases(
         flat,
         roles,

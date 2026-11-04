@@ -19,7 +19,10 @@
 //! An algebraic intermediate on a same-tick path between two producers (an
 //! alias chain such as `slow = fastAlias; fastAlias = fast`) is issued as its
 //! own [`SameTickStep::IntermediateDefinition`] step, ordered after the
-//! producers it reads and before the producers that read it. The runtime
+//! producers it reads and before the producers that read it. One that a
+//! continuous owner determines without an exact whole definition (`u[1:2] =
+//! 2*a`, a `for`-loop of element equations, an implicit residual) is issued as
+//! a [`SameTickStep::AlgebraicRefresh`] at the same rank. The runtime
 //! refreshes it into private work state so later producers observe this tick's
 //! value; it is never committed by the discrete pass ("intermediates become
 //! visible to later producers without committing unrelated targets").
@@ -136,6 +139,12 @@ pub enum SameTickStep<'dae> {
         variable: dae::VariableId<'dae>,
         definition: dae::ExprId<'dae>,
     },
+    /// Re-solve the continuous algebraic system into private work state, so
+    /// `variable` — written by a continuous owner that is not one exact
+    /// definition (an element, slice, or `for`-family equation, or an implicit
+    /// residual) — reads this tick's values of the producers issued before it
+    /// (MLS §8.6: the equations active at one instant are solved together).
+    AlgebraicRefresh { variable: dae::VariableId<'dae> },
 }
 
 /// The issued schedule: every producer exactly once, interleaved with the
@@ -185,14 +194,17 @@ impl SameTickOrderError {
 /// `exact` holds the single unconditional definition of a coordinate that a
 /// same-tick consumer can be refreshed from; `opaque` holds the coordinates
 /// that *are* written by some owner whose value this module cannot reproduce
-/// exactly, together with what those writers read. A coordinate in neither map
-/// has no writer at all (a state, parameter, input, or history lane) and is
-/// therefore genuinely current at tick entry.
+/// exactly, together with what those writers read; `settled` holds the
+/// algebraic coordinates a continuous owner determines without being their one
+/// exact definition, which an algebraic refresh recomputes. A coordinate in
+/// none of the maps has no writer at all (a state, parameter, input, or history
+/// lane) and is therefore genuinely current at tick entry.
 #[derive(Default)]
 pub struct SameTickDefinitions<'dae> {
     ids: Vec<Option<dae::VariableId<'dae>>>,
     exact: BTreeMap<u32, dae::ExprId<'dae>>,
     opaque: BTreeMap<u32, BTreeSet<u32>>,
+    settled: BTreeMap<u32, BTreeSet<u32>>,
     /// Exact always-active discrete definitions must execute inside a clock
     /// partition when one of its producers reads them. Their stored entry
     /// value predates the tick, even when they do not depend on another
@@ -255,12 +267,23 @@ impl<'dae> SameTickDefinitions<'dae> {
             }
         }
         refresh_on_tick.retain(|variable| exact.contains_key(variable));
+        let mut settled = collect_continuous_unknowns(view);
+        settled
+            .retain(|variable, _| !exact.contains_key(variable) && !opaque.contains_key(variable));
         Self {
             ids,
             exact,
             opaque,
+            settled,
             refresh_on_tick,
         }
+    }
+
+    /// What the continuous owners determining an algebraic coordinate that has
+    /// no exact definition read; an algebraic refresh recomputes it.
+    #[must_use]
+    pub fn settled_reads(&self, variable: u32) -> Option<&BTreeSet<u32>> {
+        self.settled.get(&variable)
     }
 
     /// The exact definition a same-tick consumer refreshes this coordinate from.
@@ -329,7 +352,10 @@ impl<'dae> SameTickDefinitions<'dae> {
                 let mut reads = BTreeSet::new();
                 collect_same_instant_reads(view, definition, &mut reads);
                 pending.extend(reads);
-            } else if let Some(reads) = self.opaque_reads(variable) {
+            } else if let Some(reads) = self
+                .opaque_reads(variable)
+                .or_else(|| self.settled_reads(variable))
+            {
                 pending.extend(reads.iter().copied());
             }
         }
@@ -368,6 +394,93 @@ fn collect_continuous_writers<'dae>(view: dae::DaeView<'dae>, writers: &mut Writ
             single_coordinate_definition(view, equation.residual(), CoordinateKinds::Algebraic)
         {
             record_definition(view, writers, target, value);
+        }
+    }
+}
+
+/// Every algebraic coordinate a continuous owner determines without being its
+/// exact `algebraic - value` definition — an element or slice equation, a
+/// `for`-family, an implicit residual — with what that owner reads.
+///
+/// A side that names one (subscripted) algebraic coordinate the other side
+/// does not read is that coordinate's value (`u[1:2] = 2*a` determines `u`
+/// from `a`); any other owner is implicit, and each of its unknowns reads all
+/// of it, since they are solved together.
+fn collect_continuous_unknowns(view: dae::DaeView<'_>) -> BTreeMap<u32, BTreeSet<u32>> {
+    let mut settled = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for owner in view.continuous_owners() {
+        let roots = match owner {
+            dae::ContinuousOwnerView::Residual { equation, .. } => {
+                let residual = equation.residual();
+                if single_coordinate_definition(view, residual, CoordinateKinds::Algebraic)
+                    .is_some()
+                {
+                    continue;
+                }
+                vec![residual]
+            }
+            dae::ContinuousOwnerView::Structured { family, .. } => family.bodies().iter().collect(),
+        };
+        for root in roots {
+            let (unknowns, reads) = residual_unknowns(view, root);
+            for unknown in unknowns {
+                settled
+                    .entry(unknown)
+                    .or_default()
+                    .extend(reads.iter().copied());
+            }
+        }
+    }
+    settled
+}
+
+/// The algebraic coordinates one residual determines and what it reads to
+/// determine them.
+fn residual_unknowns<'dae>(
+    view: dae::DaeView<'dae>,
+    residual: dae::ExprId<'dae>,
+) -> (BTreeSet<u32>, BTreeSet<u32>) {
+    if let Some((lhs, rhs)) = crate::residual_normalization::equation_sides(view, residual) {
+        for (target, value) in [(lhs, rhs), (rhs, lhs)] {
+            let Some(variable) = subscripted_algebraic(view, target) else {
+                continue;
+            };
+            let mut reads = BTreeSet::new();
+            collect_same_instant_reads(view, value, &mut reads);
+            if !reads.contains(&variable) {
+                // Subscripts are read too (`u[k] = ...` with a varying `k`).
+                collect_same_instant_reads(view, target, &mut reads);
+                reads.remove(&variable);
+                return (BTreeSet::from([variable]), reads);
+            }
+        }
+    }
+    let mut unknowns = BTreeSet::new();
+    let mut reads = BTreeSet::new();
+    collect_same_instant_reads(view, residual, &mut reads);
+    dae::for_each_expression(view, residual, |_, node| {
+        if let dae::ExpressionOperation::Coordinate(dae::CoordinateView::Algebraic(id)) =
+            node.operation()
+        {
+            unknowns.insert(dae::VariableId::from(id).index());
+        }
+    });
+    (unknowns, reads)
+}
+
+/// The algebraic coordinate `expression` names whole or through subscripts.
+fn subscripted_algebraic<'dae>(
+    view: dae::DaeView<'dae>,
+    expression: dae::ExprId<'dae>,
+) -> Option<u32> {
+    let mut current = expression;
+    loop {
+        match view.expression(current)?.operation() {
+            dae::ExpressionOperation::Coordinate(dae::CoordinateView::Algebraic(id)) => {
+                return Some(dae::VariableId::from(id).index());
+            }
+            dae::ExpressionOperation::Index { base, .. } => current = base,
+            _ => return None,
         }
     }
 }
@@ -620,9 +733,70 @@ fn collect_producer_reads<'dae>(
 
 /// One discovered non-producer coordinate on a same-tick path.
 struct IntermediateNode<'dae> {
-    definition: Option<dae::ExprId<'dae>>,
+    source: IntermediateSource<'dae>,
     reads: BTreeSet<u32>,
     consumers: BTreeSet<usize>,
+}
+
+/// How a discovered coordinate is brought to this tick's value.
+#[derive(Clone, Copy)]
+enum IntermediateSource<'dae> {
+    /// Its one exact definition is re-evaluated.
+    Exact(dae::ExprId<'dae>),
+    /// The continuous algebraic system is re-solved.
+    Settled,
+    /// Its writer cannot be reproduced; a kept one fails construction.
+    Opaque,
+}
+
+/// Where `variable`'s value comes from and what that source reads, or `None`
+/// when nothing writes it (a state, parameter, input, or history lane, whose
+/// tick-entry value *is* its value for the whole tick).
+fn intermediate_source<'dae>(
+    view: dae::DaeView<'dae>,
+    definitions: &SameTickDefinitions<'dae>,
+    variable: u32,
+) -> Option<(IntermediateSource<'dae>, BTreeSet<u32>)> {
+    if let Some(definition) = definitions.definition(variable) {
+        let mut reads = BTreeSet::new();
+        collect_same_instant_reads(view, definition, &mut reads);
+        return Some((IntermediateSource::Exact(definition), reads));
+    }
+    if let Some(reads) = definitions.opaque_reads(variable) {
+        return Some((IntermediateSource::Opaque, reads.clone()));
+    }
+    definitions
+        .settled_reads(variable)
+        .map(|reads| (IntermediateSource::Settled, reads.clone()))
+}
+
+/// One refresh re-solves every settled coordinate, so a settled node waits only
+/// for what the settled block it belongs to reads from outside itself: its
+/// reads are closed over the settled coordinates they name.
+fn close_settled_reads(
+    definitions: &SameTickDefinitions<'_>,
+    discovered: &mut BTreeMap<u32, IntermediateNode<'_>>,
+) {
+    for node in discovered.values_mut() {
+        if !matches!(node.source, IntermediateSource::Settled) {
+            continue;
+        }
+        let mut pending = node.reads.iter().copied().collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        let mut closed = BTreeSet::new();
+        while let Some(read) = pending.pop() {
+            if !seen.insert(read) {
+                continue;
+            }
+            match definitions.settled_reads(read) {
+                Some(reads) => pending.extend(reads.iter().copied()),
+                None => {
+                    closed.insert(read);
+                }
+            }
+        }
+        node.reads = closed;
+    }
 }
 
 /// Discover the coordinates whose values sit on a same-tick path into a
@@ -630,8 +804,10 @@ struct IntermediateNode<'dae> {
 ///
 /// Only coordinates that transitively reach a producer target are kept: those
 /// are the storage coordinates whose event-entry values go stale mid-tick. A
-/// kept coordinate with no exact definition cannot be refreshed, so it fails
-/// construction instead of silently degrading to the pre-C57 stale read.
+/// kept coordinate with an exact definition is re-evaluated, one a continuous
+/// owner determines otherwise is re-solved by an algebraic refresh, and one
+/// with an opaque writer cannot be refreshed, so it fails construction instead
+/// of silently degrading to the pre-C57 stale read.
 fn discover_intermediates<'dae>(
     view: dae::DaeView<'dae>,
     definitions: &SameTickDefinitions<'dae>,
@@ -654,97 +830,65 @@ fn discover_intermediates<'dae>(
         {
             continue;
         }
-        let (definition, reads) = if let Some(definition) = definitions.definition(variable) {
-            let mut reads = BTreeSet::new();
-            collect_same_instant_reads(view, definition, &mut reads);
-            (Some(definition), reads)
-        } else if let Some(reads) = definitions.opaque_reads(variable) {
-            (None, reads.clone())
-        } else {
-            // No writer at all: a state, parameter, input, or history lane.
-            // Its tick-entry value *is* its value for the whole tick.
+        let Some((source, reads)) = intermediate_source(view, definitions, variable) else {
             continue;
         };
         pending.extend(reads.iter().map(|&read| (consumer, read)));
         let node = discovered
             .entry(variable)
             .or_insert_with(|| IntermediateNode {
-                definition,
+                source,
                 reads,
                 consumers: BTreeSet::new(),
             });
         node.consumers.insert(consumer);
     }
-    let mut reach = BTreeMap::<u32, bool>::new();
-    let reaches_producer: BTreeMap<u32, bool> = discovered
-        .keys()
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|variable| {
-            let mut guard = BTreeSet::new();
-            let value =
-                reaches_producer_target(variable, producer_of, &discovered, &mut reach, &mut guard);
-            (variable, value)
-        })
-        .collect();
-    let mut tick_reach = BTreeMap::<u32, bool>::new();
-    let reaches_tick_refresh: BTreeMap<u32, bool> = discovered
-        .keys()
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|variable| {
-            let mut guard = BTreeSet::new();
-            let value = reaches_tick_refresh_definition(
-                variable,
-                definitions,
-                &discovered,
-                &mut tick_reach,
-                &mut guard,
-            );
-            (variable, value)
-        })
-        .collect();
+    // Reachability is a fixpoint, not a memoized walk: a settled block is
+    // cyclic, and a walk that caches a `false` found under its own recursion
+    // guard would drop a coordinate that does reach a producer.
+    let reaches_producer = backward_reach(&discovered, |read| producer_of.contains_key(&read));
+    let reaches_tick_refresh =
+        backward_reach(&discovered, |read| definitions.refreshes_on_tick(read));
     discovered.retain(|variable, _| {
-        reaches_producer.get(variable).copied().unwrap_or(false)
-            || reaches_tick_refresh.get(variable).copied().unwrap_or(false)
+        reaches_producer.contains(variable) || reaches_tick_refresh.contains(variable)
     });
     if let Some((variable, _)) = discovered
         .iter()
-        .find(|(_, node)| node.definition.is_none())
+        .find(|(_, node)| matches!(node.source, IntermediateSource::Opaque))
     {
         return Err(unrefreshable_read(view, producers, direct_reads, *variable));
     }
+    close_settled_reads(definitions, &mut discovered);
     Ok(discovered)
 }
 
-/// Whether this definition sits between a producer read and an always-active
-/// discrete definition whose stored value must be recomputed for this tick.
-fn reaches_tick_refresh_definition(
-    variable: u32,
-    definitions: &SameTickDefinitions<'_>,
+/// The discovered coordinates that are `seed` themselves or read, directly or
+/// through other discovered coordinates, a coordinate that is.
+fn backward_reach(
     discovered: &BTreeMap<u32, IntermediateNode<'_>>,
-    reach: &mut BTreeMap<u32, bool>,
-    guard: &mut BTreeSet<u32>,
-) -> bool {
-    if definitions.refreshes_on_tick(variable) {
-        return true;
+    seed: impl Fn(u32) -> bool,
+) -> BTreeSet<u32> {
+    let mut reached = discovered
+        .keys()
+        .copied()
+        .filter(|&variable| seed(variable))
+        .collect::<BTreeSet<_>>();
+    loop {
+        let before = reached.len();
+        for (&variable, node) in discovered {
+            if !reached.contains(&variable)
+                && node
+                    .reads
+                    .iter()
+                    .any(|&read| seed(read) || reached.contains(&read))
+            {
+                reached.insert(variable);
+            }
+        }
+        if reached.len() == before {
+            return reached;
+        }
     }
-    if let Some(&known) = reach.get(&variable) {
-        return known;
-    }
-    if !guard.insert(variable) {
-        return false;
-    }
-    let result = discovered.get(&variable).is_some_and(|node| {
-        node.reads.iter().any(|&read| {
-            reaches_tick_refresh_definition(read, definitions, discovered, reach, guard)
-        })
-    });
-    guard.remove(&variable);
-    reach.insert(variable, result);
-    result
 }
 
 /// Report a read this module cannot refresh, at the span of a producer that
@@ -768,32 +912,6 @@ fn unrefreshable_read<'dae>(
              pre()/previous() or give the coordinate a single unconditional definition"
             .to_owned(),
     }
-}
-
-fn reaches_producer_target(
-    variable: u32,
-    producer_of: &BTreeMap<u32, usize>,
-    discovered: &BTreeMap<u32, IntermediateNode<'_>>,
-    reach: &mut BTreeMap<u32, bool>,
-    guard: &mut BTreeSet<u32>,
-) -> bool {
-    if producer_of.contains_key(&variable) {
-        return true;
-    }
-    if let Some(&known) = reach.get(&variable) {
-        return known;
-    }
-    if !guard.insert(variable) {
-        return false;
-    }
-    let result = discovered.get(&variable).is_some_and(|node| {
-        node.reads
-            .iter()
-            .any(|&read| reaches_producer_target(read, producer_of, discovered, reach, guard))
-    });
-    guard.remove(&variable);
-    reach.insert(variable, result);
-    result
 }
 
 /// Node universe: producers in caller order, then intermediates by variable
@@ -859,14 +977,21 @@ fn emit_schedule<'dae>(
         emitted[index] = true;
         steps.push(match graph.nodes[index] {
             Node::Producer(producer) => SameTickStep::Producer(producer),
-            Node::Intermediate(variable) => SameTickStep::IntermediateDefinition {
-                variable: definitions
+            Node::Intermediate(variable) => {
+                let id = definitions
                     .variable_id(variable)
-                    .expect("a discovered intermediate has a DAE variable identity"),
-                definition: intermediates[&variable]
-                    .definition
-                    .expect("a kept intermediate has an exact definition"),
-            },
+                    .expect("a discovered intermediate has a DAE variable identity");
+                match intermediates[&variable].source {
+                    IntermediateSource::Exact(definition) => SameTickStep::IntermediateDefinition {
+                        variable: id,
+                        definition,
+                    },
+                    IntermediateSource::Settled => SameTickStep::AlgebraicRefresh { variable: id },
+                    IntermediateSource::Opaque => {
+                        unreachable!("discovery rejects a kept opaque intermediate")
+                    }
+                }
+            }
         });
     }
     if steps.len() != graph.nodes.len() {
@@ -1103,6 +1228,10 @@ mod tests {
         /// The `Aliases` wiring plus a second, conflicting definition of
         /// `ambiguous`: two writers, so no exact definition exists.
         AliasesAndAmbiguousWriter,
+        /// The `Aliases` wiring plus `ambiguous + ambiguous = a`: one
+        /// continuous owner determines `ambiguous` without being its exact
+        /// definition.
+        AliasesAndImplicitWriter,
     }
 
     #[derive(Clone, Copy)]
@@ -1118,6 +1247,7 @@ mod tests {
     struct FixtureRows<'dae> {
         alias: dae::ExprId<'dae>,
         ambiguous: [dae::ExprId<'dae>; 2],
+        implicit: dae::ExprId<'dae>,
         n_value: dae::ExprId<'dae>,
         n_alias_value: dae::ExprId<'dae>,
     }
@@ -1210,7 +1340,17 @@ mod tests {
                 .at(at)
                 .coordinate(dae::CoordinateInput::Algebraic(variables.ambiguous))?;
             let one = expressions.at(at).literal(dae::DaeLiteral::Integer(1))?;
+            let doubled = expressions.at(at).binary(
+                dae::BinaryOperator::Add,
+                ambiguous_read,
+                ambiguous_read,
+            )?;
             Ok(FixtureRows {
+                implicit: expressions.at(at).binary(
+                    dae::BinaryOperator::Subtract,
+                    doubled,
+                    a_read,
+                )?,
                 alias: expressions.at(at).binary(
                     dae::BinaryOperator::Subtract,
                     a_alias_read,
@@ -1241,10 +1381,11 @@ mod tests {
         rows: FixtureRows<'dae>,
         at: dae::DaeProvenance,
     ) -> Result<(), dae::DaeConstructionError> {
-        let ambiguous = if wiring == Wiring::AliasesAndAmbiguousWriter {
-            rows.ambiguous.as_slice()
-        } else {
-            &[]
+        let implicit = [rows.implicit];
+        let ambiguous = match wiring {
+            Wiring::AliasesAndAmbiguousWriter => rows.ambiguous.as_slice(),
+            Wiring::AliasesAndImplicitWriter => implicit.as_slice(),
+            Wiring::Aliases => &[],
         };
         dae.continuous(|continuous| {
             continuous.equation(at, |equation| equation.residual(rows.alias))?;
@@ -1409,6 +1550,9 @@ mod tests {
                     SameTickStep::IntermediateDefinition { variable, .. } => {
                         format!("<{}>", variable_name(self.view, variable.index()))
                     }
+                    SameTickStep::AlgebraicRefresh { variable } => {
+                        format!("<solve {}>", variable_name(self.view, variable.index()))
+                    }
                 })
                 .collect()
         }
@@ -1421,6 +1565,23 @@ mod tests {
             // Caller order is reader-first, exactly as the model text writes it.
             let producers = [probe.producer("b", &[a_read]), probe.producer("a", &[])];
             assert_eq!(probe.issue_names(&producers), ["a", "b"]);
+        });
+    }
+
+    /// A coordinate a continuous owner determines without an exact definition
+    /// (an element, slice, or `for` equation, an implicit residual) was read
+    /// as if nothing wrote it, so the reader took the previous tick's value
+    /// (FIRE `Tests.GnssStatistical`). It is re-solved between the producer
+    /// it depends on and its reader.
+    #[test]
+    fn an_implicitly_determined_read_is_issued_as_an_algebraic_refresh() {
+        probe(Wiring::AliasesAndImplicitWriter, |probe| {
+            let read = probe.read_of("ambiguous");
+            let producers = [probe.producer("b", &[read]), probe.producer("a", &[])];
+            assert_eq!(
+                probe.issue_names(&producers),
+                ["a", "<solve ambiguous>", "b"]
+            );
         });
     }
 

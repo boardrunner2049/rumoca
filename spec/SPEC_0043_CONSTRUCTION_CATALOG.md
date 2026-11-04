@@ -63,7 +63,7 @@ valid LOC reductions.
 |---|---|---|---|
 | `dae-core-loc` | 11,000 | 18,750 | Retain checked conditional/tensor/loop-region and initialization parameter identity; retire downstream recovery during Solve Algorithm Block cutover |
 | `dae-wire-loc` | 3,250 | 5,750 | Operation-shaped replay; consolidate correlation replay after construction coverage lands |
-| `dae-total-loc` | 14,250 | 24,250 | Both items above; total follows their sum |
+| `dae-total-loc` | 14,250 | 24,500 | Both items above; total follows their sum |
 
 **Why:** the triggers were unenforced and all three were exceeded in silence.
 The gate makes exceedance loud without blocking a landing: any measured value is
@@ -137,6 +137,15 @@ extents (FUNC-041). The derived rule rounds each measured value up to the next
 250-line step, so the `dae-core-loc` ceiling moves to 18,750 and
 `dae-total-loc` to 24,250; the review triggers, the wire ceiling, and the
 totality-debt ceilings are unchanged.
+
+**2026-11-04 sample-event review:** measured production source moved to
+18,723 core, 5,551 wire, and 24,274 total lines with each periodic
+clock's MLS §3.7.5 `sample(start, interval)` origin and its tunable operand
+parameters (DAE-C07): the checked constructor and view, the event-style
+exemption from clocked read ownership, and wire replay. The derived rule
+rounds the total up to the next 250-line step, so the `dae-total-loc`
+ceiling moves to 24,500; the review triggers, the core and wire ceilings, and
+the totality-debt ceilings are unchanged.
 
 ### 2. Reservation Owner Catalog (SPEC_0036 §Storage and Forward References)
 

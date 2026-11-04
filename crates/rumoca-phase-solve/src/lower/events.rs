@@ -289,6 +289,7 @@ struct DiscreteRows<'dae> {
     clock_partition_intermediates: ScalarRows,
     clock_partition_intermediate_targets: Vec<solve::ScalarSlot>,
     clock_partition_intermediate_clocks: Vec<Vec<solve::PeriodicClockId>>,
+    clock_partition_refresh_clocks: Vec<Vec<solve::PeriodicClockId>>,
     /// Rows of observed B.1c owners (SPEC_0022 EXPR-012): unread
     /// observations refreshed at every output point.
     observed_rows: Vec<usize>,
@@ -883,6 +884,7 @@ impl<'dae> DiscreteRows<'dae> {
             clock_partition_intermediates,
             clock_partition_intermediate_targets: self.clock_partition_intermediate_targets,
             clock_partition_intermediate_clocks: self.clock_partition_intermediate_clocks,
+            clock_partition_refresh_clocks: self.clock_partition_refresh_clocks,
             rhs,
         };
         if let Some(sensitive) = history_sensitive.as_ref() {

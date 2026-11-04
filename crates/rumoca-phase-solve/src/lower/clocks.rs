@@ -78,6 +78,24 @@ impl<'dae> LoweredClocks<'dae> {
     }
 }
 
+/// A `sample(start, interval)` over a tunable parameter keeps its
+/// translation-time lattice and names the slots an executor that sets
+/// parameters before initialization reads instead (SPEC_0044 ME-EVENT-010).
+fn tunable_sample_slots<'dae>(
+    layout: &LoweredLayout<'dae>,
+    clock: dae::ClockView<'dae>,
+) -> Result<Option<solve::ParametricSampleSlots>, LowerError> {
+    let Some(dae::SampleEvent::Tunable { start, interval }) = clock.sample_event() else {
+        return Ok(None);
+    };
+    let span = clock.provenance().span();
+    Ok(Some(solve::ParametricSampleSlots {
+        start: parameter_slot(layout, start.into(), span)?,
+        interval: parameter_slot(layout, interval.into(), span)?,
+        nominal: true,
+    }))
+}
+
 pub(super) fn lower_clocks<'dae>(
     view: dae::DaeView<'dae>,
     layout: &LoweredLayout<'dae>,
@@ -97,7 +115,7 @@ pub(super) fn lower_clocks<'dae>(
                         clock.provenance().span(),
                     )
                 })?,
-                None,
+                tunable_sample_slots(layout, clock)?,
             ),
             // MLS §3.7.5 `sample(start, interval)` over parameters without a
             // translation-time value: the schedule is the parameters' values
@@ -107,6 +125,7 @@ pub(super) fn lower_clocks<'dae>(
                 Some(solve::ParametricSampleSlots {
                     start: parameter_slot(layout, start.into(), clock.provenance().span())?,
                     interval: parameter_slot(layout, interval.into(), clock.provenance().span())?,
+                    nominal: false,
                 }),
             ),
             dae::ClockOperation::Triggered(condition)

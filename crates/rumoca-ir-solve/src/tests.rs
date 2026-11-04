@@ -731,6 +731,7 @@ fn representative_discrete_system() -> DiscreteSolveSystem {
         clock_partition_intermediates: ScalarProgramBlock::default(),
         clock_partition_intermediate_targets: Vec::new(),
         clock_partition_intermediate_clocks: Vec::new(),
+        clock_partition_refresh_clocks: Vec::new(),
     }
 }
 

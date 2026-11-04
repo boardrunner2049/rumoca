@@ -108,7 +108,18 @@ pub(in crate::construction) struct ExpressionEventPlans {
     ordered: Vec<(Span, ExpressionEventPlan)>,
     by_span: HashMap<Span, Vec<PlannedOccurrence>>,
     /// The operands of every parametric `sample(start, interval)`, by ordinal.
-    parametric_samples: Vec<(Span, Vec<Expression>)>,
+    parametric_samples: Vec<ParametricSampleOccurrence>,
+}
+
+/// One `sample(start, interval)` whose schedule initialization fixes.
+pub(in crate::construction) struct ParametricSampleOccurrence {
+    pub(in crate::construction) span: Span,
+    /// `[start, interval]`.
+    pub(in crate::construction) operands: Vec<Expression>,
+    /// The exact lattice of the operands' translation-time values, when they
+    /// have them: the operands then read a tunable parameter, and the lattice
+    /// holds unless the parameter is set before initialization.
+    pub(in crate::construction) nominal: Option<rumoca_core::PeriodicClockSchedule>,
 }
 
 impl ExpressionEventPlans {
@@ -157,15 +168,18 @@ impl ExpressionEventPlans {
         self.ordered.iter().copied()
     }
 
-    /// The source span and `[start, interval]` operands of every parametric
-    /// `sample(start, interval)` occurrence, in ordinal order.
-    pub(in crate::construction) fn parametric_samples(&self) -> &[(Span, Vec<Expression>)] {
+    /// Every parametric `sample(start, interval)` occurrence, in ordinal
+    /// order.
+    pub(in crate::construction) fn parametric_samples(&self) -> &[ParametricSampleOccurrence] {
         &self.parametric_samples
     }
 
     /// Record one `sample(start, interval)` occurrence: its exact lattice
-    /// when the operands evaluate at translation time, else, for parameter
-    /// operands, a schedule fixed at initialization.
+    /// when the operands are fixed at translation, else, for parameter
+    /// operands, a schedule fixed at initialization — with the lattice of the
+    /// translation-time values as its nominal schedule when an operand reads a
+    /// tunable parameter, whose value an importer may set before
+    /// initialization (MLS §3.7.5 requires only parameter expressions).
     fn insert_sample(
         &mut self,
         args: &[Expression],
@@ -173,20 +187,25 @@ impl ExpressionEventPlans {
         span: Span,
     ) -> Result<(), ToDaeError> {
         let operands: Vec<&Expression> = args.iter().collect();
-        let error = match evaluate_sample_schedule(args, scope.constants, span) {
-            Ok(schedule) => {
+        let nominal = match evaluate_sample_schedule(args, scope.constants, span) {
+            Ok(schedule) if !sample_operands_read_tunable(args, scope) => {
                 return self.insert(span, &operands, ExpressionEventPlan::SampleClock(schedule));
             }
-            Err(error) => error,
+            Ok(schedule) => Some(schedule),
+            Err(error) if !sample_operands_are_parameters(args, scope.roles, scope.constants) => {
+                return Err(error);
+            }
+            Err(_) => None,
         };
-        if !sample_operands_are_parameters(args, scope.roles, scope.constants) {
-            return Err(error);
-        }
         if let Some(ExpressionEventPlan::ParametricSample(_)) = self.plan(span, &operands) {
             return Ok(());
         }
         let ordinal = self.parametric_samples.len();
-        self.parametric_samples.push((span, args.to_vec()));
+        self.parametric_samples.push(ParametricSampleOccurrence {
+            span,
+            operands: args.to_vec(),
+            nominal,
+        });
         self.insert(
             span,
             &operands,
@@ -249,17 +268,22 @@ struct EventScope<'analysis> {
     flat: &'analysis flat::Model,
     roles: &'analysis HashMap<VarName, PlannedRole>,
     constants: &'analysis EvalContext,
+    /// The parameters fixed at translation (STRUCT-T10(a)); every other
+    /// parameter is tunable before initialization.
+    evaluable: &'analysis HashSet<VarName>,
 }
 
 pub(super) fn analyze_expression_events(
     flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
     constants: &EvalContext,
+    evaluable: &HashSet<VarName>,
 ) -> Result<ExpressionEventPlans, ToDaeError> {
     let scope = EventScope {
         flat,
         roles,
         constants,
+        evaluable,
     };
     let mut plans = ExpressionEventPlans::default();
     for variable in flat.variables.values() {
@@ -779,4 +803,17 @@ pub(in crate::construction) fn sample_operands_are_parameters(
                 ) && constants.deferred_parameter(reference.as_str()).is_none()
             })
         })
+}
+
+/// Whether a `sample(start, interval)` operand reads a parameter that is not
+/// fixed at translation, so its value may be set before initialization.
+fn sample_operands_read_tunable(args: &[Expression], scope: &EventScope<'_>) -> bool {
+    args.iter().any(|operand| {
+        let mut references: Vec<VarName> = Vec::new();
+        operand.collect_var_refs(&mut references);
+        references.iter().any(|reference| {
+            matches!(scope.roles.get(reference), Some(PlannedRole::Parameter))
+                && !scope.evaluable.contains(reference)
+        })
+    })
 }

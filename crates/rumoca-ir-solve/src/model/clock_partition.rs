@@ -17,6 +17,7 @@ struct ClockPartitionOwnerMask {
     structured: Vec<bool>,
     transactions: Vec<bool>,
     intermediates: Vec<bool>,
+    refreshes: Vec<bool>,
 }
 
 impl ClockPartitionOwnerMask {
@@ -27,6 +28,7 @@ impl ClockPartitionOwnerMask {
             structured: vec![false; discrete.structured_updates.len()],
             transactions: vec![false; discrete.event_transactions.len()],
             intermediates: vec![false; discrete.clock_partition_intermediates.len()],
+            refreshes: vec![false; discrete.clock_partition_refresh_clocks.len()],
         }
     }
 
@@ -76,6 +78,41 @@ fn admit_intermediate_step(
     Ok(())
 }
 
+/// Claim the one issued step of an algebraic refresh.
+fn admit_refresh_step(
+    index: usize,
+    covered: &mut ClockPartitionOwnerMask,
+) -> Result<(), SolveProblemShapeContractError> {
+    let claimed = covered
+        .refreshes
+        .get_mut(index)
+        .ok_or_else(|| order_error(index, "algebraic refresh step out of bounds"))?;
+    if std::mem::replace(claimed, true) {
+        return Err(order_error(index, "algebraic refresh scheduled twice"));
+    }
+    Ok(())
+}
+
+/// A consumer clock set is non-empty, sorted, and unique.
+fn validate_consumer_clocks(
+    row: usize,
+    clocks: &[super::PeriodicClockId],
+) -> Result<(), SolveProblemShapeContractError> {
+    if clocks.is_empty() {
+        return Err(order_error(row, "consumer clock set is empty"));
+    }
+    if clocks
+        .windows(2)
+        .any(|pair| pair[0].index() >= pair[1].index())
+    {
+        return Err(order_error(
+            row,
+            "consumer clocks are not sorted and unique",
+        ));
+    }
+    Ok(())
+}
+
 /// One typed contract error shape for every clock-partition order failure.
 fn order_error(row: usize, detail: &'static str) -> SolveProblemShapeContractError {
     SolveProblemShapeContractError::DiscreteCertificate {
@@ -97,7 +134,14 @@ impl DiscreteSolveSystem {
     pub fn validate_clock_partition_order(&self) -> Result<(), SolveProblemShapeContractError> {
         let excluded = self.transaction_owned_producers()?;
         let covered = self.issued_step_coverage(&excluded)?;
-        self.validate_clock_partition_coverage(&excluded, &covered)
+        self.validate_clock_partition_coverage(&excluded, &covered)?;
+        if let Some(index) = covered.refreshes.iter().position(|claimed| !claimed) {
+            return Err(order_error(index, "algebraic refresh has no issued step"));
+        }
+        for (index, clocks) in self.clock_partition_refresh_clocks.iter().enumerate() {
+            validate_consumer_clocks(index, clocks)?;
+        }
+        Ok(())
     }
 
     /// Mark every producer a DAE-C21/SOLVE-C55 transaction owns: those are
@@ -143,6 +187,9 @@ impl DiscreteSolveSystem {
                 }
                 ClockPartitionStep::Intermediate { row } => {
                     admit_intermediate_step(row, &mut covered)?;
+                }
+                ClockPartitionStep::AlgebraicRefresh { index } => {
+                    admit_refresh_step(index, &mut covered)?;
                 }
             }
         }
@@ -328,18 +375,7 @@ impl DiscreteSolveSystem {
             ));
         }
         for (row, clocks) in self.clock_partition_intermediate_clocks.iter().enumerate() {
-            if clocks.is_empty() {
-                return Err(order_error(row, "intermediate consumer clock set is empty"));
-            }
-            if clocks
-                .windows(2)
-                .any(|pair| pair[0].index() >= pair[1].index())
-            {
-                return Err(order_error(
-                    row,
-                    "intermediate consumer clocks are not sorted and unique",
-                ));
-            }
+            validate_consumer_clocks(row, clocks)?;
         }
         Ok(())
     }

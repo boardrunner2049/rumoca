@@ -446,6 +446,13 @@ pub(super) struct EventActionEntryWire {
 
 #[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum SampleEventWire {
+    Fixed,
+    Tunable { start: u32, interval: u32 },
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ClockKindWire {
     Periodic(PeriodicClockScheduleWire),
     ParametricSample {
@@ -539,6 +546,8 @@ impl ClockLatticeWire {
 #[serde(deny_unknown_fields)]
 pub(super) struct ClockEntryWire {
     pub(super) kind: ClockKindWire,
+    #[serde(default)]
+    pub(super) sample_event: Option<SampleEventWire>,
     #[serde(deserialize_with = "deserialize_provenance")]
     pub(super) provenance: DaeProvenance,
 }

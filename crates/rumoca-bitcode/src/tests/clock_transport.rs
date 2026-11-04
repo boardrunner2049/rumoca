@@ -16,6 +16,7 @@ fn clock_model(sampled: bool, anchor: RbcClockAnchor) -> RbcFile {
             period: rational("1", "20"),
             phase: rational("-5", "4"),
             anchor,
+            sample_event: None,
         },
         provenance: source_provenance(),
     });

@@ -80,20 +80,7 @@ pub(super) fn issue_clock_partition_order<'dae>(
     for step in schedule.steps {
         match step {
             rumoca_phase_structural::SameTickStep::Producer(index) => {
-                order.push(match admitted[index].step {
-                    PendingClockedStep::ScalarRows { start_row, count } => {
-                        solve::ClockPartitionStep::ScalarRows { start_row, count }
-                    }
-                    PendingClockedStep::GuardedAssignment { program_index } => {
-                        solve::ClockPartitionStep::GuardedAssignment { program_index }
-                    }
-                    PendingClockedStep::StructuredUpdate { update_index } => {
-                        solve::ClockPartitionStep::StructuredUpdate { update_index }
-                    }
-                    PendingClockedStep::EventTransaction { program_index } => {
-                        solve::ClockPartitionStep::EventTransaction { program_index }
-                    }
-                });
+                order.push(admitted[index].step.issued());
             }
             rumoca_phase_structural::SameTickStep::IntermediateDefinition {
                 variable,
@@ -118,10 +105,64 @@ pub(super) fn issue_clock_partition_order<'dae>(
                     &mut order,
                 )?;
             }
+            rumoca_phase_structural::SameTickStep::AlgebraicRefresh { variable } => {
+                let span = intermediate_variable_span(view, variable);
+                let consumers = intermediate_consumers
+                    .get(&variable.index())
+                    .ok_or_else(|| {
+                        LowerError::contract("issued algebraic refresh has no consumer set", span)
+                    })?;
+                let clocks = consumer_clocks(&admitted, consumers, span)?;
+                issue_algebraic_refresh(discrete, clocks, &mut order);
+            }
         }
     }
     discrete.clock_partition_order = order;
     Ok(())
+}
+
+/// Issue one algebraic refresh for its consumer clocks. A refresh directly
+/// after another re-solves the same values, so the two merge into one step
+/// whose clock set is their union.
+fn issue_algebraic_refresh(
+    discrete: &mut DiscreteRows<'_>,
+    clocks: Vec<solve::PeriodicClockId>,
+    order: &mut Vec<solve::ClockPartitionStep>,
+) {
+    if let Some(&solve::ClockPartitionStep::AlgebraicRefresh { index }) = order.last() {
+        let merged = &mut discrete.clock_partition_refresh_clocks[index];
+        merged.extend(clocks);
+        merged.sort_by_key(|clock| clock.index());
+        merged.dedup();
+        return;
+    }
+    let index = discrete.clock_partition_refresh_clocks.len();
+    discrete.clock_partition_refresh_clocks.push(clocks);
+    order.push(solve::ClockPartitionStep::AlgebraicRefresh { index });
+}
+
+/// The sorted, unique clocks of the issued consumers of one intermediate.
+fn consumer_clocks(
+    admitted: &[&PendingClockedProducer<'_>],
+    consumers: &[usize],
+    span: Span,
+) -> Result<Vec<solve::PeriodicClockId>, LowerError> {
+    let mut clocks = Vec::new();
+    for &consumer in consumers {
+        let producer = admitted.get(consumer).ok_or_else(|| {
+            LowerError::contract("issued intermediate consumer is out of bounds", span)
+        })?;
+        clocks.extend(producer.clock_owners.iter().copied());
+    }
+    clocks.sort_by_key(|clock| clock.index());
+    clocks.dedup();
+    if clocks.is_empty() {
+        return Err(LowerError::contract(
+            "issued clock-partition intermediate has no consumer clock",
+            span,
+        ));
+    }
+    Ok(clocks)
 }
 
 struct IntermediateDefinitionIssue<'a, 'dae> {
@@ -139,36 +180,7 @@ fn issue_intermediate_definition<'dae>(
     order: &mut Vec<solve::ClockPartitionStep>,
 ) -> Result<(), LowerError> {
     let span = intermediate_variable_span(view, issue.variable);
-    let mut consumer_clocks = issue
-        .consumers
-        .iter()
-        .flat_map(|&consumer| {
-            admitted
-                .get(consumer)
-                .map(|producer| {
-                    producer
-                        .clock_owners
-                        .iter()
-                        .copied()
-                        .map(Ok)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| {
-                    vec![Err(LowerError::contract(
-                        "issued intermediate consumer is out of bounds",
-                        span,
-                    ))]
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    consumer_clocks.sort_by_key(|clock| clock.index());
-    consumer_clocks.dedup();
-    if consumer_clocks.is_empty() {
-        return Err(LowerError::contract(
-            "issued clock-partition intermediate has no consumer clock",
-            span,
-        ));
-    }
+    let consumer_clocks = consumer_clocks(admitted, issue.consumers, span)?;
     let definition_span = view
         .expression(issue.definition)
         .expect("checked issued definition resolves")
@@ -254,6 +266,26 @@ pub(super) enum PendingClockedStep {
     GuardedAssignment { program_index: usize },
     StructuredUpdate { update_index: usize },
     EventTransaction { program_index: usize },
+}
+
+impl PendingClockedStep {
+    /// The Solve step that executes this producer.
+    const fn issued(self) -> solve::ClockPartitionStep {
+        match self {
+            Self::ScalarRows { start_row, count } => {
+                solve::ClockPartitionStep::ScalarRows { start_row, count }
+            }
+            Self::GuardedAssignment { program_index } => {
+                solve::ClockPartitionStep::GuardedAssignment { program_index }
+            }
+            Self::StructuredUpdate { update_index } => {
+                solve::ClockPartitionStep::StructuredUpdate { update_index }
+            }
+            Self::EventTransaction { program_index } => {
+                solve::ClockPartitionStep::EventTransaction { program_index }
+            }
+        }
+    }
 }
 
 /// The value and condition roots one guarded owner group evaluates at its tick,

@@ -29,6 +29,62 @@ equation
     ts = time;
   end when;
 end Parametric;
+
+model Order
+  discrete Real a(start = 0, fixed = true);
+  discrete Real b(start = 0, fixed = true);
+  Real u[2];
+equation
+  when sample(0, 0.1) then
+    b = u[1] + u[2];
+  end when;
+  u[1] = 2*a;
+  u[2] = a;
+  when sample(0, 0.1) then
+    a = pre(a) + 1;
+  end when;
+end Order;
+
+model Tunable
+  parameter Real period = 0.1;
+  parameter Real offset = 0.05;
+  Real twice = 2*period;
+  discrete Real n(start = 0, fixed = true);
+  discrete Real ts(start = -1, fixed = true);
+equation
+  when sample(offset, period) then
+    n = pre(n) + 1;
+    ts = time;
+  end when;
+end Tunable;
+"#;
+
+/// Prints `cs <step> <value>...` for the `VARS` value references after each
+/// Co-Simulation step of `STEP`; `PERIOD_VALUE > 0` sets the `PERIOD` value
+/// reference before initialization.
+const STEP_HARNESS: &str = r#"#include "model.c"
+#include <stdio.h>
+
+static void quiet(fmi3InstanceEnvironment e, fmi3Status s, fmi3String c, fmi3String m) { (void)e; (void)s; (void)c; fprintf(stderr, "%s\n", m); }
+static const fmi3ValueReference vars[] = { VARS };
+#define NVARS (sizeof(vars) / sizeof(vars[0]))
+
+int main(void) {
+    fmi3Instance i = fmi3InstantiateCoSimulation("h", TOKEN, NULL, fmi3False, fmi3False, fmi3False, fmi3False, NULL, 0, NULL, quiet, NULL);
+    if (!i) return 2;
+    if (PERIOD_VALUE > 0.0) { fmi3ValueReference vr = PERIOD; fmi3Float64 v = PERIOD_VALUE; if (fmi3SetFloat64(i, &vr, 1, &v, 1) != fmi3OK) return 2; }
+    if (fmi3EnterInitializationMode(i, fmi3False, 0.0, 0.0, fmi3True, 1.0) != fmi3OK || fmi3ExitInitializationMode(i) != fmi3OK) return 2;
+    for (int k = 0; k <= STEPS; ++k) {
+        if (k > 0) { fmi3Boolean ev, term, early; fmi3Float64 last; if (fmi3DoStep(i, STEP * (k - 1), STEP, fmi3True, &ev, &term, &early, &last) != fmi3OK) return 3; }
+        fmi3Float64 values[NVARS];
+        if (fmi3GetFloat64(i, vars, NVARS, values, NVARS) != fmi3OK) return 4;
+        printf("cs %d", k);
+        for (size_t v = 0; v < NVARS; ++v) printf(" %.17g", values[v]);
+        printf("\n");
+    }
+    fmi3FreeInstance(i);
+    return 0;
+}
 "#;
 
 /// The harness prints `<interface> <time> n <n> ts <ts>` lines. `N`, `TS` and
@@ -140,6 +196,90 @@ fn generated_c_component_runs_sample_ticks_as_time_events() {
     assert!(parametric.contains("unset exit 3"), "{parametric}");
 }
 
+#[test]
+fn generated_c_component_orders_same_tick_sample_clauses_by_data() {
+    if !harness_tools_available() {
+        return;
+    }
+    // `b` reads `u`, which the other clause's `a` determines through element
+    // equations, at the same tick: tick k (t = 0.1 k) gives a = k + 1 and
+    // b = 3 (k + 1), although the reading clause comes first.
+    let rows = step_rows("Order", &["a", "b"], (0.0, 0.05, 7));
+    for (step, a) in [(0, 1.0), (2, 2.0), (4, 3.0), (6, 4.0)] {
+        assert_eq!(rows[step], vec![a, 3.0 * a], "step {step}: {rows:?}");
+    }
+}
+
+#[test]
+fn generated_c_component_schedules_tunable_sample_operands_at_initialization() {
+    if !harness_tools_available() {
+        return;
+    }
+    // Defaults: sample(0.05, 0.1) on its exact lattice.
+    let rows = step_rows("Tunable", &["n", "ts", "twice"], (0.0, 0.07, 5));
+    assert_eq!(rows[1], vec![1.0, 0.05, 0.2], "{rows:?}");
+    assert_eq!(rows[3], vec![2.0, 0.15, 0.2], "{rows:?}");
+    assert_eq!(rows[4], vec![3.0, 0.25, 0.2], "{rows:?}");
+    // period = 0.04 set before initialization: the derived `twice` and the
+    // tick schedule 0.05 + 0.04 k both follow it.
+    let rows = step_rows("Tunable", &["n", "ts", "twice"], (0.04, 0.035, 5));
+    let tick = |k: f64| k.mul_add(0.04, 0.05);
+    assert_eq!(rows[0], vec![0.0, -1.0, 0.08], "{rows:?}");
+    assert_eq!(rows[1], vec![0.0, -1.0, 0.08], "{rows:?}");
+    for (step, k) in [(2, 0.0), (3, 1.0), (4, 2.0), (5, 3.0)] {
+        assert_eq!(rows[step], vec![k + 1.0, tick(k), 0.08], "{rows:?}");
+    }
+}
+
+/// Run [`STEP_HARNESS`] on `model` with `(period, step, steps)` and return
+/// the values of `names` after each step.
+fn step_rows(model: &str, names: &[&str], (period, step, steps): (f64, f64, u32)) -> Vec<Vec<f64>> {
+    let compiled = rumoca::Compiler::new()
+        .model(model)
+        .compile_str(SOURCE, "SampleEvents.mo")
+        .unwrap_or_else(|error| panic!("compile {model}: {error:?}"));
+    let work = tempdir().expect("sample-event harness work directory");
+    let fmu = build_named_fmu(work.path(), &compiled, "fmi3", model);
+    let description = fs::read_to_string(fmu.root.join("modelDescription.xml"))
+        .expect("read the packaged model description");
+    let references = names
+        .iter()
+        .map(|name| {
+            value_reference(&description, name)
+                .unwrap_or_else(|| panic!("{model} publishes no {name}"))
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let mut command = Command::new("cc");
+    command
+        .arg(format!("-DVARS={}", references.join(",")))
+        .arg(format!(
+            "-DPERIOD={}",
+            value_reference(&description, "period").unwrap_or(0)
+        ))
+        .arg(format!("-DPERIOD_VALUE={period:?}"))
+        .arg(format!("-DSTEP={step:?}"))
+        .arg(format!("-DSTEPS={steps}"));
+    let output = compile_and_run(
+        command,
+        work.path(),
+        &fmu,
+        &description,
+        STEP_HARNESS,
+        model,
+    );
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix("cs "))
+        .map(|line| {
+            line.split_whitespace()
+                .skip(1)
+                .map(|value| value.parse().expect("a printed value"))
+                .collect()
+        })
+        .collect()
+}
+
 fn harness_tools_available() -> bool {
     let tools = [("cc", command_is_available("cc"))];
     super::super::template_runtime_policy::prerequisites_are_available(
@@ -157,11 +297,29 @@ fn run_harness(model: &str, scenario: u32) -> String {
         .unwrap_or_else(|error| panic!("compile {model}: {error:?}"));
     let work = tempdir().expect("sample-event harness work directory");
     let fmu = build_named_fmu(work.path(), &compiled, "fmi3", model);
-    let sources = fmu.root.join("sources");
     let description = fs::read_to_string(fmu.root.join("modelDescription.xml"))
         .expect("read the packaged model description");
-    let token = attribute(&description, "instantiationToken");
     let mut command = Command::new("cc");
+    command.arg(format!("-DMODEL={scenario}"));
+    for (define, name) in [("N", "n"), ("TS", "ts"), ("FREQUENCY", "frequency")] {
+        let reference = value_reference(&description, name).unwrap_or(0);
+        command.arg(format!("-D{define}={reference}"));
+    }
+    compile_and_run(command, work.path(), &fmu, &description, HARNESS, model)
+}
+
+/// Compile `harness` against the packaged sources with the defines already
+/// on `command`, run it, and return its standard output.
+fn compile_and_run(
+    mut command: Command,
+    work: &Path,
+    fmu: &BuiltFmu,
+    description: &str,
+    harness: &str,
+    model: &str,
+) -> String {
+    let sources = fmu.root.join("sources");
+    let token = attribute(description, "instantiationToken");
     command
         .arg("-std=c11")
         .arg("-Wall")
@@ -169,20 +327,15 @@ fn run_harness(model: &str, scenario: u32) -> String {
         .arg("-Werror")
         .arg("-Wno-unused-function")
         .arg("-DFMI3_OVERRIDE_FUNCTION_PREFIX=1")
-        .arg(format!("-DMODEL={scenario}"))
         .arg(format!("-DTOKEN=\"{token}\""));
-    for (define, name) in [("N", "n"), ("TS", "ts"), ("FREQUENCY", "frequency")] {
-        let reference = value_reference(&description, name).unwrap_or(0);
-        command.arg(format!("-D{define}={reference}"));
-    }
-    let harness = work.path().join("sample_events_harness.c");
-    fs::write(&harness, HARNESS).expect("write the sample-event harness");
-    let binary = work.path().join("sample_events_harness");
+    let source = work.join("sample_events_harness.c");
+    fs::write(&source, harness).expect("write the sample-event harness");
+    let binary = work.join("sample_events_harness");
     checked_output(
         command
             .arg(format!("-I{}", sources.display()))
             .arg(format!("-I{}", vendored_fmi3_headers().display()))
-            .arg(&harness)
+            .arg(&source)
             .args(
                 [
                     "rmc_assign.c",

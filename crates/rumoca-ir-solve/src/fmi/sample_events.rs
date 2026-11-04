@@ -46,8 +46,10 @@ pub(super) struct SampleClock {
     /// ticks (SOLVE-C11).
     lane: usize,
     /// A parametric `sample(start, interval)`: the parameter slots whose
-    /// initialization values are its start and interval. The lattice fields
-    /// above are then unused.
+    /// initialization values are its start and interval. With no lattice
+    /// (`units == 0`) the lattice fields above are unused; with one, it is the
+    /// operands' translation-time value, ticked on exactly while the slots
+    /// still hold that value.
     start_slot: Option<usize>,
     interval_slot: Option<usize>,
 }
@@ -56,8 +58,9 @@ pub(super) struct SampleClock {
 #[derive(Debug, Serialize)]
 pub(super) struct SampleStep {
     /// `rows` (discrete rows of one `rhs` program), `guarded` (one guarded
-    /// assignment program), or `intermediate` (one same-tick algebraic
-    /// refresh row of `clock_partition_intermediates`).
+    /// assignment program), `intermediate` (one same-tick algebraic refresh
+    /// row of `clock_partition_intermediates`), or `refresh` (re-solve the
+    /// algebraic coordinates).
     kind: &'static str,
     /// The clocks any of whose ticks runs the step.
     clocks: Vec<usize>,
@@ -102,7 +105,8 @@ pub(super) fn clocks(problem: &SolveProblem) -> Result<Vec<SampleClock>, &'stati
         .zip(&clocks.activation_parameter_indices)
         .enumerate()
         .map(|(index, (schedule, &lane))| {
-            if let Some(slots) = clocks.parametric_sample(index) {
+            let slots = clocks.parametric_sample(index);
+            if let Some(slots) = slots.filter(|slots| !slots.nominal) {
                 return Ok(SampleClock {
                     phase: 0.0,
                     period: 0.0,
@@ -129,8 +133,8 @@ pub(super) fn clocks(problem: &SolveProblem) -> Result<Vec<SampleClock>, &'stati
                 units,
                 start_relative: schedule.anchor() == rumoca_core::ClockPhaseAnchor::SimulationStart,
                 lane,
-                start_slot: None,
-                interval_slot: None,
+                start_slot: slots.map(|slots| slots.start),
+                interval_slot: slots.map(|slots| slots.interval),
             })
         })
         .collect()
@@ -211,6 +215,7 @@ pub(super) fn partition(
                 }
             }
             ClockPartitionStep::Intermediate { row } => intermediate_step(discrete, row)?,
+            ClockPartitionStep::AlgebraicRefresh { index } => refresh_step(discrete, index)?,
             ClockPartitionStep::StructuredUpdate { .. }
             | ClockPartitionStep::EventTransaction { .. } => {
                 return Err(
@@ -303,6 +308,28 @@ fn intermediate_step(
         column,
         index,
         rows: vec![row],
+        offset: 0,
+        count: 0,
+    })
+}
+
+/// One algebraic refresh: the component re-solves its algebraic coordinates
+/// from the values the earlier steps wrote, as the linked runtime does in its
+/// tick work state.
+fn refresh_step(discrete: &DiscreteSolveSystem, index: usize) -> Result<SampleStep, &'static str> {
+    let clocks = discrete
+        .clock_partition_refresh_clocks
+        .get(index)
+        .map(|clocks| clocks.iter().map(|clock| clock.index()).collect::<Vec<_>>())
+        .filter(|clocks| !clocks.is_empty())
+        .ok_or("a clock-partition algebraic refresh has no consumer clock")?;
+    Ok(SampleStep {
+        kind: "refresh",
+        clocks,
+        program: 0,
+        column: "p",
+        index,
+        rows: Vec::new(),
         offset: 0,
         count: 0,
     })

@@ -5,7 +5,9 @@ use rumoca_ir_dae as dae;
 use rumoca_ir_flat as flat;
 
 use super::Coordinate;
-use super::analysis::{ClockPlan, ClockSchedule, ClockedValuePlan, EventClockPlan};
+use super::analysis::{
+    ClockPlan, ClockSchedule, ClockedValuePlan, EventClockPlan, ParametricSampleOccurrence,
+};
 
 pub(super) struct LoweredClocks<'dae> {
     pub(super) by_plan: HashMap<ClockPlan, dae::ClockId<'dae>>,
@@ -100,11 +102,11 @@ impl<'dae> LoweredClocks<'dae> {
     pub(super) fn issue_parametric_samples(
         &mut self,
         construction: &mut dae::DaeConstruction<'dae>,
-        samples: &[(Span, Vec<rumoca_core::Expression>)],
+        samples: &[ParametricSampleOccurrence],
     ) -> Result<(), dae::DaeConstructionError> {
-        for (ordinal, (span, _)) in samples.iter().enumerate() {
+        for (ordinal, sample) in samples.iter().enumerate() {
             let provenance =
-                dae::DaeProvenance::generated(dae::DaeGeneration::ClockLowering, *span)?;
+                dae::DaeProvenance::generated(dae::DaeGeneration::ClockLowering, sample.span)?;
             let value_type = construction.types(|types| {
                 types.derived(dae::ValueType::scalar(dae::ScalarType::Real), provenance)
             })?;
@@ -117,8 +119,14 @@ impl<'dae> LoweredClocks<'dae> {
                 value_type,
                 provenance,
             )?;
-            let clock = construction
-                .clocks(|clocks| clocks.parametric_sample(start, interval, provenance))?;
+            // An operand over a tunable parameter keeps its translation-time
+            // lattice as the schedule's nominal value (SPEC_0044 ME-EVENT-010).
+            let clock = construction.clocks(|clocks| match sample.nominal {
+                Some(nominal) => clocks
+                    .sample_event(nominal, Some((start, interval)), provenance)
+                    .map(Into::into),
+                None => clocks.parametric_sample(start, interval, provenance),
+            })?;
             self.parametric_samples.push(clock);
             self.pending_parametric.push(PendingParametricSample {
                 ordinal,
@@ -262,7 +270,8 @@ pub(super) fn lower_clocks<'dae>(
             continue;
         }
         let provenance = dae::DaeProvenance::source(span)?;
-        let clock = construction.clocks(|clocks| clocks.scheduled(schedule, provenance))?;
+        let clock =
+            construction.clocks(|clocks| clocks.sample_event(schedule, None, provenance))?;
         lowered.by_sample_schedule.insert(schedule, clock);
     }
     Ok(lowered)
@@ -642,7 +651,7 @@ pub(super) fn define_parametric_samples<'dae>(
     for sample in pending {
         let operands = samples
             .get(sample.ordinal)
-            .map(|(_, operands)| operands.as_slice())
+            .map(|occurrence| occurrence.operands.as_slice())
             .ok_or(dae::DaeConstructionError::MissingClockDomainOwner {
                 span: sample.provenance.span(),
             })?;

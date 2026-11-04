@@ -317,7 +317,8 @@ fn validate_discrete_event_rows(model: &solve::SolveModel) -> Result<(), Runtime
     // SPEC_0044 ME-EVENT-010: a `sample(start, interval)` whose operands are
     // fixed only at initialization carries an inert lattice in its Solve
     // schedule; this runtime schedules exact lattices alone and refuses it.
-    if model.problem.clocks.has_parametric_samples() {
+    // One over a tunable parameter ticks on its translation-time lattice.
+    if model.problem.clocks.has_unscheduled_parametric_samples() {
         return Err(RuntimeSolveError::solve_ir(
             "sample(start, interval) with operands fixed only at initialization is \
              executed by the FMI C profile, not by this runtime",

@@ -423,6 +423,9 @@ impl SolveRuntime {
                 solve::ClockPartitionStep::Intermediate { row } => {
                     self.execute_clock_partition_intermediate(mode, row, work)?;
                 }
+                solve::ClockPartitionStep::AlgebraicRefresh { index } => {
+                    self.execute_clock_partition_refresh(mode, index, work)?;
+                }
             }
         }
         Ok(())
@@ -757,6 +760,43 @@ impl SolveRuntime {
         Ok(())
     }
 
+    /// Re-solve the continuous algebraic coordinates into the private work
+    /// state, so a later producer reads them at this tick's issued values
+    /// (MLS §8.6). Like an intermediate, it runs only when one of its issued
+    /// consumer clocks ticks and is never committed.
+    fn execute_clock_partition_refresh(
+        &self,
+        mode: ClockPartitionPassMode<'_, '_>,
+        index: usize,
+        work: &mut ClockPartitionWork<'_>,
+    ) -> Result<(), RuntimeSolveError> {
+        let clocks = self
+            .model
+            .problem
+            .discrete
+            .clock_partition_refresh_clocks
+            .get(index)
+            .ok_or_else(|| {
+                RuntimeSolveError::solve_ir("clock partition algebraic refresh is out of bounds")
+            })?;
+        if matches!(mode, ClockPartitionPassMode::Filtered { .. }) {
+            let mut ticking = false;
+            for &clock in clocks {
+                ticking |= self.periodic_clock_active(clock, work.t, "clock partition refresh")?;
+            }
+            if !ticking {
+                return Ok(());
+            }
+        }
+        self.refresh_algebraic_and_output_slots(
+            work.t,
+            work.y,
+            work.p,
+            solve_eval::projection_policy::ALGEBRAIC_REFRESH_TOLERANCE,
+            solve_eval::projection_policy::ALGEBRAIC_REFRESH_MAX_ITERS,
+        )
+    }
+
     /// Replay the construction-issued consumer-domain set for one
     /// intermediate. The structural proof, not runtime program inspection,
     /// decided which clocked producers can read this row.
@@ -833,8 +873,9 @@ pub(super) fn clock_partition_clocks(
                 .structured_updates
                 .get(update_index)
                 .and_then(|update| update.clock_owner),
-            solve::ClockPartitionStep::EventTransaction { .. } => None,
-            solve::ClockPartitionStep::Intermediate { .. } => None,
+            solve::ClockPartitionStep::EventTransaction { .. }
+            | solve::ClockPartitionStep::Intermediate { .. }
+            | solve::ClockPartitionStep::AlgebraicRefresh { .. } => None,
         };
         if let Some(owner) = owner
             && !clocks.contains(&owner)

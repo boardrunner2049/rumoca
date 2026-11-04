@@ -1827,6 +1827,10 @@ pub enum RbcClockNode {
         period: RbcClockRational,
         phase: RbcClockRational,
         anchor: RbcClockAnchor,
+        /// Set when the clock is an MLS §3.7.5 `sample(start, interval)` time
+        /// event rather than an MLS §16 clock.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_event: Option<RbcSampleEvent>,
     },
     /// MLS §3.7.5 `sample(start, interval)` whose start and interval are the
     /// initialization values of two Real parameter variables.
@@ -1836,6 +1840,20 @@ pub enum RbcClockNode {
     },
     Triggered {
         condition: ConditionId,
+    },
+}
+
+/// The MLS §3.7.5 origin of a periodic clock.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RbcSampleEvent {
+    /// Both operands are fixed at translation.
+    Fixed,
+    /// An operand reads a tunable parameter: these generated Real parameters
+    /// hold the start and interval initialization settles.
+    Tunable {
+        start: VariableId,
+        interval: VariableId,
     },
 }
 

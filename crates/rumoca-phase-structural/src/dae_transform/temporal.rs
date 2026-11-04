@@ -54,22 +54,28 @@ pub(super) fn rebuild_clocks<'target>(
             .expect("finalized clock ordinal resolves");
         let clock = source.clock(id).expect("finalized clock identity resolves");
         let rebuilt = target.clocks(|target| match clock.operation() {
-            dae::ClockOperation::Periodic(schedule) => target
-                .scheduled(*schedule, clock.provenance())
-                .map(RebuiltClock::Periodic),
-            dae::ClockOperation::ParametricSample { start, interval } => {
-                let parameter =
-                    |id: dae::ParameterId<'_>| match variables[id.index() as usize].identity {
-                        TargetVariable::Parameter(parameter) => Ok(parameter),
-                        _ => Err(dae::DaeConstructionError::InvalidClockedOperand {
-                            operator: "sample(start, interval) parameter",
-                            span: clock.provenance().span(),
-                        }),
-                    };
-                target
-                    .parametric_sample(parameter(start)?, parameter(interval)?, clock.provenance())
-                    .map(RebuiltClock::Triggered)
+            dae::ClockOperation::Periodic(schedule) => match clock.sample_event() {
+                None => target.scheduled(*schedule, clock.provenance()),
+                Some(dae::SampleEvent::Fixed) => {
+                    target.sample_event(*schedule, None, clock.provenance())
+                }
+                Some(dae::SampleEvent::Tunable { start, interval }) => target.sample_event(
+                    *schedule,
+                    Some((
+                        rebuilt_parameter(variables, start, clock)?,
+                        rebuilt_parameter(variables, interval, clock)?,
+                    )),
+                    clock.provenance(),
+                ),
             }
+            .map(RebuiltClock::Periodic),
+            dae::ClockOperation::ParametricSample { start, interval } => target
+                .parametric_sample(
+                    rebuilt_parameter(variables, start, clock)?,
+                    rebuilt_parameter(variables, interval, clock)?,
+                    clock.provenance(),
+                )
+                .map(RebuiltClock::Triggered),
             dae::ClockOperation::Triggered(condition) => target
                 .triggered(conditions[condition.index() as usize], clock.provenance())
                 .map(RebuiltClock::Triggered),
@@ -95,6 +101,21 @@ pub(super) fn rebuild_clocks<'target>(
         rebuild_clock_ownership(source, target, variables, &clocks, index)?;
     }
     Ok(clocks)
+}
+
+/// The rebuilt identity of a `sample(start, interval)` operand parameter.
+fn rebuilt_parameter<'target>(
+    variables: &[ReservedVariable<'target>],
+    id: dae::ParameterId<'_>,
+    clock: dae::ClockView<'_>,
+) -> Result<dae::ParameterId<'target>, dae::DaeConstructionError> {
+    match variables[id.index() as usize].identity {
+        TargetVariable::Parameter(parameter) => Ok(parameter),
+        _ => Err(dae::DaeConstructionError::InvalidClockedOperand {
+            operator: "sample(start, interval) parameter",
+            span: clock.provenance().span(),
+        }),
+    }
 }
 
 fn rebuild_clock_ownership<'target>(

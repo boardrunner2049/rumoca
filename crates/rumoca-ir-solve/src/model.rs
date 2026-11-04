@@ -892,6 +892,11 @@ pub struct DiscreteSolveSystem {
     /// replays them and never reconstructs dependency liveness.
     #[serde(default)]
     pub clock_partition_intermediate_clocks: Vec<Vec<PeriodicClockId>>,
+    /// Exact consumer clock domains for each
+    /// [`ClockPartitionStep::AlgebraicRefresh`], by its `index`; the refresh
+    /// runs iff at least one domain in its non-empty set ticks.
+    #[serde(default)]
+    pub clock_partition_refresh_clocks: Vec<Vec<PeriodicClockId>>,
 }
 
 /// One issued step of the SOLVE-C57 clock-partition same-tick schedule.
@@ -915,6 +920,12 @@ pub enum ClockPartitionStep {
     /// Refresh one [`DiscreteSolveSystem::clock_partition_intermediates`] row
     /// into private work state (never committed by the discrete pass).
     Intermediate { row: usize },
+    /// Re-solve the continuous algebraic coordinates into private work state
+    /// from the values the earlier steps issued, for a later producer that
+    /// reads a coordinate no single exact definition determines (MLS §8.6).
+    /// `index` names its consumer clocks in
+    /// [`DiscreteSolveSystem::clock_partition_refresh_clocks`].
+    AlgebraicRefresh { index: usize },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1179,12 +1190,27 @@ pub struct SolveClockPartition {
 pub struct ParametricSampleSlots {
     pub start: usize,
     pub interval: usize,
+    /// The schedule's [`PeriodicEventSchedule`] is the exact lattice of the
+    /// operands' translation-time values (an operand reads a tunable
+    /// parameter): an executor that cannot re-read the slots after
+    /// initialization ticks on it, one that can ticks on the slots' values.
+    #[serde(default)]
+    pub nominal: bool,
 }
 
 impl SolveClockPartition {
     /// Whether a schedule's instants are fixed only at initialization.
     pub fn has_parametric_samples(&self) -> bool {
         self.parametric_samples.iter().any(Option::is_some)
+    }
+
+    /// Whether a schedule has no translation-time lattice at all, so an
+    /// executor that does not read its slots at initialization must refuse it.
+    pub fn has_unscheduled_parametric_samples(&self) -> bool {
+        self.parametric_samples
+            .iter()
+            .flatten()
+            .any(|slots| !slots.nominal)
     }
 
     /// The parameter slots of schedule `index` when it is parametric.

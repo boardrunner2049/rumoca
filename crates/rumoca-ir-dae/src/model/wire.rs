@@ -1747,9 +1747,25 @@ fn reconstruct_clocks<'dae>(
 ) -> Result<(), DaeConstructionError> {
     for (index, clock) in wire.clocks.iter().enumerate() {
         let id = dae.clocks(|clocks| match clock.kind {
-            ClockKindWire::Periodic(schedule) => clocks
-                .scheduled(schedule.checked(clock.provenance)?, clock.provenance)
-                .map(WireClockId::Periodic),
+            ClockKindWire::Periodic(schedule) => {
+                let schedule = schedule.checked(clock.provenance)?;
+                let parameter = |raw: u32| {
+                    mapped(&ids.variables, raw, "variable", clock.provenance)
+                        .map(|variable| ParameterId::from_raw(variable.index()))
+                };
+                match clock.sample_event {
+                    None => clocks.scheduled(schedule, clock.provenance),
+                    Some(SampleEventWire::Fixed) => {
+                        clocks.sample_event(schedule, None, clock.provenance)
+                    }
+                    Some(SampleEventWire::Tunable { start, interval }) => clocks.sample_event(
+                        schedule,
+                        Some((parameter(start)?, parameter(interval)?)),
+                        clock.provenance,
+                    ),
+                }
+                .map(WireClockId::Periodic)
+            }
             ClockKindWire::ParametricSample { start, interval } => clocks
                 .parametric_sample(
                     ParameterId::from_raw(

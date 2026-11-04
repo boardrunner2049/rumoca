@@ -18,7 +18,12 @@ impl Shift for RbcClock {
                 start.shift(m)?;
                 interval.shift(m)?;
             }
-            RbcClockNode::Periodic { .. } => {}
+            RbcClockNode::Periodic { sample_event, .. } => {
+                if let Some(RbcSampleEvent::Tunable { start, interval }) = sample_event {
+                    start.shift(m)?;
+                    interval.shift(m)?;
+                }
+            }
         }
         Ok(())
     }

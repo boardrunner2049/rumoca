@@ -130,6 +130,7 @@ mod temporal;
 
 pub use clocks::{
     ClockOperation, ClockOwnershipView, ClockTransferKind, ClockView, ClockedVariableKind, Clocks,
+    SampleEvent,
 };
 pub use conditions::{
     ConditionInput, ConditionOperation, ConditionView, Conditions, RelationView, RootView,

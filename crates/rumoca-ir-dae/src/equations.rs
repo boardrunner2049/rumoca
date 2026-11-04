@@ -815,6 +815,16 @@ fn expect_clock_owned_discrete_reals(
     let Some(clock) = condition_owner_clock(storage, guard, owner)? else {
         return Ok(());
     };
+    // MLS §3.7.5: the body of `when sample(start, interval)` is an ordinary
+    // event-style `when` clause, not an MLS §16 clock partition, so it reads
+    // any variable's value at the event (SPEC_0040 DAE-C07).
+    if storage
+        .clocks
+        .get(clock as usize)
+        .is_some_and(crate::clocks::ClockEntry::is_sample_event)
+    {
+        return Ok(());
+    }
     let mut pending = vec![residual];
     let mut visited = std::collections::BTreeSet::new();
     while let Some(expression) = pending.pop() {

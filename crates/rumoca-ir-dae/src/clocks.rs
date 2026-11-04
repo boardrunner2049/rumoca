@@ -64,7 +64,44 @@ pub(crate) enum ClockKind {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClockEntry {
     pub(crate) kind: ClockKind,
+    /// Set on a periodic clock that is an MLS §3.7.5 `sample(start,
+    /// interval)` time event rather than an MLS §16 clock.
+    pub(crate) sample_event: Option<SampleEventEntry>,
     pub(crate) provenance: DaeProvenance,
+}
+
+impl ClockEntry {
+    /// Whether this clock is an MLS §3.7.5 `sample(start, interval)` time
+    /// event: its `when` bodies are event-style, not a synchronous partition.
+    pub(crate) const fn is_sample_event(&self) -> bool {
+        self.sample_event.is_some() || matches!(self.kind, ClockKind::ParametricSample { .. })
+    }
+}
+
+/// The MLS §3.7.5 origin of a periodic clock (SPEC_0044 ME-EVENT-010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SampleEventEntry {
+    /// Both operands are fixed at translation.
+    Fixed,
+    /// An operand reads a tunable parameter: the lattice is the operands'
+    /// translation-time value, and these generated Real parameters, bound to
+    /// the operands, hold the start and interval initialization settles.
+    Tunable { start: u32, interval: u32 },
+}
+
+/// The MLS §3.7.5 origin of a periodic clock, as its view reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleEvent<'dae> {
+    /// Both operands are fixed at translation.
+    Fixed,
+    /// An operand reads a tunable parameter; the schedule an executor that
+    /// sets parameters before initialization ticks on is these parameters'
+    /// initialization values, the lattice their translation-time ones.
+    Tunable {
+        start: ParameterId<'dae>,
+        interval: ParameterId<'dae>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -107,12 +144,19 @@ pub enum ClockOperation<'dae> {
 #[derive(Debug, Clone, Copy)]
 pub struct ClockView<'dae> {
     pub(crate) operation: ClockOperation<'dae>,
+    pub(crate) sample_event: Option<SampleEvent<'dae>>,
     pub(crate) provenance: DaeProvenance,
 }
 
 impl<'dae> ClockView<'dae> {
     pub const fn operation(self) -> ClockOperation<'dae> {
         self.operation
+    }
+
+    /// The MLS §3.7.5 origin of a [`ClockOperation::Periodic`] clock that is a
+    /// `sample(start, interval)` time event; `None` for an MLS §16 clock.
+    pub const fn sample_event(self) -> Option<SampleEvent<'dae>> {
+        self.sample_event
     }
 
     pub const fn provenance(self) -> DaeProvenance {
@@ -201,6 +245,48 @@ impl<'dae> Clocks<'_, 'dae> {
             .map(|clock| PeriodicClockId::from_raw(clock.index()))
     }
 
+    /// The MLS §3.7.5 `sample(start, interval)` time event on an exact
+    /// schedule. `operands`, when an operand reads a tunable parameter, are
+    /// the generated Real parameters bound to the start and interval; the
+    /// schedule is then their translation-time value.
+    pub fn sample_event(
+        &mut self,
+        schedule: PeriodicClockSchedule,
+        operands: Option<(ParameterId<'dae>, ParameterId<'dae>)>,
+        provenance: DaeProvenance,
+    ) -> Result<PeriodicClockId<'dae>, DaeConstructionError> {
+        let sample_event = match operands {
+            None => SampleEventEntry::Fixed,
+            Some((start, interval)) => {
+                self.expect_parameters([start, interval], provenance)?;
+                SampleEventEntry::Tunable {
+                    start: start.index(),
+                    interval: interval.index(),
+                }
+            }
+        };
+        let clock = self.scheduled(schedule, provenance)?;
+        self.storage.clocks[clock.index() as usize].sample_event = Some(sample_event);
+        Ok(clock)
+    }
+
+    fn expect_parameters(
+        &self,
+        parameters: [ParameterId<'dae>; 2],
+        provenance: DaeProvenance,
+    ) -> Result<(), DaeConstructionError> {
+        for parameter in parameters {
+            let entry = self.storage.variable(parameter.index(), provenance)?;
+            if entry.role != VariableRole::Parameter {
+                return Err(DaeConstructionError::InvalidVariableRole {
+                    name: entry.name.clone(),
+                    span: provenance.span(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The MLS §3.7.5 `sample(start, interval)` time event whose start and
     /// interval are the initialization values of two Real parameters.
     pub fn parametric_sample(
@@ -210,15 +296,7 @@ impl<'dae> Clocks<'_, 'dae> {
         provenance: DaeProvenance,
     ) -> Result<ClockId<'dae>, DaeConstructionError> {
         check_provenance(self.source_map, provenance)?;
-        for parameter in [start.index(), interval.index()] {
-            let entry = self.storage.variable(parameter, provenance)?;
-            if entry.role != VariableRole::Parameter {
-                return Err(DaeConstructionError::InvalidVariableRole {
-                    name: entry.name.clone(),
-                    span: provenance.span(),
-                });
-            }
-        }
+        self.expect_parameters([start, interval], provenance)?;
         self.insert(
             ClockKind::ParametricSample {
                 start: start.index(),
@@ -347,7 +425,11 @@ impl<'dae> Clocks<'_, 'dae> {
     ) -> Result<ClockId<'dae>, DaeConstructionError> {
         check_provenance(self.source_map, provenance)?;
         let raw = checked_u32(self.storage.clocks.len(), "clock arena", provenance)?;
-        self.storage.clocks.push(ClockEntry { kind, provenance });
+        self.storage.clocks.push(ClockEntry {
+            kind,
+            sample_event: None,
+            provenance,
+        });
         Ok(ClockId::from_raw(raw))
     }
 

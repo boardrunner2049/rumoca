@@ -23,6 +23,13 @@ pub(super) fn export_clocks(view: dae::DaeView<'_>, ctx: &mut Ctx<'_>) -> Vec<Rb
                             RbcClockAnchor::SimulationStart
                         }
                     },
+                    sample_event: clock.sample_event().map(|event| match event {
+                        dae::SampleEvent::Fixed => RbcSampleEvent::Fixed,
+                        dae::SampleEvent::Tunable { start, interval } => RbcSampleEvent::Tunable {
+                            start: VariableId(start.index()),
+                            interval: VariableId(interval.index()),
+                        },
+                    }),
                 },
                 dae::ClockOperation::ParametricSample { start, interval } => {
                     RbcClockNode::ParametricSample {

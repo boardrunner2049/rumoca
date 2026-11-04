@@ -165,7 +165,9 @@ pub(crate) use construction_checks::{
 /// exported causality.
 /// 43 marks a B.1c owner whose targets are unread observations of a
 /// continuous-time definition, evaluated at every output point.
-pub const DAE_SCHEMA_VERSION: u16 = 43;
+/// 44 records each periodic clock's MLS §3.7.5 `sample(start, interval)`
+/// origin, with the generated operand parameters of a tunable one.
+pub const DAE_SCHEMA_VERSION: u16 = 44;
 
 pub use domains::Domains;
 pub(crate) use domains::insert_domain;

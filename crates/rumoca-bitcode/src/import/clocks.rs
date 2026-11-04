@@ -29,6 +29,7 @@ pub(super) fn rebuild<'dae>(
                 period,
                 phase,
                 anchor,
+                sample_event,
             } => {
                 let lattice = ClockLattice::new(rational(period, ctx)?, rational(phase, ctx)?)
                     .map_err(|error| ctx.unsupported(error.to_string()))?;
@@ -39,9 +40,22 @@ pub(super) fn rebuild<'dae>(
                     }
                 }
                 .map_err(|error| ctx.unsupported(error.to_string()))?;
-                owner
-                    .scheduled(schedule, at)
-                    .map(|id| (id.into(), Some(id)))
+                let parameter = |id: &VariableId| match resolve(variables, id.0, "variable", ctx)? {
+                    VariableSlot::Parameter(parameter) => Ok(parameter),
+                    _ => {
+                        Err(ctx.unsupported("a sample(start, interval) operand is not a parameter"))
+                    }
+                };
+                match sample_event {
+                    None => owner.scheduled(schedule, at),
+                    Some(RbcSampleEvent::Fixed) => owner.sample_event(schedule, None, at),
+                    Some(RbcSampleEvent::Tunable { start, interval }) => owner.sample_event(
+                        schedule,
+                        Some((parameter(start)?, parameter(interval)?)),
+                        at,
+                    ),
+                }
+                .map(|id| (id.into(), Some(id)))
             }
             RbcClockNode::Shifted {
                 base,
