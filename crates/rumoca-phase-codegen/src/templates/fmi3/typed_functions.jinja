@@ -11,6 +11,18 @@
 if ({{ name }}((const void*[]){ {% for input in inputs %}r{{ input }},{% else %}NULL{% endfor %} }, (void*[]){ {% for output in outputs %}r{{ output }},{% else %}NULL{% endfor %} })) return 1;
 {% endmacro %}
 
+{#- A cataloged MSL random generator, `ModelicaRandom_<generator>(stateIn,
+    stateOut, result)`: the Modelica Integer state passes as C `int` words
+    (MLS §12.9.1.1), the draw comes back through a pointer. -#}
+{%- macro external(op, program) -%}
+{% set n = program.register_types[op.arguments[0]].scalar_count -%}
+{ int rmc_in[{{ n }}]; int rmc_out[{{ n }}]; double rmc_draw;
+for (size_t k=0; k<{{ n }}; ++k) rmc_in[k]=(int)r{{ op.arguments[0] }}[k];
+ModelicaRandom_{{ op.function }}(rmc_in, rmc_out, &rmc_draw);
+r{{ op.destinations[0] }}[0]=rmc_draw;
+for (size_t k=0; k<{{ n }}; ++k) r{{ op.destinations[1] }}[k]=(int64_t)rmc_out[k]; }
+{% endmacro %}
+
 {%- macro operation(op, program, region_name, prefix="rumoca_pure_") -%}
 {% if op.operation in ["constant", "unary", "binary", "compare", "convert"] -%}
 {{ arithmetic(op, program) -}}
@@ -25,6 +37,8 @@ if (r{{ op.condition }}[0]) { {{ call(region_name ~ "_true", op.captures, op.des
 else { {{ call(region_name ~ "_false", op.captures, op.destinations)|trim }} }
 {% elif op.operation == "call" -%}
 {{ call(prefix ~ op.owner, op.arguments, op.destinations) -}}
+{% elif op.operation == "external" -%}
+{{ external(op, program) -}}
 {% elif op.operation == "map" -%}
 { size_t cursor=0;
 {% for binder in op.domain.binders -%}

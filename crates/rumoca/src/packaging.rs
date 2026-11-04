@@ -310,7 +310,8 @@ pub fn render_web(
     let mut digests: HashMap<(String, ChecksumAlgorithm), String> = HashMap::new();
     // Render into `order` positions but return in declaration order, so the
     // in-memory caller sees files in the same order the `target.toml` declares
-    // them (`render_target_files` asserts a 1:1 file-count match).
+    // them. A file whose path renders empty is not part of this product and
+    // leaves no entry.
     let mut rendered: Vec<Option<(String, Vec<u8>)>> = (0..files.len()).map(|_| None).collect();
     for &index in &order {
         let file = &files[index];
@@ -335,6 +336,11 @@ pub fn render_web(
             .with_context(|| format!("Render target output path '{}'", file.path))?
             .trim()
             .to_string();
+        // A path that renders empty names no product file: the target ships
+        // this file only for some models (e.g. external C sources).
+        if path.is_empty() {
+            continue;
+        }
         let bytes = render(&file.template, &context)
             .with_context(|| format!("Render target template '{}'", file.template))?
             .into_bytes();
@@ -356,10 +362,7 @@ pub fn render_web(
         rendered[index] = Some((path, bytes));
     }
 
-    Ok(rendered
-        .into_iter()
-        .map(|entry| entry.expect("every file rendered exactly once in topological order"))
-        .collect())
+    Ok(rendered.into_iter().flatten().collect())
 }
 
 /// SHA-1 digest of exact artifact bytes as lowercase hexadecimal.

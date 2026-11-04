@@ -1,6 +1,7 @@
 mod construction_checks;
 mod domains;
 mod evaluable;
+mod external_catalog;
 mod external_functions;
 mod function_checks;
 mod function_conditionals;
@@ -168,6 +169,7 @@ pub const DAE_SCHEMA_VERSION: u16 = 43;
 
 pub use domains::Domains;
 pub(crate) use domains::insert_domain;
+pub use external_catalog::{CatalogExternal, catalog_external};
 use external_functions::build_external_body;
 pub use external_functions::{
     ExternalArgument, ExternalFunctionBody, ExternalLanguage, ExternalLinkage, FunctionPurity,

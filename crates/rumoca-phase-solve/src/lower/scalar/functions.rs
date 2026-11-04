@@ -4126,6 +4126,16 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         Ok(scheduled)
     }
 
+    /// Whether a call of `function` reaches an external body, which only a
+    /// typed pure-call owner can invoke.
+    fn reaches_external_body(&mut self, function: dae::FunctionId<'dae>) -> bool {
+        let view = self.view;
+        *self
+            .external_reach
+            .entry(function)
+            .or_insert_with(|| crate::lower::typed_functions::reaches_external_body(view, function))
+    }
+
     pub(super) fn emit_typed_pure_call(
         &mut self,
         call: dae::ExprId<'dae>,
@@ -4168,6 +4178,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         if self.active_clock.is_none()
             && !self.call_action_compilation
             && registered.site.directional().is_none()
+            && !self.reaches_external_body(function)
         {
             return Ok(None);
         }

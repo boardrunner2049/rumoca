@@ -92,6 +92,20 @@ impl PureCallFamilies {
         Value::from_serialize(&self.symbols)
     }
 
+    /// `{ modelica_random: bool }`: whether an emitted body invokes a
+    /// cataloged MLS §12.9 external function whose C source ships with the
+    /// component (`ModelicaRandom.c`, library `ModelicaExternalC`).
+    pub(super) fn external_c_value(&self) -> Value {
+        let mut functions = Vec::new();
+        for owner in self.owners.iter().chain(&self.directional) {
+            collect_external_functions(owner, &mut functions);
+        }
+        let modelica_random = functions
+            .iter()
+            .any(|function| function.c_source() == "ModelicaRandom.c");
+        Value::from_serialize(serde_json::json!({ "modelica_random": modelica_random }))
+    }
+
     #[cfg(test)]
     pub(super) fn symbols(&self) -> &[u32] {
         &self.symbols
@@ -221,6 +235,28 @@ fn rename_calls(
             .iter_mut()
             .try_for_each(|value| rename_calls(value, rename)),
         _ => Ok(()),
+    }
+}
+
+/// Every cataloged external function an `external` operation names.
+fn collect_external_functions(json: &Json, out: &mut Vec<solve::SolveExternalFunction>) {
+    match json {
+        Json::Object(fields) => {
+            if fields.get("operation").and_then(Json::as_str) == Some("external")
+                && let Some(function) = fields
+                    .get("function")
+                    .and_then(|function| serde_json::from_value(function.clone()).ok())
+            {
+                out.push(function);
+            }
+            fields
+                .values()
+                .for_each(|value| collect_external_functions(value, out));
+        }
+        Json::Array(items) => items
+            .iter()
+            .for_each(|value| collect_external_functions(value, out)),
+        _ => {}
     }
 }
 

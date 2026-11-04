@@ -887,6 +887,14 @@ impl ProgramLowerer<'_, '_> {
                 matrix,
                 rhs,
             } => self.lower_linear_solve(*destination, *matrix, *rhs),
+            // A cataloged external body runs in the typed-program interpreter;
+            // the JIT declines the whole table rather than call foreign code.
+            solve::SolveOperation::External { function, .. } => {
+                Err(CompileError::Backend(format!(
+                    "external function `{}` is executed by the typed-program interpreter",
+                    function.c_symbol()
+                )))
+            }
             solve::SolveOperation::Scale {
                 destination,
                 aggregate,

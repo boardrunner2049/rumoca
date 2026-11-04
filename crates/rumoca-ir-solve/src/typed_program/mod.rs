@@ -12,9 +12,9 @@ pub use call::{
 };
 pub use program::{
     ProgramRegister, ProgramSlot, ProgramTensorViewAxis, SolveBinaryOperator, SolveCompareOperator,
-    SolveConversionOperator, SolveOperation, SolveProgramConstructionError, SolveProgramRegion,
-    SolveReductionOperator, SolveRegisterId, SolveSlot, SolveSlotAccess, SolveSlotId,
-    SolveSpannedOperation, SolveStorageClass, SolveTensorViewAxis, SolveUnaryOperator,
+    SolveConversionOperator, SolveExternalFunction, SolveOperation, SolveProgramConstructionError,
+    SolveProgramRegion, SolveReductionOperator, SolveRegisterId, SolveSlot, SolveSlotAccess,
+    SolveSlotId, SolveSpannedOperation, SolveStorageClass, SolveTensorViewAxis, SolveUnaryOperator,
     TypedProgram, TypedProgramBuilder, promoted_concatenate_dimensions,
 };
 pub use types::{

@@ -25,9 +25,9 @@ residual_equations = false
 exact_algebraic_assignments = true
 algebraic_projection = true
 scalar_fallback = true
-external_functions = false
+external_functions = true
 external_tables = false
-random = false
+random = true
 initialization = false
 parameter_initialization = true
 events = false
@@ -84,3 +84,35 @@ template = "rmc_assign.c.jinja"
 [[files]]
 path = "sources/rmc_jacobian.c"
 template = "rmc_jacobian.c.jinja"
+
+# The MSL ModelicaExternalC sources a cataloged external C function needs
+# (MLS §12.9). A path that renders empty is not part of the product, so these
+# ship only with a model that calls one.
+
+[[files]]
+path = "{% if fmi_external_c is defined and fmi_external_c.modelica_random %}sources/ModelicaRandom.c{% endif %}"
+template = "msl_ModelicaRandom.c.jinja"
+
+[[files]]
+path = "{% if fmi_external_c is defined and fmi_external_c.modelica_random %}sources/ModelicaRandom.h{% endif %}"
+template = "msl_ModelicaRandom.h.jinja"
+
+[[files]]
+path = "{% if fmi_external_c is defined and fmi_external_c.modelica_random %}sources/ModelicaInternal.h{% endif %}"
+template = "msl_ModelicaInternal.h.jinja"
+
+[[files]]
+path = "{% if fmi_external_c is defined and fmi_external_c.modelica_random %}sources/ModelicaUtilities.h{% endif %}"
+template = "msl_ModelicaUtilities.h.jinja"
+
+[[files]]
+path = "{% if fmi_external_c is defined and fmi_external_c.modelica_random %}sources/gconstructor.h{% endif %}"
+template = "msl_gconstructor.h.jinja"
+
+[[files]]
+path = "{% if fmi_external_c is defined and fmi_external_c.modelica_random %}sources/rmc_modelica_external.c{% endif %}"
+template = "rmc_modelica_external.c.jinja"
+
+[[files]]
+path = "{% if fmi_external_c is defined and fmi_external_c.modelica_random %}documentation/licenses/ModelicaExternalC.txt{% endif %}"
+template = "msl_licenses.txt.jinja"

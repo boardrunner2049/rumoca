@@ -99,7 +99,7 @@ impl TypeChecker {
         let mut references = Vec::new();
         for subscript in &data.dims_expr {
             if let rumoca_ir_ast::Subscript::Expression(expr) = subscript {
-                collect_class_rooted_references(expr, &mut references);
+                collect_class_rooted_references(tree, expr, &mut references);
             }
         }
         let classes = references
@@ -132,8 +132,17 @@ fn scope_has_values(ctx: &rumoca_eval_ast::eval::TypeCheckEvalContext, prefix: &
 }
 
 /// `(first segment, its resolved declaration)` of every multi-segment
-/// component reference in a dimension expression.
-fn collect_class_rooted_references(expr: &Expression, out: &mut Vec<(String, DefId)>) {
+/// component reference in a dimension expression, followed by
+/// `(class path, its declaration)` of the deepest class the reference names
+/// before its member (`A.B.C` in `A.B.C.n`). Extraction from a class reaches
+/// one nested level, so a package constant several packages deep
+/// (`Modelica.Math.Random.Generators.Xorshift128plus.nState`) is only
+/// seeded through its own enclosing class (MLS §5.3.2, §10.1).
+fn collect_class_rooted_references(
+    tree: &ClassTree,
+    expr: &Expression,
+    out: &mut Vec<(String, DefId)>,
+) {
     match expr {
         Expression::ComponentReference(cr) => {
             if cr.parts.len() >= 2
@@ -141,17 +150,22 @@ fn collect_class_rooted_references(expr: &Expression, out: &mut Vec<(String, Def
                 && let Some(def_id) = first.def_id
             {
                 out.push((first.ident.text.to_string(), def_id));
+                if let Some(deepest) = deepest_named_class(tree, cr, def_id) {
+                    out.push(deepest);
+                }
             }
         }
         Expression::Binary { lhs, rhs, .. } => {
-            collect_class_rooted_references(lhs, out);
-            collect_class_rooted_references(rhs, out);
+            collect_class_rooted_references(tree, lhs, out);
+            collect_class_rooted_references(tree, rhs, out);
         }
-        Expression::Unary { rhs, .. } => collect_class_rooted_references(rhs, out),
-        Expression::Parenthesized { inner, .. } => collect_class_rooted_references(inner, out),
+        Expression::Unary { rhs, .. } => collect_class_rooted_references(tree, rhs, out),
+        Expression::Parenthesized { inner, .. } => {
+            collect_class_rooted_references(tree, inner, out)
+        }
         Expression::FunctionCall { args, .. } => {
             for arg in args {
-                collect_class_rooted_references(arg, out);
+                collect_class_rooted_references(tree, arg, out);
             }
         }
         Expression::If {
@@ -160,11 +174,36 @@ fn collect_class_rooted_references(expr: &Expression, out: &mut Vec<(String, Def
             ..
         } => {
             for (cond, value) in branches {
-                collect_class_rooted_references(cond, out);
-                collect_class_rooted_references(value, out);
+                collect_class_rooted_references(tree, cond, out);
+                collect_class_rooted_references(tree, value, out);
             }
-            collect_class_rooted_references(else_branch, out);
+            collect_class_rooted_references(tree, else_branch, out);
         }
         _ => {}
     }
+}
+
+/// The deepest nested class (below the first segment's class) that the
+/// non-final segments of `cr` name, as `(dotted path, declaration)`.
+fn deepest_named_class(
+    tree: &ClassTree,
+    cr: &rumoca_ir_ast::ComponentReference,
+    root: DefId,
+) -> Option<(String, DefId)> {
+    let mut class = tree.get_class_by_def_id(root)?;
+    let mut path = cr.parts.first()?.ident.text.to_string();
+    let mut deepest = None;
+    for part in &cr.parts[1..cr.parts.len() - 1] {
+        let name = part.ident.text.as_ref();
+        let Some(nested) = class.classes.get(name) else {
+            break;
+        };
+        let Some(def_id) = nested.def_id else {
+            break;
+        };
+        path = format!("{path}.{name}");
+        class = nested;
+        deepest = Some((path.clone(), def_id));
+    }
+    deepest
 }

@@ -2,9 +2,11 @@ mod construction_error;
 pub use construction_error::SolveProgramConstructionError;
 
 mod directional;
+mod external;
 mod linear_solve;
 mod tensor;
 
+pub use external::SolveExternalFunction;
 pub use tensor::promoted_concatenate_dimensions;
 pub(in crate::typed_program) mod wire;
 
@@ -387,6 +389,13 @@ pub enum SolveOperation {
         matrix: SolveRegisterId,
         rhs: SolveRegisterId,
     },
+    /// One invocation of a cataloged MLS §12.9 external function. The
+    /// destinations are its results in Modelica output order.
+    External {
+        function: SolveExternalFunction,
+        arguments: Box<[SolveRegisterId]>,
+        destinations: Box<[SolveRegisterId]>,
+    },
 }
 
 impl SolveOperation {
@@ -485,7 +494,9 @@ impl SolveOperation {
                 visit(*value);
                 visit_view_axis_registers(axes, &mut visit);
             }
-            Self::Call { arguments, .. } => arguments.iter().copied().for_each(&mut visit),
+            Self::Call { arguments, .. } | Self::External { arguments, .. } => {
+                arguments.iter().copied().for_each(&mut visit);
+            }
         }
     }
 
@@ -523,7 +534,8 @@ impl SolveOperation {
             | Self::UpdateView { destination, .. } => visit(*destination),
             Self::Conditional { destinations, .. }
             | Self::Fold { destinations, .. }
-            | Self::Call { destinations, .. } => {
+            | Self::Call { destinations, .. }
+            | Self::External { destinations, .. } => {
                 destinations.iter().copied().for_each(&mut visit);
             }
         }

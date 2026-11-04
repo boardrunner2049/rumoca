@@ -130,6 +130,8 @@ fn program_supports_directional(
                 ..
             } => false,
             SolveOperation::Call { owner, .. } => available.get(owner.index() as usize).is_some(),
+            // A foreign body has no derivative the program could state.
+            SolveOperation::External { .. } => false,
             SolveOperation::Conditional {
                 if_true, if_false, ..
             } => {
@@ -708,6 +710,9 @@ impl<'primal, 'program> DirectionalBuilder<'primal, 'program> {
                 arguments,
                 destinations,
             } => self.derive_call(*owner, arguments, destinations, provenance),
+            SolveOperation::External { .. } => {
+                Err(SolveProgramConstructionError::InvalidCallInterface { provenance })
+            }
         }
     }
 

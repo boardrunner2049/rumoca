@@ -26,6 +26,8 @@ The FMI 2 target shares the FMI 3 C kernel and profile: see the Unsupported
 section of the `fmi3` target. Integer and enumeration ordinals export as
 Integer, Boolean as Boolean, and String parameters and constants as String. It
 does not advertise state serialization or derivatives it does not implement.
+A component that calls a cataloged external C function (SPEC_0044 ME-EXT-001)
+lists the shipped MSL source in both `SourceFiles` lists.
 
 ## Verification
 

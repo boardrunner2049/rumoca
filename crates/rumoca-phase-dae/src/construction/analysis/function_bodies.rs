@@ -1695,14 +1695,27 @@ fn resolve_fold_iteration(
             (
                 rumoca_core::Statement::FunctionCall { args, span, .. },
                 FunctionStatementPlan::MultiOutputCall { outputs },
-            ) => {
-                resolve_multi_output_definitions(args, *span, outputs, context, definitions)?;
-            }
+            ) => resolve_fold_multi_output(args, *span, outputs, context, definitions)?,
             _ => unreachable!("analysis admits only checked transition statements in a fold"),
         }
         index += 1;
     }
     Ok(())
+}
+
+/// A whole receiver first defined inside the loop is carried like an
+/// assigned one: it needs the dead initial slot.
+fn resolve_fold_multi_output(
+    arguments: &[Expression],
+    span: Span,
+    outputs: &mut [Option<FunctionAssignmentPlan>],
+    context: FunctionValidationContext<'_>,
+    definitions: &mut FunctionDefinitions,
+) -> Result<(), ToDaeError> {
+    for plan in outputs.iter_mut().flatten().filter(|plan| plan.is_whole()) {
+        seed_undefined_whole_loop_value(plan, context, definitions, span)?;
+    }
+    resolve_multi_output_definitions(arguments, span, outputs, context, definitions)
 }
 
 fn resolve_fold_record_assembly(

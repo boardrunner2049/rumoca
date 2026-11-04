@@ -66,10 +66,16 @@ fn register_call_body<'dae>(
     let function = view
         .function(function)
         .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-    if function.is_external() {
-        return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-            provenance: call_node.provenance().span(),
-        });
+    if let Some(external) = function.external() {
+        return super::external_calls::register_external_body(
+            table,
+            view,
+            function,
+            external,
+            identity,
+            arithmetic,
+            call_node.provenance().span(),
+        );
     }
     let assertions = assertion_conditions(view, function)?;
     let conditional_groups = conditional_definition_groups(function.statements())?;

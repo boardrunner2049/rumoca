@@ -982,7 +982,39 @@ fn static_subscript_indices(
         }
         return Some(indices);
     }
+    if let Expression::ArrayComprehension {
+        expr,
+        indices,
+        filter: None,
+        ..
+    } = expression
+        && let [index] = indices.as_slice()
+    {
+        return comprehension_subscript_indices(expr, index, context);
+    }
     settled_subscript_integer(expression, context).map(|index| vec![index])
+}
+
+/// The indices of a one-binder comprehension subscript, such as the
+/// `{(i - 2) + (k - 1) for k in 1:2}` an affine slice `x[i-2:i-1]` is
+/// rewritten to, when its range and every element settle (MLS §10.4.2).
+fn comprehension_subscript_indices(
+    element: &Expression,
+    index: &rumoca_core::ComprehensionIndex,
+    context: FunctionValidationContext<'_>,
+) -> Option<Vec<i64>> {
+    let binder = VarName::new(&index.name);
+    let mut integers = context.static_integers.clone();
+    let mut selected = Vec::new();
+    for value in static_subscript_indices(&index.range, context)? {
+        integers.insert(binder.clone(), value);
+        let point = FunctionValidationContext {
+            static_integers: &integers,
+            ..context
+        };
+        selected.push(settled_subscript_integer(element, point)?);
+    }
+    Some(selected)
 }
 
 fn settled_subscript_integer(

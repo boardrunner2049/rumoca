@@ -14,6 +14,10 @@
       <File name="rmc_functions.c"/>
       <File name="rmc_assign.c"/>
       <File name="rmc_jacobian.c"/>
+{%- if fmi_external_c.modelica_random %}
+      <File name="ModelicaRandom.c"/>
+      <File name="rmc_modelica_external.c"/>
+{%- endif %}
     </SourceFiles>
   </ModelExchange>
   <CoSimulation modelIdentifier="{{ model_identifier }}" canHandleVariableCommunicationStepSize="true">
@@ -24,6 +28,10 @@
       <File name="rmc_functions.c"/>
       <File name="rmc_assign.c"/>
       <File name="rmc_jacobian.c"/>
+{%- if fmi_external_c.modelica_random %}
+      <File name="ModelicaRandom.c"/>
+      <File name="rmc_modelica_external.c"/>
+{%- endif %}
     </SourceFiles>
   </CoSimulation>
   <UnitDefinitions>

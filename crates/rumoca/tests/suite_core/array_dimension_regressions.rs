@@ -411,3 +411,34 @@ end C;
     let s = initial_value(FIXTURE, "C.M", "src.s");
     assert!((s - 3.0).abs() < 1e-9, "s = {s}");
 }
+
+/// A dimension naming a package constant several packages deep
+/// (`Modelica.Math.Random.Generators.Xorshift128plus.nState` in the MSL random
+/// generators) while another constant of the same root package is already
+/// known: the deepest named class is seeded, not only the root, whose
+/// extraction reaches one nested level (MLS §5.3.2, §10.1; ET004 before).
+#[test]
+fn dimension_reads_a_constant_several_packages_deep() {
+    const FIXTURE: &str = "\
+package P
+  constant Integer m = 2;
+  package A
+    package B
+      package C
+        constant Integer n = 3;
+      end C;
+    end B;
+  end A;
+end P;
+model Deep
+  Real y[P.m];
+  Real x[P.A.B.C.n];
+  Real total = sum(x) + sum(y);
+equation
+  y = ones(P.m);
+  x = {1, 2, 3};
+end Deep;
+";
+    let total = initial_value(FIXTURE, "Deep", "total");
+    assert!((total - 8.0).abs() < 1e-12, "total = {total}");
+}

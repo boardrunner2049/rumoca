@@ -3,7 +3,7 @@
 use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
 
-/// Whether the checked DAE carries any MLS §12.9 external function interface.
+/// The first MLS §12.9 external function interface of the checked DAE.
 ///
 /// SEV-155: this probe used to return a hard-coded `false`, so the
 /// `external_functions == Some(false)` gate in
@@ -23,19 +23,55 @@ use rumoca_ir_solve as solve;
 /// what licenses `FunctionView::is_external` to assert it rather than this
 /// caller re-deciding it.
 ///
-/// SEV-156 keeps the reject arm total: there is no invoke/effect grammar for an
-/// external call yet, so every external function must reject at the capability
-/// boundary.
-pub(super) fn dae_has_external_functions(model: &dae::Dae) -> bool {
+/// SEV-156: the Solve typed program invokes only the cataloged external
+/// functions (`SolveOperation::External`, `rumoca_core::ModelicaExternalFunction`),
+/// so a target declaring `external_functions = false` rejects every external
+/// function, and the FMI C profile, which declares it supported, still rejects
+/// each external it cannot link ([`fmi_c_cannot_link`]).
+///
+/// The probe names the first such function (`external <language> function
+/// `<name>` calls `<symbol>``) among those `admit` selects, so a refusal says
+/// which declaration it refuses.
+pub(super) fn first_external_function(
+    model: &dae::Dae,
+    admit: impl for<'dae> Fn(dae::DaeView<'dae>, dae::FunctionView<'dae>) -> bool,
+) -> Option<String> {
     model.inspect(|view| {
-        (0..view.function_count()).any(|index| {
+        (0..view.function_count()).find_map(|index| {
             let id = view
                 .function_id(index)
                 .expect("dense checked function identity resolves");
             let function = view.function(id).expect("checked function resolves");
-            function.is_external()
+            let external = function.external()?;
+            admit(view, function).then(|| {
+                format!(
+                    "external {} function `{}` calls `{}`",
+                    external.language().as_str(),
+                    function.name(),
+                    external.symbol()
+                )
+            })
         })
     })
+}
+
+/// Whether the FMI C profile cannot link `function`'s external body: it
+/// links the C math library functions the elementary builtins name (whose
+/// calls lower as those builtins) and the cataloged MSL `ModelicaExternalC`
+/// functions it ships the sources of ([`dae::catalog_external`]).
+pub(super) fn fmi_c_cannot_link<'dae>(
+    view: dae::DaeView<'dae>,
+    function: dae::FunctionView<'dae>,
+) -> bool {
+    let Some(external) = function.external() else {
+        return false;
+    };
+    let elementary = matches!(
+        external.language(),
+        dae::ExternalLanguage::Builtin | dae::ExternalLanguage::C
+    ) && rumoca_core::elementary_math_builtin(external.symbol().as_str())
+        .is_some();
+    !elementary && dae::catalog_external(view, function).is_none()
 }
 
 pub(super) fn dae_uses_external_tables(model: &dae::Dae) -> bool {

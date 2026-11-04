@@ -169,8 +169,8 @@ pub use ids::{
 };
 pub use model::initial_parameters::InitialParameterValueView;
 pub use model::{
-    ContinuousOwnerView, CoordinateView, DAE_SCHEMA_VERSION, Dae, DaeConstruction, DaeView,
-    DeclaredCausality, DomainView, Domains, ExpressionKind, ExpressionOperands,
+    CatalogExternal, ContinuousOwnerView, CoordinateView, DAE_SCHEMA_VERSION, Dae, DaeConstruction,
+    DaeView, DeclaredCausality, DomainView, Domains, ExpressionKind, ExpressionOperands,
     ExpressionOperation, ExpressionView, ExternalArgument, ExternalArgumentView,
     ExternalFunctionBody, ExternalFunctionView, ExternalLanguage, ExternalLinkage, FunctionBody,
     FunctionConditionalView, FunctionDefinitionValues, FunctionDefinitionView,
@@ -182,7 +182,7 @@ pub use model::{
     RuntimeQuotientOwnerView, StringConversionFormatView, StructuredFamilyView, SubscriptView,
     SubscriptsView, ValueTypeOperands, ValueTypes, VariableAttributes, VariableCausality,
     VariableIdentity, VariableOrigin, VariableReservation, VariableRole, VariableView, Variables,
-    broadcast_scalar_values,
+    broadcast_scalar_values, catalog_external,
 };
 pub use model_event_transactions::{
     ModelEventDefinition, ModelEventDefinitionView, ModelEventStep, ModelEventStepView,

@@ -111,6 +111,9 @@ pub(crate) fn invalidate_target_output(
 
     for file in &manifest.files {
         let path = render_builtin_output_path(&file.path, &identity.artifact_stem)?;
+        if path.trim().is_empty() {
+            continue;
+        }
         invalidate_output_file(&safe_target_join(&out_dir, path.trim())?)?;
     }
     Ok(())
@@ -426,6 +429,10 @@ fn render_manifest_files(
         let path = renderer
             .render(result, &file.path, model_identifier)
             .with_context(|| format!("Render target output path '{}'", file.path))?;
+        // A path that renders empty names no product file for this model.
+        if path.trim().is_empty() {
+            continue;
+        }
         let template = bundle.template_source(&file.template)?;
         let content =
             render_manifest_template(result, renderer, template.as_ref(), model_identifier)

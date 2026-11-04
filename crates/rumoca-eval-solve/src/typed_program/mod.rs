@@ -1,3 +1,4 @@
+mod external;
 mod linear_solve;
 mod number;
 mod tensor;
@@ -689,6 +690,11 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
                 arguments,
                 destinations,
             } => self.eval_call(*owner, arguments, destinations, provenance),
+            SolveOperation::External {
+                function,
+                arguments,
+                destinations,
+            } => self.eval_external(*function, arguments, destinations, provenance),
         }
     }
 

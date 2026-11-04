@@ -9,6 +9,10 @@
       <SourceFile name="rmc_functions.c"/>
       <SourceFile name="rmc_assign.c"/>
       <SourceFile name="rmc_jacobian.c"/>
+{%- if fmi_external_c.modelica_random %}
+      <SourceFile name="ModelicaRandom.c"/>
+      <SourceFile name="rmc_modelica_external.c"/>
+{%- endif %}
       <PreprocessorDefinition name="FMI3_OVERRIDE_FUNCTION_PREFIX" value="1" description="Export the unprefixed FMI 3 shared-library ABI"/>
     </SourceFileSet>
   </BuildConfiguration>

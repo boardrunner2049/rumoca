@@ -1358,7 +1358,7 @@ clocks = false
     );
 }
 
-/// The invariant that licenses `dae_has_external_functions` to `expect` its
+/// The invariant that licenses `first_external_function` to `expect` its
 /// way through the function table instead of carrying a fail-closed arm: a
 /// reserved-but-undefined function cannot reach a finalized `Dae`, so there is
 /// no "unreadable body" state for the probe to be conservative about.

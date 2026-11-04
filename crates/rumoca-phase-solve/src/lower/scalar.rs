@@ -456,6 +456,9 @@ pub(super) struct ScalarCompiler<'layout, 'dae> {
     unary_values: HashMap<(u64, solve::UnaryOp, solve::Reg), solve::Reg>,
     expression_cache: rustc_hash::FxHashMap<(u64, dae::ExprId<'dae>, usize), solve::Reg>,
     packed_expression_cache: rustc_hash::FxHashMap<(u64, dae::ExprId<'dae>), solve::Reg>,
+    /// Whether a function reaches an MLS §12.9 external body (memoized
+    /// `typed_functions::reaches_external_body`).
+    external_reach: rustc_hash::FxHashMap<dae::FunctionId<'dae>, bool>,
     typed_pure_call_cache: rustc_hash::FxHashMap<
         (u64, dae::ExprId<'dae>),
         (
@@ -534,6 +537,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             unary_values: HashMap::new(),
             expression_cache: rustc_hash::FxHashMap::default(),
             packed_expression_cache: rustc_hash::FxHashMap::default(),
+            external_reach: rustc_hash::FxHashMap::default(),
             typed_pure_call_cache: rustc_hash::FxHashMap::default(),
             matrix_multiply_cache: HashMap::new(),
             tensor_binary_cache: HashMap::new(),

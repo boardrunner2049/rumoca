@@ -104,7 +104,7 @@ impl SolveTemplateRenderer {
         let text_starts = super::fmi_c_assertions::text_starts(&fmi)?;
         let context = solve_render_context_value_with_handles(handle, None, Value::default())?;
         Ok(Self {
-            context: minijinja::context! { typed_pure_calls => pure_calls.owners_value(), typed_directional_calls => pure_calls.directional_value(), pure_call_symbols => pure_calls.symbols_value(), fmi_assertion_messages => assertion_messages, fmi_assertion_message_rows => assertion_message_rows, fmi_text_starts => text_starts, me_refresh => me_refresh, ..context },
+            context: minijinja::context! { fmi_external_c => pure_calls.external_c_value(), typed_pure_calls => pure_calls.owners_value(), typed_directional_calls => pure_calls.directional_value(), pure_call_symbols => pure_calls.symbols_value(), fmi_assertion_messages => assertion_messages, fmi_assertion_message_rows => assertion_message_rows, fmi_text_starts => text_starts, me_refresh => me_refresh, ..context },
         })
     }
 

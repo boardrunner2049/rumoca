@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use feature_analysis::{
     dae_has_clocks, dae_has_dynamic_derivative_subscripts, dae_has_dynamic_ranges, dae_has_events,
-    dae_has_external_functions, dae_has_initialization, dae_has_runtime_events,
-    dae_has_unlowered_source_temporal_operators, dae_uses_external_tables, dae_uses_random,
+    dae_has_initialization, dae_has_runtime_events, dae_has_unlowered_source_temporal_operators,
+    dae_uses_external_tables, dae_uses_random, first_external_function, fmi_c_cannot_link,
     solve_requires_residual_equations,
 };
 
@@ -779,13 +779,7 @@ pub fn validate_dae_target_capabilities(
             format!("{residual_owner_count} equation(s)"),
         )?;
     }
-    if capabilities.external_functions == Some(false) && dae_has_external_functions(dae) {
-        unsupported_feature(
-            manifest,
-            "external_functions",
-            "external declarations present",
-        )?;
-    }
+    validate_external_functions(dae, manifest, capabilities)?;
     if capabilities.external_tables == Some(false) && dae_uses_external_tables(dae) {
         unsupported_feature(manifest, "external_tables", "table runtime calls present")?;
     }
@@ -1393,6 +1387,35 @@ fn validate_target_capabilities(
 fn render_dae_target_str(dae: &dae::Dae, template: &str, model_name: &str) -> Result<String> {
     crate::codegen_api::render_dae_template_with_name(dae, template, model_name)
         .map_err(anyhow::Error::from)
+}
+
+/// MLS §12.9 external functions against a target's declaration: a target
+/// declaring none rejects every external, and the FMI C profile, which
+/// declares them, still rejects each one it cannot link (SPEC_0044
+/// ME-EXT-001). Each refusal names the function and its symbol.
+fn validate_external_functions(
+    dae: &dae::Dae,
+    manifest: &TargetManifest,
+    capabilities: &TargetCapabilities,
+) -> Result<()> {
+    if capabilities.external_functions == Some(false)
+        && let Some(external) = first_external_function(dae, |_, _| true)
+    {
+        unsupported_feature(manifest, "external_functions", external)?;
+    }
+    if manifest.ir == TargetTemplateIr::Fmi
+        && capabilities.external_functions == Some(true)
+        && let Some(external) = first_external_function(dae, fmi_c_cannot_link)
+    {
+        bail!(
+            "unsupported-feature:external_functions: Target '{}' cannot link {external}: the FMI C \
+             profile links only the C math library and the MSL ModelicaExternalC random \
+             generators it ships (ModelicaRandom_xorshift64star, ModelicaRandom_xorshift128plus, \
+             ModelicaRandom_xorshift1024star)",
+            manifest.name.as_deref().unwrap_or("custom"),
+        );
+    }
+    Ok(())
 }
 
 fn unsupported_feature(

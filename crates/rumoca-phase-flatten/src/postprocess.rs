@@ -12,6 +12,7 @@ mod constant_lookup;
 mod constant_substituter;
 mod constructor_calls;
 mod discrete_array_equations;
+mod external_builtins;
 mod field_access;
 mod function_exposures;
 mod function_shape_constants;
@@ -19,6 +20,7 @@ mod index_collapse;
 mod indexed_dimension_recovery;
 mod input_history;
 mod invariant_bindings;
+mod model_rewrite;
 mod occurrence_graph;
 mod operator_records;
 mod package_constants;
@@ -37,6 +39,7 @@ pub(crate) use constant_lookup::constant_expr_preserves_array_shape;
 pub(crate) use constant_substituter::substitute_known_constants_expr;
 pub(crate) use constructor_calls::mark_record_constructor_calls;
 pub(crate) use discrete_array_equations::split_discrete_array_equations;
+pub(crate) use external_builtins::lower_elementary_external_builtins;
 pub(super) use field_access::{
     drop_invalid_field_access_bindings, expand_record_array_field_projections_in_equations,
     normalize_record_array_field_access_bindings, resolve_nested_constructor_field_access_bindings,

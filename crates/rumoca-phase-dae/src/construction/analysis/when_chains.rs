@@ -121,13 +121,12 @@ fn validate_when_equations(
                     validate_when_equations(else_branch, scope, sample_lattices, clocked)?;
                 }
             }
-            flat::WhenEquation::FunctionCallOutputs { span, .. } => {
-                return Err(ToDaeError::unsupported_flat(
-                    "when function-call outputs",
-                    "multi-output event calls require a checked function-action owner",
-                    *span,
-                ));
-            }
+            flat::WhenEquation::FunctionCallOutputs {
+                outputs,
+                function,
+                span,
+                ..
+            } => validate_function_call_outputs(outputs, function, *span, scope, clocked)?,
         }
     }
     Ok(())
@@ -221,14 +220,68 @@ fn non_real_targets(
                     targets.extend(non_real_targets(else_branch, roles));
                 }
             }
+            flat::WhenEquation::FunctionCallOutputs { outputs, .. } => {
+                targets.extend(
+                    outputs
+                        .iter()
+                        .filter(|output| {
+                            matches!(roles.get(*output), Some(PlannedRole::DiscreteValue))
+                        })
+                        .cloned(),
+                );
+            }
             flat::WhenEquation::Assign { .. }
             | flat::WhenEquation::Reinit { .. }
             | flat::WhenEquation::Assert { .. }
-            | flat::WhenEquation::Terminate { .. }
-            | flat::WhenEquation::FunctionCallOutputs { .. } => {}
+            | flat::WhenEquation::Terminate { .. } => {}
         }
     }
     targets
+}
+
+/// `(a, b) = f(...)` in a `when` body: every receiver is a discrete
+/// assignment target of the chain and the call is read once. A clocked
+/// partition has no owner for the shared call yet.
+fn validate_function_call_outputs(
+    outputs: &[VarName],
+    function: &Expression,
+    span: Span,
+    scope: WhenScope<'_>,
+    clocked: bool,
+) -> Result<(), ToDaeError> {
+    if clocked {
+        return Err(ToDaeError::unsupported_flat(
+            "when function-call outputs",
+            "a multi-output call in a clocked when-clause has no clocked call owner",
+            span,
+        ));
+    }
+    if !matches!(
+        function,
+        Expression::FunctionCall {
+            is_constructor: false,
+            ..
+        }
+    ) {
+        return Err(ToDaeError::unsupported_flat(
+            "when function-call outputs",
+            "the right-hand side of a receiving tuple must be a function call",
+            span,
+        ));
+    }
+    for output in outputs {
+        if !matches!(
+            scope.roles.get(output),
+            Some(PlannedRole::DiscreteReal | PlannedRole::DiscreteValue)
+        ) {
+            return Err(ToDaeError::unsupported_flat(
+                "when function-call outputs",
+                format!("`{output}` is not a discrete coordinate"),
+                span,
+            ));
+        }
+    }
+    validate_read(function, scope, clocked)
 }
 
 fn validate_assignment(

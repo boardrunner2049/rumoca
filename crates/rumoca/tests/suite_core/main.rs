@@ -85,6 +85,7 @@ mod event_inductive_commutation;
 mod event_iteration_entry;
 mod event_latch_cascade;
 mod event_relation_cascade;
+mod external_functions;
 mod family_branch_selection;
 mod final_parameter_modifiers;
 mod fire_library_constructs;
