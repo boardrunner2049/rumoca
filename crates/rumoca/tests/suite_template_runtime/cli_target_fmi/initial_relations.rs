@@ -36,9 +36,17 @@ equation
   y = if u > 0.5 then sqrt(u - 0.5) else 0;
   der(area) = y;
 end InputRelation;
+
+model ArrayInputRelation
+  input Real v[2](start = {1, 0});
+  output Real y;
+equation
+  assert(abs(v[1]^2 + v[2]^2 - 1) < 1e-9, "v must be a unit vector");
+  y = if v[1] > 0.5 then 1 else 0;
+end ArrayInputRelation;
 "#;
 
-/// `MODEL` selects the scenario; `D`, `X`, `U`, `AREA`, and `Y` are value
+/// `MODEL` selects the scenario; `D`, `X`, `U`, `V`, `AREA`, and `Y` are value
 /// references (no variable is named like a unit, which the description also
 /// lists by name). Every failed call exits with a distinct status.
 const HARNESS: &str = r#"#include "model.c"
@@ -80,6 +88,28 @@ int main(void) {
     if (!i || fmi3EnterInitializationMode(i, fmi3True, 1e-10, 0.0, fmi3True, 1.0) != fmi3OK || fmi3ExitInitializationMode(i) != fmi3OK) return 2;
     me_update(i);
     printf("me start x %.17g\n", get_f(i, X));
+#elif MODEL == 2
+    /* A host writes an array input element by element, reading the array
+       back between the writes (as a co-simulation master merging element
+       signals does); the half-written array violates the model's assert, so
+       reading it back must not evaluate the model. */
+    fmi3ValueReference v = V; fmi3Float64 values[2];
+    fmi3Instance i = fmi3InstantiateCoSimulation("h", TOKEN, NULL, fmi3False, fmi3False, fmi3False, fmi3False, NULL, 0, NULL, quiet, NULL);
+    if (!i || fmi3EnterInitializationMode(i, fmi3True, 1e-10, 0.0, fmi3True, 1.0) != fmi3OK) return 2;
+    values[0] = 1.0; values[1] = 0.0;
+    if (fmi3SetFloat64(i, &v, 1, values, 2) != fmi3OK || fmi3ExitInitializationMode(i) != fmi3OK) return 2;
+    printf("cs start y %.17g\n", get_f(i, Y));
+    step(i, 0.0, 0.1);
+    if (fmi3GetFloat64(i, &v, 1, values, 2) != fmi3OK) return 7;
+    values[0] = 0.0;
+    if (fmi3SetFloat64(i, &v, 1, values, 2) != fmi3OK) return 5;
+    if (fmi3GetFloat64(i, &v, 1, values, 2) != fmi3OK) return 8;
+    printf("cs half v %.17g %.17g\n", values[0], values[1]);
+    values[1] = 1.0;
+    if (fmi3SetFloat64(i, &v, 1, values, 2) != fmi3OK) return 5;
+    printf("cs written y %.17g\n", get_f(i, Y));
+    step(i, 0.1, 0.1);
+    printf("cs end y %.17g\n", get_f(i, Y));
 #else
     /* The input crosses the relation between communication steps; every
        read between the write and the step sees the written side. */
@@ -179,6 +209,23 @@ fn an_input_written_across_a_relation_moves_it_before_the_next_read() {
     }
 }
 
+#[test]
+fn an_input_reads_back_its_written_value_without_an_evaluation() {
+    if !harness_tools_available() {
+        return;
+    }
+    let output = run_harness("ArrayInputRelation", 2);
+    let start = find_line(&output, "cs start y ");
+    assert_close(field(&start, 3), 1.0, 0.0, &start);
+    let half = find_line(&output, "cs half v ");
+    assert_close(field(&half, 3), 0.0, 0.0, &half);
+    assert_close(field(&half, 4), 0.0, 0.0, &half);
+    for prefix in ["cs written y ", "cs end y "] {
+        let line = find_line(&output, prefix);
+        assert_close(field(&line, 3), 0.0, 0.0, &line);
+    }
+}
+
 /// Package `model`, compile the harness scenario against it, and return its
 /// standard output.
 fn run_harness(model: &str, scenario: u32) -> String {
@@ -206,6 +253,7 @@ fn run_harness(model: &str, scenario: u32) -> String {
         ("D", "d"),
         ("X", "x"),
         ("U", "u"),
+        ("V", "v"),
         ("AREA", "area"),
         ("Y", "y"),
     ] {

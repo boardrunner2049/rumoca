@@ -173,6 +173,11 @@ static const double* rmc_settled_source(ModelInstance* m, const RmcValueReferenc
    limit once it was observed there (component.rs public_time_eval_time). */
 static const double* rmc_numeric_source(ModelInstance* m, const RmcValueReference* ref) {
     if (ref->column == RMC_COLUMN_TIME) return &m->time;
+    /* FMI 3 2.2.6: an input reads back the value last set; nothing is
+       evaluated, so a host writing an array input element by element can
+       read the partly written array (ME-EVENT-011). */
+    if (ref->access == RMC_ACCESS_INPUT && ref->column == RMC_COLUMN_Y) return m->y;
+    if (ref->access == RMC_ACCESS_INPUT && ref->column == RMC_COLUMN_P) return m->p;
 {%- if fmi.scalar_events %}
     bool continuous = ref->column == RMC_COLUMN_DERIVATIVE || ref->column == RMC_COLUMN_INDICATOR;
     double saved = continuous ? rmc_continuous_time_enter(m) : rmc_public_time_enter(m);

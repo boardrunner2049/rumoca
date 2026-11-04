@@ -147,6 +147,10 @@ static fmi2Status rmc_settled_numeric(ModelInstance* m, const RmcValueReference*
 }
 static fmi2Status rmc_get_numeric(ModelInstance* m, const RmcValueReference* ref, double* value) {
     if (ref->column == RMC_COLUMN_TIME) { *value = m->time; return fmi2OK; }
+    /* An input reads back the value last set, without an evaluation
+       (ME-EVENT-011). */
+    if (ref->access == RMC_ACCESS_INPUT && ref->column == RMC_COLUMN_Y) { *value = m->y[ref->index]; return fmi2OK; }
+    if (ref->access == RMC_ACCESS_INPUT && ref->column == RMC_COLUMN_P) { *value = m->p[ref->index]; return fmi2OK; }
 {%- if fmi.scalar_events %}
     double saved = ref->column == RMC_COLUMN_DERIVATIVE ? rmc_continuous_time_enter(m) : rmc_public_time_enter(m);
     fmi2Status status = rmc_settled_numeric(m, ref, value);
