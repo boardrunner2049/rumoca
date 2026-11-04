@@ -45,6 +45,7 @@ static int {{ name }}({{ signature }}) {
 {%- if me.blocks|length > 0 %} double rmc_seed[{{ me.seed_len if me.seed_len > 0 else 1 }}]; size_t rmc_fb_calls[{{ me.blocks|length + 1 }}]; size_t rmc_fb_count[{{ me.blocks|length + 1 }}]; size_t rmc_fb_mark[{{ me.blocks|length + 1 }}]; bool rmc_fb_active[{{ me.blocks|length + 1 }}]; bool rmc_fb_reported[{{ me.blocks|length + 1 }}];{% endif -%}
 {%- if me.lane_max > 0 %} double rmc_lane_seed[{{ (me.seed_len if me.seed_len > 0 else 1) * me.lane_max }}];{% endif -%}
 {%- if me.switching %} size_t rmc_chart; size_t rmc_chart_target; bool rmc_chart_pending; double rmc_chart_reference; double rmc_chart_target_reference; bool rmc_chart_log; double rmc_chart_y[Y_LEN];{% endif -%}
+{%- if me.manifold %} double rmc_mf_seed[{{ me.seed_len }}];{% endif -%}
 {%- endmacro %}
 {%- macro workspace_reset(me) -%}
 {%- if me.kernel %} m->rmc_dtop = 0; m->rmc_stop = 0; m->rmc_tol = {{ me.policy.tolerance }}; m->rmc_certify = true;{% endif -%}
@@ -52,6 +53,7 @@ static int {{ name }}({{ signature }}) {
 {%- if me.blocks|length > 0 %} memset(m->rmc_seed, 0, sizeof(m->rmc_seed)); memset(m->rmc_fb_calls, 0, sizeof(m->rmc_fb_calls)); memset(m->rmc_fb_count, 0, sizeof(m->rmc_fb_count)); memset(m->rmc_fb_mark, 0, sizeof(m->rmc_fb_mark)); memset(m->rmc_fb_active, 0, sizeof(m->rmc_fb_active)); memset(m->rmc_fb_reported, 0, sizeof(m->rmc_fb_reported));{% endif -%}
 {%- if me.lane_max > 0 %} memset(m->rmc_lane_seed, 0, sizeof(m->rmc_lane_seed));{% endif -%}
 {%- if me.switching %} m->rmc_chart = 0; m->rmc_chart_target = 0; m->rmc_chart_pending = false; m->rmc_chart_reference = {{ me.switching[0].trial_rcond }}; m->rmc_chart_target_reference = 0.0;{% endif -%}
+{%- if me.manifold %} memset(m->rmc_mf_seed, 0, sizeof(m->rmc_mf_seed));{% endif -%}
 {%- endmacro %}
 
 {#- ── generic kernel ─────────────────────────────────────────────────────── -#}
@@ -176,41 +178,42 @@ static bool rmc_lu_solve(const double* lu, size_t n, const size_t* ipiv, double*
     }
     return true;
 }
-/* Rank-deficient least-squares fallback: one-sided Jacobi SVD, dropping
-   singular values at or below `eps` (nalgebra SVD::solve); -1 error */
-RMC_COLD static int rmc_svd_solve(ModelInstance* m, const double* a, size_t n, const double* rhs, double eps, double* x) {
+/* Rank-deficient least-squares fallback: one-sided Jacobi SVD of the
+   rows x cols matrix `a` (cols >= rows), dropping singular values at or below
+   `eps` (nalgebra SVD::solve): the minimum-norm least-squares solution; -1
+   error */
+RMC_COLD static int rmc_svd_solve_wide(ModelInstance* m, const double* a, size_t rows, size_t cols, const double* rhs, double eps, double* x) {
     RMC_MARK;
-    double* u = rmc_dalloc(m, n * n); double* v = rmc_dalloc(m, n * n);
+    double* u = rmc_dalloc(m, rows * cols); double* v = rmc_dalloc(m, cols * cols);
     if (!u || !v) { RMC_RELEASE; return rmc_exhausted(m); }
-    for (size_t i = 0; i < n * n; ++i) u[i] = a[i];
-    for (size_t i = 0; i < n; ++i) v[i * n + i] = 1.0;
+    for (size_t i = 0; i < rows * cols; ++i) u[i] = a[i];
+    for (size_t i = 0; i < cols; ++i) v[i * cols + i] = 1.0;
     for (int sweep = 0; sweep < 64; ++sweep) {
         bool rotated = false;
-        for (size_t p = 0; p + 1 < n; ++p) for (size_t q = p + 1; q < n; ++q) {
+        for (size_t p = 0; p + 1 < cols; ++p) for (size_t q = p + 1; q < cols; ++q) {
             double alpha = 0.0, beta = 0.0, gamma = 0.0;
-            for (size_t i = 0; i < n; ++i) { alpha += u[i * n + p] * u[i * n + p]; beta += u[i * n + q] * u[i * n + q]; gamma += u[i * n + p] * u[i * n + q]; }
+            for (size_t i = 0; i < rows; ++i) { alpha += u[i * cols + p] * u[i * cols + p]; beta += u[i * cols + q] * u[i * cols + q]; gamma += u[i * cols + p] * u[i * cols + q]; }
             if (fabs(gamma) <= DBL_EPSILON * sqrt(alpha * beta)) continue;
             rotated = true;
             double zeta = (beta - alpha) / (2.0 * gamma);
             double t = (zeta >= 0.0 ? 1.0 : -1.0) / (fabs(zeta) + sqrt(1.0 + zeta * zeta));
             double c = 1.0 / sqrt(1.0 + t * t), s = c * t;
-            for (size_t i = 0; i < n; ++i) {
-                double up = u[i * n + p], uq = u[i * n + q]; u[i * n + p] = c * up - s * uq; u[i * n + q] = s * up + c * uq;
-                double vp = v[i * n + p], vq = v[i * n + q]; v[i * n + p] = c * vp - s * vq; v[i * n + q] = s * vp + c * vq;
-            }
+            for (size_t i = 0; i < rows; ++i) { double up = u[i * cols + p], uq = u[i * cols + q]; u[i * cols + p] = c * up - s * uq; u[i * cols + q] = s * up + c * uq; }
+            for (size_t i = 0; i < cols; ++i) { double vp = v[i * cols + p], vq = v[i * cols + q]; v[i * cols + p] = c * vp - s * vq; v[i * cols + q] = s * vp + c * vq; }
         }
         if (!rotated) break;
     }
-    for (size_t i = 0; i < n; ++i) x[i] = 0.0;
-    for (size_t j = 0; j < n; ++j) {
+    for (size_t i = 0; i < cols; ++i) x[i] = 0.0;
+    for (size_t j = 0; j < cols; ++j) {
         double sigma2 = 0.0, projection = 0.0;
-        for (size_t i = 0; i < n; ++i) { sigma2 += u[i * n + j] * u[i * n + j]; projection += u[i * n + j] * rhs[i]; }
+        for (size_t i = 0; i < rows; ++i) { sigma2 += u[i * cols + j] * u[i * cols + j]; projection += u[i * cols + j] * rhs[i]; }
         if (!(sqrt(sigma2) > eps)) continue;
         double coefficient = projection / sigma2;
-        for (size_t i = 0; i < n; ++i) x[i] += coefficient * v[i * n + j];
+        for (size_t i = 0; i < cols; ++i) x[i] += coefficient * v[i * cols + j];
     }
     RMC_RELEASE; return 0;
 }
+RMC_COLD static int rmc_svd_solve(ModelInstance* m, const double* a, size_t n, const double* rhs, double eps, double* x) { return rmc_svd_solve_wide(m, a, n, n, rhs, eps, x); }
 
 /* One scaled dense Newton factorization, reused for every right-hand side
    while its matrix and scales are fixed (sparse_newton/dense.rs). */
@@ -1397,6 +1400,7 @@ static {{ prefix }}Status refresh_parameters(ModelInstance* m) {
     return {{ prefix }}OK;
 }
 {{ projection_kernel(me) }}
+{{ manifold_kernel(me, prefix) }}
 {{ refresh_kernel(me, prefix) }}
 {%- set plan_suffix = "_plan" if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" else "" %}
 {%- if me.switching %}
@@ -2226,5 +2230,248 @@ static {{ prefix }}Status refresh_algebraics(ModelInstance* m) {
 static inline void rmc_seed_commit(ModelInstance* m) { (void)m; }
 static inline void rmc_seed_mark(ModelInstance* m) { (void)m; }
 static inline void rmc_seed_suspend(ModelInstance* m) { (void)m; }
+{%- endif %}
+{%- endmacro %}
+
+{#- The retained state-manifold projection (SPEC_0044 ME-PROJ-007):
+    `runtime::projection::manifold` of the linked kernel. Index reduction keeps
+    the lower-order constraints it differentiated away; every accepted point
+    is projected back onto them by a damped minimum-norm scaled Newton update
+    per block, the initialization certifies them, and an event corrects them
+    before its refresh. The program text, block table, and sweep budget come
+    from the checked view (me_projection/manifold.rs). The hooks the
+    components call are emitted only for a model that retains a manifold. -#}
+{%- macro manifold_kernel(me, prefix) %}
+{%- set mf = me.manifold %}
+{%- if mf %}
+#define RMC_MF_ROWS {{ mf.rows }}
+#define RMC_MF_BLOCKS {{ mf.blocks|length }}
+#define RMC_MF_ITERS {{ mf.max_iters }}
+/* ContinuousSolveSystem::manifold_residual */
+static int rmc_mf_residual(ModelInstance* m, double* o) {
+    (void)m; (void)o;
+{%- for program in mf.residual.programs %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "o", "-1") }}
+{%- endfor %}
+    }
+{%- endfor %}
+    return 0;
+}
+/* SolveArtifacts::manifold_jacobian_v along `seed` */
+static int rmc_mf_jvp(ModelInstance* m, const double* seed, double* o) {
+    (void)m; (void)seed; (void)o;
+{%- for program in mf.jvp.programs %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "o", "-1") }}
+{%- endfor %}
+    }
+{%- endfor %}
+    return 0;
+}
+typedef struct { size_t nrows; size_t ncols; const size_t* rows; const size_t* y; } RmcManifoldBlock;
+static const size_t rmc_mf_pool[{{ mf.pool|length }}] = {
+{%- for chunk in mf.pool|batch(24) %}
+    {% for value in chunk %}{{ value }},{% endfor %}
+{%- endfor %}
+};
+static const RmcManifoldBlock rmc_mf_blocks[RMC_MF_BLOCKS] = {
+{%- for b in mf.blocks %}
+    { {{ b.nrows }}, {{ b.ncols }}, rmc_mf_pool + {{ b.rows }}, rmc_mf_pool + {{ b.y }} },
+{%- endfor %}
+};
+/* One block's residual rows out of the full residual `full`. */
+static void rmc_mf_select(const RmcManifoldBlock* b, const double* full, double* residual) {
+    for (size_t r = 0; r < b->nrows; ++r) residual[r] = full[b->rows[r]];
+}
+/* manifold.rs: evaluate_manifold_block. The Jacobian takes one forward
+   direction per state column (manifold_block_jacobian); the variable scales
+   are the declared solver scales (manifold_variable_scale) and the row scales
+   jacobian_row_scales with the unit fallback (manifold_block_scales). -1 error */
+static int rmc_mf_evaluate(ModelInstance* m, const RmcManifoldBlock* b, double* full, double* residual, double* jac, double* rscale, double* vscale) {
+    RMC_MARK; int result = 0;
+    double* out = rmc_dalloc(m, RMC_MF_ROWS);
+    if (!out) { RMC_RELEASE; return rmc_exhausted(m); }
+    if (rmc_mf_residual(m, full) != 0) { RMC_RELEASE; return -1; }
+    rmc_mf_select(b, full, residual);
+    for (size_t c = 0; c < b->ncols && result == 0; ++c) {
+        m->rmc_mf_seed[b->y[c]] = 1.0;
+        if (rmc_mf_jvp(m, m->rmc_mf_seed, out) != 0) result = -1;
+        m->rmc_mf_seed[b->y[c]] = 0.0;
+        for (size_t r = 0; r < b->nrows && result == 0; ++r) jac[r * b->ncols + c] = out[b->rows[r]];
+    }
+    for (size_t c = 0; c < b->ncols; ++c) vscale[c] = rmc_variable_scale[b->y[c]];
+    for (size_t r = 0; r < b->nrows; ++r) {
+        double scale = 0.0;
+        for (size_t c = 0; c < b->ncols; ++c) {
+            double contribution = fabs(jac[r * b->ncols + c]) * rmc_valid_scale(vscale[c]);
+            if (isfinite(contribution)) scale = rmc_max(scale, contribution);
+        }
+        rscale[r] = scale > 0.0 ? scale : 1.0;
+    }
+    RMC_RELEASE; return result;
+}
+/* scaling.rs: scaled_newton_delta for a manifold block: a square block takes
+   the dense LU with its SVD fallback, a wider one the minimum-norm SVD solve
+   at the projection tolerance. -1 error, 1 solved */
+static int rmc_mf_delta(ModelInstance* m, const RmcManifoldBlock* b, const double* jac, const double* residual, const double* rscale, const double* vscale, double* delta) {
+    if (b->nrows == b->ncols) return rmc_scaled_newton_delta(m, jac, b->ncols, residual, rscale, vscale, delta);
+    RMC_MARK; int result = 1;
+    double* scaled = rmc_dalloc(m, b->nrows * b->ncols); double* rhs = rmc_dalloc(m, b->nrows); double* x = rmc_dalloc(m, b->ncols);
+    if (!scaled || !rhs || !x) { RMC_RELEASE; return rmc_exhausted(m); }
+    for (size_t r = 0; r < b->nrows; ++r) {
+        rhs[r] = -residual[r] / rmc_valid_scale(rscale[r]);
+        for (size_t c = 0; c < b->ncols; ++c) scaled[r * b->ncols + c] = jac[r * b->ncols + c] * rmc_valid_scale(vscale[c]) / rmc_valid_scale(rscale[r]);
+    }
+    if (rmc_svd_solve_wide(m, scaled, b->nrows, b->ncols, rhs, m->rmc_tol, x) != 0) result = -1;
+    else for (size_t c = 0; c < b->ncols; ++c) delta[c] = x[c] * rmc_valid_scale(vscale[c]);
+    RMC_RELEASE; return result;
+}
+/* manifold.rs: project_manifold_block; the backtracking line search accepts
+   a trial within tolerance, or a decrease of the scaled residual while the
+   step still moves a coordinate by more than one ulp. -1 error */
+static int rmc_mf_block(ModelInstance* m, const RmcManifoldBlock* b, RmcUpdate* update) {
+    RMC_MARK; size_t nr = b->nrows, nc = b->ncols; int result = 0;
+    double* full = rmc_dalloc(m, RMC_MF_ROWS); double* residual = rmc_dalloc(m, nr); double* jac = rmc_dalloc(m, nr * nc);
+    double* rscale = rmc_dalloc(m, nr); double* vscale = rmc_dalloc(m, nc); double* delta = rmc_dalloc(m, nc); double* snapshot = rmc_dalloc(m, nc);
+    update->changed = false; update->settled = false;
+    if (!full || !residual || !jac || !rscale || !vscale || !delta || !snapshot) { RMC_RELEASE; return rmc_exhausted(m); }
+    if (rmc_mf_evaluate(m, b, full, residual, jac, rscale, vscale) != 0) { RMC_RELEASE; return -1; }
+    if (rmc_scaled_converged(m->rmc_tol, residual, rscale, nr)) { update->settled = true; RMC_RELEASE; return 0; }
+    double before = rmc_scaled_norm(residual, rscale, nr);
+    if (rmc_mf_delta(m, b, jac, residual, rscale, vscale, delta) != 1) { RMC_RELEASE; return -1; }
+    for (size_t c = 0; c < nc; ++c) snapshot[c] = m->y[b->y[c]];
+    for (double alpha = 1.0;;) {
+        bool changed = false, at_resolution = true, finite = true;
+        for (size_t c = 0; c < nc; ++c) m->y[b->y[c]] = snapshot[c];
+        for (size_t c = 0; c < nc; ++c) {
+            double candidate = snapshot[c] + alpha * delta[c];
+            if (!isfinite(candidate)) { finite = false; break; }
+            changed = changed || candidate != snapshot[c];
+            at_resolution = at_resolution && (candidate == snapshot[c] || candidate == nextafter(snapshot[c], INFINITY) || candidate == nextafter(snapshot[c], -INFINITY));
+            m->y[b->y[c]] = candidate;
+        }
+        if (finite && changed) {
+            if (rmc_mf_residual(m, full) != 0) { result = -1; break; }
+            rmc_mf_select(b, full, residual);
+            double after = rmc_scaled_norm(residual, rscale, nr);
+            if (isfinite(after) && (after <= fabs(m->rmc_tol) || (!at_resolution && after < before))) {
+                update->changed = true; update->settled = after <= fabs(m->rmc_tol);
+                RMC_RELEASE; return 0;
+            }
+        }
+        if (at_resolution) break;
+        /* projection.rs: next_scaled_backtrack */
+        double next = alpha * 0.5; bool significant = false;
+        if (!(next > 0.0 && next < alpha)) break;
+        for (size_t c = 0; c < nc; ++c) if (fabs(next * delta[c]) > rmc_scaled_tolerance(m->rmc_tol, vscale[c])) significant = true;
+        if (!significant) break;
+        alpha = next;
+    }
+    for (size_t c = 0; c < nc; ++c) m->y[b->y[c]] = snapshot[c];
+    RMC_RELEASE; return result;
+}
+/* manifold.rs: project_state_manifold at tolerance `tol`. Sweeps every block
+   until all settle, a sweep changes nothing, or the budget runs out; a failure
+   restores the incoming states and logs the worst retained row. `*moved`
+   reports any state bit that changed. -1 error */
+static int rmc_mf_project(ModelInstance* m, double tol, bool* moved) {
+    double incoming[STATE_LEN]; double saved_tol = m->rmc_tol; int result = 1;
+    memcpy(incoming, m->y, sizeof(incoming)); m->rmc_tol = tol; *moved = false;
+    for (size_t iteration = 0; iteration < RMC_MF_ITERS && result == 1; ++iteration) {
+        bool settled = true, changed = false;
+        for (size_t k = 0; k < RMC_MF_BLOCKS; ++k) {
+            RmcUpdate update = { false, false };
+            if (rmc_mf_block(m, &rmc_mf_blocks[k], &update) != 0) { result = -1; break; }
+            settled = settled && update.settled; changed = changed || update.changed;
+        }
+        if (result == 1 && settled) result = 0;
+        else if (result == 1 && !changed) break;
+    }
+    if (result == 1) {
+        RMC_MARK; double* full = rmc_dalloc(m, RMC_MF_ROWS); char message[160];
+        if (full && rmc_mf_residual(m, full) == 0) {
+            size_t worst = 0;
+            for (size_t row = 1; row < RMC_MF_ROWS; ++row) if (!(fabs(full[row]) < fabs(full[worst]))) worst = row;
+            snprintf(message, sizeof message, "index-reduction manifold projection did not converge; residual row %zu is %e", worst, full[worst]);
+        } else snprintf(message, sizeof message, "index-reduction manifold projection did not converge");
+        RMC_LOG(m, message); RMC_RELEASE;
+    }
+    m->rmc_tol = saved_tol;
+    if (result != 0) { memcpy(m->y, incoming, sizeof(incoming)); return -1; }
+    *moved = memcmp(incoming, m->y, sizeof(incoming)) != 0;
+    return 0;
+}
+/* The component tolerance of the refresh policy: the FMI tolerance, or the
+   refresh tolerance when the importer defines none. */
+static double rmc_mf_tolerance(const ModelInstance* m) { return m->tolerance > 0.0 ? m->tolerance : RMC_TOL; }
+/* solve_ops.rs: runtime_values_changed over the states. */
+static bool rmc_mf_changed(const double* before, const double* after, double tol) {
+    for (size_t k = 0; k < STATE_LEN; ++k) {
+        if (before[k] == after[k]) continue;
+        if (!isfinite(before[k]) || !isfinite(after[k])) return true;
+        if (fabs(before[k] - after[k]) > fabs(tol) * fmax(1.0, fmax(fabs(before[k]), fabs(after[k])))) return true;
+    }
+    return false;
+}
+/* manifold.rs: certify_state_manifold (ManifoldAction::CertifyInitial): the
+   settled initial states must satisfy every retained constraint; they are
+   never corrected. -1 error */
+RMC_COLD static int rmc_manifold_certify(ModelInstance* m, double tol) {
+    double saved_tol = m->rmc_tol; int result = 0;
+    m->rmc_tol = tol;
+    for (size_t k = 0; k < RMC_MF_BLOCKS && result == 0; ++k) {
+        const RmcManifoldBlock* b = &rmc_mf_blocks[k]; RMC_MARK;
+        double* full = rmc_dalloc(m, RMC_MF_ROWS); double* residual = rmc_dalloc(m, b->nrows); double* jac = rmc_dalloc(m, b->nrows * b->ncols);
+        double* rscale = rmc_dalloc(m, b->nrows); double* vscale = rmc_dalloc(m, b->ncols);
+        if (!full || !residual || !jac || !rscale || !vscale) result = rmc_exhausted(m);
+        else if (rmc_mf_evaluate(m, b, full, residual, jac, rscale, vscale) != 0) result = -1;
+        else if (!rmc_scaled_converged(tol, residual, rscale, b->nrows)) {
+            char message[160];
+            snprintf(message, sizeof message, "initial state manifold is inconsistent in constraint block %zu; settled initial states cannot be corrected", k);
+            RMC_LOG(m, message); result = -1;
+        }
+        RMC_RELEASE;
+    }
+    m->rmc_tol = saved_tol;
+    return result;
+}
+/* component.rs: project_continuous_states_inner at an accepted point: the
+   projection at the refresh tolerance, kept only when it moves a state by
+   more than the component tolerance (a smaller correction is the same
+   accepted point, and keeping it would only discard the integrator's
+   history). */
+static {{ prefix }}Status rmc_manifold_accept(ModelInstance* m, bool* changed) {
+    double before[STATE_LEN]; bool moved = false;
+    memcpy(before, m->y, sizeof(before)); *changed = false;
+    if (rmc_mf_project(m, RMC_TOL, &moved) != 0) return {{ prefix }}Error;
+    *changed = moved && rmc_mf_changed(before, m->y, rmc_mf_tolerance(m));
+    if (!*changed) memcpy(m->y, before, sizeof(before));
+    return {{ prefix }}OK;
+}
+/* Model Exchange cannot move states in Continuous-Time Mode: a completed step
+   whose accepted point needs the correction requests Event Mode, where
+   rmc_manifold_event applies it. */
+static {{ prefix }}Status rmc_manifold_completed(ModelInstance* m, bool* request) {
+    double before[STATE_LEN];
+    memcpy(before, m->y, sizeof(before));
+    {{ prefix }}Status status = rmc_manifold_accept(m, request);
+    memcpy(m->y, before, sizeof(before));
+    return status;
+}
+/* kernel.rs: project_event_algebraics (ManifoldAction::CorrectContinuous):
+   the event's states are projected at the component tolerance before its
+   refresh; `*changed` is the runtime_values_changed test. */
+static {{ prefix }}Status rmc_manifold_event(ModelInstance* m, bool* changed) {
+    double before[STATE_LEN]; double tol = rmc_mf_tolerance(m); bool moved = false;
+    memcpy(before, m->y, sizeof(before)); *changed = false;
+    if (rmc_mf_project(m, tol, &moved) != 0) return {{ prefix }}Error;
+    *changed = moved && rmc_mf_changed(before, m->y, tol);
+    return {{ prefix }}OK;
+}
 {%- endif %}
 {%- endmacro %}

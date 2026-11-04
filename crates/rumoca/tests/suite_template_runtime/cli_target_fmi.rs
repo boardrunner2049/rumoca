@@ -19,6 +19,7 @@ mod integer_parameter;
 mod lifecycle;
 mod mass_matrix;
 mod projection;
+mod refused_trial;
 mod reported_models;
 mod residual_split_harness;
 mod state_events;

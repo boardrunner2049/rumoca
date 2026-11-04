@@ -563,7 +563,7 @@ typedef struct { RmcCsMode mode; double jac[STATE_LEN * STATE_LEN]; double w[STA
     components: the tableau and controller of rumoca-solver-rk45, with the
     controller constants read from the plan, and the plan's stiff method for a
     mode that tableau finds stiff. -#}
-{%- macro cs_integrator_function(fmi, solve, prefix) %}
+{%- macro cs_integrator_function(fmi, solve, prefix, manifold=none) %}
 {%- set plan = fmi.co_simulation.controller %}
 {%- set stiff = fmi.co_simulation.stiffness %}
 /* Stiff substeps of the Co-Simulation step rule (Solve IR
@@ -576,6 +576,19 @@ static {{ prefix }}Status rmc_cs_eval(ModelInstance* m, size_t n, double t, cons
     m->time = t;
     if (rmc_me_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
     for (size_t i = 0; i < n; ++i) f[i] = m->derivative[i];
+    return {{ prefix }}OK;
+}
+/* A trial stage of a substep: a failed evaluation (its algebraic refresh does
+   not converge, a derivative is not finite, or a pure call fails) sets
+   `*refused` and is not logged, since its point is discarded; a failed
+   assertion stays an Error. */
+static {{ prefix }}Status rmc_cs_trial(ModelInstance* m, size_t n, double t, const double* y, double* f, bool* refused) {
+    m->rmc_quiet = true;
+    {{ prefix }}Status status = rmc_cs_eval(m, n, t, y, f);
+    m->rmc_quiet = false;
+    if (status == {{ prefix }}OK) return {{ prefix }}OK;
+    if (m->assertion_failed) return {{ prefix }}Error;
+    *refused = true;
     return {{ prefix }}OK;
 }
 /* df/dy column by column, each state moved by sqrt(eps) * max(|y|, 1), and
@@ -640,7 +653,7 @@ static void rmc_cs_solve(const ModelInstance* m, size_t n, double* b) {
    m->y and its derivative in fnew; `*error` is the max-norm of the error
    estimate h/6 (k1 - 2 k2 + k3) over tol * (1 + max(|y0|, |y1|)), infinite when
    W is singular or a value is not finite. */
-static {{ prefix }}Status rmc_cs_rosenbrock(ModelInstance* m, size_t n, double t, double h, double end_time, const double* y0, const double* f0, const double* dfdt, double tol, double* fnew, double* error) {
+static {{ prefix }}Status rmc_cs_rosenbrock(ModelInstance* m, size_t n, double t, double h, double end_time, const double* y0, const double* f0, const double* dfdt, double tol, double* fnew, double* error, bool* refused) {
     const double d = 1.0 / (2.0 + sqrt(2.0)), e32 = 6.0 + sqrt(2.0);
     double k1[STATE_LEN], k2[STATE_LEN], k3[STATE_LEN], f1[STATE_LEN], ys[STATE_LEN];
     *error = INFINITY;
@@ -648,11 +661,13 @@ static {{ prefix }}Status rmc_cs_rosenbrock(ModelInstance* m, size_t n, double t
     for (size_t i = 0; i < n; ++i) k1[i] = f0[i] + h * d * dfdt[i];
     rmc_cs_solve(m, n, k1);
     for (size_t i = 0; i < n; ++i) ys[i] = y0[i] + 0.5 * h * k1[i];
-    if (rmc_cs_eval(m, n, t + 0.5 * h, ys, f1) != {{ prefix }}OK) return {{ prefix }}Error;
+    if (rmc_cs_trial(m, n, t + 0.5 * h, ys, f1, refused) != {{ prefix }}OK) return {{ prefix }}Error;
+    if (*refused) return {{ prefix }}OK;
     for (size_t i = 0; i < n; ++i) k2[i] = f1[i] - k1[i];
     rmc_cs_solve(m, n, k2);
     for (size_t i = 0; i < n; ++i) { k2[i] += k1[i]; ys[i] = y0[i] + h * k2[i]; }
-    if (rmc_cs_eval(m, n, end_time, ys, fnew) != {{ prefix }}OK) return {{ prefix }}Error;
+    if (rmc_cs_trial(m, n, end_time, ys, fnew, refused) != {{ prefix }}OK) return {{ prefix }}Error;
+    if (*refused) return {{ prefix }}OK;
     for (size_t i = 0; i < n; ++i) k3[i] = fnew[i] - e32 * (k2[i] - f1[i]) - 2.0 * (k1[i] - f0[i]) + h * d * dfdt[i];
     rmc_cs_solve(m, n, k3);
     double worst = 0.0;
@@ -686,7 +701,7 @@ static void rmc_cs_switch(ModelInstance* m, double bound) {
 }
 /* One explicit Dormand-Prince 5(4) substep from (t, y0) with k[0] = f(t, y0),
    leaving the fifth-order state in m->y; `*hlamb` is the stiffness estimate. */
-static {{ prefix }}Status rmc_cs_dopri5(ModelInstance* m, size_t n, double t, double h, double end_time, const double* y0, double k[7][STATE_LEN], double tol, double* error, double* hlamb) {
+static {{ prefix }}Status rmc_cs_dopri5(ModelInstance* m, size_t n, double t, double h, double end_time, const double* y0, double k[7][STATE_LEN], double tol, double* error, double* hlamb, bool* refused) {
     static const double a[6][6] = {
         {1.0 / 5.0},
         {3.0 / 40.0, 9.0 / 40.0},
@@ -705,7 +720,14 @@ static {{ prefix }}Status rmc_cs_dopri5(ModelInstance* m, size_t n, double t, do
             if (s == 4) ystage[i] = m->y[i];
         }
         m->time = s >= 4 ? end_time : t + c[s] * h;
-        if (rmc_me_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+        m->rmc_quiet = true;
+        {{ prefix }}Status stage = rmc_me_derivatives(m);
+        m->rmc_quiet = false;
+        if (stage != {{ prefix }}OK) {
+            if (m->assertion_failed) return {{ prefix }}Error;
+            *refused = true;
+            return {{ prefix }}OK;
+        }
         for (size_t i = 0; i < n; ++i) k[s + 1][i] = m->derivative[i];
     }
     double worst = 0.0, num = 0.0, den = 0.0;
@@ -746,9 +768,18 @@ static {{ prefix }}Status rmc_cs_dopri5(ModelInstance* m, size_t n, double t, do
      switch is instance state: it persists across communication steps and
      FMU states, and every trial of a state-event search starts from the
      interval's.
+   - A failed evaluation at a trial stage of the substep (any stage after
+     the accepted start point) rejects the substep like an error estimate
+     above tolerance and retries it {{ plan.min_factor }} times as long, as
+     rumoca-solver-rk45 retries a refused trial point. A failed assertion stays
+     a failure, as does a failed evaluation at the accepted start point or in
+     the stiff linearization, which return Error.
+   - A model retaining a state-manifold projection projects every accepted
+     substep onto it (SPEC_0044 ME-PROJ-007); a correction that moves a state
+     restarts the next substep from a fresh derivative.
    - A communication step whose substep underflows or which attempts more
-     than {{ plan.max_substeps }} substeps returns Discard; a failed derivative
-     evaluation returns Error. The caller rolls the state back either way.
+     than {{ plan.max_substeps }} substeps returns Discard. The caller rolls the
+     state back either way.
    Accuracy therefore follows the tolerance, not the importer's communication
    step size. */
 static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double start, double step) {
@@ -772,12 +803,21 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
         }
         const bool stiff = m->rmc_cs.mode.stiff;
         double error = 0.0, hlamb = 0.0;
+        bool refused = false;
         if (stiff && !linearized) {
             if (rmc_cs_linearize(m, n, t, h, y0, k[0], dfdt, &rho) != {{ prefix }}OK) return {{ prefix }}Error;
             linearized = true;
         }
-        if ((stiff ? rmc_cs_rosenbrock(m, n, t, h, last ? end : t + h, y0, k[0], dfdt, tol, fnew, &error)
-                   : rmc_cs_dopri5(m, n, t, h, last ? end : t + h, y0, k, tol, &error, &hlamb)) != {{ prefix }}OK) return {{ prefix }}Error;
+        if ((stiff ? rmc_cs_rosenbrock(m, n, t, h, last ? end : t + h, y0, k[0], dfdt, tol, fnew, &error, &refused)
+                   : rmc_cs_dopri5(m, n, t, h, last ? end : t + h, y0, k, tol, &error, &hlamb, &refused)) != {{ prefix }}OK) return {{ prefix }}Error;
+        if (refused) {
+            /* A refused trial point rejects the substep; its start derivative
+               (and linearization) is still the accepted point's. */
+            for (size_t i = 0; i < n; ++i) m->y[i] = y0[i];
+            m->time = t;
+            h *= {{ plan.min_factor }};
+            continue;
+        }
         const double exponent = stiff ? {{ stiff.exponent }} : {{ plan.exponent }};
         double factor = error > 0.0 ? fmin(fmax({{ plan.safety }} * pow(error, exponent), {{ plan.min_factor }}), {{ plan.max_factor }}) : {{ plan.max_factor }};
         if (error <= 1.0) {
@@ -789,6 +829,12 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
             linearized = false;
             if (stiff) rmc_cs_switch(m, fmax(m->rmc_cs_substep, h * factor) * rho);
             else if (!last) rmc_cs_switch(m, hlamb);
+{%- if manifold %}
+            bool projected = false;
+            m->time = t;
+            if (rmc_manifold_accept(m, &projected) != {{ prefix }}OK) return {{ prefix }}Error;
+            if (projected) start_derivative = false;
+{%- endif %}
         } else {
             for (size_t i = 0; i < n; ++i) m->y[i] = y0[i];
             m->time = t;

@@ -435,7 +435,7 @@ enum InterfaceType {{ INTERFACE_ME, INTERFACE_CS }};
 #define RMC_API
 typedef struct {{ bool stiff; unsigned hits; unsigned clear; }} RmcCsMode;
 typedef struct {{ RmcCsMode mode; double jac[STATE_LEN * STATE_LEN]; double w[STATE_LEN * STATE_LEN]; size_t pivot[STATE_LEN]; }} RmcCsStiffness;
-typedef struct {{ bool assertions_initialized; bool assertion_failed; bool parameters_dirty; void* environment; fmi3LogMessageCallback logger; double time; double tolerance; double rmc_cs_substep; RmcCsStiffness rmc_cs; double y[Y_LEN]; double p[P_LEN]; double derivative[STATE_LEN]; enum ModelState state; enum InterfaceType type; }} ModelInstance;
+typedef struct {{ bool assertions_initialized; bool assertion_failed; bool parameters_dirty; void* environment; fmi3LogMessageCallback logger; double time; double tolerance; double rmc_cs_substep; RmcCsStiffness rmc_cs; bool rmc_quiet; double y[Y_LEN]; double p[P_LEN]; double derivative[STATE_LEN]; enum ModelState state; enum InterfaceType type; }} ModelInstance;
 {assign_c}
 {kernel}
 {value_helpers}

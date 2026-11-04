@@ -16,6 +16,7 @@ mod chart;
 mod initial;
 #[cfg(test)]
 mod lane_render_tests;
+mod manifold;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -106,13 +107,17 @@ fn algebraic_refresh_covers(
 
 /// The runtime projection shapes the shared kernel does not execute: a block
 /// with alternate reduced charts (the first-integral mirrors the linked kernel
-/// selects per block) and a retained state-manifold projection (the linked
-/// kernel projects accepted states onto lower-order constraints). A model
+/// selects per block), and a retained state-manifold projection beside a
+/// switching reduced chart set (each alternate chart drops the primary's
+/// manifold rows, so one projection cannot serve every chart). A model
 /// carrying either is refused rather than integrated on one chart or without
 /// the manifold correction. A reduced chart set with executable alternates is
 /// executed: the generated kernel switches among its charts exactly as the
-/// linked kernel does (SPEC_0040 STRUCT-T07 constraint-fold chart rows).
-fn unsupported_runtime_shape(problem: &solve::SolveProblem) -> Option<&'static str> {
+/// linked kernel does (SPEC_0040 STRUCT-T07 constraint-fold chart rows). A
+/// retained state-manifold projection on its own is executed: the generated
+/// kernel projects accepted states onto it as the linked kernel does
+/// (SPEC_0044 ME-PROJ-007).
+pub(super) fn unsupported_runtime_shape(problem: &solve::SolveProblem) -> Option<&'static str> {
     let continuous = &problem.continuous;
     if continuous
         .algebraic_projection_plan
@@ -122,8 +127,8 @@ fn unsupported_runtime_shape(problem: &solve::SolveProblem) -> Option<&'static s
     {
         return Some("a projection block carries alternate reduced charts");
     }
-    if !continuous.manifold_projection_plan.is_empty() {
-        return Some("the model retains a state-manifold projection");
+    if !continuous.manifold_projection_plan.is_empty() && chart::switches_charts(problem) {
+        return Some("the model retains a state-manifold projection beside switching charts");
     }
     None
 }
@@ -536,15 +541,17 @@ pub(super) fn me_refresh_value(
     let (init, init_doubles) =
         initial::initialization_value(problem, artifacts, (&mut table, &seed_blocks, seed_len))?;
     let init_sizes = init.get_attr("sizes")?.as_usize().unwrap_or(0);
-    let kernel = !records.is_empty() || init_doubles > 0;
+    let (manifold, (manifold_doubles, manifold_sizes)) =
+        manifold::manifold_view(problem, artifacts, seed_len)?;
+    let kernel = !records.is_empty() || init_doubles > 0 || manifold.is_some();
     let table = table.into_value(&implicits)?;
     // The initialization frames hold the algebraic refresh, whose deepest
-    // block frame and isolator outputs nest inside them; a chart
-    // conditioning or transfer frame holds no other.
+    // block frame and isolator outputs nest inside them; a chart conditioning
+    // or transfer frame, or a state-manifold projection, holds no other.
     let doubles =
         (block_doubles + table.get_attr("iso_max_outputs")?.as_usize().unwrap_or(1) + init_doubles)
-            .max(chart_doubles);
-    let sizes = block_sizes + init_sizes;
+            .max(chart_doubles.max(manifold_doubles));
+    let sizes = (block_sizes + init_sizes).max(manifold_sizes);
     Ok(minijinja::context! {
         derivative => charts[0].get_attr("derivative")?,
         algebraic => charts[0].get_attr("algebraic")?,
@@ -556,6 +563,7 @@ pub(super) fn me_refresh_value(
         kernel => kernel,
         assign => assignments.into_value()?,
         init => init,
+        manifold => manifold,
         work => minijinja::context! { doubles => doubles, sizes => sizes },
         seed_len => seed_len,
         lane_max => lane_max,

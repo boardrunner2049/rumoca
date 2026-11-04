@@ -32,7 +32,7 @@ enum ModelState { MODEL_INSTANTIATED, MODEL_INITIALIZATION, MODEL_EVENT, MODEL_C
 {{ cs_stiffness_type() }}
 typedef struct {
     bool assertions_initialized; bool assertion_failed; bool parameters_dirty;
-    double time; double tolerance; double rmc_cs_substep; RmcCsStiffness rmc_cs;
+    double time; double tolerance; double rmc_cs_substep; RmcCsStiffness rmc_cs; bool rmc_quiet;
     double y[Y_LEN];
     double p[P_LEN];
     double derivative[STATE_LEN];

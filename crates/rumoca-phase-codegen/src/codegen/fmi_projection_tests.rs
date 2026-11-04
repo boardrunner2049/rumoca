@@ -329,14 +329,15 @@ fn the_fmi_render_context_exposes_no_dae() {
     );
 }
 
-/// A retained state-manifold projection is a runtime shape the shared ME
-/// projection does not execute. The Solve admissibility gate refuses it, and
-/// a checked component cannot even reach the renderer: the retained manifold
-/// rows are initialization residuals, which the C profile narrowing refuses
-/// first. The renderer's own refusal of the same shape is therefore a second,
-/// independent guard behind a typed input it can no longer receive.
+/// A retained state-manifold projection is executed by the shared ME
+/// projection (SPEC_0044 ME-PROJ-007): the Solve admissibility gate admits
+/// it, and the C profile narrowing admits its retained rows as the only
+/// initialization residual rows (they read states alone, so the settled view
+/// evaluates them as the stored coordinates do). Beside a switching
+/// reduced chart set it is refused: each alternate chart drops the primary's
+/// manifold rows.
 #[test]
-fn a_state_manifold_projection_is_refused_before_any_byte() {
+fn a_state_manifold_projection_is_admitted_unless_charts_switch() {
     let plain = model_with_one_state_run(false);
     assert!(super::me_projection::me_refresh_admissible(&plain.problem));
 
@@ -372,18 +373,37 @@ fn a_state_manifold_projection_is_refused_before_any_byte() {
         .problem
         .validate()
         .expect("the manifold-bearing fixture is a valid Solve problem");
-    assert!(!super::me_projection::me_refresh_admissible(&model.problem));
+    assert!(super::me_projection::me_refresh_admissible(&model.problem));
+    assert_eq!(
+        super::me_projection::unsupported_runtime_shape(&model.problem),
+        None
+    );
 
+    let mut switching = model.clone();
+    switching.problem.continuous.reduced_chart_set.charts = vec![
+        solve::ReducedChart::default(),
+        solve::ReducedChart {
+            plan: Some(solve::ReducedChartPlan::default()),
+            ..solve::ReducedChart::default()
+        },
+    ];
+    assert_eq!(
+        super::me_projection::unsupported_runtime_shape(&switching.problem),
+        Some("the model retains a state-manifold projection beside switching charts")
+    );
+
+    // The C narrowing no longer refuses the retained rows; this fixture's
+    // solver coordinates stop short of its Y storage, which it reports next.
     let component = solve::fmi::FmiComponent::construct(model, vec![state_input()])
         .expect("the manifold-bearing fixture is a checked component");
     let error = component
         .into_codegen_view()
         .try_c()
-        .expect_err("the C profile refuses the retained manifold initialization rows");
+        .expect_err("the fixture's partial solver coordinates are refused");
     assert!(
         error
             .to_string()
-            .contains("C initialization cannot certify retained state-manifold rows"),
+            .contains("C initialization needs the solver coordinates to fill the Y storage"),
         "{error}"
     );
 }
