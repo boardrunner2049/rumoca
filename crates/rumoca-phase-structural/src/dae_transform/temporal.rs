@@ -57,6 +57,19 @@ pub(super) fn rebuild_clocks<'target>(
             dae::ClockOperation::Periodic(schedule) => target
                 .scheduled(*schedule, clock.provenance())
                 .map(RebuiltClock::Periodic),
+            dae::ClockOperation::ParametricSample { start, interval } => {
+                let parameter =
+                    |id: dae::ParameterId<'_>| match variables[id.index() as usize].identity {
+                        TargetVariable::Parameter(parameter) => Ok(parameter),
+                        _ => Err(dae::DaeConstructionError::InvalidClockedOperand {
+                            operator: "sample(start, interval) parameter",
+                            span: clock.provenance().span(),
+                        }),
+                    };
+                target
+                    .parametric_sample(parameter(start)?, parameter(interval)?, clock.provenance())
+                    .map(RebuiltClock::Triggered)
+            }
             dae::ClockOperation::Triggered(condition) => target
                 .triggered(conditions[condition.index() as usize], clock.provenance())
                 .map(RebuiltClock::Triggered),

@@ -5,7 +5,7 @@ use rumoca_core::{ClockLattice, PeriodicClockSchedule};
 use crate::model::{Storage, check_provenance, checked_u32, unknown};
 use crate::{
     ClockId, ClockOwnershipId, ConditionId, DaeConstructionError, DaeProvenance, DiscreteRealId,
-    DiscreteValueId, PeriodicClockId, VariableId, VariableRole,
+    DiscreteValueId, ParameterId, PeriodicClockId, VariableId, VariableRole,
 };
 
 /// Exact MLS §16.5.2 relationship carried by one cross-clock value transfer.
@@ -42,6 +42,14 @@ impl ClockTransferKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClockKind {
     Periodic(PeriodicClockSchedule),
+    /// MLS §3.7.5 `sample(start, interval)` whose operands are parameter
+    /// expressions without a translation-time value: tick `k` is
+    /// `start + k * interval`, both read from these parameter variables once
+    /// initialization has fixed them.
+    ParametricSample {
+        start: u32,
+        interval: u32,
+    },
     Triggered(u32),
     /// MLS §16.5.2 `shiftSample(u, counter)` of an event clock: the clock
     /// `base` without its first `counter` ticks, ticking on `condition`.
@@ -79,6 +87,12 @@ pub(crate) struct ClockOwnershipEntry {
 #[derive(Debug, Clone, Copy)]
 pub enum ClockOperation<'dae> {
     Periodic(&'dae PeriodicClockSchedule),
+    /// MLS §3.7.5 `sample(start, interval)` whose start and interval are the
+    /// values these parameters take at initialization.
+    ParametricSample {
+        start: ParameterId<'dae>,
+        interval: ParameterId<'dae>,
+    },
     Triggered(ConditionId<'dae>),
     /// MLS §16.5.2 `shiftSample(u, counter)` of the event clock `base`
     /// (never itself shifted): it ticks at every tick of `base` after the
@@ -185,6 +199,33 @@ impl<'dae> Clocks<'_, 'dae> {
         })?;
         self.insert(ClockKind::Periodic(schedule), provenance)
             .map(|clock| PeriodicClockId::from_raw(clock.index()))
+    }
+
+    /// The MLS §3.7.5 `sample(start, interval)` time event whose start and
+    /// interval are the initialization values of two Real parameters.
+    pub fn parametric_sample(
+        &mut self,
+        start: ParameterId<'dae>,
+        interval: ParameterId<'dae>,
+        provenance: DaeProvenance,
+    ) -> Result<ClockId<'dae>, DaeConstructionError> {
+        check_provenance(self.source_map, provenance)?;
+        for parameter in [start.index(), interval.index()] {
+            let entry = self.storage.variable(parameter, provenance)?;
+            if entry.role != VariableRole::Parameter {
+                return Err(DaeConstructionError::InvalidVariableRole {
+                    name: entry.name.clone(),
+                    span: provenance.span(),
+                });
+            }
+        }
+        self.insert(
+            ClockKind::ParametricSample {
+                start: start.index(),
+                interval: interval.index(),
+            },
+            provenance,
+        )
     }
 
     pub fn triggered(

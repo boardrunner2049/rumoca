@@ -45,6 +45,11 @@ pub(super) struct SampleClock {
     /// The hidden activation parameter that holds `1` exactly while the clock
     /// ticks (SOLVE-C11).
     lane: usize,
+    /// A parametric `sample(start, interval)`: the parameter slots whose
+    /// initialization values are its start and interval. The lattice fields
+    /// above are then unused.
+    start_slot: Option<usize>,
+    interval_slot: Option<usize>,
 }
 
 /// One producer of the sample partition, in issued order.
@@ -95,7 +100,21 @@ pub(super) fn clocks(problem: &SolveProblem) -> Result<Vec<SampleClock>, &'stati
         .periodic_event_schedules
         .iter()
         .zip(&clocks.activation_parameter_indices)
-        .map(|(schedule, &lane)| {
+        .enumerate()
+        .map(|(index, (schedule, &lane))| {
+            if let Some(slots) = clocks.parametric_sample(index) {
+                return Ok(SampleClock {
+                    phase: 0.0,
+                    period: 0.0,
+                    phase_units: 0.0,
+                    period_units: 0.0,
+                    units: 0.0,
+                    start_relative: false,
+                    lane,
+                    start_slot: Some(slots.start),
+                    interval_slot: Some(slots.interval),
+                });
+            }
             let (phase, period) = (schedule.phase_seconds(), schedule.period_seconds());
             if !phase.is_finite() || !period.is_finite() || period <= 0.0 {
                 return Err("a sample clock has no finite positive period");
@@ -110,6 +129,8 @@ pub(super) fn clocks(problem: &SolveProblem) -> Result<Vec<SampleClock>, &'stati
                 units,
                 start_relative: schedule.anchor() == rumoca_core::ClockPhaseAnchor::SimulationStart,
                 lane,
+                start_slot: None,
+                interval_slot: None,
             })
         })
         .collect()
@@ -120,14 +141,19 @@ pub(super) fn clocks(problem: &SolveProblem) -> Result<Vec<SampleClock>, &'stati
 fn exact_units(lattice: rumoca_core::ClockLattice) -> Option<(f64, f64, f64)> {
     let (phase, period) = (lattice.phase(), lattice.period());
     let gcd = gcd(phase.denominator(), period.denominator());
-    let units = phase.denominator().checked_div(gcd)?.checked_mul(period.denominator())?;
+    let units = phase
+        .denominator()
+        .checked_div(gcd)?
+        .checked_mul(period.denominator())?;
     let phase_units = phase.numerator().checked_mul(units / phase.denominator())?;
-    let period_units = period.numerator().checked_mul(units / period.denominator())?;
+    let period_units = period
+        .numerator()
+        .checked_mul(units / period.denominator())?;
     const EXACT: i128 = 1 << 53;
     [phase_units, period_units, units]
         .iter()
         .all(|value| value.abs() < EXACT)
-        .then(|| (phase_units as f64, period_units as f64, units as f64))
+        .then_some((phase_units as f64, period_units as f64, units as f64))
 }
 
 fn gcd(mut a: i128, mut b: i128) -> i128 {
@@ -187,7 +213,9 @@ pub(super) fn partition(
             ClockPartitionStep::Intermediate { row } => intermediate_step(discrete, row)?,
             ClockPartitionStep::StructuredUpdate { .. }
             | ClockPartitionStep::EventTransaction { .. } => {
-                return Err("the C profile runs only scalar-row, guarded, and intermediate sample steps");
+                return Err(
+                    "the C profile runs only scalar-row, guarded, and intermediate sample steps",
+                );
             }
         });
     }
@@ -246,7 +274,10 @@ fn rows_step(
 /// One same-tick algebraic refresh: the linked runtime writes it into the
 /// tick's work state; the C profile writes the coordinate itself, which the
 /// event iteration's own refresh then settles.
-fn intermediate_step(discrete: &DiscreteSolveSystem, row: usize) -> Result<SampleStep, &'static str> {
+fn intermediate_step(
+    discrete: &DiscreteSolveSystem,
+    row: usize,
+) -> Result<SampleStep, &'static str> {
     let block = &discrete.clock_partition_intermediates;
     let program = block
         .program_index_for_output(row)

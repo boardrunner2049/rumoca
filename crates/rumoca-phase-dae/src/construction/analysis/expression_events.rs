@@ -55,6 +55,10 @@ pub(in crate::construction) enum ExpressionEventPlan {
     DynamicTimeEvent(DynamicTimeEventOperand),
     /// `sample(start, interval)`, the MLS §3.7.5 periodic Boolean operator.
     SampleClock(rumoca_core::PeriodicClockSchedule),
+    /// `sample(start, interval)` over parameter operands with no
+    /// translation-time value: its schedule is fixed at initialization. The
+    /// ordinal names its operands in [`ExpressionEventPlans::parametric_samples`].
+    ParametricSample(usize),
     /// `floor`, `ceil`, or `integer` of a varying argument: MLS §3.7.2 makes
     /// each integer crossing of the argument an event, located by the
     /// `sin(pi*x) >= 0` indicator root the dynamic quotients also use.
@@ -103,6 +107,8 @@ impl PlannedOccurrence {
 pub(in crate::construction) struct ExpressionEventPlans {
     ordered: Vec<(Span, ExpressionEventPlan)>,
     by_span: HashMap<Span, Vec<PlannedOccurrence>>,
+    /// The operands of every parametric `sample(start, interval)`, by ordinal.
+    parametric_samples: Vec<(Span, Vec<Expression>)>,
 }
 
 impl ExpressionEventPlans {
@@ -151,6 +157,43 @@ impl ExpressionEventPlans {
         self.ordered.iter().copied()
     }
 
+    /// The source span and `[start, interval]` operands of every parametric
+    /// `sample(start, interval)` occurrence, in ordinal order.
+    pub(in crate::construction) fn parametric_samples(&self) -> &[(Span, Vec<Expression>)] {
+        &self.parametric_samples
+    }
+
+    /// Record one `sample(start, interval)` occurrence: its exact lattice
+    /// when the operands evaluate at translation time, else, for parameter
+    /// operands, a schedule fixed at initialization.
+    fn insert_sample(
+        &mut self,
+        args: &[Expression],
+        scope: &EventScope<'_>,
+        span: Span,
+    ) -> Result<(), ToDaeError> {
+        let operands: Vec<&Expression> = args.iter().collect();
+        let error = match evaluate_sample_schedule(args, scope.constants, span) {
+            Ok(schedule) => {
+                return self.insert(span, &operands, ExpressionEventPlan::SampleClock(schedule));
+            }
+            Err(error) => error,
+        };
+        if !sample_operands_are_parameters(args, scope.roles, scope.constants) {
+            return Err(error);
+        }
+        if let Some(ExpressionEventPlan::ParametricSample(_)) = self.plan(span, &operands) {
+            return Ok(());
+        }
+        let ordinal = self.parametric_samples.len();
+        self.parametric_samples.push((span, args.to_vec()));
+        self.insert(
+            span,
+            &operands,
+            ExpressionEventPlan::ParametricSample(ordinal),
+        )
+    }
+
     /// Record the plan proved for one occurrence.
     ///
     /// A repeat of the same occurrence is the same proof and is dropped. A
@@ -195,6 +238,7 @@ impl ExpressionEventPlan {
             (Self::TimeEvent(left), Self::TimeEvent(right)) => left == right,
             (Self::DynamicTimeEvent(left), Self::DynamicTimeEvent(right)) => left == right,
             (Self::SampleClock(left), Self::SampleClock(right)) => left == right,
+            (Self::ParametricSample(left), Self::ParametricSample(right)) => left == right,
             (Self::IntegerStep, Self::IntegerStep) => true,
             _ => false,
         }
@@ -330,11 +374,7 @@ fn collect_activation_time_events(
             function: BuiltinFunction::Sample,
             args,
             span,
-        } => {
-            let schedule = evaluate_sample_schedule(args, scope.constants, *span)?;
-            let operands: Vec<&Expression> = args.iter().collect();
-            plans.insert(*span, &operands, ExpressionEventPlan::SampleClock(schedule))?;
-        }
+        } => plans.insert_sample(args, scope, *span)?,
         Expression::Binary { op, lhs, rhs, span } if op.is_relational() => {
             if let Some(instant) = time_event_instant(op, lhs, rhs, scope.constants) {
                 plans.insert(*span, &[lhs, rhs], ExpressionEventPlan::TimeEvent(instant))?;
@@ -426,9 +466,7 @@ fn collect_event_owners(
             args,
             span,
         } if !is_clocked_value_sample(scope.flat, args) => {
-            let schedule = evaluate_sample_schedule(args, scope.constants, *span)?;
-            let operands: Vec<&Expression> = args.iter().collect();
-            plans.insert(*span, &operands, ExpressionEventPlan::SampleClock(schedule))?;
+            plans.insert_sample(args, scope, *span)?;
             return Ok(());
         }
         Expression::Binary { op, lhs, rhs, span }
@@ -719,4 +757,26 @@ fn affine_time_coefficients(
         }
         _ => None,
     }
+}
+
+/// Whether `sample(start, interval)`'s two operands read only parameters and
+/// constants whose values the parameter bindings fix, so initialization
+/// fixes them (MLS §3.7.5 requires parameter expressions). A `fixed = false`
+/// parameter the initialization system determines keeps its own refusal.
+pub(in crate::construction) fn sample_operands_are_parameters(
+    args: &[Expression],
+    roles: &HashMap<VarName, PlannedRole>,
+    constants: &EvalContext,
+) -> bool {
+    args.len() == 2
+        && args.iter().all(|operand| {
+            let mut references: Vec<VarName> = Vec::new();
+            operand.collect_var_refs(&mut references);
+            references.iter().all(|reference| {
+                matches!(
+                    roles.get(reference),
+                    Some(PlannedRole::Parameter | PlannedRole::Constant)
+                ) && constants.deferred_parameter(reference.as_str()).is_none()
+            })
+        })
 }

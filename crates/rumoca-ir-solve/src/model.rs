@@ -1161,9 +1161,37 @@ pub struct SolveClockPartition {
     /// instant. These lanes make clock leaves computable inside mixed
     /// condition DAGs without creating another clock or row owner.
     pub activation_parameter_indices: Vec<usize>,
+    /// Per periodic schedule, in the same order: the parameter slots of an
+    /// MLS §3.7.5 `sample(start, interval)` whose operands have no
+    /// translation-time value, or `None` for an exact lattice. Such a
+    /// schedule's [`PeriodicEventSchedule`] entry is not its instants: an
+    /// executor reads `start` and `interval` once initialization has fixed
+    /// them, and one that cannot must refuse the problem
+    /// ([`Self::has_parametric_samples`]). Empty when no schedule is
+    /// parametric.
+    #[serde(default)]
+    pub parametric_samples: Vec<Option<ParametricSampleSlots>>,
+}
+
+/// The parameter slots holding one parametric `sample(start, interval)`'s
+/// start and interval (SPEC_0044 ME-EVENT-010).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ParametricSampleSlots {
+    pub start: usize,
+    pub interval: usize,
 }
 
 impl SolveClockPartition {
+    /// Whether a schedule's instants are fixed only at initialization.
+    pub fn has_parametric_samples(&self) -> bool {
+        self.parametric_samples.iter().any(Option::is_some)
+    }
+
+    /// The parameter slots of schedule `index` when it is parametric.
+    pub fn parametric_sample(&self, index: usize) -> Option<ParametricSampleSlots> {
+        self.parametric_samples.get(index).copied().flatten()
+    }
+
     pub fn periodic_clock_id(&self, index: usize) -> Option<PeriodicClockId> {
         self.periodic_event_schedules
             .get(index)

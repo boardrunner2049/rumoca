@@ -14,6 +14,10 @@ impl Shift for RbcClock {
                 base.shift(m)?;
                 condition.shift(m)?;
             }
+            RbcClockNode::ParametricSample { start, interval } => {
+                start.shift(m)?;
+                interval.shift(m)?;
+            }
             RbcClockNode::Periodic { .. } => {}
         }
         Ok(())

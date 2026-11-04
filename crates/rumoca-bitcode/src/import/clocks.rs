@@ -55,6 +55,17 @@ pub(super) fn rebuild<'dae>(
                     at,
                 )
                 .map(|id| (id, None)),
+            RbcClockNode::ParametricSample { start, interval } => {
+                let parameter = |id: &VariableId| match resolve(variables, id.0, "variable", ctx)? {
+                    VariableSlot::Parameter(parameter) => Ok(parameter),
+                    _ => {
+                        Err(ctx.unsupported("a sample(start, interval) operand is not a parameter"))
+                    }
+                };
+                owner
+                    .parametric_sample(parameter(start)?, parameter(interval)?, at)
+                    .map(|id| (id, None))
+            }
             RbcClockNode::Triggered { condition } => owner
                 .triggered(resolve(conditions, condition.0, "condition", ctx)?, at)
                 .map(|id| (id, None)),

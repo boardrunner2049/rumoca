@@ -14,9 +14,8 @@ use serde::{Deserialize, Serialize};
 use feature_analysis::{
     dae_has_clocks, dae_has_dynamic_derivative_subscripts, dae_has_dynamic_ranges, dae_has_events,
     dae_has_initialization, dae_has_runtime_events, dae_has_synchronous_clocks,
-    dae_has_unlowered_source_temporal_operators,
-    dae_uses_external_tables, dae_uses_random, first_external_function, fmi_c_cannot_link,
-    solve_requires_residual_equations,
+    dae_has_unlowered_source_temporal_operators, dae_uses_external_tables, dae_uses_random,
+    first_external_function, fmi_c_cannot_link, solve_requires_residual_equations,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

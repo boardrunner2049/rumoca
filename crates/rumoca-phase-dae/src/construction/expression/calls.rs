@@ -431,12 +431,16 @@ pub(super) fn lower_sample_event_operator<'dae>(
 ) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
     let span = provenance.span();
     let operands: Vec<&Expression> = arguments.iter().collect();
-    let Some(ExpressionEventPlan::SampleClock(schedule)) =
-        symbols.functions.expression_events.plan(span, &operands)
-    else {
-        return Err(dae::DaeConstructionError::InvalidExpressionForm { span });
+    let clock = match symbols.functions.expression_events.plan(span, &operands) {
+        Some(ExpressionEventPlan::SampleClock(schedule)) => {
+            symbols.functions.clocks.sample_id(schedule, span)?
+        }
+        Some(ExpressionEventPlan::ParametricSample(ordinal)) => symbols
+            .functions
+            .clocks
+            .parametric_sample_id(ordinal, span)?,
+        _ => return Err(dae::DaeConstructionError::InvalidExpressionForm { span }),
     };
-    let clock = symbols.functions.clocks.sample_id(schedule, span)?;
     let condition = construction.conditions(|conditions| conditions.reserve(provenance))?;
     construction.conditions(|conditions| {
         conditions.define(condition, dae::ConditionInput::Clock(clock), provenance)

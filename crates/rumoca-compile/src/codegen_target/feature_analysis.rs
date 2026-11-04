@@ -160,9 +160,12 @@ pub(super) fn dae_has_clocks(model: &dae::Dae) -> bool {
 pub(super) fn dae_has_synchronous_clocks(model: &dae::Dae) -> bool {
     model.inspect(|view| {
         view.previous_value_count() != 0
-            || view
-                .clocks()
-                .any(|(_, clock)| !matches!(clock.operation(), dae::ClockOperation::Periodic(_)))
+            || view.clocks().any(|(_, clock)| {
+                !matches!(
+                    clock.operation(),
+                    dae::ClockOperation::Periodic(_) | dae::ClockOperation::ParametricSample { .. }
+                )
+            })
             || view
                 .clock_ownerships()
                 .any(|(_, ownership)| ownership.sampled())

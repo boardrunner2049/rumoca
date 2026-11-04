@@ -376,6 +376,7 @@ fn phase_zero_clock_tick_executes_once_after_initialization() {
     let clocks = solve::SolveClockPartition {
         periodic_event_schedules: vec![schedule.clone()],
         activation_parameter_indices: vec![2],
+        parametric_samples: Vec::new(),
     };
     let owner = clocks
         .periodic_clock_id(0)

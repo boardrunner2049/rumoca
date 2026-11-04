@@ -1004,6 +1004,11 @@ fn project_clocks(view: dae::DaeView<'_>) -> Value {
                         "lattice": schedule.lattice(),
                         "anchor": schedule.anchor(),
                     }),
+                    dae::ClockOperation::ParametricSample { start, interval } => json!({
+                        "kind": "parametric_sample",
+                        "start": start.index(),
+                        "interval": interval.index(),
+                    }),
                     dae::ClockOperation::Triggered(condition) => json!({
                         "kind": "triggered",
                         "condition": condition.index(),

@@ -574,10 +574,15 @@ fn discrete_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
             Arc::new(handle.problem().discrete.post_commit_assignment_rhs.clone()),
         )?);
     let guarded_assignment_plan = guarded_assignment_plan(&handle.problem().discrete)?;
-    let clock_partition_intermediate_plan =
-        Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(Arc::new(
-            handle.problem().discrete.clock_partition_intermediates.clone(),
-        ))?);
+    let clock_partition_intermediate_plan = Value::from_object(
+        super::scalar_program_plan::ScalarProgramPlan::new(Arc::new(
+            handle
+                .problem()
+                .discrete
+                .clock_partition_intermediates
+                .clone(),
+        ))?,
+    );
     let targets = scalar.targets;
     let pre_modes = scalar.pre_modes;
     let observation_refresh = scalar.observation_refresh;

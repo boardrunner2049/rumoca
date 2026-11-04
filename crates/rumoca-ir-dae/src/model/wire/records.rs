@@ -448,6 +448,10 @@ pub(super) struct EventActionEntryWire {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ClockKindWire {
     Periodic(PeriodicClockScheduleWire),
+    ParametricSample {
+        start: u32,
+        interval: u32,
+    },
     Triggered(u32),
     Shifted {
         base: u32,

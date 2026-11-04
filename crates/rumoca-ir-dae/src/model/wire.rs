@@ -1750,6 +1750,17 @@ fn reconstruct_clocks<'dae>(
             ClockKindWire::Periodic(schedule) => clocks
                 .scheduled(schedule.checked(clock.provenance)?, clock.provenance)
                 .map(WireClockId::Periodic),
+            ClockKindWire::ParametricSample { start, interval } => clocks
+                .parametric_sample(
+                    ParameterId::from_raw(
+                        mapped(&ids.variables, start, "variable", clock.provenance)?.index(),
+                    ),
+                    ParameterId::from_raw(
+                        mapped(&ids.variables, interval, "variable", clock.provenance)?.index(),
+                    ),
+                    clock.provenance,
+                )
+                .map(WireClockId::Triggered),
             ClockKindWire::Triggered(condition) => clocks
                 .triggered(
                     mapped(&ids.conditions, condition, "condition", clock.provenance)?,

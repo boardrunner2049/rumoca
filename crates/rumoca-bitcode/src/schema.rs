@@ -1828,6 +1828,12 @@ pub enum RbcClockNode {
         phase: RbcClockRational,
         anchor: RbcClockAnchor,
     },
+    /// MLS §3.7.5 `sample(start, interval)` whose start and interval are the
+    /// initialization values of two Real parameter variables.
+    ParametricSample {
+        start: VariableId,
+        interval: VariableId,
+    },
     Triggered {
         condition: ConditionId,
     },

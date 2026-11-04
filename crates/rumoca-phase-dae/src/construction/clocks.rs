@@ -16,6 +16,13 @@ pub(super) struct LoweredClocks<'dae> {
     /// periodic schedule. Every occurrence and exact Boolean alias reuses this
     /// one owner rather than allocating parallel activation lanes.
     by_sample_schedule: HashMap<PeriodicClockSchedule, dae::PeriodicClockId<'dae>>,
+    /// MLS §3.7.5 `sample(start, interval)` occurrences over parameters with
+    /// no translation-time value, by analysis ordinal: each owns one clock
+    /// reading two generated parameters whose bindings are its operands.
+    parametric_samples: Vec<dae::ClockId<'dae>>,
+    /// The generated start/interval parameters still to be defined once the
+    /// operand expressions can be lowered.
+    pending_parametric: Vec<PendingParametricSample<'dae>>,
     /// Clock coordinates keyed by their Flat catalog name, the identity every
     /// Flat expression occurrence names. `Reference::instance_id` carries the
     /// enclosing class occurrence, so it cannot select a referenced coordinate.
@@ -74,6 +81,58 @@ impl<'dae> LoweredClocks<'dae> {
             .get(&clock)
             .copied()
             .ok_or(dae::DaeConstructionError::MissingClockDomainOwner { span })
+    }
+
+    pub(super) fn parametric_sample_id(
+        &self,
+        ordinal: usize,
+        span: Span,
+    ) -> Result<dae::ClockId<'dae>, dae::DaeConstructionError> {
+        self.parametric_samples
+            .get(ordinal)
+            .copied()
+            .ok_or(dae::DaeConstructionError::MissingClockDomainOwner { span })
+    }
+
+    /// Issue one clock per parametric `sample(start, interval)` occurrence,
+    /// reading two generated Real parameters that are defined by
+    /// [`define_parametric_samples`] once expressions can be lowered.
+    pub(super) fn issue_parametric_samples(
+        &mut self,
+        construction: &mut dae::DaeConstruction<'dae>,
+        samples: &[(Span, Vec<rumoca_core::Expression>)],
+    ) -> Result<(), dae::DaeConstructionError> {
+        for (ordinal, (span, _)) in samples.iter().enumerate() {
+            let provenance =
+                dae::DaeProvenance::generated(dae::DaeGeneration::ClockLowering, *span)?;
+            let value_type = construction.types(|types| {
+                types.derived(dae::ValueType::scalar(dae::ScalarType::Real), provenance)
+            })?;
+            let (start, start_reservation) =
+                reserve_sample_parameter(construction, "Start", ordinal, value_type, provenance)?;
+            let (interval, interval_reservation) = reserve_sample_parameter(
+                construction,
+                "Interval",
+                ordinal,
+                value_type,
+                provenance,
+            )?;
+            let clock = construction
+                .clocks(|clocks| clocks.parametric_sample(start, interval, provenance))?;
+            self.parametric_samples.push(clock);
+            self.pending_parametric.push(PendingParametricSample {
+                ordinal,
+                provenance,
+                start: start_reservation,
+                interval: interval_reservation,
+            });
+        }
+        Ok(())
+    }
+
+    /// The generated parameters [`Self::issue_parametric_samples`] reserved.
+    pub(super) fn take_parametric_definitions(&mut self) -> Vec<PendingParametricSample<'dae>> {
+        std::mem::take(&mut self.pending_parametric)
     }
 
     pub(super) fn sample_id(
@@ -178,6 +237,8 @@ pub(super) fn lower_clocks<'dae>(
         by_plan: HashMap::new(),
         lattices: HashMap::new(),
         by_sample_schedule: HashMap::new(),
+        parametric_samples: Vec::new(),
+        pending_parametric: Vec::new(),
         by_coordinate: HashMap::new(),
         first_ticks: HashMap::new(),
         pending_events: Vec::new(),
@@ -540,6 +601,80 @@ pub(super) fn lower_clocked_value_owners<'dae>(
                 span: plan.ownership_span,
             }),
         })?;
+    }
+    Ok(())
+}
+
+fn reserve_sample_parameter<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    role: &str,
+    ordinal: usize,
+    value_type: dae::ValueTypeId<'dae>,
+    provenance: dae::DaeProvenance,
+) -> Result<(dae::ParameterId<'dae>, dae::VariableReservation<'dae>), dae::DaeConstructionError> {
+    construction.variables(|variables| {
+        variables.reserve_parameter(
+            VarName::new(format!("sample{role}(occurrence {ordinal})")),
+            value_type,
+            provenance,
+        )
+    })
+}
+
+/// The two generated parameters of one parametric `sample(start, interval)`.
+pub(super) struct PendingParametricSample<'dae> {
+    ordinal: usize,
+    provenance: dae::DaeProvenance,
+    start: dae::VariableReservation<'dae>,
+    interval: dae::VariableReservation<'dae>,
+}
+
+/// Define each generated parameter of a parametric `sample(start, interval)`
+/// by its operand: initialization evaluates the bindings, and the schedule
+/// reads the values they settle at (MLS §3.7.5).
+pub(super) fn define_parametric_samples<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    coordinates: &HashMap<VarName, Coordinate<'dae>>,
+    functions: &super::FunctionRegistry<'_, 'dae>,
+    pending: Vec<PendingParametricSample<'dae>>,
+) -> Result<(), dae::DaeConstructionError> {
+    let samples = functions.expression_events.parametric_samples();
+    for sample in pending {
+        let operands = samples
+            .get(sample.ordinal)
+            .map(|(_, operands)| operands.as_slice())
+            .ok_or(dae::DaeConstructionError::MissingClockDomainOwner {
+                span: sample.provenance.span(),
+            })?;
+        let [start, interval] = operands else {
+            return Err(dae::DaeConstructionError::InvalidExpressionForm {
+                span: sample.provenance.span(),
+            });
+        };
+        for (reservation, operand) in [(sample.start, start), (sample.interval, interval)] {
+            let binding =
+                super::lower_expression(construction, coordinates, functions, operand, None)?;
+            // The binding is evaluated at initialization; the start only
+            // gives the declaration a finite value before that, as an
+            // operand may divide by a parameter still at its default.
+            let start = construction.expressions(|expressions| {
+                expressions
+                    .at(sample.provenance)
+                    .literal(dae::DaeLiteral::Real(0.0))
+            })?;
+            construction.variables(|variables| {
+                variables.define(
+                    reservation,
+                    dae::VariableAttributes {
+                        binding: Some(binding),
+                        start: Some(start),
+                        origin: dae::VariableOrigin::Generated,
+                        ..Default::default()
+                    },
+                    sample.provenance,
+                )
+            })?;
+        }
     }
     Ok(())
 }

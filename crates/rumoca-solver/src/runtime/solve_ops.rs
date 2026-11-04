@@ -620,6 +620,7 @@ mod tests {
         let clocks = solve::SolveClockPartition {
             periodic_event_schedules: vec![schedule],
             activation_parameter_indices: vec![0],
+            parametric_samples: Vec::new(),
         };
         let owner = clocks
             .periodic_clock_id(0)
@@ -659,6 +660,7 @@ mod tests {
                     // Deliberately not schedule order: typed identity owns the
                     // mapping, not a row target or incidental P-slot ordinal.
                     activation_parameter_indices: vec![2, 0],
+                    parametric_samples: Vec::new(),
                 },
                 ..Default::default()
             },

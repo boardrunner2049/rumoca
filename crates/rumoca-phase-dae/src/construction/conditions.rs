@@ -237,15 +237,22 @@ fn lower_sample_condition<'dae>(
     // periods or phases. Analysis proved this exact occurrence and lowering
     // must consume that proof instead of selecting the first lattice by span.
     let operands: Vec<&Expression> = arguments.iter().collect();
-    let Some(ExpressionEventPlan::SampleClock(schedule)) = functions
+    let clock = match functions
         .expression_events
         .plan(provenance.span(), &operands)
-    else {
-        return Err(dae::DaeConstructionError::InvalidExpressionForm {
-            span: provenance.span(),
-        });
+    {
+        Some(ExpressionEventPlan::SampleClock(schedule)) => {
+            functions.clocks.sample_id(schedule, provenance.span())?
+        }
+        Some(ExpressionEventPlan::ParametricSample(ordinal)) => functions
+            .clocks
+            .parametric_sample_id(ordinal, provenance.span())?,
+        _ => {
+            return Err(dae::DaeConstructionError::InvalidExpressionForm {
+                span: provenance.span(),
+            });
+        }
     };
-    let clock = functions.clocks.sample_id(schedule, provenance.span())?;
     Ok((dae::ConditionInput::Clock(clock), Vec::new(), Some(clock)))
 }
 

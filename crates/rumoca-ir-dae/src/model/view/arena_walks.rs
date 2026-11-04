@@ -156,6 +156,12 @@ fn event_action_view(entry: &EventActionEntry) -> EventActionView<'_> {
 fn clock_view(entry: &ClockEntry) -> ClockView<'_> {
     let operation = match &entry.kind {
         crate::clocks::ClockKind::Periodic(lattice) => ClockOperation::Periodic(lattice),
+        crate::clocks::ClockKind::ParametricSample { start, interval } => {
+            ClockOperation::ParametricSample {
+                start: crate::ParameterId::from_raw(*start),
+                interval: crate::ParameterId::from_raw(*interval),
+            }
+        }
         crate::clocks::ClockKind::Triggered(condition) => {
             ClockOperation::Triggered(ConditionId::from_raw(*condition))
         }

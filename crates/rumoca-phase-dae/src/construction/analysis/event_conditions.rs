@@ -84,16 +84,7 @@ fn validate_condition_expression_in_context(
             function: BuiltinFunction::Sample,
             args,
             span,
-        } => {
-            let schedule = evaluate_sample_schedule(args, constants, *span)?;
-            if !sample_lattices
-                .iter()
-                .any(|(existing, _)| *existing == *span)
-            {
-                sample_lattices.push((*span, schedule));
-            }
-            Ok(())
-        }
+        } => record_sample_lattice(args, roles, constants, sample_lattices, *span),
         Expression::Unary {
             op: OpUnary::Not,
             rhs,
@@ -175,16 +166,7 @@ pub(super) fn validate_algorithm_condition(
             function: BuiltinFunction::Sample,
             args,
             span,
-        } => {
-            let schedule = evaluate_sample_schedule(args, constants, *span)?;
-            if !sample_lattices
-                .iter()
-                .any(|(existing, _)| *existing == *span)
-            {
-                sample_lattices.push((*span, schedule));
-            }
-            Ok(())
-        }
+        } => record_sample_lattice(args, roles, constants, sample_lattices, *span),
         Expression::Unary {
             op: OpUnary::Not,
             rhs,
@@ -208,6 +190,34 @@ pub(super) fn validate_algorithm_condition(
         }
         _ => validate_expression(expression, roles, states),
     }
+}
+
+/// Record the exact lattice of one `sample(start, interval)` condition. A
+/// sample over parameters without a translation-time value has none: its
+/// schedule is fixed at initialization (`ExpressionEventPlan::ParametricSample`).
+fn record_sample_lattice(
+    args: &[Expression],
+    roles: &HashMap<VarName, PlannedRole>,
+    constants: &EvalContext,
+    sample_lattices: &mut Vec<(Span, PeriodicClockSchedule)>,
+    span: Span,
+) -> Result<(), ToDaeError> {
+    let schedule = match evaluate_sample_schedule(args, constants, span) {
+        Ok(schedule) => schedule,
+        Err(_)
+            if super::expression_events::sample_operands_are_parameters(args, roles, constants) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if !sample_lattices
+        .iter()
+        .any(|(existing, _)| *existing == span)
+    {
+        sample_lattices.push((span, schedule));
+    }
+    Ok(())
 }
 
 pub(super) fn evaluate_sample_schedule(

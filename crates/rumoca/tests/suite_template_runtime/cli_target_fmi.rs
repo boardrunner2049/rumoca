@@ -24,6 +24,7 @@ mod projection;
 mod refused_trial;
 mod reported_models;
 mod residual_split_harness;
+mod sample_events;
 mod state_events;
 mod stiff_floating_node;
 mod tensor_algebra;

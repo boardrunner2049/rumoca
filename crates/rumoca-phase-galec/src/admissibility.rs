@@ -81,7 +81,9 @@ fn projection_errors<'dae>(
         .filter(|(_, clock)| {
             matches!(
                 clock.operation(),
-                dae::ClockOperation::Triggered(_) | dae::ClockOperation::Shifted { .. }
+                dae::ClockOperation::Triggered(_)
+                    | dae::ClockOperation::Shifted { .. }
+                    | dae::ClockOperation::ParametricSample { .. }
             ) || matches!(
                 clock.operation(),
                 dae::ClockOperation::Periodic(schedule)
@@ -195,6 +197,7 @@ fn periodic_clocks(view: dae::DaeView<'_>) -> Vec<(u32, &rumoca_core::PeriodicCl
                 Some((id.index(), schedule))
             }
             dae::ClockOperation::Periodic(_)
+            | dae::ClockOperation::ParametricSample { .. }
             | dae::ClockOperation::Triggered(_)
             | dae::ClockOperation::Shifted { .. } => None,
         })

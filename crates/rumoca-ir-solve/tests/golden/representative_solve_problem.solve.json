@@ -675,6 +675,7 @@
     ],
     "activation_parameter_indices": [
       0
-    ]
+    ],
+    "parametric_samples": []
   }
 }

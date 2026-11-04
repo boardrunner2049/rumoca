@@ -314,6 +314,15 @@ fn set_initial_event_flag(model: &solve::SolveModel, p: &mut [f64], value: bool)
 }
 
 fn validate_discrete_event_rows(model: &solve::SolveModel) -> Result<(), RuntimeSolveError> {
+    // SPEC_0044 ME-EVENT-010: a `sample(start, interval)` whose operands are
+    // fixed only at initialization carries an inert lattice in its Solve
+    // schedule; this runtime schedules exact lattices alone and refuses it.
+    if model.problem.clocks.has_parametric_samples() {
+        return Err(RuntimeSolveError::solve_ir(
+            "sample(start, interval) with operands fixed only at initialization is \
+             executed by the FMI C profile, not by this runtime",
+        ));
+    }
     let rows = model.problem.discrete.rhs.len();
     let targets = model.problem.discrete.update_targets.len();
     let roles = model.problem.discrete.row_roles.len();

@@ -141,14 +141,7 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
     let roots = (0..count)
         .map(|index| scalar_event_root(problem, &search, index))
         .collect::<Result<Vec<_>, _>>()?;
-    let discrete_targets = discrete
-        .update_targets
-        .iter()
-        .map(|slot| match slot {
-            ScalarSlot::P { index, .. } => Ok(*index),
-            _ => Err("a discrete row writes outside the parameters"),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let discrete_targets = parameter_targets(&discrete.update_targets)?;
     if discrete.row_roles.iter().any(|role| {
         !matches!(
             role,
@@ -231,14 +224,23 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
     })
 }
 
+/// The parameter index of every discrete row target.
+fn parameter_targets(targets: &[ScalarSlot]) -> Result<Vec<usize>, &'static str> {
+    targets
+        .iter()
+        .map(|slot| match slot {
+            ScalarSlot::P { index, .. } => Ok(*index),
+            _ => Err("a discrete row writes outside the parameters"),
+        })
+        .collect()
+}
+
 fn refuse_unsupported_owners(model: &SolveModel) -> Result<(), &'static str> {
     let problem = &model.problem;
     let events = &problem.events;
     let discrete = &problem.discrete;
     if crate::solve_has_runtime_events(problem) || crate::solve_has_synchronous_clocks(problem) {
-        return Err(
-            "the C profile cannot execute delays, terminal events, or synchronous clocks",
-        );
+        return Err("the C profile cannot execute delays, terminal events, or synchronous clocks");
     }
     // An assertion inside `when sample(...)` is checked at its clock's ticks
     // (ME-EVENT-010); the synchronous clocks that could own one otherwise are

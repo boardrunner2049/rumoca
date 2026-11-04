@@ -195,7 +195,7 @@ fn event_edge_actions_are_refused() {
 #[test]
 fn clocked_previous_history_is_refused() {
     assert_refused(
-        "the C profile cannot execute clocked previous() history",
+        "the C profile cannot execute delays, terminal events, or synchronous clocks",
         |model| {
             static_partition(model);
             model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {

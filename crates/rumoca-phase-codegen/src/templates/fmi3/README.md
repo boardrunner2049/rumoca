@@ -56,7 +56,14 @@ projected at every accepted Co-Simulation substep and every Event-Mode update;
 a Model-Exchange completed step whose point needs the correction requests
 Event Mode (SPEC_0044 ME-PROJ-007).
 
-The current profile rejects general events, clocks, runtime event history,
+MLS §3.7.5 `when sample(start, interval)` clauses run as time events
+(`sample_events = true`, SPEC_0044 ME-EVENT-010): each tick is announced as
+`nextEventTime` and as a Co-Simulation stop, computed from an exact tick
+counter, and its clock-owned producers run once per tick. An interval or
+start over parameters without a translation-time value is read from the
+parameters at Exit Initialization Mode.
+
+The current profile rejects MLS §16 synchronous clocks, runtime event history,
 external tables, and impure random operations. External functions are
 admitted when the component can link them (SPEC_0044 ME-EXT-001): an
 `external "builtin"` or C math-library function is the builtin, and the MSL

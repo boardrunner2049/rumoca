@@ -85,23 +85,36 @@ pub(super) fn lower_clocks<'dae>(
     let mut partition = solve::SolveClockPartition {
         periodic_event_schedules: Vec::with_capacity(view.clock_count()),
         activation_parameter_indices: Vec::with_capacity(view.clock_count()),
+        parametric_samples: Vec::new(),
     };
     let mut dae_clocks = Vec::with_capacity(view.clock_count());
     for (index, (_, clock)) in view.clocks().enumerate() {
-        let schedule = match clock.operation() {
-            dae::ClockOperation::Periodic(schedule) => schedule,
+        let (schedule, parametric) = match clock.operation() {
+            dae::ClockOperation::Periodic(schedule) => (
+                solve::PeriodicEventSchedule::from_schedule(*schedule).map_err(|error| {
+                    LowerError::contract(
+                        format!("checked DAE clock lattice cannot form a Solve schedule: {error}"),
+                        clock.provenance().span(),
+                    )
+                })?,
+                None,
+            ),
+            // MLS §3.7.5 `sample(start, interval)` over parameters without a
+            // translation-time value: the schedule is the parameters' values
+            // at initialization, recorded by slot beside an inert lattice.
+            dae::ClockOperation::ParametricSample { start, interval } => (
+                solve::PeriodicEventSchedule::default(),
+                Some(solve::ParametricSampleSlots {
+                    start: parameter_slot(layout, start.into(), clock.provenance().span())?,
+                    interval: parameter_slot(layout, interval.into(), clock.provenance().span())?,
+                }),
+            ),
             dae::ClockOperation::Triggered(condition)
             | dae::ClockOperation::Shifted { condition, .. } => {
                 dae_clocks.push(LoweredClock::Triggered(condition));
                 continue;
             }
         };
-        let schedule = solve::PeriodicEventSchedule::from_schedule(*schedule).map_err(|error| {
-            LowerError::contract(
-                format!("checked DAE clock lattice cannot form a Solve schedule: {error}"),
-                clock.provenance().span(),
-            )
-        })?;
         let activation = layout
             .clock_activations
             .get(index)
@@ -114,12 +127,16 @@ pub(super) fn lower_clocks<'dae>(
             })?;
         partition.periodic_event_schedules.push(schedule);
         partition.activation_parameter_indices.push(activation);
+        partition.parametric_samples.push(parametric);
         let solve_clock = partition
             .periodic_clock_id(partition.periodic_event_schedules.len() - 1)
             .expect("u32 checked DAE clock identity fits Solve clock identity");
         dae_clocks.push(LoweredClock::Periodic(solve_clock));
     }
 
+    if !partition.has_parametric_samples() {
+        partition.parametric_samples.clear();
+    }
     let mut variable_owners = vec![None; view.variable_count()];
     let mut variable_triggers = vec![None; view.variable_count()];
     let mut sampled_variables = vec![false; view.variable_count()];
@@ -798,5 +815,22 @@ impl DependencyEdge {
             Self::Clocked { clock, target } if allowed.contains(&clock) => Some(target),
             Self::Clocked { .. } => None,
         }
+    }
+}
+
+/// The parameter-storage slot of a scalar parameter variable.
+fn parameter_slot(
+    layout: &LoweredLayout<'_>,
+    variable: dae::VariableId<'_>,
+    span: rumoca_core::Span,
+) -> Result<usize, LowerError> {
+    match layout.variables.get(variable.index() as usize) {
+        Some(slot) if matches!(slot.storage, crate::layout::StorageClass::P) && slot.count == 1 => {
+            Ok(slot.base)
+        }
+        _ => Err(LowerError::contract(
+            "a sample(start, interval) operand is not one scalar parameter slot",
+            span,
+        )),
     }
 }

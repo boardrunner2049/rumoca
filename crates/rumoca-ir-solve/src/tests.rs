@@ -1116,6 +1116,7 @@ fn representative_clock_partition() -> SolveClockPartition {
                 .unwrap(),
         ],
         activation_parameter_indices: vec![0],
+        parametric_samples: Vec::new(),
     }
 }
 
@@ -2146,6 +2147,7 @@ fn clocked_scalar_discrete_fixture_rows(rows: usize) -> DiscreteSolveSystem {
             PeriodicEventSchedule::from_seconds(0.1, 0.0).expect("fixture clock lattice is exact"),
         ],
         activation_parameter_indices: vec![1],
+        parametric_samples: Vec::new(),
     }
     .periodic_clock_id(0)
     .expect("fixture clock identity resolves");

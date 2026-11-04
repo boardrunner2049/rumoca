@@ -289,6 +289,7 @@ fn build_checked<'dae>(
     }
     let value_types = reserve_value_types(flat, analysis, construction)?;
     let mut clocks = lower_analysis_clocks(construction, flat, analysis)?;
+    let parametric_samples = clocks.take_parametric_definitions();
     let no_function_ids = HashMap::new();
     let no_coordinate_instances = HashMap::new();
     let analysis_functions = model_function_registry(
@@ -335,6 +336,7 @@ fn build_checked<'dae>(
         coordinates.by_instance(),
         &clocks,
     );
+    clocks::define_parametric_samples(construction, &coordinates, &functions, parametric_samples)?;
     define_reserved_variables(
         construction,
         VariableDefinitionContext {
@@ -442,6 +444,10 @@ fn lower_analysis_clocks<'dae>(
     )?;
     clocks.issue_event_intervals(construction, event_intervals)?;
     clocks.issue_tick_counters(construction)?;
+    clocks.issue_parametric_samples(
+        construction,
+        analysis.expression_events.parametric_samples(),
+    )?;
     Ok(clocks)
 }
 

@@ -729,6 +729,7 @@ fn clock_owned_equation_executes_only_on_the_first_whole_event_pass() {
     let clocks = solve::SolveClockPartition {
         periodic_event_schedules: vec![schedule],
         activation_parameter_indices: vec![4],
+        parametric_samples: Vec::new(),
     };
     let clock = clocks
         .periodic_clock_id(0)
@@ -832,6 +833,7 @@ fn phase_zero_clock_partition() -> (solve::SolveClockPartition, solve::PeriodicC
     let clocks = solve::SolveClockPartition {
         periodic_event_schedules: vec![schedule],
         activation_parameter_indices: vec![3],
+        parametric_samples: Vec::new(),
     };
     let clock = clocks
         .periodic_clock_id(0)

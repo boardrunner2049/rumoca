@@ -252,7 +252,30 @@ where
             if is_non_numeric(variable) {
                 continue;
             }
-            let values = self.evaluator.initial_value(id).map_err(evaluation_error)?;
+            let values = match self.evaluator.initial_value(id) {
+                Ok(values) => values,
+                // A generated parameter (a parametric `sample(start,
+                // interval)` operand, SPEC_0044 ME-EVENT-010) is computed by
+                // its binding at initialization; with its operands still at
+                // their declaration defaults it may not evaluate here, and
+                // its seed is then only a placeholder.
+                Err(_)
+                    if variable.role() == dae::VariableRole::Parameter
+                        && variable.origin() == dae::VariableOrigin::Generated =>
+                {
+                    vec![0.0; variable.scalar_count()]
+                }
+                // MLS §8.6: a parameter with neither a binding nor a start
+                // holds its type's default start, the zero the FMI
+                // description also publishes; the importer sets its value.
+                Err(error)
+                    if variable.role() == dae::VariableRole::Parameter
+                        && error.kind() == NumericEvaluationErrorKind::MissingValue =>
+                {
+                    vec![0.0; variable.scalar_count()]
+                }
+                Err(error) => return Err(evaluation_error(error)),
+            };
             let nominals = self.variable_nominals(variable)?;
             self.write_variable(variable, &values, &nominals, &mut columns)?;
         }

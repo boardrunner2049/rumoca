@@ -24,6 +24,12 @@ pub(super) fn export_clocks(view: dae::DaeView<'_>, ctx: &mut Ctx<'_>) -> Vec<Rb
                         }
                     },
                 },
+                dae::ClockOperation::ParametricSample { start, interval } => {
+                    RbcClockNode::ParametricSample {
+                        start: VariableId(start.index()),
+                        interval: VariableId(interval.index()),
+                    }
+                }
                 dae::ClockOperation::Shifted {
                     base,
                     counter,

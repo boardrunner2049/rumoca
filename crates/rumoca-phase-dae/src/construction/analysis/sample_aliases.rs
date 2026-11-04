@@ -112,6 +112,7 @@ fn alias_definition(
                     Some(AliasDefinition::Schedule(schedule))
                 }
                 ExpressionEventPlan::StateRelation
+                | ExpressionEventPlan::ParametricSample(_)
                 | ExpressionEventPlan::TimeEvent(_)
                 | ExpressionEventPlan::DynamicTimeEvent(_)
                 | ExpressionEventPlan::IntegerStep => None,

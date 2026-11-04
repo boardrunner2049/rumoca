@@ -350,6 +350,7 @@ fn observation_clock_alias_model() -> solve::SolveModel {
             clocks: solve::SolveClockPartition {
                 periodic_event_schedules: vec![schedule],
                 activation_parameter_indices: vec![0],
+                parametric_samples: Vec::new(),
             },
             solve_layout: solve::SolveLayout {
                 parameter_count: 2,
