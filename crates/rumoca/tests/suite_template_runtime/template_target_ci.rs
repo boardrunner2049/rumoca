@@ -372,7 +372,9 @@ fn assert_manifest_only_target(target: &templates::BuiltinTarget, manifest: &Tar
 
 /// Render every `[[files]]` entry through the real CLI path (capability
 /// validation, path templates, name-dispatched renderers) and assert each
-/// rendered file is non-empty.
+/// rendered file is non-empty. An entry whose path template is guarded by
+/// `{% if %}` (a model-dependent support file, such as the MSL random
+/// sources) renders only when its guard holds, so it may be absent.
 fn render_manifest_target_files(
     fixture: &Fixture,
     target: &'static templates::BuiltinTarget,
@@ -385,11 +387,18 @@ fn render_manifest_target_files(
                 target.name, fixture.model_name
             )
         });
-    assert_eq!(
+    let unconditional = manifest
+        .files
+        .iter()
+        .filter(|file| !file.path.trim_start().starts_with("{% if"))
+        .count();
+    assert!(
+        (unconditional..=manifest.files.len()).contains(&files.len()),
+        "target {} rendered {} files; its manifest declares {} ({} unconditional)",
+        target.name,
         files.len(),
         manifest.files.len(),
-        "target {} rendered a different file count than its manifest declares",
-        target.name
+        unconditional
     );
     for file in &files {
         assert!(
@@ -652,6 +661,13 @@ fn shared_template_names_are_globally_unique_and_target_owned() {
             "algorithm-code-source.jinja <- galec/model.alg.jinja".to_string(),
             "fmi-c-kernel.jinja <- fmi3/scalar_kernel.jinja".to_string(),
             "fmi-me-projection.jinja <- fmi3/me_projection.jinja".to_string(),
+            "fmi-msl-ModelicaInternal.h <- fmi3/msl_ModelicaInternal.h.jinja".to_string(),
+            "fmi-msl-ModelicaRandom.c <- fmi3/msl_ModelicaRandom.c.jinja".to_string(),
+            "fmi-msl-ModelicaRandom.h <- fmi3/msl_ModelicaRandom.h.jinja".to_string(),
+            "fmi-msl-ModelicaUtilities.h <- fmi3/msl_ModelicaUtilities.h.jinja".to_string(),
+            "fmi-msl-gconstructor.h <- fmi3/msl_gconstructor.h.jinja".to_string(),
+            "fmi-msl-licenses.txt <- fmi3/msl_licenses.txt.jinja".to_string(),
+            "fmi-rmc_modelica_external.c <- fmi3/rmc_modelica_external.c.jinja".to_string(),
             "fmi-scalar-events.jinja <- fmi3/scalar_events.jinja".to_string(),
             "fmi-typed-arithmetic.jinja <- fmi3/typed_arithmetic.jinja".to_string(),
             "fmi-typed-functions.jinja <- fmi3/typed_functions.jinja".to_string(),
