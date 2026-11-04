@@ -103,6 +103,26 @@ pub fn solve_has_clocks(problem: &SolveProblem) -> bool {
             .any(|update| update.clock_owner.is_some())
 }
 
+/// Whether the checked problem's clock partition needs an MLS §16
+/// synchronous construct.
+///
+/// Every Solve clock is periodic: an MLS §3.7.5 `sample(start, interval)`
+/// owner and a `Clock(period)` partition lower to the same typed schedule.
+/// The partition is synchronous only when it reads a clocked history lane
+/// (`previous`, `interval`, `firstTick`), whose binding carries its clock's
+/// schedule. Without one, its owners are `when` clauses activated by
+/// periodic time events, whose `pre` reads are ordinary event-entry lanes and
+/// whose same-tick intermediates are ordinary algebraic refreshes (SPEC_0044
+/// ME-EVENT-010).
+#[must_use]
+pub fn solve_has_synchronous_clocks(problem: &SolveProblem) -> bool {
+    problem
+        .solve_layout
+        .pre_param_bindings
+        .iter()
+        .any(|binding| binding.clock_schedule.is_some())
+}
+
 /// Whether the checked problem carries an initialization owner.
 #[must_use]
 pub fn solve_has_initialization(problem: &SolveProblem) -> bool {

@@ -40,6 +40,7 @@ mod max_step_duration;
 mod metadata;
 mod parameter_updates;
 mod root_location;
+mod sample_events;
 mod scalar_events;
 mod static_assertions;
 #[cfg(test)]

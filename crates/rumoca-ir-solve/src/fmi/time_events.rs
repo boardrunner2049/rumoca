@@ -15,10 +15,16 @@
 //! side, and every read at the instant after the event keeps that right limit
 //! until integration moves on (component.rs `public_time_eval_time`).
 //!
+//! The MLS §3.7.5 `sample(start, interval)` clocks of the Solve clock
+//! partition are time events too (SPEC_0044 ME-EVENT-010): each announces its
+//! next unconsumed tick `phase + k * period`, the instant evaluated from the
+//! tick counter `k` rather than accumulated, and a tick is consumed exactly
+//! once, by the event at its instant ([`super::sample_events`]).
+//!
 //! Periodic sample roots (`events.scheduled_root_conditions`) are refused: no
-//! Solve lowering produces them (`sample()` lowers to clock partitions, which
-//! the scalar event profile refuses), so the C profile has no executed path
-//! that could show their arm-then-clear relation memory is right.
+//! Solve lowering produces them (`sample()` lowers to periodic clock
+//! schedules), so the C profile has no executed path that could show their
+//! arm-then-clear relation memory is right.
 
 use serde::Serialize;
 
@@ -40,6 +46,8 @@ pub(super) struct TimeEventProfile {
     /// `rumoca_core::SCHEDULE_TIME_RELATIVE_TOLERANCE`: two instants within
     /// `tol * (1 + max(|a|, |b|))` are one instant.
     match_tolerance: f64,
+    /// The periodic `sample(start, interval)` clocks, in Solve clock order.
+    samples: Vec<super::sample_events::SampleClock>,
 }
 
 /// Admit the problem's time events, or say why the C profile cannot run one.
@@ -89,5 +97,6 @@ pub(super) fn validate(
         named_deadlines,
         initial_flag: layout.initial_event_parameter_index,
         match_tolerance: tolerance,
+        samples: super::sample_events::clocks(problem)?,
     })
 }

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use feature_analysis::{
     dae_has_clocks, dae_has_dynamic_derivative_subscripts, dae_has_dynamic_ranges, dae_has_events,
-    dae_has_initialization, dae_has_runtime_events, dae_has_unlowered_source_temporal_operators,
+    dae_has_initialization, dae_has_runtime_events, dae_has_synchronous_clocks,
+    dae_has_unlowered_source_temporal_operators,
     dae_uses_external_tables, dae_uses_random, first_external_function, fmi_c_cannot_link,
     solve_requires_residual_equations,
 };
@@ -158,6 +159,10 @@ pub struct TargetCapabilities {
     pub dynamic_control_flow: Option<bool>,
     pub host_callbacks: Option<bool>,
     pub clocks: Option<bool>,
+    /// The target executes MLS §3.7.5 `sample(start, interval)` time events
+    /// (periodic clock owners with no MLS §16 synchronous construct) even
+    /// when it declares `clocks` unsupported (SPEC_0044 ME-EVENT-010).
+    pub sample_events: Option<bool>,
     pub dynamic_ranges: Option<bool>,
     pub dynamic_derivative_subscripts: Option<bool>,
     pub tensor: Option<TensorCapabilities>,
@@ -805,7 +810,7 @@ pub fn validate_dae_target_capabilities(
             "delay-history or terminal-event runtime support is required",
         )?;
     }
-    if capabilities.clocks != Some(true) && dae_has_clocks(dae) {
+    if capabilities.clocks != Some(true) && dae_has_unsupported_clocks(dae, capabilities) {
         unsupported_feature(manifest, "clocks", "clock partition entries present")?;
     }
     if capabilities.dynamic_ranges == Some(false) && dae_has_dynamic_ranges(dae) {
@@ -874,7 +879,7 @@ pub fn validate_solve_target_capabilities(
             "delay-history or terminal-event runtime support is required",
         )?;
     }
-    if capabilities.clocks != Some(true) && rumoca_ir_solve::solve_has_clocks(solve) {
+    if capabilities.clocks != Some(true) && solve_has_unsupported_clocks(solve, capabilities) {
         unsupported_feature(manifest, "clocks", "clock partition entries present")?;
     }
     let mut inventory = solve.compute_node_counts();
@@ -890,6 +895,30 @@ pub fn validate_solve_target_capabilities(
         inventory,
         uses_linear_solve_component,
     )
+}
+
+/// Whether the DAE carries a clock the target cannot execute: any clock when
+/// the target declares no `sample_events`, else only an MLS §16 synchronous
+/// construct. An MLS §3.7.5 `sample(start, interval)` is a time event, not a
+/// synchronous clock partition.
+fn dae_has_unsupported_clocks(dae: &dae::Dae, capabilities: &TargetCapabilities) -> bool {
+    if capabilities.sample_events == Some(true) {
+        dae_has_synchronous_clocks(dae)
+    } else {
+        dae_has_clocks(dae)
+    }
+}
+
+/// The Solve counterpart of [`dae_has_unsupported_clocks`].
+fn solve_has_unsupported_clocks(
+    solve: &rumoca_ir_solve::SolveProblem,
+    capabilities: &TargetCapabilities,
+) -> bool {
+    if capabilities.sample_events == Some(true) {
+        rumoca_ir_solve::solve_has_synchronous_clocks(solve)
+    } else {
+        rumoca_ir_solve::solve_has_clocks(solve)
+    }
 }
 
 fn supports_static_assertions(

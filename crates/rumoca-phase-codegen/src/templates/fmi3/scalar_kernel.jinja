@@ -374,7 +374,9 @@ static {{ prefix }}Status check_assertions(ModelInstance* m) {
     }
 {%- endfor %}
 {%- for action in solve.events.actions %}{% if action.kind != "Warning" %}
-    if (actions[{{ loop.index0 }}] != 0.0) {
+    {#- An assertion inside `when sample(...)` holds only at its clock's ticks
+        (SPEC_0044 ME-EVENT-010). #}
+    if ({% if action.clock_owner is not none %}m->rmc_ticking[{{ action.clock_owner }}] && {% endif %}actions[{{ loop.index0 }}] != 0.0) {
 {{- log_message(messages[loop.index0], rows, prefix) }}
         m->assertion_failed = true;
         return {{ prefix }}Error;
@@ -399,7 +401,7 @@ static {{ prefix }}Status report_warnings(ModelInstance* m) {
     }
 {%- endfor %}
 {%- for action in solve.events.actions %}{% if action.kind == "Warning" %}
-    if (actions[{{ loop.index0 }}] != 0.0 && !m->rmc_warned[{{ loop.index0 }}]) {
+    if ({% if action.clock_owner is not none %}m->rmc_ticking[{{ action.clock_owner }}] && {% endif %}actions[{{ loop.index0 }}] != 0.0 && !m->rmc_warned[{{ loop.index0 }}]) {
         m->rmc_warned[{{ loop.index0 }}] = true;
 {{- log_message(messages[loop.index0], rows, prefix, "log_warning") }}
     }

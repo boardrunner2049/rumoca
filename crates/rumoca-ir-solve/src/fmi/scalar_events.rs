@@ -8,8 +8,10 @@
 //! targets and zero domains, the event iteration schedule, and the pre-binding
 //! lanes of each iteration run. Runtime, post-commit, and unclocked guarded
 //! assignments run as their row blocks. Time events are scheduled by
-//! [`super::time_events`]. Clocks, delays, structured updates, and event
-//! transactions are refused here.
+//! [`super::time_events`], and MLS §3.7.5 `sample(start, interval)` clocks
+//! run their clock-owned producers by [`super::sample_events`]. Synchronous
+//! clocks, delays, structured updates, and event transactions are refused
+//! here.
 
 use serde::Serialize;
 
@@ -57,6 +59,8 @@ pub(super) struct ScalarEventProfile {
     schedule: crate::EventIterationSchedule,
     /// The time events the component announces and stops at.
     time_events: super::time_events::TimeEventProfile,
+    /// The clock-owned producers each sample tick runs (ME-EVENT-010).
+    samples: super::sample_events::SamplePartition,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,6 +206,7 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
         iteration_lanes.extend(lanes);
     }
     let steady_lanes = steady_lanes(problem.initialization.steady_pre(), &pre_bindings)?;
+    let samples = super::sample_events::partition(discrete, &guarded_program_outputs)?;
     Ok(ScalarEventProfile {
         roots,
         pre_bindings,
@@ -222,6 +227,7 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
         root_neighborhoods: crate::root_neighborhoods(&events.root_conditions)
             .map_err(|_| "a root condition's coordinate reads cannot be derived")?,
         time_events: super::time_events::validate(problem, &search)?,
+        samples,
     })
 }
 
@@ -229,16 +235,23 @@ fn refuse_unsupported_owners(model: &SolveModel) -> Result<(), &'static str> {
     let problem = &model.problem;
     let events = &problem.events;
     let discrete = &problem.discrete;
-    if crate::solve_has_runtime_events(problem) || crate::solve_has_clocks(problem) {
-        return Err("the C profile cannot execute delays, terminal events, or clocks");
+    if crate::solve_has_runtime_events(problem) || crate::solve_has_synchronous_clocks(problem) {
+        return Err(
+            "the C profile cannot execute delays, terminal events, or synchronous clocks",
+        );
     }
+    // An assertion inside `when sample(...)` is checked at its clock's ticks
+    // (ME-EVENT-010); the synchronous clocks that could own one otherwise are
+    // refused above.
     if events.actions.iter().any(|action| {
         !matches!(
             action.kind,
             SolveEventActionKind::Assert | SolveEventActionKind::Warning
-        ) || action.clock_owner.is_some()
+        ) || action
+            .clock_owner
+            .is_some_and(|clock| clock.index() >= problem.clocks.periodic_event_schedules.len())
     }) {
-        return Err("the C profile executes only unscheduled assertions");
+        return Err("the C profile executes only unscheduled or sample-clocked assertions");
     }
     if !discrete.structured_rhs.is_empty()
         || !discrete.structured_updates.is_empty()
@@ -288,8 +301,8 @@ fn scalar_event_root(
 }
 
 /// The guarded assignments' targets, expanded from their compact ranges in
-/// program and range order, and each program's output count; an owner under
-/// a clock is refused.
+/// program and range order, and each program's output count. A sample clock's
+/// owners are listed too; [`super::sample_events`] runs them.
 fn guarded_targets(
     discrete: &crate::DiscreteSolveSystem,
 ) -> Result<(Vec<Slot>, Vec<usize>), &'static str> {
@@ -297,9 +310,6 @@ fn guarded_targets(
     let mut counts = Vec::new();
     for program in &discrete.guarded_assignments {
         let first = targets.len();
-        if program.clock_owner().is_some() {
-            return Err("the C profile cannot execute clocked guarded assignments");
-        }
         for range in program.target_ranges() {
             let (column, base) = match range.base() {
                 ScalarSlot::Y { index, .. } => ("y", index),

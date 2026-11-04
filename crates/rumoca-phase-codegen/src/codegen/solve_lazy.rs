@@ -574,6 +574,10 @@ fn discrete_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
             Arc::new(handle.problem().discrete.post_commit_assignment_rhs.clone()),
         )?);
     let guarded_assignment_plan = guarded_assignment_plan(&handle.problem().discrete)?;
+    let clock_partition_intermediate_plan =
+        Value::from_object(super::scalar_program_plan::ScalarProgramPlan::new(Arc::new(
+            handle.problem().discrete.clock_partition_intermediates.clone(),
+        ))?);
     let targets = scalar.targets;
     let pre_modes = scalar.pre_modes;
     let observation_refresh = scalar.observation_refresh;
@@ -586,6 +590,7 @@ fn discrete_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
             "post_commit_assignment_rhs",
             "post_commit_assignment_plan",
             "guarded_assignment_plan",
+            "clock_partition_intermediate_plan",
             "post_commit_assignment_targets",
             "post_commit_assignment_runtime_rows",
             "rhs",
@@ -602,6 +607,9 @@ fn discrete_value(handle: SolveRenderHandle) -> Result<Value, CodegenError> {
                 "runtime_assignment_plan" => Some(runtime_assignment_plan.clone()),
                 "post_commit_assignment_plan" => Some(post_commit_assignment_plan.clone()),
                 "guarded_assignment_plan" => Some(guarded_assignment_plan.clone()),
+                "clock_partition_intermediate_plan" => {
+                    Some(clock_partition_intermediate_plan.clone())
+                }
                 "runtime_assignment_rhs" => Some(scalar_program_block_value(Arc::new(
                     d.runtime_assignment_rhs.clone(),
                 ))),

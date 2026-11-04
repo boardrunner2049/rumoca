@@ -34,6 +34,7 @@ events = false
 static_assertions = true
 runtime_events = false
 clocks = false
+sample_events = true
 dynamic_ranges = false
 dynamic_derivative_subscripts = false
 forward_ad = false

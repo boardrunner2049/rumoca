@@ -145,6 +145,37 @@ pub(super) fn dae_has_clocks(model: &dae::Dae) -> bool {
     model.inspect(|view| view.clock_count() != 0)
 }
 
+/// Whether the checked DAE carries an MLS §16 synchronous clock construct
+/// rather than only MLS §3.7.5 `sample(start, interval)` time events.
+///
+/// Phase DAE gives every `when sample(start, interval)` its exact periodic
+/// schedule as a clock owner, the same typed owner a `Clock(period)`
+/// constructor gets. What separates a synchronous partition is the
+/// clock-only vocabulary it needs: an event clock (`Clock(condition)`,
+/// `shiftSample` of one), a clocked `previous`/`interval`/`firstTick` history
+/// lane, a `sample(u)` left-limit coordinate, or a clock conversion
+/// (`subSample`, `superSample`, `shiftSample`, `backSample`). A partition with
+/// none of these is a set of `when` clauses on periodic time events and runs
+/// with ordinary event semantics (SPEC_0044 ME-EVENT-010).
+pub(super) fn dae_has_synchronous_clocks(model: &dae::Dae) -> bool {
+    model.inspect(|view| {
+        view.previous_value_count() != 0
+            || view
+                .clocks()
+                .any(|(_, clock)| !matches!(clock.operation(), dae::ClockOperation::Periodic(_)))
+            || view
+                .clock_ownerships()
+                .any(|(_, ownership)| ownership.sampled())
+            || (0..view.expression_count()).any(|index| {
+                view.expression_id(index)
+                    .and_then(|id| view.expression(id))
+                    .is_some_and(|expression| {
+                        expression.kind() == dae::ExpressionKind::ClockTransfer
+                    })
+            })
+    })
+}
+
 pub(super) const fn dae_has_unlowered_source_temporal_operators(_: &dae::Dae) -> bool {
     // The checked expression grammar has typed temporal coordinates and no
     // source temporal-call variant.

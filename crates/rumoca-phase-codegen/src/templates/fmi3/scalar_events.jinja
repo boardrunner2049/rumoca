@@ -10,10 +10,12 @@
 {%- from "fmi-c-kernel.jinja" import scalar_op %}
 
 {%- macro event_fields(fmi) -%}
+{%- if fmi.scalar_events and fmi.scalar_events.time_events.samples|length > 0 %}{% set ns = fmi.scalar_events.time_events.samples|length %} int64_t rmc_tick[{{ ns }}]; bool rmc_ticking[{{ ns }}]; bool rmc_sample_pending; double rmc_start_time;{% endif -%}
 {%- if fmi.scalar_events %} bool rmc_domain[{{ [fmi.event_indicator_roots|length, 1]|max }}]; bool rmc_domain_valid; double rmc_indicator[{{ [fmi.event_indicator_roots|length, 1]|max }}]; double rmc_entry_y[Y_LEN]; double rmc_entry_p[P_LEN]; bool rmc_entry_captured; bool rmc_initial_event; double rmc_scan; size_t rmc_override_root[{{ [fmi.scalar_events.roots|length, 1]|max }}]; double rmc_override_value[{{ [fmi.scalar_events.roots|length, 1]|max }}]; size_t rmc_override_count; double rmc_next_time; bool rmc_next_defined; bool rmc_next_right; double rmc_post_time; double rmc_post_anchor; bool rmc_post_defined;{% endif -%}
 {%- endmacro %}
 
 {%- macro event_reset(fmi) -%}
+{%- if fmi.scalar_events and fmi.scalar_events.time_events.samples|length > 0 %} memset(m->rmc_tick, 0, sizeof(m->rmc_tick)); memset(m->rmc_ticking, 0, sizeof(m->rmc_ticking)); m->rmc_sample_pending=false; m->rmc_start_time=0.0;{% endif -%}
 {%- if fmi.scalar_events %} m->rmc_domain_valid=false; m->rmc_entry_captured=false; m->rmc_initial_event=false; m->rmc_override_count=0; m->rmc_scan=0.0; m->rmc_next_defined=false; m->rmc_next_right=false; m->rmc_next_time=INFINITY; m->rmc_post_defined=false; m->rmc_post_time=0.0; m->rmc_post_anchor=0.0;{% endif -%}
 {%- endmacro %}
 
@@ -110,6 +112,66 @@ static void rmc_offer(RmcNextStop* next, double candidate, double after, bool ri
         next->time = candidate; next->defined = true; next->right = right;
     }
 }
+{%- set samples = te.samples %}
+{%- if samples|length > 0 %}
+/* MLS 3.7.5 sample(start, interval) clocks (SPEC_0044 ME-EVENT-010): tick k
+   of clock c is the instant phase + k * period, evaluated from the counter
+   rather than accumulated, so no drift builds up. rmc_tick[c] is the first
+   tick not yet consumed; an event at its instant consumes it exactly once. */
+#define RMC_SAMPLE_CLOCKS {{ samples|length }}
+static const double rmc_sample_phase[RMC_SAMPLE_CLOCKS] = { {% for c in samples %}{{ c.phase }},{% endfor %} };
+static const double rmc_sample_period[RMC_SAMPLE_CLOCKS] = { {% for c in samples %}{{ c.period }},{% endfor %} };
+static const bool rmc_sample_relative[RMC_SAMPLE_CLOCKS] = { {% for c in samples %}{{ "true" if c.start_relative else "false" }},{% endfor %} };
+static const size_t rmc_sample_lane[RMC_SAMPLE_CLOCKS] = { {% for c in samples %}{{ c.lane }},{% endfor %} };
+/* The exact lattice over one denominator: tick k is (a + k*b)/d rounded once
+   (ClockLattice::tick_time_seconds); past 2^53 units, phase + k*period. */
+static const double rmc_sample_a[RMC_SAMPLE_CLOCKS] = { {% for c in samples %}{{ c.phase_units }},{% endfor %} };
+static const double rmc_sample_b[RMC_SAMPLE_CLOCKS] = { {% for c in samples %}{{ c.period_units }},{% endfor %} };
+static const double rmc_sample_d[RMC_SAMPLE_CLOCKS] = { {% for c in samples %}{{ c.units }},{% endfor %} };
+static double rmc_sample_time(const ModelInstance* m, size_t c, int64_t k) {
+    double units = rmc_sample_a[c] + (double)k * rmc_sample_b[c];
+    double offset = fabs(units) < 9007199254740992.0 ? units / rmc_sample_d[c] : fma((double)k, rmc_sample_period[c], rmc_sample_phase[c]);
+    return rmc_sample_relative[c] ? m->rmc_start_time + offset : offset;
+}
+static bool rmc_sample_reached(const ModelInstance* m, size_t c, int64_t k, double t) {
+    double tick = rmc_sample_time(m, c, k);
+    return t >= tick || rmc_time_match(t, tick);
+}
+/* The first tick at or after the start instant; ticks before it never run
+   (sample is true only at start + i * interval, i >= 0). */
+static void rmc_sample_seed(ModelInstance* m) {
+    m->rmc_start_time = m->time;
+    m->rmc_sample_pending = false;
+    for (size_t c = 0; c < RMC_SAMPLE_CLOCKS; ++c) {
+        double first = ceil((m->time - rmc_sample_time(m, c, 0)) / rmc_sample_period[c]);
+        int64_t k = first > 0.0 ? (int64_t)first : 0;
+        while (k > 0 && rmc_time_match(m->time, rmc_sample_time(m, c, k - 1))) --k;
+        while (m->time > rmc_sample_time(m, c, k) && !rmc_time_match(m->time, rmc_sample_time(m, c, k))) ++k;
+        m->rmc_tick[c] = k;
+        m->rmc_ticking[c] = false;
+        m->p[rmc_sample_lane[c]] = 0.0;
+    }
+}
+/* The clocks whose next tick an event at `t` reaches tick now: their
+   activation lanes hold 1 and their counters move past `t`. */
+static bool rmc_sample_begin(ModelInstance* m, double t) {
+    bool any = false;
+    for (size_t c = 0; c < RMC_SAMPLE_CLOCKS; ++c) {
+        bool due = rmc_sample_reached(m, c, m->rmc_tick[c], t);
+        m->rmc_ticking[c] = due;
+        m->p[rmc_sample_lane[c]] = due ? 1.0 : 0.0;
+        while (due && rmc_sample_reached(m, c, m->rmc_tick[c], t)) ++m->rmc_tick[c];
+        any |= due;
+    }
+    m->rmc_sample_pending = any;
+    return any;
+}
+/* Clock activations are event pulses: false everywhere but at the tick. */
+static void rmc_sample_end(ModelInstance* m) {
+    for (size_t c = 0; c < RMC_SAMPLE_CLOCKS; ++c) { m->rmc_ticking[c] = false; m->p[rmc_sample_lane[c]] = 0.0; }
+    m->rmc_sample_pending = false;
+}
+{%- endif %}
 /* The next time event strictly after `after`, stored as the instance's
    announced stop: static instants, the parameter of each direct time root,
    named deadlines, and the dynamic deadline rows at the settled
@@ -138,6 +200,10 @@ static {{ prefix }}Status rmc_next_time_event(ModelInstance* m, double after) {
 {%- endfor %}
     for (size_t k = 0; k < {{ te.deadlines }}; ++k) rmc_offer(&next, deadlines[k], after, true);
     }
+{%- endif %}
+{%- if samples|length > 0 %}
+    /* A tick is read at its own instant, not its right limit. */
+    for (size_t c = 0; c < RMC_SAMPLE_CLOCKS; ++c) rmc_offer(&next, rmc_sample_time(m, c, m->rmc_tick[c]), after, false);
 {%- endif %}
     m->rmc_next_defined = next.defined;
     m->rmc_next_time = next.time;
@@ -368,6 +434,7 @@ static {{ prefix }}Status rmc_guarded_programs(ModelInstance* m, ModelInstance* 
 {%- set gp = namespace(offset=0) %}
 {%- if solve.discrete.guarded_assignment_plan.programs|length != ev.guarded_program_outputs|length %}{{ fail("unsupported-feature:fmi.c.guarded-program-count") }}{% endif %}
 {%- for program in solve.discrete.guarded_assignment_plan.programs %}
+{%- if not ev.samples.clocked_guarded[loop.index0] %}
     {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
 {%- for op in program.ops %}
@@ -375,9 +442,63 @@ static {{ prefix }}Status rmc_guarded_programs(ModelInstance* m, ModelInstance* 
 {%- endfor %}
     }
     rmc_guarded_apply(m, gindex, gin_y, gvalues, {{ gp.offset }}, {{ ev.guarded_program_outputs[loop.index0] }}, changed);
+{%- endif %}
 {%- set gp.offset = gp.offset + ev.guarded_program_outputs[loop.index0] %}
 {%- endfor %}
 {%- if gp.offset != nguard %}{{ fail("unsupported-feature:fmi.c.guarded-output-count") }}{% endif %}
+    return {{ prefix }}OK;
+}
+{%- endif %}
+
+{%- set samples = ev.samples %}
+{%- if samples.steps|length > 0 %}
+/* discrete_rows.rs execute_clock_partition_steps (SPEC_0044 ME-EVENT-010):
+   the producers of the ticking sample clocks, once per tick in issued causal
+   order, each step's outputs reaching the working state before the next
+   step reads it; every `pre` read is the event-entry lane. */
+static {{ prefix }}Status rmc_sample_partition(ModelInstance* m, bool* changed) {
+{%- if ndisc > 0 %}
+    static const size_t targets[{{ ndisc }}] = { {% for target in ev.discrete_targets %}{{ target }},{% endfor %} };
+    double values[{{ ndisc }}]; (void)targets; (void)values;
+{%- endif %}
+{%- if nguard > 0 %}
+    static const size_t gindex[{{ nguard }}] = { {% for slot in ev.guarded_targets %}{{ slot.index }},{% endfor %} };
+    static const bool gin_y[{{ nguard }}] = { {% for slot in ev.guarded_targets %}{{ "true" if slot.column == "y" else "false" }},{% endfor %} };
+    double gvalues[{{ nguard }}]; (void)gindex; (void)gin_y; (void)gvalues;
+{%- endif %}
+{%- set nint = solve.discrete.clock_partition_intermediate_plan.output_count %}
+{%- if nint > 0 %}
+    double ivalues[{{ nint }}]; (void)ivalues;
+{%- endif %}
+{%- for step in samples.steps %}
+    if ({% for clock in step.clocks %}{% if not loop.first %} || {% endif %}m->rmc_ticking[{{ clock }}]{% endfor %}) {
+{%- if step.kind == "rows" %}
+{%- set program = solve.discrete.rhs_plan.programs[step.program] %}
+        double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "values", prefix ~ "Error") }}
+{%- endfor %}
+{%- for row in step.rows %}
+        *changed |= memcmp(&m->p[targets[{{ row }}]], &values[{{ row }}], sizeof(double)) != 0;
+        m->p[targets[{{ row }}]] = values[{{ row }}];
+{%- endfor %}
+{%- elif step.kind == "intermediate" %}
+{%- set program = solve.discrete.clock_partition_intermediate_plan.programs[step.program] %}
+        double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "ivalues", prefix ~ "Error") }}
+{%- endfor %}
+        m->{{ step.column }}[{{ step.index }}] = ivalues[{{ step.rows[0] }}];
+{%- else %}
+{%- set program = solve.discrete.guarded_assignment_plan.programs[step.program] %}
+        double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "gvalues", prefix ~ "Error") }}
+{%- endfor %}
+        rmc_guarded_apply(m, gindex, gin_y, gvalues, {{ step.offset }}, {{ step.count }}, changed);
+{%- endif %}
+    }
+{%- endfor %}
     return {{ prefix }}OK;
 }
 {%- endif %}
@@ -387,17 +508,29 @@ static {{ prefix }}Status rmc_guarded_programs(ModelInstance* m, ModelInstance* 
    located side, and a change is a change of bits. */
 static {{ prefix }}Status rmc_discrete_owners(ModelInstance* m, bool* changed, bool memories_only) {
     (void)m; (void)changed; (void)memories_only;
+{%- if samples.steps|length > 0 %}
+    /* The first pass of a tick runs the sample partition once
+       (discrete_rows.rs: a clock partition is solved once per tick, in the
+       first event iteration); later passes never rerun it. */
+    if (!memories_only && m->rmc_sample_pending) {
+        m->rmc_sample_pending = false;
+        if (rmc_sample_partition(m, changed) != {{ prefix }}OK) return {{ prefix }}Error;
+    }
+{%- endif %}
 {%- if ndisc > 0 %}
     static const size_t targets[{{ ndisc }}] = { {% for target in ev.discrete_targets %}{{ target }},{% endfor %} };
     static const bool memory_row[{{ ndisc }}] = { {% for row in ev.condition_memory_rows %}{{ "true" if row else "false" }},{% endfor %} };
+    static const bool clocked_row[{{ ndisc }}] = { {% for row in samples.clocked_rows %}{{ "true" if row else "false" }},{% else %}false{% endfor %} };
     double values[{{ ndisc }}];
 {%- for program in solve.discrete.rhs_plan.programs %}
+{%- if not samples.clocked_programs[loop.index0] %}
     {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
 {%- for op in program.ops %}
 {{ scalar_op(op, "values", prefix ~ "Error") }}
 {%- endfor %}
     }
+{%- endif %}
 {%- endfor %}
 {%- endif %}
 {%- if nguard > 0 %}
@@ -422,7 +555,7 @@ static {{ prefix }}Status rmc_discrete_owners(ModelInstance* m, bool* changed, b
         for (size_t d = 0; d < {{ ndisc }}; ++d) if ((long)targets[d] == memory) values[d] = m->rmc_override_value[k];
     }
     for (size_t d = 0; d < {{ ndisc }}; ++d) {
-        if (memories_only && !memory_row[d]) continue;
+        if (clocked_row[d] || (memories_only && !memory_row[d])) continue;
         *changed |= memcmp(&m->p[targets[d]], &values[d], sizeof(double)) != 0;
         m->p[targets[d]] = values[d];
     }
@@ -720,6 +853,9 @@ static {{ prefix }}Status rmc_event_iterate(ModelInstance* m, bool canonicalize)
 static {{ prefix }}Status rmc_events_initialize(ModelInstance* m) {
     bool changed = false;
     m->rmc_override_count = 0;
+{%- if ev.time_events.samples|length > 0 %}
+    rmc_sample_seed(m);
+{%- endif %}
     if (settle_values(m) != {{ prefix }}OK || rmc_relation_refresh(m, false, &changed) != {{ prefix }}OK) return {{ prefix }}Error;
     for (size_t k = 0; k < RMC_PRE_LANES; ++k) m->p[rmc_pre_dest[k]] = rmc_pre_source(m->y, m->p, k);
     /* initial() is false wherever a condition memory is seeded; it holds
@@ -808,9 +944,27 @@ static {{ prefix }}Status rmc_events_update(ModelInstance* m, bool* states_chang
         m->rmc_post_anchor = event_time;
         m->rmc_post_time = m->time;
     }
+{%- if ev.time_events.samples|length > 0 %}
+    /* SDO-080: a sample tick never runs in the initial event; one due at the
+       start instant runs as the next event at that instant, below. */
+    if (!initial) (void)rmc_sample_begin(m, event_time);
+{%- endif %}
     {{ prefix }}Status status = initial ? rmc_initial_iterate(m) : rmc_event_iterate(m, true);
+{%- if ev.time_events.samples|length > 0 %}
+    rmc_sample_end(m);
+{%- endif %}
     m->time = event_time;
     if (initial) { rmc_clear_initial_flag(m); m->assertions_initialized = true; }
+{%- if ev.time_events.samples|length > 0 %}
+    if (status == {{ prefix }}OK && initial && rmc_sample_begin(m, event_time)) {
+        memcpy(m->rmc_entry_y, m->y, sizeof(m->y));
+        memcpy(m->rmc_entry_p, m->p, sizeof(m->p));
+        m->rmc_override_count = 0;
+        status = rmc_event_iterate(m, true);
+        rmc_sample_end(m);
+        m->time = event_time;
+    }
+{%- endif %}
     *states_changed = memcmp(states, m->y, sizeof(states)) != 0;
     m->rmc_entry_captured = false;
     m->rmc_initial_event = false;
