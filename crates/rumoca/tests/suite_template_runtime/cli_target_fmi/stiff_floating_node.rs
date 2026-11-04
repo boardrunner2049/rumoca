@@ -171,7 +171,7 @@ fn generated_fmi3_co_simulation_holds_a_stiff_floating_node_at_its_dc_value() {
         // The leakage time constant is 15 ns, so every floating sample after
         // the first step is at the DC point; the closed node settles with
         // L / (R + 1 / (Gh + 2 G)) = 0.495 ms and is checked after 20 of them.
-        let expected = if t < 2e-3 + 1e-9 || t > 12e-3 + 1.5e-5 {
+        let expected = if !(2e-3 + 1e-9..=12e-3 + 1.5e-5).contains(&t) {
             floating
         } else if t > 12e-3 - 1e-9 {
             continue;
