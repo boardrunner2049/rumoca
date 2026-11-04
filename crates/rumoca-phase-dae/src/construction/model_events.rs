@@ -2,10 +2,11 @@ use super::*;
 
 /// The activation of a section that is not a `when`.
 ///
-/// An unguarded algorithm section and an `assert` in an equation,
-/// initial-equation, or initial-algorithm section both run because the section
-/// runs — MLS §8.3.7 violates an assertion because its condition *is* false, not
-/// because it became false — so their activation is a level.
+/// An unguarded algorithm section and an `assert` in an equation section both
+/// run because the section runs — MLS §8.3.7 violates an assertion because its
+/// condition *is* false, not because it became false — so their activation is
+/// a level. An initial section runs at initialization only; see
+/// [`assertion_activation`].
 ///
 /// This is [`dae::ConditionInput::Always`] and deliberately *not* a literal
 /// `true`. A model author's `when true then` is a real `when`: §8.3.5.1 starts
@@ -22,6 +23,31 @@ pub(super) fn always_condition<'dae>(
     let condition = construction.conditions(|conditions| conditions.reserve(provenance))?;
     construction.conditions(|conditions| {
         conditions.define(condition, dae::ConditionInput::Always, provenance)
+    })?;
+    Ok(condition)
+}
+
+/// The activation of an `assert`: [`always_condition`] in an equation
+/// section, `initial()` in an initial-equation or initial-algorithm section.
+///
+/// An initial section holds during initialization only (MLS §8.6), so its
+/// assertion is checked there and nowhere else: `assert(startTime >= time)`
+/// in an initial equation restricts the start time, not the simulated time.
+/// The activation is the `initial()` level, which is true exactly at
+/// initialization, the activation of `when initial() then assert(...)`.
+pub(super) fn assertion_activation<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    owner_span: Span,
+    initial: bool,
+) -> Result<dae::ConditionId<'dae>, dae::DaeConstructionError> {
+    if !initial {
+        return always_condition(construction, owner_span);
+    }
+    let provenance =
+        dae::DaeProvenance::generated(dae::DaeGeneration::ConditionLowering, owner_span)?;
+    let condition = construction.conditions(|conditions| conditions.reserve(provenance))?;
+    construction.conditions(|conditions| {
+        conditions.define(condition, dae::ConditionInput::Initial, provenance)
     })?;
     Ok(condition)
 }

@@ -227,6 +227,7 @@ mod sampled_integral_consistency;
 mod sampled_timer_accuracy;
 mod selected_package_vectorization;
 mod semi_linear_zero_flow;
+mod sensor_library_constructs;
 mod state_select_priorities;
 mod structural_evaluation_regressions;
 mod supplied_derivative_record_fields;

@@ -333,12 +333,22 @@ fn fuse_record_param_path(
 
 fn rewrite_record_param_size_refs_in_function(
     func: &mut rumoca_core::Function,
-    shape_sources: &[(String, String)],
+    shape_sources: &[ShapeSource],
 ) {
     if shape_sources.is_empty() {
         return;
     }
-    let mut rewriter = RecordParamSizeRewriter { shape_sources };
+    let mut rewriter = RecordParamSizeRewriter {
+        shape_sources,
+        exact_identity: false,
+    };
+    // A declared extent `y[size(r, 1)]` reads the record input `r` too. Shape
+    // materialization admits only references to the function's own
+    // declarations, so there the field input keeps its declaration identity.
+    let mut shape_rewriter = RecordParamSizeRewriter {
+        shape_sources,
+        exact_identity: true,
+    };
     for param in func
         .inputs
         .iter_mut()
@@ -348,14 +358,26 @@ fn rewrite_record_param_size_refs_in_function(
         if let Some(default) = &mut param.default {
             *default = rewriter.rewrite_expression(default);
         }
+        for subscript in &mut param.shape_expr {
+            if let rumoca_core::Subscript::Expr { expr, .. } = subscript {
+                **expr = shape_rewriter.rewrite_expression(expr);
+            }
+        }
     }
     for stmt in &mut func.body {
         *stmt = rewriter.rewrite_statement(stmt);
     }
 }
 
+/// A decomposed record input, the field input that carries its extents, and
+/// that field's declaration identity.
+type ShapeSource = (String, String, Option<rumoca_core::DefId>);
+
 struct RecordParamSizeRewriter<'a> {
-    shape_sources: &'a [(String, String)],
+    shape_sources: &'a [ShapeSource],
+    /// Name the field input by its declaration rather than by a generated
+    /// reference.
+    exact_identity: bool,
 }
 
 impl ExpressionRewriter for RecordParamSizeRewriter<'_> {
@@ -377,13 +399,19 @@ impl ExpressionRewriter for RecordParamSizeRewriter<'_> {
                 span,
             } = first_arg
             && subscripts.is_empty()
-            && let Some((_, shape_source)) = self
+            && let Some((_, shape_source, def_id)) = self
                 .shape_sources
                 .iter()
-                .find(|(param_name, _)| param_name == name.as_str())
+                .find(|(param_name, _, _)| param_name == name.as_str())
         {
+            let reference = match def_id {
+                Some(def_id) if self.exact_identity => {
+                    declared_param_reference(shape_source, *def_id, *span)
+                }
+                _ => record_param_reference(shape_source, *span),
+            };
             *first_arg = rumoca_core::Expression::VarRef {
-                name: record_param_reference(shape_source, *span),
+                name: reference,
                 subscripts: Vec::new(),
                 span: *span,
             };
@@ -674,6 +702,28 @@ fn record_param_reference(param: &str, _span: rumoca_core::Span) -> rumoca_core:
     rumoca_core::Reference::generated(param)
 }
 
+/// A reference to the function parameter `param` declared by `def_id`.
+fn declared_param_reference(
+    param: &str,
+    def_id: rumoca_core::DefId,
+    span: rumoca_core::Span,
+) -> rumoca_core::Reference {
+    rumoca_core::ComponentReference::construct(
+        false,
+        span,
+        vec![rumoca_core::ComponentRefPart {
+            ident: param.to_string(),
+            span,
+            subs: Vec::new(),
+            def_id,
+        }],
+    )
+    .map_or_else(
+        |_| record_param_reference(param, span),
+        rumoca_core::Reference::from_component_reference,
+    )
+}
+
 /// Decompose record-typed function parameters and rewrite call sites.
 ///
 /// For each function with a known record-typed input (e.g., `Complex`):
@@ -843,9 +893,7 @@ fn lower_record_function_params_once(flat: &mut flat::Model) -> Result<bool, Fla
         // Rewrite FieldAccess in body
         let shape_sources = decomposed
             .iter()
-            .filter_map(|d| {
-                record_param_shape_source(d).map(|source| (d.param_name.clone(), source))
-            })
+            .filter_map(record_param_shape_source)
             .collect::<Vec<_>>();
         rewrite_record_param_size_refs_in_function(func, &shape_sources);
         for stmt in &mut func.body {
@@ -1189,13 +1237,19 @@ impl RecordDecompositionMap {
     }
 }
 
-fn record_param_shape_source(param: &DecomposedParam) -> Option<String> {
+fn record_param_shape_source(param: &DecomposedParam) -> Option<ShapeSource> {
     param
         .fields
         .iter()
         .find(|field| field.dimensions().is_empty() && field.shape_expr.is_empty())
         .or_else(|| param.fields.first())
-        .map(|field| format!("{}_{}", param.param_name, field.name))
+        .map(|field| {
+            (
+                param.param_name.clone(),
+                format!("{}_{}", param.param_name, field.name),
+                field.def_id,
+            )
+        })
 }
 
 fn decomposed_record_field_param(
