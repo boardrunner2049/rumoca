@@ -110,6 +110,11 @@ fn block_records(
     Ok((records, widest))
 }
 
+/// No manifold view: index reduction retained no constraint.
+fn no_retained_manifold() -> Result<Option<Value>, CodegenError> {
+    Ok(Option::None)
+}
+
 /// The manifold view, or `None` when index reduction retained no constraint.
 fn manifold_value(
     problem: &solve::SolveProblem,
@@ -119,7 +124,7 @@ fn manifold_value(
     let continuous = &problem.continuous;
     let plan = &continuous.manifold_projection_plan;
     if plan.is_empty() {
-        return Ok(None);
+        return no_retained_manifold();
     }
     let residual = rumoca_eval_solve::to_scalar_program_block(&continuous.manifold_residual)?;
     let directional =
