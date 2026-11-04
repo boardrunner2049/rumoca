@@ -36,16 +36,23 @@
 //! same guard, so it reaches the assertion owner above. [`checking_calls`]
 //! states that acceptance contract and rejects every call outside it by name.
 //!
+//! A call statement that binds outputs is replayed one receiver at a time: each
+//! receiver takes the call, its arguments substituted, projected to its output
+//! ordinal ([`call_outputs`]). A replayed array keeps its whole value, so a
+//! later element read is that element of the value.
+//!
 //! Every other written coordinate keeps a typed rejection: the initialization
 //! system has no checked owner that solves for a state, algebraic, output, or
 //! input coordinate from an algorithm, and inventing one would replace a
 //! missing capability with an unproven guess.
+mod call_outputs;
 mod checking_calls;
 mod element_definitions;
 mod loops;
 mod relations;
 
 use super::*;
+pub(in crate::construction) use call_outputs::as_call_output;
 use checking_calls::{checking_call, expand_checking_call, reject_unsupported_checking_call};
 use element_definitions::{ElementDefinitions, ElementTarget, element_ordinal};
 use relations::{InitialEquationShape, InitialRelation, settle_initial_relations};
@@ -432,25 +439,26 @@ fn reject_unsupported_statements(
                 require_span(*span, "initial algorithm for statement")?;
                 reject_unsupported_statements(flat, equations, true)?;
             }
-            rumoca_core::Statement::FunctionCall {
-                comp,
-                outputs,
-                span,
-                ..
-            } => {
-                let callee = comp.as_str();
-                let detail = if outputs.iter().all(Option::is_none) {
+            // A call statement that binds outputs is replayed one receiver at
+            // a time (see `call_outputs`); its receivers obey the assignment
+            // target grammar.
+            rumoca_core::Statement::FunctionCall { outputs, span, .. }
+                if outputs.iter().any(Option::is_some) =>
+            {
+                require_span(*span, "initial algorithm call statement")?;
+                if !in_loop {
+                    call_outputs::require_receiver_targets(flat, outputs, *span)?;
+                }
+            }
+            rumoca_core::Statement::FunctionCall { comp, span, .. } => {
+                return Err(unsupported(
                     format!(
-                        "a call statement to `{callee}` names a callee the Flat function table \
-                         does not register, so its body cannot be proven to only raise assertions"
-                    )
-                } else {
-                    format!(
-                        "a call statement to `{callee}` binds outputs; the initialization \
-                         partition has no owner that solves a coordinate from a call statement"
-                    )
-                };
-                return Err(unsupported(detail, *span));
+                        "a call statement to `{}` names a callee the Flat function table does \
+                         not register, so its body cannot be proven to only raise assertions",
+                        comp.as_str()
+                    ),
+                    *span,
+                ));
             }
             _ => {
                 let span =
@@ -674,15 +682,6 @@ fn plan_initial_parameter(
             format!(
                 "parameter `{target}` already has a declaration binding, so the initial \
                  algorithm would give it a second determining owner"
-            ),
-            value.span,
-        ));
-    }
-    if !variable.dims.is_empty() {
-        return Err(unsupported(
-            format!(
-                "parameter `{target}` is an array; an array-valued initial algorithm target \
-                 requires a vector-equation owner"
             ),
             value.span,
         ));
@@ -945,6 +944,12 @@ impl Replay<'_> {
                 equations,
                 span,
             } => self.unrolled(indices, equations, *span, guard, values),
+            rumoca_core::Statement::FunctionCall {
+                comp,
+                args,
+                outputs,
+                span,
+            } => self.call_outputs(comp, args, outputs, span, values),
             _ => unreachable!("the statement grammar is proven before analysis replays it"),
         }
     }
@@ -1285,10 +1290,17 @@ impl ExpressionRewriter for Substitution<'_> {
         subscripts: &[Subscript],
         span: Span,
     ) -> Expression {
-        if subscripts.is_empty()
-            && let Some(value) = self.values.get(name.var_name())
-        {
-            return value.expression.clone();
+        if let Some(value) = self.values.get(name.var_name()) {
+            // An element read of a replayed array is that element of its
+            // replayed value.
+            if subscripts.is_empty() {
+                return value.expression.clone();
+            }
+            return Expression::Index {
+                base: Box::new(value.expression.clone()),
+                subscripts: self.rewrite_subscripts(subscripts),
+                span,
+            };
         }
         Expression::VarRef {
             name: name.clone(),

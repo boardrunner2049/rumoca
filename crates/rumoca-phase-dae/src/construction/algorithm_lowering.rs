@@ -158,7 +158,7 @@ fn lower_algorithm_plan<'dae>(
                 lowering.coordinates,
                 lowering.functions,
                 request.environment.sample_lattices,
-                assertions,
+                assertions.iter().map(|assertion| (assertion, false)),
             )?;
         }
         ModelAlgorithmPlan::Declarative {
@@ -171,7 +171,9 @@ fn lower_algorithm_plan<'dae>(
                 lowering.coordinates,
                 lowering.functions,
                 request.environment.sample_lattices,
-                &declarative_assertions(algorithm),
+                declarative_assertions(algorithm)
+                    .iter()
+                    .map(|assertion| (assertion, false)),
             )?;
         }
         ModelAlgorithmPlan::TotalArrayDefinition {

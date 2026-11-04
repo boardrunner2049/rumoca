@@ -19,13 +19,19 @@
 //! holds when initialization finishes, and of its `pre` value at that instant.
 //! The equation section keeps its own owner for every later instant.
 //!
+//! Also accepted: a call statement `(a, b) := f(x)` to a pure function. Each
+//! receiver takes the call's output in its position, with the arguments read
+//! before any receiver is assigned (MLS §11.2.1.2), and an array `parameter`
+//! declared `fixed = false` takes a whole array value; a later element read
+//! is that element of the value.
+//!
 //! A target is one declared coordinate; a component-array element such as
 //! `c[2].count` is addressed by its literal subscripts, or by a `for` index
 //! over a range fixed at translation, which unrolls into those literals.
 //!
 //! Rejected, each naming the owner that is absent rather than a consequence of
-//! it: a call statement that binds an output or whose body has any other
-//! effect, a state/algebraic/output/input target the initialization system
+//! it: a zero-output call statement whose body has any effect other than
+//! raising assertions, a state/algebraic/output/input target the initialization system
 //! solves from residual rows instead, a `while` or `when` carrying implicit
 //! memory, and a value that reads a coordinate with no proven value where it is
 //! evaluated.
@@ -260,11 +266,10 @@ fn every_unrolled_iteration_of_a_checking_call_owns_its_own_assertion() {
     );
 }
 
-/// A checking call is admitted by proving its body has no effect other than
-/// raising assertions. A callee that writes an output has one, so it keeps a
-/// typed rejection naming the call statement rather than being replayed.
+/// A call statement that binds outputs gives each receiver the output in its
+/// position (MLS §11.2.1.2).
 #[test]
-fn a_call_statement_that_binds_an_output_names_the_missing_owner() {
+fn a_call_statement_binds_each_receiver_to_its_output() {
     const SOURCE: &str = r#"
 model InitialAlgorithmOutputCall
   parameter Real t[2] = {1.0, 2.0};
@@ -287,15 +292,27 @@ equation
   der(x) = lo + hi;
 end InitialAlgorithmOutputCall;
 "#;
-    let rendered = rejection(SOURCE, "InitialAlgorithmOutputCall");
+    let compiled = Compiler::new()
+        .model("InitialAlgorithmOutputCall")
+        .compile_str(SOURCE, "initial_algorithm.mo")
+        .expect("a call statement binding outputs has a checked owner");
+    let simulation = simulate_dae(
+        &compiled.dae,
+        &SimOptions {
+            t_end: 1.0,
+            ..SimOptions::default()
+        },
+    )
+    .expect("the initial algorithm settles");
+    let x = simulation
+        .names
+        .iter()
+        .position(|name| name == "x")
+        .expect("x is recorded");
+    let last = *simulation.data[x].last().expect("x has samples");
     assert!(
-        rendered.contains("ED013") && rendered.contains("bounds"),
-        "the rejection must name the unowned call statement, got: {rendered}"
-    );
-    assert!(
-        !rendered.contains("unresolved Flat reference"),
-        "a call statement inside the rejected section must not be reported as an \
-         unresolved callee, got: {rendered}"
+        (last - 3.0).abs() < 1e-9,
+        "lo + hi = 1 + 2, got x(1) = {last}"
     );
 }
 

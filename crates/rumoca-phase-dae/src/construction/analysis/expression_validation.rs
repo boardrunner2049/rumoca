@@ -429,6 +429,10 @@ impl<'a> ExpressionValidator<'a> {
     }
 
     fn validate_field_access(self, expression: &Expression, span: Span) -> Result<(), ToDaeError> {
+        // An initial-algorithm call output reads the call's result ordinal.
+        if let Some((call, _)) = super::as_call_output(expression) {
+            return self.validate(call);
+        }
         let Some(fields) = self.record_array_fields else {
             return Err(unsupported_record_field(expression, span));
         };

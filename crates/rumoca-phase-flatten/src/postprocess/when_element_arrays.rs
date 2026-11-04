@@ -13,12 +13,18 @@
 //! literal element becomes its scalar, the whole array becomes the array of
 //! them, and anything else indexes that array. An array some `when` assigns
 //! whole is left alone.
+//!
+//! A slice target `x[1,:] = u` is first split into its element assignments
+//! `x[1,k] = u[k]` (MLS §10.6.1: an array equation is the equations of its
+//! elements), so a `when` that fills an array row by row assigns it element
+//! by element too.
 
 use super::*;
 use rumoca_core::{FallibleExpressionRewriter, FallibleStatementRewriter};
 use std::collections::HashMap;
 
 pub(crate) fn scalarize_when_element_arrays(flat: &mut flat::Model) -> Result<(), FlattenError> {
+    split_slice_targets(flat);
     let arrays = element_assigned_arrays(flat);
     if arrays.is_empty() {
         return Ok(());
@@ -83,6 +89,189 @@ fn collect_targets(equations: &[flat::WhenEquation], targets: &mut HashSet<rumoc
             }
             _ => {}
         }
+    }
+}
+
+/// Replace each `when` assignment to a slice `x[i,:]` of an array with literal
+/// extents by the assignments of its elements.
+fn split_slice_targets(flat: &mut flat::Model) {
+    let variables = &flat.variables;
+    for chain in &mut flat.when_chains {
+        for branch in chain.branches_mut() {
+            split_slices_in(&mut branch.equations, variables);
+        }
+    }
+}
+
+fn split_slices_in(
+    equations: &mut Vec<flat::WhenEquation>,
+    variables: &flat::VarNameIndexMap<flat::Variable>,
+) {
+    let mut split = Vec::with_capacity(equations.len());
+    for mut equation in equations.drain(..) {
+        if let flat::WhenEquation::Conditional {
+            branches,
+            else_branch,
+            ..
+        } = &mut equation
+        {
+            for (_, branch) in branches.iter_mut() {
+                split_slices_in(branch, variables);
+            }
+            if let Some(branch) = else_branch {
+                split_slices_in(branch, variables);
+            }
+        }
+        match slice_elements(&equation, variables) {
+            Some(elements) => split.extend(elements),
+            None => split.push(equation),
+        }
+    }
+    *equations = split;
+}
+
+/// The element assignments of a slice assignment; `None` when `equation` is
+/// not one or its extents are not literal.
+fn slice_elements(
+    equation: &flat::WhenEquation,
+    variables: &flat::VarNameIndexMap<flat::Variable>,
+) -> Option<Vec<flat::WhenEquation>> {
+    let flat::WhenEquation::Assign {
+        target,
+        value,
+        span,
+        origin,
+    } = equation
+    else {
+        return None;
+    };
+    let (base, subscripts) = target.as_str().strip_suffix(']')?.rsplit_once('[')?;
+    let subscripts = subscripts
+        .split(',')
+        .map(|subscript| match subscript.trim() {
+            ":" => Some(None),
+            index => index.parse::<i64>().ok().map(Some),
+        })
+        .collect::<Option<Vec<Option<i64>>>>()?;
+    let dims = &variables.get(&rumoca_core::VarName::new(base))?.dims;
+    if dims.len() != subscripts.len()
+        || !subscripts.iter().any(Option::is_none)
+        || dims.iter().any(|extent| *extent <= 0)
+    {
+        return None;
+    }
+    let free = subscripts
+        .iter()
+        .zip(dims)
+        .filter(|(subscript, _)| subscript.is_none())
+        .map(|(_, extent)| *extent)
+        .collect::<Vec<_>>();
+    let elements = index_tuples(&free)
+        .into_iter()
+        .map(|picks| {
+            let mut free_picks = picks.iter();
+            let indices = subscripts
+                .iter()
+                .map(|subscript| subscript.or_else(|| free_picks.next().copied()))
+                .collect::<Option<Vec<i64>>>()
+                .expect("one pick per colon");
+            flat::WhenEquation::Assign {
+                target: rumoca_core::VarName::new(element_name(base, &indices)),
+                value: slice_value_element(value, &picks, *span),
+                span: *span,
+                origin: origin.clone(),
+            }
+        })
+        .collect();
+    Some(elements)
+}
+
+/// The element `picks` (one index per dimension) of an array-valued `value`:
+/// pushed into a component reference's colons, through `pre`/`edge`/`change`,
+/// an `if` and a literal array; otherwise the indexed expression.
+fn slice_value_element(
+    value: &rumoca_core::Expression,
+    picks: &[i64],
+    span: rumoca_core::Span,
+) -> rumoca_core::Expression {
+    use rumoca_core::{Expression, Subscript};
+    let index = |value: i64| Subscript::Index { value, span };
+    match value {
+        Expression::VarRef {
+            name, subscripts, ..
+        } if subscripts.is_empty() => Expression::VarRef {
+            name: name.clone(),
+            subscripts: picks.iter().copied().map(index).collect(),
+            span,
+        },
+        Expression::VarRef {
+            name, subscripts, ..
+        } if subscripts
+            .iter()
+            .filter(|subscript| matches!(subscript, Subscript::Colon { .. }))
+            .count()
+            == picks.len() =>
+        {
+            let mut picks = picks.iter().copied();
+            let subscripts = subscripts
+                .iter()
+                .map(|subscript| match subscript {
+                    Subscript::Colon { .. } => picks.next().map_or(subscript.clone(), index),
+                    other => other.clone(),
+                })
+                .collect();
+            Expression::VarRef {
+                name: name.clone(),
+                subscripts,
+                span,
+            }
+        }
+        Expression::BuiltinCall {
+            function:
+                function @ (rumoca_core::BuiltinFunction::Pre
+                | rumoca_core::BuiltinFunction::Edge
+                | rumoca_core::BuiltinFunction::Change),
+            args,
+            ..
+        } if args.len() == 1 => Expression::BuiltinCall {
+            function: *function,
+            args: vec![slice_value_element(&args[0], picks, span)],
+            span,
+        },
+        Expression::If {
+            branches,
+            else_branch,
+            ..
+        } => Expression::If {
+            branches: branches
+                .iter()
+                .map(|(condition, branch)| {
+                    (condition.clone(), slice_value_element(branch, picks, span))
+                })
+                .collect(),
+            else_branch: Box::new(slice_value_element(else_branch, picks, span)),
+            span,
+        },
+        Expression::Array {
+            elements,
+            kind: rumoca_core::ArrayConstructor::Array,
+            ..
+        } if picks
+            .first()
+            .and_then(|&first| usize::try_from(first - 1).ok())
+            .is_some_and(|offset| offset < elements.len()) =>
+        {
+            let element = &elements[(picks[0] - 1) as usize];
+            match &picks[1..] {
+                [] => element.clone(),
+                rest => slice_value_element(element, rest, span),
+            }
+        }
+        other => Expression::Index {
+            base: Box::new(other.clone()),
+            subscripts: picks.iter().copied().map(index).collect(),
+            span,
+        },
     }
 }
 

@@ -56,9 +56,17 @@ fn assert_refused(message: &str, mutate: impl FnOnce(&mut SolveModel)) {
 
 /// One initialization residual row with the given role.
 fn one_initial_row(model: &mut SolveModel, role: InitializationRowRole) {
+    one_initial_program(model, role, constant_row(0.0));
+}
+
+/// One initialization residual row computing `program`, with the given role.
+fn one_initial_program(
+    model: &mut SolveModel,
+    role: InitializationRowRole,
+    program: Vec<LinearOp>,
+) {
     let mut initialization = model.problem.initialization.clone().into_input();
-    initialization.residual =
-        ComputeBlock::from_scalar_program_block(rows(vec![constant_row(0.0)]));
+    initialization.residual = ComputeBlock::from_scalar_program_block(rows(vec![program]));
     initialization.row_roles = vec![role];
     model.problem.initialization = crate::InitializationSolveSystem::construct(initialization)
         .expect("one surplus row is a checked initialization");
@@ -66,11 +74,53 @@ fn one_initial_row(model: &mut SolveModel, role: InitializationRowRole) {
 
 const SETTLED: InitializationRowRole = InitializationRowRole::SurplusAlgebraicCheck;
 
+const SEEDS: &str =
+    "C initialization evaluates residual rows only on the settled algebraic refresh";
+
+/// A row over the declaration seed of an algebraic `y[0]` (no state precedes
+/// it) reads a value the settled view replaces.
 #[test]
-fn initialization_rows_over_declaration_seeds_are_refused() {
-    assert_refused(
-        "C initialization evaluates residual rows only on the settled algebraic refresh",
-        |model| one_initial_row(model, InitializationRowRole::SurplusCheck),
+fn initialization_rows_over_algebraic_declaration_seeds_are_refused() {
+    assert_refused(SEEDS, |model| {
+        model.problem.layout = crate::VarLayout::from_parts(Default::default(), 1, 2);
+        one_initial_program(
+            model,
+            InitializationRowRole::SurplusCheck,
+            vec![
+                LinearOp::LoadY { dst: 0, index: 0 },
+                LinearOp::StoreOutput { src: 0 },
+            ],
+        );
+    });
+}
+
+/// A row that reads no coordinate the algebraic refresh writes has the same
+/// residual over the seeds and over the settled view, so it is not refused
+/// for reading seeds (SPEC_0044 ME-PARAM-001).
+#[test]
+fn initialization_rows_over_parameters_run_on_the_settled_view() {
+    let (mut model, input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    one_initial_program(
+        &mut model,
+        InitializationRowRole::SurplusCheck,
+        vec![
+            LinearOp::LoadP { dst: 0, index: 1 },
+            LinearOp::StoreOutput { src: 0 },
+        ],
+    );
+    let outcome = FmiComponent::construct(model, vec![input])
+        .expect("the fixture is a checked component")
+        .into_codegen_view()
+        .try_c()
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    assert!(
+        outcome
+            .as_ref()
+            .err()
+            .is_none_or(|refused| !refused.contains(SEEDS)),
+        "a parameter row is not a row over seeds: {outcome:?}"
     );
 }
 

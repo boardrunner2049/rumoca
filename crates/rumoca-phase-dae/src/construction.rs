@@ -495,8 +495,13 @@ fn lower_model_owners<'dae>(
         &analysis.sample_lattices,
         flat.assert_equations
             .iter()
-            .chain(&flat.initial_assert_equations)
-            .chain(&analysis.initial_algorithm_assertions),
+            .map(|assertion| (assertion, false))
+            .chain(
+                flat.initial_assert_equations
+                    .iter()
+                    .chain(&analysis.initial_algorithm_assertions)
+                    .map(|assertion| (assertion, true)),
+            ),
     )?;
     lower_algorithms(
         construction,
@@ -753,9 +758,9 @@ fn lower_assertions<'dae, 'flat>(
     coordinates: &HashMap<VarName, Coordinate<'dae>>,
     functions: &FunctionRegistry<'_, 'dae>,
     sample_lattices: &[(Span, PeriodicClockSchedule)],
-    assertions: impl IntoIterator<Item = &'flat flat::AssertEquation>,
+    assertions: impl IntoIterator<Item = (&'flat flat::AssertEquation, bool)>,
 ) -> Result<(), dae::DaeConstructionError> {
-    for assertion in assertions {
+    for (assertion, initial) in assertions {
         let level = settled_assertion_level(assertion.level.as_ref(), assertion.span)?;
         let provenance = dae::DaeProvenance::source(assertion.span)?;
         if level == dae::AssertionLevel::Warning {
@@ -773,9 +778,10 @@ fn lower_assertions<'dae, 'flat>(
                 &assertion.message,
                 None,
             )?;
-            let always = always_condition(construction, assertion.span)?;
+            let trigger =
+                model_events::assertion_activation(construction, assertion.span, initial)?;
             construction
-                .events(|events| events.warning(always, always, holds, message, provenance))?;
+                .events(|events| events.warning(trigger, trigger, holds, message, provenance))?;
             continue;
         }
         let (condition, _) = lower_condition(
@@ -786,7 +792,7 @@ fn lower_assertions<'dae, 'flat>(
             &assertion.condition,
         )?;
         let action_guard = negate_condition(construction, condition, assertion.span)?;
-        let trigger = always_condition(construction, assertion.span)?;
+        let trigger = model_events::assertion_activation(construction, assertion.span, initial)?;
         let message = lower_expression(
             construction,
             coordinates,

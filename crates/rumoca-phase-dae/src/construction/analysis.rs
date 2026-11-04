@@ -124,6 +124,7 @@ use function_value_types::validate_function_value_type;
 pub(super) use history_operators::HistoryOperatorPlans;
 use history_operators::analyze_history_operators;
 pub(super) use initial_algorithms::InitialDiscreteValue;
+pub(super) use initial_algorithms::as_call_output;
 use initial_algorithms::{
     InitialAlgorithmAnalysis, analyze_initial_algorithms, assertion_call,
     claim_initial_discrete_equations, claimed_initial_families,

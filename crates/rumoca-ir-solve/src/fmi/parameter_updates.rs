@@ -363,8 +363,11 @@ fn validate_projection(problem: &SolveProblem) -> Result<(), &'static str> {
     });
     // Retained state-manifold rows read states and parameters only (Solve
     // lowering keeps algebraics out of retained constraints), so the settled
-    // view gives them the values and tangent the stored coordinates do.
-    if !settled && rows != init.manifold_row_count() {
+    // view gives them the values and tangent the stored coordinates do. The
+    // same holds for any row set that neither reads nor solves an
+    // algebraic/output coordinate: the refresh writes only those, so the
+    // settled residual and its tangent are the ones over the seeds.
+    if !settled && rows != init.manifold_row_count() && reads_or_solves_algebraics(problem) {
         return Err(
             "C initialization evaluates residual rows only on the settled algebraic refresh; rows over declaration seeds need row isolation and a forward initial Jacobian",
         );
@@ -373,4 +376,27 @@ fn validate_projection(problem: &SolveProblem) -> Result<(), &'static str> {
         return Err("C initialization needs the solver coordinates to fill the Y storage");
     }
     Ok(())
+}
+
+/// Whether an initialization residual row reads, or a projection block
+/// solves, a solver coordinate past the states: one the algebraic refresh
+/// writes. A residual the checker cannot read per operation counts as one.
+fn reads_or_solves_algebraics(problem: &SolveProblem) -> bool {
+    let states = problem.solve_layout.state_scalar_count();
+    let algebraics: std::collections::BTreeSet<usize> =
+        (states..problem.layout.y_scalars()).collect();
+    let init = &problem.initialization;
+    let solves = init
+        .projection_unknowns()
+        .iter()
+        .any(|slot| matches!(slot, ScalarSlot::Y { index, .. } if *index >= states));
+    solves
+        || init.residual().nodes.iter().any(|node| match node {
+            crate::ComputeNode::ScalarPrograms(block) => block
+                .programs()
+                .iter()
+                .flatten()
+                .any(|op| op.reads_y_index_in(&algebraics)),
+            _ => true,
+        })
 }

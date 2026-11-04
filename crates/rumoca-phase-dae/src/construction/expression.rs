@@ -503,12 +503,37 @@ fn lower_expression_node<'dae>(
             provenance,
         ),
         Expression::FieldAccess { .. } => {
-            lower_record_array_field_access(construction, symbols, binders, expression, provenance)
+            lower_field_access(construction, symbols, binders, expression, provenance)
         }
         Expression::Tuple { .. } | Expression::Empty { .. } => {
             Err(dae::DaeConstructionError::InvalidExpressionForm { span })
         }
     }
+}
+
+/// A record-array field, or an initial-algorithm call output, which reads the
+/// call's result ordinal.
+fn lower_field_access<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    symbols: LoweringSymbols<'_, 'dae>,
+    binders: &HashMap<VarName, dae::DomainBinderId<'dae>>,
+    expression: &Expression,
+    provenance: dae::DaeProvenance,
+) -> Result<dae::ExprId<'dae>, dae::DaeConstructionError> {
+    if let Some((
+        Expression::FunctionCall {
+            name,
+            args: arguments,
+            ..
+        },
+        ordinal,
+    )) = super::analysis::as_call_output(expression)
+    {
+        let call =
+            lower_call_operands(construction, symbols, binders, name, arguments, provenance)?;
+        return call.result(construction, ordinal, provenance);
+    }
+    lower_record_array_field_access(construction, symbols, binders, expression, provenance)
 }
 
 fn lower_builtin_expression<'dae>(
