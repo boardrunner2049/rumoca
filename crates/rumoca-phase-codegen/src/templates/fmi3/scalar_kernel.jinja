@@ -428,7 +428,15 @@ static {{ prefix }}Status update_assertion_memory(ModelInstance* m) {
 {%- endmacro %}
 
 {%- macro assertion_lifecycle(prefix, scalar_events=none) %}
+{%- if scalar_events %}
+static {{ prefix }}Status rmc_relations_settle_pending(ModelInstance* m);
+{%- endif %}
 static {{ prefix }}Status settle_values(ModelInstance* m) {
+{%- if scalar_events %}
+    /* A read after an input write in Initialization, Event, or Step Mode
+       sees relations at their operands' values (scalar_events.jinja). */
+    if (rmc_relations_settle_pending(m) != {{ prefix }}OK) return {{ prefix }}Error;
+{%- endif %}
     if (refresh_algebraics(m) != {{ prefix }}OK) return {{ prefix }}Error;
     return m->assertions_initialized ? check_assertions(m) : {{ prefix }}OK;
 }

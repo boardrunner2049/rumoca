@@ -26,7 +26,8 @@ use crate::runtime::solve_ops::{
 };
 use crate::runtime::solve_runtime::{
     AlgebraicLinearization, AlgebraicSettle, EventUpdateRowFilter, InitialEventObservation,
-    ProjectedEventUpdateInput, ProjectedInitialEventInput, SolveRuntime, SolveRuntimeSnapshot,
+    ProjectedEventUpdateInput, ProjectedInitialEventInput, RelationEncoding, SolveRuntime,
+    SolveRuntimeSnapshot,
 };
 use crate::runtime::time::time_match_with_tol;
 use crate::solver::{SimTermination, SimVariableMeta};
@@ -206,6 +207,13 @@ pub struct SolveMeKernel {
     /// the initial `update_discrete_states` continues from the same vector
     /// instead of rebuilding one.
     settled_initialization_y: Option<Vec<f64>>,
+}
+
+/// The coordinate before a host input write
+/// ([`SolveMeKernel::input_write_entry`]).
+pub(crate) struct MeInputWriteEntry {
+    y: Vec<f64>,
+    p: Vec<f64>,
 }
 
 /// Complete continuation state captured by `fmi3GetFMUState`.
@@ -772,6 +780,46 @@ impl SolveMeKernel {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// The event entry of an input write the host is about to make: the
+    /// coordinate before the write (SPEC_0044 ME-EVENT-011).
+    pub(crate) fn input_write_entry(&self) -> Result<MeInputWriteEntry, MeError> {
+        self.require_active_lifecycle("input_write_entry")?;
+        Ok(MeInputWriteEntry {
+            y: self.solver_y_at_time(self.time)?,
+            p: self.params.clone(),
+        })
+    }
+
+    /// MLS 3.6 §8.5: a relation is frozen only while the integrator advances.
+    /// After the host wrote inputs at a coordinate it stands on, every relation
+    /// memory is encoded from its written operands, so no read evaluates an
+    /// equation the written value deselects. When a relation moved, `entry`
+    /// becomes the pending event entry and the caller runs Event Mode there:
+    /// the iteration reads `pre` at the coordinate before the write, so a
+    /// `when` on the moved relation sees its edge. Returns whether one moved
+    /// (SPEC_0044 ME-EVENT-011).
+    pub(crate) fn arm_input_write_event(
+        &mut self,
+        entry: MeInputWriteEntry,
+    ) -> Result<bool, MeError> {
+        self.require_active_lifecycle("arm_input_write_event")?;
+        let settle = self.numerics_settle();
+        let moved = self.runtime.encode_relations_from_operands(
+            &entry.y,
+            &mut self.params,
+            self.time,
+            settle.tol,
+            settle.max_iters,
+            RelationEncoding::MemoryOnly,
+        );
+        if moved {
+            self.clear_runtime_caches();
+            self.pending_event_pre_y = Some(entry.y);
+            self.pending_event_pre_p = Some(entry.p);
+        }
+        Ok(moved)
     }
 
     pub(crate) fn get_float64(

@@ -15,6 +15,7 @@ mod declared_causality;
 mod derivative_kinks;
 mod external_functions;
 mod initial_pre;
+mod initial_relations;
 mod initial_seed_rows;
 mod input_start;
 mod integer_parameter;

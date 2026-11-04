@@ -1188,6 +1188,7 @@ impl SolveMeKernel {
     /// [`MeStage::Initialization`].
     pub(super) fn exit_initialization_mode_inner(&mut self) -> Result<(), MeError> {
         let mut solver_y = self.initialization_solver_y()?;
+        let (entry_y, entry_p) = (solver_y.clone(), self.params.clone());
         let policy = self.algebraic_projection_policy();
         let settle = policy.settle;
         self.runtime.settle_initialization_system(
@@ -1218,8 +1219,11 @@ impl SolveMeKernel {
         // MLS 3.6 §8.6: before integration, v = pre(v). The initial event
         // therefore reads the values the initialization system just settled,
         // never the declared starts that seeded that solve.
-        self.pending_event_pre_y = Some(solver_y.clone());
-        self.pending_event_pre_p = Some(self.params.clone());
+        let (mut pre_y, mut pre_p) = (solver_y.clone(), self.params.clone());
+        self.runtime
+            .keep_entry_runtime_assignments(&entry_y, &entry_p, &mut pre_y, &mut pre_p);
+        self.pending_event_pre_y = Some(pre_y);
+        self.pending_event_pre_p = Some(pre_p);
         self.settled_initialization_y = Some(solver_y);
         self.initial_event_pending = true;
         Ok(())

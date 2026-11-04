@@ -30,7 +30,7 @@ static void log_warning(ModelInstance* m, const char* message) { if (m->callback
 {{ refresh_values(solve, me_refresh, "fmi2") }}
 {{ assertion_lifecycle("fmi2", fmi.scalar_events) }}
 {%- if fmi.scalar_events %}
-{{ scalar_events(solve, fmi, "fmi2") }}
+{{ scalar_events(solve, fmi, "fmi2", me_refresh.init.rows > 0) }}
 {%- endif %}
 
 {%- if me_refresh.switching %}
@@ -191,15 +191,23 @@ FMI_EXPORT fmi2Status fmi2Get##Name(fmi2Component c, const fmi2ValueReference vr
    event whose entry is the coordinate before the first changed write. */
 static void rmc_input_changing(ModelInstance* m) {
 {%- if fmi.scalar_events %}
-    if (m->rmc_entry_captured || m->rmc_initial_event || !(m->state == MODEL_EVENT || m->state == MODEL_STEP)) return;
-    double saved = rmc_public_time_enter(m);
-    fmi2Status settled = settle_values(m);
-    m->time = saved;
-    if (settled != fmi2OK) return;
-    memcpy(m->rmc_entry_y, m->y, sizeof(m->y));
-    memcpy(m->rmc_entry_p, m->p, sizeof(m->p));
-    m->rmc_override_count = 0;
-    m->rmc_entry_captured = true;
+    bool host = m->state == MODEL_EVENT || m->state == MODEL_STEP;
+    if (host && !m->rmc_entry_captured && !m->rmc_initial_event) {
+        double saved = rmc_public_time_enter(m);
+        fmi2Status settled = settle_values(m);
+        m->time = saved;
+        if (settled == fmi2OK) {
+            memcpy(m->rmc_entry_y, m->y, sizeof(m->y));
+            memcpy(m->rmc_entry_p, m->p, sizeof(m->p));
+            m->rmc_override_count = 0;
+            m->rmc_entry_captured = true;
+        }
+    }
+    /* MLS 8.5, 8.6: outside integration the relations follow the written
+       value at the next read or event (rmc_relations_consistent). A write
+       in Continuous-Time Mode leaves them frozen: the completed step requests
+       the event (rmc_static_relations_stale). */
+    if (host || m->state == MODEL_INITIALIZATION) m->rmc_relations_pending = true;
 {%- else %}
     (void)m;
 {%- endif %}
@@ -212,7 +220,7 @@ FMI_EXPORT fmi2Status fmi2Set##Name(fmi2Component c, const fmi2ValueReference vr
     for (size_t i = 0; i < n; ++i) { \
         const RmcValueReference* ref = &rmc_value_references[vr[i]]; Type value = values[i]; \
         double* slot = &(ref->column == RMC_COLUMN_Y ? m->y : m->p)[ref->index]; double stored = STORE; \
-        if (ref->access == RMC_ACCESS_INPUT && memcmp(slot, &stored, sizeof(double)) != 0) rmc_input_changing(m); \
+        if ((ref->access == RMC_ACCESS_INPUT || m->state == MODEL_INITIALIZATION) && memcmp(slot, &stored, sizeof(double)) != 0) rmc_input_changing(m); \
         *slot = stored; \
         if (ref->marks_parameters) m->parameters_dirty = true; \
     } \
@@ -230,8 +238,8 @@ FMI_EXPORT fmi2Component fmi2Instantiate(fmi2String name, fmi2Type type, fmi2Str
 }
 FMI_EXPORT void fmi2FreeInstance(fmi2Component c) { if (c) { ModelInstance* m = c; rmc_release_text(m); m->callbacks.freeMemory(m); } }
 FMI_EXPORT fmi2Status fmi2SetupExperiment(fmi2Component c, fmi2Boolean td, fmi2Real tol, fmi2Real start, fmi2Boolean sd, fmi2Real stop) { ModelInstance* m = c; if (!m || m->state != MODEL_INSTANTIATED || !isfinite(start) || (td && (!isfinite(tol) || tol < 0.0)) || (sd && (!isfinite(stop) || stop < start))) return fmi2Error; m->time = start; m->tolerance = td ? tol : 0.0; {% if fmi.scalar_events %}m->rmc_scan = sd ? rmc_scan_resolution(stop - start) : 0.0; {% endif %}return fmi2OK; }
-FMI_EXPORT fmi2Status fmi2EnterInitializationMode(fmi2Component c) { ModelInstance* m = c; if (!m || m->state != MODEL_INSTANTIATED) return fmi2Error; {% if fmi.scalar_events %}rmc_set_initial_flag(m, 1.0); {% endif %}m->state = MODEL_INITIALIZATION; return fmi2OK; }
-FMI_EXPORT fmi2Status fmi2ExitInitializationMode(fmi2Component c) { ModelInstance* m = c; if (!m || m->state != MODEL_INITIALIZATION || {% if me_refresh.init.rows > 0 %}rmc_initialize(m, m->tolerance) != fmi2OK || {% else %}rmc_apply_updates(m, true) < 0 || {% endif %}{% if me_refresh.manifold %}rmc_manifold_certify(m, rmc_mf_tolerance(m)) != 0 || {% endif %}{% if fmi.scalar_events %}rmc_events_initialize(m){% else %}initialize_assertions(m){% endif %} != fmi2OK || {% if fmi.scalar_events %}(m->type == fmi2CoSimulation && rmc_cs_initial_event(m) != fmi2OK) || {% endif %}evaluate_derivatives(m) != fmi2OK) return fmi2Error; m->state = m->type == fmi2ModelExchange ? MODEL_EVENT : MODEL_STEP; return fmi2OK; }
+FMI_EXPORT fmi2Status fmi2EnterInitializationMode(fmi2Component c) { ModelInstance* m = c; if (!m || m->state != MODEL_INSTANTIATED) return fmi2Error; {% if fmi.scalar_events %}rmc_set_initial_flag(m, 1.0); m->rmc_relations_pending = true; {% endif %}m->state = MODEL_INITIALIZATION; return fmi2OK; }
+FMI_EXPORT fmi2Status fmi2ExitInitializationMode(fmi2Component c) { ModelInstance* m = c; if (!m || m->state != MODEL_INITIALIZATION || {% if fmi.scalar_events %}rmc_initialization(m) != fmi2OK || {% elif me_refresh.init.rows > 0 %}rmc_initialize(m, m->tolerance) != fmi2OK || {% else %}rmc_apply_updates(m, true) < 0 || {% endif %}{% if me_refresh.manifold %}rmc_manifold_certify(m, rmc_mf_tolerance(m)) != 0 || {% endif %}{% if fmi.scalar_events %}rmc_events_initialize(m){% else %}initialize_assertions(m){% endif %} != fmi2OK || {% if fmi.scalar_events %}(m->type == fmi2CoSimulation && rmc_cs_initial_event(m) != fmi2OK) || {% endif %}evaluate_derivatives(m) != fmi2OK) return fmi2Error; m->state = m->type == fmi2ModelExchange ? MODEL_EVENT : MODEL_STEP; return fmi2OK; }
 FMI_EXPORT fmi2Status fmi2Terminate(fmi2Component c) { ModelInstance* m = c; if (!m || (m->state != MODEL_EVENT && m->state != MODEL_CONTINUOUS && m->state != MODEL_STEP)) return fmi2Error; m->state = MODEL_TERMINATED; return fmi2OK; }
 FMI_EXPORT fmi2Status fmi2Reset(fmi2Component c) { ModelInstance* m = c; if (!m) return fmi2Error; initialize_values(m); m->state = MODEL_INSTANTIATED; return fmi2OK; }
 RMC_GET_NUMERIC(Real, fmi2Real, RMC_KIND_FLOAT64, value)

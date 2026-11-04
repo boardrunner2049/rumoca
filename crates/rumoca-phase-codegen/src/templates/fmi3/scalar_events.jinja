@@ -11,12 +11,12 @@
 
 {%- macro event_fields(fmi) -%}
 {%- if fmi.scalar_events and fmi.scalar_events.time_events.samples|length > 0 %}{% set ns = fmi.scalar_events.time_events.samples|length %} int64_t rmc_tick[{{ ns }}]; bool rmc_ticking[{{ ns }}]; double rmc_sample_start[{{ ns }}]; double rmc_sample_interval[{{ ns }}]; bool rmc_sample_exact[{{ ns }}]; bool rmc_sample_pending; double rmc_start_time;{% endif -%}
-{%- if fmi.scalar_events %} bool rmc_domain[{{ [fmi.event_indicator_roots|length, 1]|max }}]; bool rmc_domain_valid; double rmc_indicator[{{ [fmi.event_indicator_roots|length, 1]|max }}]; double rmc_entry_y[Y_LEN]; double rmc_entry_p[P_LEN]; bool rmc_entry_captured; bool rmc_initial_event; double rmc_scan; size_t rmc_override_root[{{ [fmi.scalar_events.roots|length, 1]|max }}]; double rmc_override_value[{{ [fmi.scalar_events.roots|length, 1]|max }}]; size_t rmc_override_count; double rmc_next_time; bool rmc_next_defined; bool rmc_next_right; double rmc_post_time; double rmc_post_anchor; bool rmc_post_defined;{% endif -%}
+{%- if fmi.scalar_events %} bool rmc_domain[{{ [fmi.event_indicator_roots|length, 1]|max }}]; bool rmc_domain_valid; double rmc_indicator[{{ [fmi.event_indicator_roots|length, 1]|max }}]; double rmc_entry_y[Y_LEN]; double rmc_entry_p[P_LEN]; bool rmc_entry_captured; bool rmc_initial_event; double rmc_scan; size_t rmc_override_root[{{ [fmi.scalar_events.roots|length, 1]|max }}]; double rmc_override_value[{{ [fmi.scalar_events.roots|length, 1]|max }}]; size_t rmc_override_count; double rmc_next_time; bool rmc_next_defined; bool rmc_next_right; double rmc_post_time; double rmc_post_anchor; bool rmc_post_defined; bool rmc_relations_pending;{% endif -%}
 {%- endmacro %}
 
 {%- macro event_reset(fmi) -%}
 {%- if fmi.scalar_events and fmi.scalar_events.time_events.samples|length > 0 %} memset(m->rmc_tick, 0, sizeof(m->rmc_tick)); memset(m->rmc_ticking, 0, sizeof(m->rmc_ticking)); memset(m->rmc_sample_start, 0, sizeof(m->rmc_sample_start)); memset(m->rmc_sample_interval, 0, sizeof(m->rmc_sample_interval)); memset(m->rmc_sample_exact, 0, sizeof(m->rmc_sample_exact)); m->rmc_sample_pending=false; m->rmc_start_time=0.0;{% endif -%}
-{%- if fmi.scalar_events %} m->rmc_domain_valid=false; m->rmc_entry_captured=false; m->rmc_initial_event=false; m->rmc_override_count=0; m->rmc_scan=0.0; m->rmc_next_defined=false; m->rmc_next_right=false; m->rmc_next_time=INFINITY; m->rmc_post_defined=false; m->rmc_post_time=0.0; m->rmc_post_anchor=0.0;{% endif -%}
+{%- if fmi.scalar_events %} m->rmc_domain_valid=false; m->rmc_entry_captured=false; m->rmc_initial_event=false; m->rmc_override_count=0; m->rmc_scan=0.0; m->rmc_next_defined=false; m->rmc_next_right=false; m->rmc_next_time=INFINITY; m->rmc_post_defined=false; m->rmc_post_time=0.0; m->rmc_post_anchor=0.0; m->rmc_relations_pending=false;{% endif -%}
 {%- endmacro %}
 
 {#- One named change step of a pass; `flag` accumulates whether it changed the
@@ -234,7 +234,7 @@ static {{ prefix }}Status rmc_next_time_event(ModelInstance* m, double after) {
 }
 {%- endmacro %}
 
-{%- macro scalar_events(solve, fmi, prefix) %}
+{%- macro scalar_events(solve, fmi, prefix, init_rows=false) %}
 {%- set ev = fmi.scalar_events %}
 {%- set nroots = ev.roots|length %}
 {%- set nind = fmi.event_indicator_roots|length %}
@@ -423,6 +423,44 @@ static {{ prefix }}Status rmc_event_projection(ModelInstance* m, bool* changed) 
     if (refresh_algebraics(m) != {{ prefix }}OK) return {{ prefix }}Error;
     for (size_t k = 0; k < Y_LEN; ++k) if (rmc_value_changed(before[k], m->y[k], m->tolerance)) { *changed = true; break; }
     return {{ prefix }}OK;
+}
+
+/* MLS §8.5, §8.6: outside continuous integration (Initialization Mode, the
+   initial event, and an input written in Event or Step Mode) a relation takes
+   the value of its operands; only integration freezes it between located
+   crossings. Relation memory and the algebraic coordinate settle together:
+   every relation is encoded at the current coordinate with the runtime
+   assignments that read it, the algebraics are refreshed under it, and the
+   relations are encoded again until none moves
+   (initial_projection.rs seed_initial_relation_memory). A refresh the stale
+   branch fails (a division the moved relation deselects) is a trial: it is
+   retried once the relations move, and is an error only when they do not.
+   `*moved` reports whether any relation memory changed. */
+static {{ prefix }}Status rmc_runtime_assignments(ModelInstance* m, bool* changed);
+static {{ prefix }}Status rmc_relations_consistent(ModelInstance* m, bool* moved) {
+    bool refreshed = true;
+    for (size_t pass = 0; pass < {{ schedule.fixed_point_cap }}; ++pass) {
+        bool changed = false, assigned = false;
+        if (rmc_relation_refresh(m, false, &changed) != {{ prefix }}OK) return {{ prefix }}Error;
+        if (rmc_runtime_assignments(m, &assigned) != {{ prefix }}OK) return {{ prefix }}Error;
+        *moved |= changed;
+        if (pass > 0 && !changed && !assigned) {
+            if (!refreshed) break;
+            m->rmc_relations_pending = false;
+            return {{ prefix }}OK;
+        }
+        bool quiet = m->rmc_quiet;
+        m->rmc_quiet = true;
+        refreshed = refresh_algebraics(m) == {{ prefix }}OK;
+        m->rmc_quiet = quiet;
+    }
+    RMC_LOG(m, "event relations did not settle consistently with the values of their operands");
+    return {{ prefix }}Error;
+}
+/* The relations an input write or Initialization Mode left pending. */
+static {{ prefix }}Status rmc_relations_settle_pending(ModelInstance* m) {
+    bool moved = false;
+    return m->rmc_relations_pending ? rmc_relations_consistent(m, &moved) : {{ prefix }}OK;
 }
 
 
@@ -873,6 +911,39 @@ static {{ prefix }}Status rmc_event_iterate(ModelInstance* m, bool canonicalize)
 }
 
 
+/* initial_projection.rs seed_initial_relation_memory: the relations the
+   start values select, before the initialization system is solved. An
+   algebraic refresh the start values cannot complete leaves the coordinate
+   as it was; the relations it did move stay. */
+static void rmc_relations_seed(ModelInstance* m) {
+    double* y = malloc(sizeof(m->y));
+    if (!y) return;
+    memcpy(y, m->y, sizeof(m->y));
+    bool quiet = m->rmc_quiet, moved = false;
+    m->rmc_quiet = true;
+    if (rmc_relations_consistent(m, &moved) != {{ prefix }}OK) memcpy(m->y, y, sizeof(m->y));
+    m->rmc_quiet = quiet;
+    free(y);
+}
+/* initial_projection.rs settle_initialization_system with its relation
+   passes (MLS §8.6): the initialization system is solved under the
+   relations its start values select, and solved again from its solution
+   while the relations there differ from the ones it was solved under. */
+static {{ prefix }}Status rmc_initialization(ModelInstance* m) {
+    for (size_t round = 0; round < {{ schedule.fixed_point_cap }}; ++round) {
+        bool moved = false;
+        if (rmc_apply_updates(m, true) < 0) return {{ prefix }}Error;
+        rmc_relations_seed(m);
+{%- if init_rows %}
+        if (rmc_initialize(m, m->tolerance) != {{ prefix }}OK) return {{ prefix }}Error;
+{%- endif %}
+        if (rmc_relations_consistent(m, &moved) != {{ prefix }}OK) return {{ prefix }}Error;
+        if (!moved) return {{ prefix }}OK;
+    }
+    RMC_LOG(m, "the initialization system and its event relations did not settle together");
+    return {{ prefix }}Error;
+}
+
 /* component.rs exit_initialization_mode_inner and discrete_rows.rs
    seed_condition_memory_for_initialization: relation memory from the settled
    state, then every condition memory with pre following the current value. */
@@ -952,6 +1023,9 @@ static {{ prefix }}Status rmc_events_update(ModelInstance* m, bool* states_chang
     /* Any other event at an instant whose time event was already observed at
        its right limit reads that right limit too (public_time_eval_time). */
     (void)rmc_public_time_enter(m);
+    /* An input written in Event or Step Mode: the iteration starts from the
+       relations the written values select. */
+    if (rmc_relations_settle_pending(m) != {{ prefix }}OK) { m->time = event_time; return {{ prefix }}Error; }
     if (!m->rmc_entry_captured) {
         if (settle_values(m) != {{ prefix }}OK) { m->time = event_time; return {{ prefix }}Error; }
         memcpy(m->rmc_entry_y, m->y, sizeof(m->y));

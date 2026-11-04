@@ -1,5 +1,14 @@
 use super::*;
 
+/// What [`SolveRuntime::encode_relations_from_operands`] carries back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelationEncoding {
+    /// Relation memory and the runtime assignments that read it.
+    WithAssignments,
+    /// Relation memory alone, so discrete values keep their event-entry side.
+    MemoryOnly,
+}
+
 impl SolveRuntime {
     pub fn update_relation_memory_from_state(
         &self,
@@ -17,6 +26,102 @@ impl SolveRuntime {
             max_iters,
             &[],
         )
+    }
+
+    /// Encode every relation memory from the values of its operands at the
+    /// coordinate `y` as it stands (MLS 3.6 §8.5, §8.6: outside continuous
+    /// integration a relation is not frozen), for initialization and for an
+    /// input the host wrote across a relation (SPEC_0044 ME-EVENT-011).
+    ///
+    /// The roots are read from `y` directly, not through the certified root
+    /// refresh: an operand of one relation may be an algebraic another stale
+    /// relation makes non-finite (`r = if par then 0 else h / den`, read by
+    /// `r < 0`). The algebraics are refreshed on a trial copy under the
+    /// encoded relations, and the encoding repeats until no relation moves; a
+    /// refresh the stale branch fails is retried after the relations move.
+    /// `y` is never written: only relation memory (and, with
+    /// [`RelationEncoding::WithAssignments`], the runtime assignments that read
+    /// it) reaches `p`. A relation this cannot reach keeps its memory; the
+    /// caller's strict evaluation reports it. Returns whether any relation
+    /// memory moved.
+    pub(crate) fn encode_relations_from_operands(
+        &self,
+        y: &[f64],
+        p: &mut [f64],
+        t: f64,
+        tol: f64,
+        max_iters: usize,
+        encoding: RelationEncoding,
+    ) -> bool {
+        let targets = &self.model.problem.events.root_relation_memory_targets;
+        if targets.iter().all(Option::is_none) {
+            return false;
+        }
+        let mut trial_y = y.to_vec();
+        let mut trial_p = p.to_vec();
+        let mut refreshed = true;
+        let mut moved = false;
+        for _ in 0..max_iters {
+            let Ok(roots) = self.eval_root_conditions_from_solver_y(t, &trial_y, &trial_p) else {
+                break;
+            };
+            let Ok(changed) =
+                self.update_root_relation_memory_from_values(&roots, &mut trial_p, &[])
+            else {
+                break;
+            };
+            moved |= changed;
+            let assigned = self
+                .apply_runtime_assignments_until_stable(
+                    &mut trial_y,
+                    &mut trial_p,
+                    t,
+                    tol,
+                    max_iters,
+                )
+                .unwrap_or(false);
+            if refreshed && !changed && !assigned {
+                break;
+            }
+            refreshed = self
+                .refresh_algebraic_and_output_slots(t, &mut trial_y, &trial_p, tol, max_iters)
+                .is_ok();
+        }
+        match encoding {
+            RelationEncoding::WithAssignments => p.copy_from_slice(&trial_p),
+            RelationEncoding::MemoryOnly => {
+                let memory = targets.iter().flatten().filter_map(|slot| match *slot {
+                    solve::ScalarSlot::P { index, .. } => Some(index),
+                    _ => None,
+                });
+                for index in memory {
+                    p[index] = trial_p[index];
+                }
+            }
+        }
+        moved
+    }
+
+    /// The `pre` side of the runtime assignments at the initial event: the
+    /// values they had when initialization began. Initialization encodes the
+    /// relations they read, and assigns them, only so its equations select
+    /// the branches the relations select (MLS 3.6 §8.6); `pre` of such a
+    /// discrete variable at the initial event is still its start value unless
+    /// an initial equation fixes it (SPEC_0044 ME-EVENT-011).
+    pub(crate) fn keep_entry_runtime_assignments(
+        &self,
+        entry_y: &[f64],
+        entry_p: &[f64],
+        pre_y: &mut [f64],
+        pre_p: &mut [f64],
+    ) {
+        for slot in &self.model.problem.discrete.runtime_assignment_targets {
+            match *slot {
+                solve::ScalarSlot::P { index, .. } => pre_p[index] = entry_p[index],
+                solve::ScalarSlot::Y { index, .. } => pre_y[index] = entry_y[index],
+                solve::ScalarSlot::Time | solve::ScalarSlot::Constant(_) => {}
+            }
+        }
     }
 
     pub(crate) fn update_relation_memory_from_state_except_overrides(

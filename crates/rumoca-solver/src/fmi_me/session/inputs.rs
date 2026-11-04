@@ -1,7 +1,8 @@
 //! Input transactions belong to the common master (SPEC_0044 ME-HOST-001/ME-BUF-001).
 
 use super::{MeSessionError, MeSessionLoss, MeSimulationSession};
-use crate::fmi_me::{MeTime, MeValueRef};
+use crate::fmi_me::kernel::MeInputWriteEntry;
+use crate::fmi_me::{MeEventCause, MeTime, MeValueRef};
 
 impl MeSimulationSession<'_, '_> {
     /// Apply one declared input through the same transaction as a batch.
@@ -33,10 +34,26 @@ impl MeSimulationSession<'_, '_> {
             self.record_inputs(inputs);
             return Ok(());
         }
+        let entry = self.host.kernel.borrow().input_write_entry()?;
         self.write_inputs(&references, &values)?;
-        let correlated = self.correlate_inputs(inputs);
+        let correlated = self
+            .settle_written_relations(entry)
+            .and_then(|()| self.correlate_inputs(inputs));
         self.host
             .guard_mutation(MeSessionLoss::InputApplication, correlated)
+    }
+
+    /// SPEC_0044 ME-EVENT-011: a written input that moves a relation is a
+    /// host event at the coordinate the session stands on. The relations take
+    /// the written side before any read, and Event Mode settles the discrete
+    /// values with `pre` at the coordinate before the write. A write that
+    /// moves no relation leaves the component in Continuous-Time Mode.
+    fn settle_written_relations(&mut self, entry: MeInputWriteEntry) -> Result<(), MeSessionError> {
+        let moved = self.host.kernel.borrow_mut().arm_input_write_event(entry)?;
+        if moved {
+            self.process_event_boundary(MeEventCause::StateEvent, self.host.time)?;
+        }
+        Ok(())
     }
 
     fn input_references(&self, inputs: &[(&str, f64)]) -> Result<Vec<MeValueRef>, MeSessionError> {

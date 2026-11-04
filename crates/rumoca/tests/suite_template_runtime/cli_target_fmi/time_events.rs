@@ -365,7 +365,7 @@ fn simultaneous_when_bodies_settle_together() {
     }
 }
 
-fn harness_tools_available() -> bool {
+pub(super) fn harness_tools_available() -> bool {
     let tools = [("cc", command_is_available("cc"))];
     super::super::template_runtime_policy::prerequisites_are_available(
         "FMI C time-event harness",
@@ -373,7 +373,7 @@ fn harness_tools_available() -> bool {
     )
 }
 
-fn find_line(output: &str, prefix: &str) -> String {
+pub(super) fn find_line(output: &str, prefix: &str) -> String {
     output
         .lines()
         .find(|line| line.starts_with(prefix))
@@ -381,14 +381,14 @@ fn find_line(output: &str, prefix: &str) -> String {
         .to_string()
 }
 
-fn field(line: &str, index: usize) -> f64 {
+pub(super) fn field(line: &str, index: usize) -> f64 {
     line.split_whitespace()
         .nth(index)
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| panic!("field {index} of `{line}`"))
 }
 
-fn assert_close(actual: f64, expected: f64, tolerance: f64, context: &str) {
+pub(super) fn assert_close(actual: f64, expected: f64, tolerance: f64, context: &str) {
     assert!(
         (actual - expected).abs() <= tolerance,
         "{context}: expected {expected}, got {actual}"
@@ -466,11 +466,11 @@ fn run_harness(model: &str, scenario: u32) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn vendored_fmi3_headers() -> PathBuf {
+pub(super) fn vendored_fmi3_headers() -> PathBuf {
     workspace_root().join("crates/rumoca-phase-codegen/src/templates/fmi-ls-wasm/fmi3-headers")
 }
 
-fn attribute(xml: &str, name: &str) -> String {
+pub(super) fn attribute(xml: &str, name: &str) -> String {
     let start = xml
         .find(&format!("{name}=\""))
         .unwrap_or_else(|| panic!("model description has no {name}"))
@@ -479,7 +479,7 @@ fn attribute(xml: &str, name: &str) -> String {
     xml[start..start + xml[start..].find('"').expect("terminated attribute")].to_string()
 }
 
-fn value_reference(xml: &str, variable: &str) -> Option<u32> {
+pub(super) fn value_reference(xml: &str, variable: &str) -> Option<u32> {
     let at = xml.find(&format!(" name=\"{variable}\""))?;
     let tail = &xml[at..];
     let start = tail.find("valueReference=\"")? + "valueReference=\"".len();

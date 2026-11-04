@@ -91,6 +91,7 @@ use plans::{
 };
 use refresh_execution::static_refresh_parameter_indices;
 use refresh_projection::*;
+pub(crate) use relation_memory::RelationEncoding;
 use seed_linearization::SeedProjectionCache;
 use support::{
     build_visible_name_index, compiled_expression, compiled_jacobian, copy_runtime_values,

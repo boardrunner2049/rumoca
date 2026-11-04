@@ -27,7 +27,7 @@ static void log_warning(ModelInstance* m, const char* message) { if (m->logger) 
 {{ refresh_values(solve, me_refresh, "fmi3") }}
 {{ assertion_lifecycle("fmi3", fmi.scalar_events) }}
 {%- if fmi.scalar_events %}
-{{ scalar_events(solve, fmi, "fmi3") }}
+{{ scalar_events(solve, fmi, "fmi3", me_refresh.init.rows > 0) }}
 {%- endif %}
 {%- if me_refresh.switching %}
 {%- macro derivative_programs(plan) %}
@@ -199,15 +199,23 @@ FMI_EXPORT fmi3Status fmi3Get##Name(fmi3Instance i, const fmi3ValueReference vr[
    `change()` or relation on the input sees its pre-event value. */
 static void rmc_input_changing(ModelInstance* m) {
 {%- if fmi.scalar_events %}
-    if (m->rmc_entry_captured || m->rmc_initial_event || !(m->state == MODEL_EVENT || m->state == MODEL_STEP)) return;
-    double saved = rmc_public_time_enter(m);
-    fmi3Status settled = settle_values(m);
-    m->time = saved;
-    if (settled != fmi3OK) return;
-    memcpy(m->rmc_entry_y, m->y, sizeof(m->y));
-    memcpy(m->rmc_entry_p, m->p, sizeof(m->p));
-    m->rmc_override_count = 0;
-    m->rmc_entry_captured = true;
+    bool host = m->state == MODEL_EVENT || m->state == MODEL_STEP;
+    if (host && !m->rmc_entry_captured && !m->rmc_initial_event) {
+        double saved = rmc_public_time_enter(m);
+        fmi3Status settled = settle_values(m);
+        m->time = saved;
+        if (settled == fmi3OK) {
+            memcpy(m->rmc_entry_y, m->y, sizeof(m->y));
+            memcpy(m->rmc_entry_p, m->p, sizeof(m->p));
+            m->rmc_override_count = 0;
+            m->rmc_entry_captured = true;
+        }
+    }
+    /* MLS 8.5, 8.6: outside integration the relations follow the written
+       value at the next read or event (rmc_relations_consistent). A write
+       in Continuous-Time Mode leaves them frozen: the completed step requests
+       the event (rmc_static_relations_stale). */
+    if (host || m->state == MODEL_INITIALIZATION) m->rmc_relations_pending = true;
 {%- else %}
     (void)m;
 {%- endif %}
@@ -222,7 +230,7 @@ FMI_EXPORT fmi3Status fmi3Set##Name(fmi3Instance i, const fmi3ValueReference vr[
     } \
     for (size_t k = 0; k < nvr; ++k) { \
         const RmcValueReference* ref = &rmc_value_references[vr[k]]; double* target = ref->column == RMC_COLUMN_Y ? m->y : m->p; \
-        for (size_t j = 0; j < ref->count; ++j) { Type value = values[cursor++]; double stored = STORE; if (ref->access == RMC_ACCESS_INPUT && memcmp(&target[ref->base + j], &stored, sizeof(double)) != 0) rmc_input_changing(m); target[ref->base + j] = stored; } \
+        for (size_t j = 0; j < ref->count; ++j) { Type value = values[cursor++]; double stored = STORE; if ((ref->access == RMC_ACCESS_INPUT || m->state == MODEL_INITIALIZATION) && memcmp(&target[ref->base + j], &stored, sizeof(double)) != 0) rmc_input_changing(m); target[ref->base + j] = stored; } \
         if (ref->marks_parameters) m->parameters_dirty = true; \
     } \
     return fmi3OK; \
@@ -267,8 +275,8 @@ FMI_EXPORT fmi3Instance fmi3InstantiateCoSimulation(fmi3String name, fmi3String 
 FMI_EXPORT fmi3Instance fmi3InstantiateScheduledExecution(fmi3String name, fmi3String token, fmi3String resources, fmi3Boolean visible, fmi3Boolean loggingOn, fmi3InstanceEnvironment environment, fmi3LogMessageCallback logger, fmi3ClockUpdateCallback clockUpdate, fmi3LockPreemptionCallback lockPreemption, fmi3UnlockPreemptionCallback unlockPreemption) { (void)name;(void)token;(void)resources;(void)visible;(void)loggingOn;(void)environment;(void)logger;(void)clockUpdate;(void)lockPreemption;(void)unlockPreemption;return NULL; }
 FMI_EXPORT void fmi3FreeInstance(fmi3Instance instance) { if (instance) rmc_release_text(instance); free(instance); }
 FMI_EXPORT fmi3Status fmi3SetDebugLogging(fmi3Instance i, fmi3Boolean loggingOn, size_t n, const fmi3String categories[]) { {% if me_refresh.switching %}if (i && (categories || n == 0)) ((ModelInstance*)i)->rmc_chart_log = loggingOn;{% else %}(void)loggingOn;{% endif %} return i && (categories || n == 0) ? fmi3OK : fmi3Error; }
-FMI_EXPORT fmi3Status fmi3EnterInitializationMode(fmi3Instance i, fmi3Boolean td, fmi3Float64 tol, fmi3Float64 start, fmi3Boolean sd, fmi3Float64 stop) { ModelInstance* m=i; if (!m || m->state != MODEL_INSTANTIATED || !isfinite(start) || (td && (!isfinite(tol) || tol < 0.0)) || (sd && (!isfinite(stop) || stop < start))) return fmi3Error; m->time=start; m->tolerance=td ? tol : 0.0; {% if fmi.scalar_events %}m->rmc_scan = sd ? rmc_scan_resolution(stop - start) : 0.0; rmc_set_initial_flag(m, 1.0); {% endif %}m->state=MODEL_INITIALIZATION; return fmi3OK; }
-FMI_EXPORT fmi3Status fmi3ExitInitializationMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->state != MODEL_INITIALIZATION || {% if me_refresh.init.rows > 0 %}rmc_initialize(m, m->tolerance) != fmi3OK || {% else %}rmc_apply_updates(m, true) < 0 || {% endif %}{% if me_refresh.manifold %}rmc_manifold_certify(m, rmc_mf_tolerance(m)) != 0 || {% endif %}{% if fmi.scalar_events %}rmc_events_initialize(m){% else %}initialize_assertions(m){% endif %} != fmi3OK || {% if fmi.scalar_events %}(m->type == INTERFACE_CS && rmc_cs_initial_event(m) != fmi3OK) || {% endif %}evaluate_derivatives(m) != fmi3OK) return fmi3Error; m->state=m->type==INTERFACE_ME?MODEL_EVENT:MODEL_STEP; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3EnterInitializationMode(fmi3Instance i, fmi3Boolean td, fmi3Float64 tol, fmi3Float64 start, fmi3Boolean sd, fmi3Float64 stop) { ModelInstance* m=i; if (!m || m->state != MODEL_INSTANTIATED || !isfinite(start) || (td && (!isfinite(tol) || tol < 0.0)) || (sd && (!isfinite(stop) || stop < start))) return fmi3Error; m->time=start; m->tolerance=td ? tol : 0.0; {% if fmi.scalar_events %}m->rmc_scan = sd ? rmc_scan_resolution(stop - start) : 0.0; rmc_set_initial_flag(m, 1.0); m->rmc_relations_pending = true; {% endif %}m->state=MODEL_INITIALIZATION; return fmi3OK; }
+FMI_EXPORT fmi3Status fmi3ExitInitializationMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->state != MODEL_INITIALIZATION || {% if fmi.scalar_events %}rmc_initialization(m) != fmi3OK || {% elif me_refresh.init.rows > 0 %}rmc_initialize(m, m->tolerance) != fmi3OK || {% else %}rmc_apply_updates(m, true) < 0 || {% endif %}{% if me_refresh.manifold %}rmc_manifold_certify(m, rmc_mf_tolerance(m)) != 0 || {% endif %}{% if fmi.scalar_events %}rmc_events_initialize(m){% else %}initialize_assertions(m){% endif %} != fmi3OK || {% if fmi.scalar_events %}(m->type == INTERFACE_CS && rmc_cs_initial_event(m) != fmi3OK) || {% endif %}evaluate_derivatives(m) != fmi3OK) return fmi3Error; m->state=m->type==INTERFACE_ME?MODEL_EVENT:MODEL_STEP; return fmi3OK; }
 FMI_EXPORT fmi3Status fmi3EnterEventMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || (m->state != MODEL_EVENT && m->state != MODEL_CONTINUOUS)) return fmi3Error; rmc_seed_suspend(m); m->state=MODEL_EVENT; return fmi3OK; }
 FMI_EXPORT fmi3Status fmi3UpdateDiscreteStates(fmi3Instance i, fmi3Boolean* need, fmi3Boolean* terminate, fmi3Boolean* nominalsChanged, fmi3Boolean* valuesChanged, fmi3Boolean* nextDefined, fmi3Float64* nextTime) { ModelInstance* m=i; if (!m || m->state != MODEL_EVENT || !need || !terminate || !nominalsChanged || !valuesChanged || !nextDefined || !nextTime) return fmi3Error; {% if me_refresh.manifold %}bool projected = false; if (rmc_manifold_event(m, &projected) != fmi3OK) return fmi3Error; {% endif %}{% if fmi.scalar_events %}bool reinit = false; if (rmc_events_update(m, &reinit) != fmi3OK) return fmi3Error; {% endif %}{% if me_refresh.switching %}bool changed = false, nominals = false; if (m->rmc_chart_pending ? rmc_chart_transfer(m, &changed, &nominals) != fmi3OK : settle_assertion_event(m) != fmi3OK) return fmi3Error; *need=0; *terminate=0; *nominalsChanged=nominals; *valuesChanged=changed; {% else %}{% if not fmi.scalar_events %}if (settle_assertion_event(m) != fmi3OK) return fmi3Error; {% endif %}*need=0; *terminate=0; *nominalsChanged=0; *valuesChanged=0; {% endif %}*nextDefined=0; *nextTime=0.0; {% if fmi.scalar_events %}if (reinit) *valuesChanged=fmi3True; if (m->rmc_next_defined) { *nextDefined=fmi3True; *nextTime=m->rmc_next_time; } {% endif %}{% if me_refresh.manifold %}if (projected) *valuesChanged=fmi3True; {% endif %}return fmi3OK; }
 FMI_EXPORT fmi3Status fmi3EnterContinuousTimeMode(fmi3Instance i) { ModelInstance* m=i; if (!m || m->type != INTERFACE_ME || m->state != MODEL_EVENT{% if fmi.scalar_events %} || rmc_events_continuous(m) != fmi3OK{% endif %}) return fmi3Error; rmc_seed_commit(m); m->state=MODEL_CONTINUOUS; return fmi3OK; }

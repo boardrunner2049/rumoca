@@ -838,6 +838,19 @@ impl SolveRuntime {
             // coordinate before either updates or residuals observe them.
             self.refresh_delay_values(t, y, p)?;
             self.apply_initialization_updates(y, p, t, tol, max_iters)?;
+            // MLS 3.6 §8.6: a relation takes the value of its operands at
+            // initialization, never the declaration seed of its relation
+            // memory; the strict encoding after the projection repeats the
+            // pass until the relations at the solution are the ones it was
+            // solved under (SPEC_0044 ME-EVENT-011).
+            self.encode_relations_from_operands(
+                y,
+                p,
+                t,
+                tol,
+                max_iters,
+                RelationEncoding::WithAssignments,
+            );
             self.project_initial_variables(y, p, t, tol, max_iters)?;
             // Projection can move a delay source. Refresh its identity value
             // before deciding that the coupled initialization fixed point has
@@ -850,13 +863,31 @@ impl SolveRuntime {
                 self.refresh_algebraic_and_output_slots(t, y, p, tol, max_iters)?;
             }
             let update_changed = self.apply_initialization_updates(y, p, t, tol, max_iters)?;
-            if !delay_changed && !update_changed {
+            let relation_changed = self.encode_initial_relations(y, p, t, tol, max_iters)?;
+            if !delay_changed && !update_changed && !relation_changed {
                 return Ok(());
             }
         }
         Err(RuntimeSolveError::solve_ir(format!(
-            "initial algebraic/update projection did not converge at t={t}"
+            "initial algebraic/update projection did not converge at t={t} \
+             (bindings, delays, or event relations kept changing)"
         )))
+    }
+
+    /// Encode every relation memory at the current coordinate, with the
+    /// runtime assignments that read it; whether either changed.
+    fn encode_initial_relations(
+        &self,
+        y: &mut [f64],
+        p: &mut [f64],
+        t: f64,
+        tol: f64,
+        max_iters: usize,
+    ) -> Result<bool, RuntimeSolveError> {
+        let state = &y[..self.model.state_scalar_count().min(y.len())];
+        let relations = self.update_relation_memory_from_state(t, state, p, tol, max_iters)?;
+        let assigned = self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
+        Ok(relations || assigned)
     }
 
     /// Whether any initialization update row reads an algebraic coordinate.
