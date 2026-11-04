@@ -61,9 +61,9 @@ valid LOC reductions.
 
 | Trigger | Threshold | Acknowledged ceiling | Reduction owner |
 |---|---|---|---|
-| `dae-core-loc` | 11,000 | 18,500 | Retain checked conditional/tensor/loop-region and initialization parameter identity; retire downstream recovery during Solve Algorithm Block cutover |
+| `dae-core-loc` | 11,000 | 18,750 | Retain checked conditional/tensor/loop-region and initialization parameter identity; retire downstream recovery during Solve Algorithm Block cutover |
 | `dae-wire-loc` | 3,250 | 5,750 | Operation-shaped replay; consolidate correlation replay after construction coverage lands |
-| `dae-total-loc` | 14,250 | 24,000 | Both items above; total follows their sum |
+| `dae-total-loc` | 14,250 | 24,250 | Both items above; total follows their sum |
 
 **Why:** the triggers were unenforced and all three were exceeded in silence.
 The gate makes exceedance loud without blocking a landing: any measured value is
@@ -127,6 +127,16 @@ derived rule rounds each measured value up to the next 250-line step, so the
 `dae-core-loc` ceiling moves to 18,500, `dae-wire-loc` to 5,750, and
 `dae-total-loc` to 24,000; the review triggers and totality-debt ceilings are
 unchanged.
+
+**2026-11-03 sensor-library review:** measured production source moved to
+18,571 core, 5,511 wire, and 24,082 total lines with the sensor-library
+constructs: element-wise slice targets in when-equations (EQN-042),
+initialization-only assertions (EQN-041), multi-output calls in initial
+algorithms (ALG-019) and when-equations (EQN-043), and record-array input
+extents (FUNC-041). The derived rule rounds each measured value up to the next
+250-line step, so the `dae-core-loc` ceiling moves to 18,750 and
+`dae-total-loc` to 24,250; the review triggers, the wire ceiling, and the
+totality-debt ceilings are unchanged.
 
 ### 2. Reservation Owner Catalog (SPEC_0036 §Storage and Forward References)
 

@@ -1,3 +1,4 @@
+mod affine_extents;
 mod derivatives;
 mod expression_rules;
 mod integer_bounds;

@@ -6,27 +6,77 @@ use rumoca_core::Span;
 pub enum SolveProgramConstructionError {
     MissingProvenance,
     WireMismatch,
-    IdentityOverflow { provenance: Span },
-    ProfileMismatch { provenance: Span },
-    WritableConstant { provenance: Span },
-    UnknownSlot { provenance: Span },
-    UnknownRegister { provenance: Span },
-    ReadOnlyStore { provenance: Span },
-    TypeMismatch { provenance: Span },
-    InvalidAggregate { provenance: Span },
-    InvalidProjection { provenance: Span },
-    UnknownCallOwner { provenance: Span },
-    InvalidCallInterface { provenance: Span },
-    RecursiveCall { provenance: Span },
-    EmptyCallOutput { provenance: Span },
-    InvalidCallOutput { provenance: Span },
-    InvalidRegion { provenance: Span },
-    InvalidMap { provenance: Span },
-    InvalidFold { provenance: Span },
-    InvalidTensorAlgebra { provenance: Span },
-    IncompleteCallOutput { provenance: Span },
-    DuplicateCallIdentity { provenance: Span },
-    UninitializedSlot { provenance: Span },
+    IdentityOverflow {
+        provenance: Span,
+    },
+    ProfileMismatch {
+        provenance: Span,
+    },
+    WritableConstant {
+        provenance: Span,
+    },
+    UnknownSlot {
+        provenance: Span,
+    },
+    UnknownRegister {
+        provenance: Span,
+    },
+    ReadOnlyStore {
+        provenance: Span,
+    },
+    TypeMismatch {
+        provenance: Span,
+    },
+    InvalidAggregate {
+        provenance: Span,
+    },
+    InvalidProjection {
+        provenance: Span,
+    },
+    UnknownCallOwner {
+        provenance: Span,
+    },
+    InvalidCallInterface {
+        provenance: Span,
+    },
+    RecursiveCall {
+        provenance: Span,
+    },
+    EmptyCallOutput {
+        provenance: Span,
+    },
+    InvalidCallOutput {
+        provenance: Span,
+    },
+    InvalidRegion {
+        provenance: Span,
+    },
+    InvalidMap {
+        provenance: Span,
+    },
+    InvalidFold {
+        provenance: Span,
+    },
+    InvalidTensorAlgebra {
+        provenance: Span,
+    },
+    IncompleteCallOutput {
+        provenance: Span,
+    },
+    DuplicateCallIdentity {
+        provenance: Span,
+    },
+    UninitializedSlot {
+        provenance: Span,
+    },
+    /// An MLS §12.9 external body outside the cataloged external functions
+    /// ([`rumoca_core::ModelicaExternalFunction`]) a typed program can invoke.
+    UnsupportedExternalFunction {
+        function: Box<str>,
+        language: &'static str,
+        symbol: Box<str>,
+        provenance: Span,
+    },
 }
 
 impl SolveProgramConstructionError {
@@ -54,7 +104,8 @@ impl SolveProgramConstructionError {
             | Self::InvalidTensorAlgebra { provenance }
             | Self::IncompleteCallOutput { provenance }
             | Self::DuplicateCallIdentity { provenance }
-            | Self::UninitializedSlot { provenance } => Some(*provenance),
+            | Self::UninitializedSlot { provenance }
+            | Self::UnsupportedExternalFunction { provenance, .. } => Some(*provenance),
         }
     }
 }
@@ -62,6 +113,18 @@ impl SolveProgramConstructionError {
 impl std::fmt::Display for SolveProgramConstructionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
+            Self::UnsupportedExternalFunction {
+                function,
+                language,
+                symbol,
+                ..
+            } => {
+                return write!(
+                    formatter,
+                    "external {language} function `{function}` calls `{symbol}`, which is not \
+                     an external function this runtime can execute"
+                );
+            }
             Self::MissingProvenance => "typed program owner is missing exact provenance",
             Self::WireMismatch => "typed program wire does not replay through checked construction",
             Self::IdentityOverflow { .. } => "typed program identity capacity exceeded",

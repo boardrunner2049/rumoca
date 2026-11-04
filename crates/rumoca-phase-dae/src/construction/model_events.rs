@@ -1,5 +1,7 @@
 use super::*;
 
+mod call_outputs;
+
 /// The activation of a section that is not a `when`.
 ///
 /// An unguarded algorithm section and an `assert` in an equation section both
@@ -219,10 +221,12 @@ fn collect_when_targets(equations: &[flat::WhenEquation], targets: &mut HashSet<
                 else_branch,
                 ..
             } => collect_conditional_targets(branches, else_branch.as_deref(), targets),
+            flat::WhenEquation::FunctionCallOutputs { outputs, .. } => {
+                targets.extend(outputs.iter().cloned());
+            }
             flat::WhenEquation::Reinit { .. }
             | flat::WhenEquation::Assert { .. }
-            | flat::WhenEquation::Terminate { .. }
-            | flat::WhenEquation::FunctionCallOutputs { .. } => {}
+            | flat::WhenEquation::Terminate { .. } => {}
         }
     }
 }
@@ -347,18 +351,12 @@ fn own_clocked_targets<'dae>(
     for equation in equations {
         match equation {
             flat::WhenEquation::Assign { target, .. } => {
-                let provenance = dae::DaeProvenance::source(equation.span())?;
-                construction.clocks(|clocks| match coordinates[target] {
-                    Coordinate::DiscreteReal(variable) => {
-                        clocks.own_discrete_real(clock, variable, provenance)?;
-                        Ok(())
-                    }
-                    Coordinate::DiscreteValue(variable) => {
-                        clocks.own_discrete_value(clock, variable, provenance)?;
-                        Ok(())
-                    }
-                    _ => unreachable!("clock analysis accepts only discrete clocked targets"),
-                })?;
+                own_clocked_target(construction, coordinates, clock, target, equation.span())?;
+            }
+            flat::WhenEquation::FunctionCallOutputs { outputs, .. } => {
+                for target in outputs {
+                    own_clocked_target(construction, coordinates, clock, target, equation.span())?;
+                }
             }
             flat::WhenEquation::Conditional {
                 branches,
@@ -375,12 +373,30 @@ fn own_clocked_targets<'dae>(
             flat::WhenEquation::Reinit { .. }
             | flat::WhenEquation::Assert { .. }
             | flat::WhenEquation::Terminate { .. } => {}
-            flat::WhenEquation::FunctionCallOutputs { .. } => {
-                unreachable!("analysis rejects unchecked event function calls")
-            }
         }
     }
     Ok(())
+}
+
+fn own_clocked_target<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    coordinates: &HashMap<VarName, Coordinate<'dae>>,
+    clock: dae::ClockId<'dae>,
+    target: &VarName,
+    span: Span,
+) -> Result<(), dae::DaeConstructionError> {
+    let provenance = dae::DaeProvenance::source(span)?;
+    construction.clocks(|clocks| match coordinates[target] {
+        Coordinate::DiscreteReal(variable) => {
+            clocks.own_discrete_real(clock, variable, provenance)?;
+            Ok(())
+        }
+        Coordinate::DiscreteValue(variable) => {
+            clocks.own_discrete_value(clock, variable, provenance)?;
+            Ok(())
+        }
+        _ => unreachable!("clock analysis accepts only discrete clocked targets"),
+    })
 }
 
 impl<'shape, 'dae> WhenLowering<'_, '_, 'shape, 'dae> {
@@ -497,8 +513,10 @@ impl<'shape, 'dae> WhenLowering<'_, '_, 'shape, 'dae> {
                 else_branch.as_deref(),
                 equation.span(),
             ),
-            flat::WhenEquation::FunctionCallOutputs { span, .. } => {
-                unreachable!("analysis explicitly rejects event function-call outputs at {span:?}")
+            flat::WhenEquation::FunctionCallOutputs {
+                outputs, function, ..
+            } => {
+                self.lower_function_call_outputs(owners, guard, outputs, function, equation.span())
             }
         }
     }

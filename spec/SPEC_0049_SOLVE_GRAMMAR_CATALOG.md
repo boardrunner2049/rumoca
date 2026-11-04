@@ -126,19 +126,21 @@ declared end state that construction does not admit yet.
 | `UpdateSlice` | Current | `(aggregate, value, origin)` zero-based | none | `NotApplicable` | Functional slice update |
 | `UpdateView` | Current | `(aggregate, value, axes)` | none | `NotApplicable` | Functional update through a checked view |
 | `Call` | Current | `owner: SolvePureCallOwnerId`, `arguments: [reg]`, `destinations: [reg]`. Aggregate arguments and results each retain ONE typed register; destinations are ordered VALUE results followed by ASSERTION OUTPUTS (predicates and converted message values) exactly as declared by the owner interface | callee body is a separate `TypedProgram` | call | Invokes one compiler-issued pure-call owner atomically; never merges with another invocation (SEV-048) |
+| `External` | Current | `function: SolveExternalFunction` (= `rumoca_core::ModelicaExternalFunction`), `arguments: [reg]`, `destinations: [reg]` in Modelica output order. Each catalog entry fixes its interface: the random generators take one Integer state vector of the entry's length and return a Real draw and the next state | none | call | Invokes one cataloged MLS §12.9 external function atomically with the catalog's reference semantics; has no directional derivative, so an owner containing one has no directional owner; never merges (SEV-048) |
 
 **Aspirational.** SEV-001's `InvokeOp`/`EffectOp`/`Terminator` factoring is the
 proposed end state. Today `Call` is the single pure-call owner above — there is
 no general effectful invoke, no volatile/atomic effect owner (SEV-016), and no
-terminator discriminant. EXTERNAL FUNCTIONS belong to that same future closure:
-a external-function invocation is an `InvokeOp` with a declared effect footprint,
-so it cannot be cataloged until those factors exist. Its capability check now
-interrogates the checked DAE function table (`FunctionView::is_external`) and
-REJECTS at the declared target boundary (SEV-155, discharged); what remains
-missing is the admitting path. Those factors are uncataloged and the grammar is
+terminator discriminant. GENERAL EXTERNAL FUNCTIONS belong to that same future
+closure: an arbitrary external-function invocation is an `InvokeOp` with a
+declared effect footprint, so it cannot be cataloged until those factors exist.
+What exists today is the closed `External` leaf above: a fixed catalog of
+external C functions whose reference semantics every backend implements, so no
+effect footprint is needed. The capability check interrogates the checked DAE
+function table (`FunctionView::is_external`) and REJECTS at the declared target
+boundary (SEV-155, discharged). Those factors are uncataloged and the grammar is
 NOT closed; SPEC_0047 §1 carries the gap rows, and SEV-156 makes the
-consequence explicit — every external function REJECTS today, since there is no
-grammar for it to be checked against.
+consequence explicit — every external function outside the catalog REJECTS.
 
 The Proposed leaves that slice must add, sketched so the reject arm has a
 successor:

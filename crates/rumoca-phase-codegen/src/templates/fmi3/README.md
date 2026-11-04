@@ -57,7 +57,15 @@ a Model-Exchange completed step whose point needs the correction requests
 Event Mode (SPEC_0044 ME-PROJ-007).
 
 The current profile rejects general events, clocks, runtime event history,
-external calls/tables, and random operations. A derivative inside a matrix
+external tables, and impure random operations. External functions are
+admitted when the component can link them (SPEC_0044 ME-EXT-001): an
+`external "builtin"` or C math-library function is the builtin, and the MSL
+`ModelicaExternalC` random generators (`Modelica.Math.Random.Generators.*`)
+call the unmodified MSL `ModelicaRandom.c`, which then ships in `sources/`
+with its headers, a generated `rmc_modelica_external.c` (the tool-provided
+`ModelicaUtilities.h` functions), and the MSL licences in
+`documentation/licenses/ModelicaExternalC.txt`. Any other external function is
+refused by name. A derivative inside a matrix
 product (`J * der(w) = f`) lowers to a Solve IR `LinSolve` that the state
 derivative kernel evaluates by the linked kernel's Gauss-Jordan elimination
 with partial pivoting; a singular matrix fails the evaluation. A `LinSolve` in
@@ -70,7 +78,8 @@ The C sources are split into translation units that compile in parallel:
 `model.c` (FMI surface, refresh, kernel), `rmc_assign.c` (exact assignments),
 `rmc_rows.c` (residual rows), `rmc_jacobian.c` (forward Jacobians),
 `rmc_isolators.c` (isolators and causal runs), and `rmc_functions.c` (pure
-functions), sharing `model.h`.
+functions), sharing `model.h`; a component calling a cataloged external C
+function adds the shipped MSL sources.
 
 ## Verification
 
@@ -93,6 +102,10 @@ functions), sharing `model.h`.
 - `cargo test -p rumoca --features template-runtime-tests --test suite_template_runtime -- backend_template_runtime_regression::fmi3_exact_runtime_`
   compiles and runs final-step refresh, non-finite rollback, and chained-singleton
   order discriminators against the rendered C.
+- `cargo test -p rumoca --features template-runtime-tests --test suite_template_runtime -- cli_target_fmi::external_functions`
+  links the shipped MSL random source and draws the C reference states and
+  numbers, runs a builtin external with its relation event, and refuses an
+  external without a source by name.
 - `cargo test -p rumoca --features template-runtime-tests --test suite_template_runtime -- backend_template_runtime_regression::fmi2_and_fmi3_reject_a_tunable_algebraic_coefficient`
   proves the explicit profile fails closed when a runtime coefficient would
   require a residual solver.

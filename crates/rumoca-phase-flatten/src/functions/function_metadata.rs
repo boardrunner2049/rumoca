@@ -254,13 +254,23 @@ fn effective_function_param_primitive_type(
 }
 
 /// Convert an AST ExternalFunction to ExternalFunction.
+///
+/// `simple_name` is the declaring function's own simple name, the entry point
+/// MLS §12.9 uses when the declaration omits one; Flat keeps it here because
+/// the flattened function path cannot be split back into it.
 pub(super) fn convert_external_function(
     ext: &rumoca_ir_ast::ExternalFunction,
+    simple_name: &str,
     predefined_intrinsics: ast_lower::PredefinedIntrinsicIds,
 ) -> Result<rumoca_core::ExternalFunction, FlattenError> {
     Ok(rumoca_core::ExternalFunction {
         language: ext.language.clone().unwrap_or_else(|| "C".to_string()),
-        function_name: ext.function_name.as_ref().map(|t| t.text.to_string()),
+        function_name: Some(
+            ext.function_name
+                .as_ref()
+                .map_or(simple_name, |t| t.text.as_ref())
+                .to_string(),
+        ),
         output_name: ext.output.as_ref().map(|o| {
             o.parts
                 .iter()

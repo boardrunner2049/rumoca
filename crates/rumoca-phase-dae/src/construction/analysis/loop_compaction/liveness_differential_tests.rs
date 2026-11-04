@@ -601,18 +601,19 @@ fn call_writing(target: &str) -> rumoca_core::Statement {
     }
 }
 
-/// A call's receiving element writes its target (MLS §12.4.4), and neither
-/// answer treats that write as a kill: the site's kill rule recognizes only an
-/// assignment, so the incoming value stays live wherever a later statement
-/// reads it. Both answers also agree that the element itself is not a read, so
-/// the two stay aligned on this form in both directions.
+/// A call's receiving element writes its target (MLS §11.2.1.2, §12.4.4). The
+/// syntactic scan treats a whole-target receiver as a definition, so a read
+/// after the call observes the call's value, not the incoming one; liveness
+/// stays conservative (its kill rule recognizes only an assignment), which is
+/// the safe direction for a deletion proof. Both answers agree that the
+/// element itself is not a read.
 #[test]
 fn a_call_receiving_element_is_a_write_neither_answer_kills_on() {
     let name = VarName::new("t");
     let read_after = vec![call_writing("t"), assign("c", &["t"])];
     assert!(
-        statements_read_incoming_name(&read_after, &name),
-        "the syntactic scan sees the read behind the call"
+        !statements_read_incoming_name(&read_after, &name),
+        "the call defines `t`, so the read behind it sees the call's value"
     );
     assert!(
         liveness::live_in(&read_after, &LiveSet::new()).contains(&name),

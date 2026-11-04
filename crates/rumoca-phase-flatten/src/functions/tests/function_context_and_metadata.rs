@@ -228,6 +228,7 @@ end Linked;
         .expect("external declaration");
     let metadata = convert_external_function(
         external,
+        "Linked",
         ast_lower::PredefinedIntrinsicIds::from_tree(resolved.inner()),
     )
     .expect("external annotations should lower without loss");
@@ -283,6 +284,7 @@ end Linked;
         .expect("external declaration");
     let error = convert_external_function(
         external,
+        "Linked",
         ast_lower::PredefinedIntrinsicIds::from_tree(resolved.inner()),
     )
     .expect_err("unrepresentable annotation syntax must fail instead of being dropped");
@@ -314,6 +316,7 @@ end Linked;
         .expect("external declaration");
     let lowered = convert_external_function(
         external,
+        "Linked",
         ast_lower::PredefinedIntrinsicIds::from_tree(resolved.inner()),
     )
     .expect("all external ABI arguments must lower without loss");

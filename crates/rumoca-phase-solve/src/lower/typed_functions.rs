@@ -2,6 +2,7 @@
 
 mod assertions;
 mod captures;
+mod external_calls;
 mod folds;
 pub(crate) mod formal_stages;
 mod indexed_slices;
@@ -14,6 +15,7 @@ mod registration;
 mod tensor;
 
 use assertions::{assertion_conditions, assertion_is_map_independent, nested_calls};
+pub(crate) use external_calls::reaches_external_body;
 use model_coordinates::ModelCoordinateKey;
 pub(super) use model_events::lower_model_event_transactions;
 use regions::{

@@ -59,6 +59,7 @@ mod expression_rewriter;
 mod expression_visitor;
 mod ir_primitives;
 mod modelica_builtins;
+mod modelica_external;
 mod source_map;
 mod statement_rewriter;
 mod structured_domain;
@@ -75,6 +76,7 @@ pub use expression_rewriter::{ExpressionRewriter, FallibleExpressionRewriter};
 pub use expression_visitor::{ExpressionScope, ExpressionVisitor, FallibleExpressionVisitor};
 pub use ir_primitives::*;
 pub use modelica_builtins::*;
+pub use modelica_external::{ModelicaExternalFunction, elementary_math_builtin};
 pub use source_map::{SourceMap, placeholder_source_name, source_id_for_name};
 pub use statement_rewriter::{FallibleStatementRewriter, StatementRewriter};
 pub use structured_domain::{

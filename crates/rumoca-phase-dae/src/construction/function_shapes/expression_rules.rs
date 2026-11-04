@@ -407,12 +407,24 @@ fn range_expression_shape(
     values: &ShapeEnvironment,
     span: Span,
 ) -> Result<ValueShape, ToDaeError> {
-    let start = evaluate_shape_integer(start, values)?;
     let step = step
         .map(|step| evaluate_shape_integer(step, values))
         .transpose()?
         .unwrap_or(1);
-    let end = evaluate_shape_integer(end, values)?;
+    let bounds = (
+        evaluate_shape_integer(start, values),
+        evaluate_shape_integer(end, values),
+    );
+    let (start, end) = match bounds {
+        (Ok(start), Ok(end)) => (start, end),
+        (Err(error), _) | (_, Err(error)) => {
+            // `i-2:i-1`: the bounds share one symbolic offset, so the
+            // cardinality is exact although neither bound is (MLS §10.4.3).
+            let difference =
+                super::affine_extents::affine_bound_difference(start, end, values).ok_or(error)?;
+            (0, difference)
+        }
+    };
     Ok(vec![range_cardinality(start, step, end, span)?])
 }
 

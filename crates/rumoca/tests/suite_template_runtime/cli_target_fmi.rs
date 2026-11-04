@@ -13,6 +13,7 @@ mod chart_switching;
 mod co_simulation_step;
 mod declared_causality;
 mod derivative_kinks;
+mod external_functions;
 mod initial_pre;
 mod initial_seed_rows;
 mod input_start;

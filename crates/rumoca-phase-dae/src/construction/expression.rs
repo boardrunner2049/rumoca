@@ -1147,6 +1147,23 @@ fn is_declared_extent_argument(function: BuiltinFunction, index: usize) -> bool 
     }
 }
 
+/// The extent `size(a, d)` denotes when this scope proves `a`'s shape.
+fn proven_size_extent(
+    shapes: &ShapeEnvironment,
+    function: BuiltinFunction,
+    arguments: &[Expression],
+    provenance: dae::DaeProvenance,
+) -> Option<i64> {
+    if function != BuiltinFunction::Size || arguments.len() != 2 {
+        return None;
+    }
+    shapes.proven_extent(&Expression::BuiltinCall {
+        function,
+        args: arguments.to_vec(),
+        span: provenance.span(),
+    })
+}
+
 fn lower_builtin_call<'dae>(
     construction: &mut dae::DaeConstruction<'dae>,
     symbols: LoweringSymbols<'_, 'dae>,
@@ -1165,6 +1182,16 @@ fn lower_builtin_call<'dae>(
     // extents only from the trailing arguments, and `linspace(x1, x2, n)`
     // declares its extent in the third; the extent positions are named per
     // builtin so a non-extent argument is never mistaken for one.
+    if let Some(extent) = proven_size_extent(symbols.shapes, function, arguments, provenance) {
+        // MLS §10.3.1: `size(a, d)` of a proven shape is that extent, and it
+        // never reads `a`'s value, so an output not yet assigned (`size(state,
+        // 1)` before `state :=`) is still a defined operand.
+        return construction.expressions(|expressions| {
+            expressions
+                .at(provenance)
+                .literal(dae::DaeLiteral::Integer(extent))
+        });
+    }
     let source_arguments = arguments;
     let arguments = arguments
         .iter()

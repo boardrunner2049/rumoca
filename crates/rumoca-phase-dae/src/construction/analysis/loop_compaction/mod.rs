@@ -1090,20 +1090,18 @@ fn statement_incoming_value_flow(
             read: expression_reads_name(value, name) || component_subscripts_read_name(comp, name),
             definitely_defined: scalar_assignment_target(comp).as_ref() == Some(name),
         },
-        // `(q, w) := g(x)` reads only its arguments and output subscripts and
-        // defines every whole output it receives (MLS §11.2.1.2).
-        rumoca_core::Statement::FunctionCall { args, outputs, .. } => {
-            let outputs = outputs.iter().flatten();
-            IncomingValueFlow {
-                read: args.iter().any(|arg| expression_reads_name(arg, name))
-                    || outputs
-                        .clone()
-                        .any(|output| component_subscripts_read_name(output, name)),
-                definitely_defined: outputs
-                    .filter_map(scalar_assignment_target)
-                    .any(|target| &target == name),
-            }
-        }
+        // `(q, w) := f[k](x)` reads what the generic statement walk reaches
+        // (its arguments, the callable's subscripts and the receivers'
+        // subscripts) and defines every whole output it receives
+        // (MLS §11.2.1.2, §12.4.4).
+        rumoca_core::Statement::FunctionCall { outputs, .. } => IncomingValueFlow {
+            read: statements_read_name(std::slice::from_ref(statement), name),
+            definitely_defined: outputs
+                .iter()
+                .flatten()
+                .filter_map(scalar_assignment_target)
+                .any(|target| &target == name),
+        },
         rumoca_core::Statement::For {
             indices, equations, ..
         } => IncomingValueFlow {

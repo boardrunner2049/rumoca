@@ -1124,6 +1124,9 @@ pub(crate) fn finalize_flat_model(
     if options.specialize_frozen_bindings {
         functions::specialize_frozen_bindings(flat)?;
     }
+    // MLS §12.9.1: a call of an `external "builtin"` math function is that
+    // builtin; rewritten before pruning so the declaration is dropped.
+    crate::postprocess::lower_elementary_external_builtins(flat);
     functions::prune_unreachable_functions(flat);
     // Pure calls with settled inputs are folded by the `fold-pure-calls`
     // bitcode pass, not here; the frontend only proves their bindings in

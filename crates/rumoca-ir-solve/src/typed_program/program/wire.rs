@@ -195,6 +195,11 @@ enum SolveOperationWire {
         matrix: SolveRegisterId,
         rhs: SolveRegisterId,
     },
+    External {
+        function: rumoca_core::ModelicaExternalFunction,
+        arguments: Box<[SolveRegisterId]>,
+        destinations: Box<[SolveRegisterId]>,
+    },
 }
 
 #[derive(Clone, Deserialize)]
@@ -729,6 +734,19 @@ fn replay_operation<'program>(
                 .map(|argument| register_at(registers, *argument))
                 .collect::<Result<Vec<_>, _>>()?;
             let actual = builder.call(*owner, &arguments, at)?;
+            require_destinations(&actual, destinations, registers, wire)?;
+            return Ok(actual);
+        }
+        SolveOperationWire::External {
+            function,
+            arguments,
+            destinations,
+        } => {
+            let arguments = arguments
+                .iter()
+                .map(|argument| register_at(registers, *argument))
+                .collect::<Result<Vec<_>, _>>()?;
+            let actual = builder.external(*function, &arguments, at)?;
             require_destinations(&actual, destinations, registers, wire)?;
             return Ok(actual);
         }

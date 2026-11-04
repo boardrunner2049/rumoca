@@ -1240,6 +1240,7 @@ fn convert_function<'tree>(
     if let Some(ref ext) = class_def.external {
         func.external = Some(convert_external_function(
             ext,
+            &class_def.name.text,
             ast_lower::PredefinedIntrinsicIds::from_tree(tree),
         )?);
     }

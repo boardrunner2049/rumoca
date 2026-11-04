@@ -490,7 +490,7 @@ where
         // no runtime that can execute one, so it fails with the call's exact
         // provenance instead of substituting a plausible value.
         if let Some(external) = definition.external() {
-            return Err(external_function_failure(definition.name(), external, span));
+            return self.external_call(definition, external, output, &arguments, span);
         }
         let result = definition
             .result_values()
@@ -504,6 +504,34 @@ where
         self.scoped_expression_values.pop();
         self.function_arguments.pop();
         value
+    }
+
+    /// A cataloged external body runs its reference semantics
+    /// ([`rumoca_core::ModelicaExternalFunction::step`]); any other foreign
+    /// body fails with the call's exact provenance instead of a plausible value.
+    fn external_call(
+        &self,
+        definition: dae::FunctionView<'dae>,
+        external: dae::ExternalFunctionView<'dae>,
+        output: u32,
+        arguments: &[Vec<f64>],
+        span: Span,
+    ) -> Result<Vec<f64>, NumericEvaluationError> {
+        let Some(catalog) = dae::catalog_external(self.view, definition) else {
+            return Err(external_function_failure(definition.name(), external, span));
+        };
+        let [state] = arguments else {
+            return Err(function_parameter_error(span));
+        };
+        let state = state.iter().map(|&value| value as i64).collect::<Vec<_>>();
+        let (draw, next) = catalog.function.step(&state);
+        match output as usize {
+            ordinal if ordinal == catalog.draw_result => Ok(vec![draw]),
+            ordinal if ordinal == catalog.state_result() => {
+                Ok(next.into_iter().map(|value| value as f64).collect())
+            }
+            _ => Err(function_result_error(span)),
+        }
     }
 
     fn function_statements(

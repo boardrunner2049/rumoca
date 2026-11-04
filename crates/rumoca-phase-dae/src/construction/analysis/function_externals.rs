@@ -134,10 +134,9 @@ pub(super) fn validate_external_function(
 /// MLS §12.9: the entry point is the exact declared external name.
 ///
 /// When the declaration omits it, MLS defaults the entry point to the
-/// function's own *simple* name. Flat stores only the flattened path, and
-/// recovering a simple name from that rendered text is exactly the
-/// rendered-name fallback this compiler forbids, so the omitted form fails
-/// until Flat preserves the declared simple name structurally.
+/// function's own *simple* name; Flat records that default when it lowers the
+/// declaration, so an absent name here is a Flat contract violation, refused
+/// rather than recovered from the rendered flattened path.
 fn external_symbol(
     function: &rumoca_core::Function,
     external: &rumoca_core::ExternalFunction,
