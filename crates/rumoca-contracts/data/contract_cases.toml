@@ -4011,3 +4011,24 @@ case_id = 'inst_058_redeclare_value_alias_selects_the_outer_redeclaration'
 test_file = 'tests/inst_lookup_contracts.rs'
 kind = 'Sim'
 outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-059'
+case_id = 'inst_059_nested_modifier_class_redeclare_selects_the_occurrence_class'
+test_file = 'tests/inst_lookup_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-060'
+case_id = 'inst_060_inherited_member_of_selected_alias_class'
+test_file = 'tests/inst_lookup_contracts.rs'
+kind = 'Sim'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'INST-060'
+case_id = 'inst_060_member_absent_from_selected_alias_class_rejected'
+test_file = 'tests/inst_lookup_contracts.rs'
+kind = 'Compile'
+outcome = 'Reject'

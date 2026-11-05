@@ -90,6 +90,16 @@ struct NestedModificationFlags<'a> {
     prefixes: ModifierPrefixes,
     each_flags: &'a [bool],
     final_flags: &'a [bool],
+    redeclare_flags: &'a [bool],
+}
+
+/// Per-element prefixes of one class modification (`each`, `final`,
+/// `redeclare`), parallel to its element list.
+#[derive(Clone, Copy)]
+struct NestedElementFlags<'a> {
+    each_flags: &'a [bool],
+    final_flags: &'a [bool],
+    redeclare_flags: &'a [bool],
 }
 
 struct ScopedModifierBinding {
@@ -291,6 +301,7 @@ fn apply_component_modifier(
             modifications,
             each_flags,
             final_flags,
+            redeclare_flags,
             ..
         } => {
             apply_nested_class_modifier(
@@ -299,8 +310,11 @@ fn apply_component_modifier(
                 modifications,
                 eval_ctx,
                 prefixes,
-                each_flags,
-                final_flags,
+                NestedElementFlags {
+                    each_flags,
+                    final_flags,
+                    redeclare_flags,
+                },
             )?;
             preserve_redeclare_class_modifier(ctx, target_name, mod_expr, eval_ctx);
         }
@@ -316,6 +330,7 @@ fn apply_component_modifier(
                 modifications,
                 each_flags,
                 final_flags,
+                redeclare_flags,
                 ..
             } = &**lhs
             {
@@ -325,8 +340,11 @@ fn apply_component_modifier(
                     modifications,
                     eval_ctx,
                     prefixes,
-                    each_flags,
-                    final_flags,
+                    NestedElementFlags {
+                        each_flags,
+                        final_flags,
+                        redeclare_flags,
+                    },
                 )?;
             }
             insert_modifier_value_with_structural_overrides(
@@ -368,8 +386,7 @@ fn apply_nested_class_modifier(
     modifications: &[ast::Expression],
     eval_ctx: &ModifierEvalContext<'_>,
     prefixes: ModifierPrefixes,
-    each_flags: &[bool],
-    final_flags: &[bool],
+    element_flags: NestedElementFlags<'_>,
 ) -> InstantiateResult<()> {
     let prefix = ast::QualifiedName::from_ident(target_name);
     let nested_ctx = NestedModificationContext {
@@ -385,8 +402,9 @@ fn apply_nested_class_modifier(
         &nested_ctx,
         NestedModificationFlags {
             prefixes,
-            each_flags,
-            final_flags,
+            each_flags: element_flags.each_flags,
+            final_flags: element_flags.final_flags,
+            redeclare_flags: element_flags.redeclare_flags,
         },
     )
 }
@@ -950,6 +968,12 @@ fn process_nested_modifications_recursive(
                 value,
                 ..
             } => {
+                let class_redeclare = flags
+                    .redeclare_flags
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| Box::new(nested_mod.clone()));
                 let attr_name = attr_target.to_string();
                 let preserve_source = preserves_source_scoped_attribute(attr_name.as_str());
                 let mut qn = prefix.clone();
@@ -968,22 +992,22 @@ fn process_nested_modifications_recursive(
                         false,
                     )?
                 };
-                ctx.mod_env_mut().add(
-                    qn,
-                    ast::ModificationValue::with_source_scope_and_prefixes(
-                        stored_expr,
-                        Some(value.as_ref().clone()),
-                        nested_ctx.source_scope.clone(),
-                        nested_prefixes.each,
-                        nested_prefixes.final_,
-                    ),
+                let mut modification = ast::ModificationValue::with_source_scope_and_prefixes(
+                    stored_expr,
+                    Some(value.as_ref().clone()),
+                    nested_ctx.source_scope.clone(),
+                    nested_prefixes.each,
+                    nested_prefixes.final_,
                 );
+                modification.class_redeclare = class_redeclare;
+                ctx.mod_env_mut().add(qn, modification);
             }
             ast::Expression::ClassModification {
                 target,
                 modifications: nested_mods,
                 each_flags: nested_each_flags,
                 final_flags: nested_final_flags,
+                redeclare_flags: nested_redeclare_flags,
                 ..
             } => {
                 let target_name = target.to_string();
@@ -998,6 +1022,7 @@ fn process_nested_modifications_recursive(
                         prefixes: nested_prefixes,
                         each_flags: nested_each_flags,
                         final_flags: nested_final_flags,
+                        redeclare_flags: nested_redeclare_flags,
                     },
                 )?;
             }

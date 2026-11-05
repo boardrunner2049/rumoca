@@ -21,25 +21,25 @@ This document catalogs the implicit and explicit contracts from the Modelica Lan
 | §3. Data Structures | 74–331 | Class tree, instance tree, modification env, connection set, DAE, type attributes, variability, class types, prefixes, arrays, state machines |
 | §4.1 LEX contracts | 332–351 | Contract catalog heading + lexical rules (13 contracts) |
 | §4.2 DECL contracts | 352–393 | Declaration rules (37 contracts) |
-| §4.3 INST contracts | 394–456 | Instantiation rules (58 contracts) |
-| §4.4 EXPR contracts | 457–502 | Expression/operator rules (41 contracts) |
-| §4.5 EQN contracts | 503–547 | Equation rules (40 contracts) |
-| §4.6 ALG contracts | 548–569 | Algorithm rules (18 contracts) |
-| §4.7 CONN contracts | 570–604 | Connection rules (30 contracts) |
-| §4.8 FUNC contracts | 605–649 | Function rules (40 contracts) |
-| §4.9 TYPE contracts | 650–690 | Type/interface rules (36 contracts) |
-| §4.10 ARR contracts | 691–739 | Array rules (44 contracts) |
-| §4.11 PKG contracts | 740–756 | Package/import rules (12 contracts) |
-| §4.12 OPREC contracts | 757–772 | Operator record rules (11 contracts) |
-| §4.13 SIM contracts | 773–787 | Simulation rules (10 contracts) |
-| §4.14 CLK contracts | 788–812 | Clock/synchronous rules (20 contracts) |
-| §4.15 STRM contracts | 813–830 | Stream connector rules (13 contracts) |
-| §4.16 SM contracts | 831–927 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
-| §4.17 ANN contracts | 928–949 | Annotation rules (17 contracts) |
-| §4.18 UNIT contracts | 950–965 | Unit expression rules (9 contracts) |
-| §5. Contract Summary | 966–991 | Category counts and totals |
-| §6. Compiler Phases | 992–1041 | Phase input/output mapping |
-| §7. MLS Chapter Index | 1042–1069 | MLS chapter → contract category mapping |
+| §4.3 INST contracts | 394–458 | Instantiation rules (60 contracts) |
+| §4.4 EXPR contracts | 459–504 | Expression/operator rules (41 contracts) |
+| §4.5 EQN contracts | 505–552 | Equation rules (43 contracts) |
+| §4.6 ALG contracts | 553–575 | Algorithm rules (19 contracts) |
+| §4.7 CONN contracts | 576–610 | Connection rules (30 contracts) |
+| §4.8 FUNC contracts | 611–659 | Function rules (44 contracts) |
+| §4.9 TYPE contracts | 660–700 | Type/interface rules (36 contracts) |
+| §4.10 ARR contracts | 701–749 | Array rules (44 contracts) |
+| §4.11 PKG contracts | 750–766 | Package/import rules (12 contracts) |
+| §4.12 OPREC contracts | 767–782 | Operator record rules (11 contracts) |
+| §4.13 SIM contracts | 783–798 | Simulation rules (11 contracts) |
+| §4.14 CLK contracts | 799–823 | Clock/synchronous rules (20 contracts) |
+| §4.15 STRM contracts | 824–841 | Stream connector rules (13 contracts) |
+| §4.16 SM contracts | 842–938 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
+| §4.17 ANN contracts | 939–960 | Annotation rules (17 contracts) |
+| §4.18 UNIT contracts | 961–976 | Unit expression rules (9 contracts) |
+| §5. Contract Summary | 977–1002 | Category counts and totals |
+| §6. Compiler Phases | 1003–1052 | Phase input/output mapping |
+| §7. MLS Chapter Index | 1053–1080 | MLS chapter → contract category mapping |
 
 ---
 
@@ -453,6 +453,8 @@ Defines state-to-state transitions with priority and timing control.
 | INST-056 | Extends-modified package constant in sibling bindings | §7.2 | Modifications of an extends clause apply to the inherited elements, so a constant an extends modification binds (`extends TableBased(tableDensity = [...])`) has that value wherever the package is read, including inside the binding of a sibling constant (`poly_rho = fitting(tableDensity[:, 1], ...)`) and through an element selection. Rumoca: constant substitution reads a constant's binding in the package it is exposed through and resolves modified constants, whole or indexed, from that scope. Tested in `suite_core/fluid_function_data.rs` |
 | INST-057 | Occurrence-selected member class | §7.3 | A redeclaration modifies one occurrence, so a component declared through a replaceable alias (`Medium.BaseProperties medium`) therefore has its class selected per occurrence, and a reference `tank.medium.T` written outside `tank` (in an equation or a modifier binding) names the member of the class that occurrence of `tank.medium` selected; occurrences of one declaration that select different classes have no single member tail and are rejected |
 | INST-058 | Redeclare value through the enclosing occurrence | §7.3 | A redeclare value that names a replaceable element of the enclosing class (`Inner a(redeclare package Medium = MA)`) denotes the class that occurrence of the enclosing class selected for `MA`, which an outer redeclaration may have replaced, never the default of the lexical declaration |
+| INST-059 | Class redeclaration in a nested modifier | §7.2, §7.3 | A modification of a component may itself modify that component's elements, and a `redeclare` of a replaceable class element there (`plant(sensors(redeclare model ImuModel = DigitalSensor))`) selects that class for the occurrence `plant.sensors` exactly as a redeclaration on the declaration of `sensors` does, subject to the same replaceable/final/constraining-type checks (§7.3.2); as the outer modification it overrides a redeclaration on that declaration (§7.2.4), and other occurrences of the declaration keep their own selection. Tested in `suite_core/replaceable_model_alias_selected_members.rs` |
+| INST-060 | Members of the selected class through a replaceable class alias | §5.3, §7.3, §7.3.2 | A component typed by a replaceable class alias (`replaceable model ImuModel = Sensor constrainedby PartialSensor; ImuModel imu;`) has the class its occurrence selected, so a reference `plant.sensors.imu.sampleTime` written outside names the member of that class, including members it only inherits through an `extends` chain; the constraining class restricts which classes a redeclaration may select, not lookup in the selected class. A member absent from the selected class is a redeclaration error (EI007). Tested in `suite_core/replaceable_model_alias_selected_members.rs` |
 
 ### 4.4 Expression/Operator Contracts (EXPR)
 
@@ -978,23 +980,23 @@ areas.
 |----------|--------|-------|
 | Lexical | LEX | 13 |
 | Declarations | DECL | 37 |
-| Instantiation | INST | 58 |
+| Instantiation | INST | 60 |
 | Expressions | EXPR | 41 |
-| Equations | EQN | 40 |
-| Algorithms | ALG | 18 |
+| Equations | EQN | 43 |
+| Algorithms | ALG | 19 |
 | Connections | CONN | 30 |
-| Functions | FUNC | 40 |
+| Functions | FUNC | 44 |
 | Types/Interfaces | TYPE | 36 |
 | Arrays | ARR | 44 |
 | Packages | PKG | 12 |
 | Operator Records | OPREC | 11 |
-| Simulation | SIM | 10 |
+| Simulation | SIM | 11 |
 | Clocks/Synchronous | CLK | 20 |
 | Stream Connectors | STRM | 13 |
 | State Machines | SM | 8 |
 | Annotations | ANN | 17 |
 | Unit Expressions | UNIT | 9 |
-| **Total** | | **457** |
+| **Total** | | **468** |
 
 ---
 
@@ -1083,5 +1085,5 @@ The following design decisions extend MLS requirements for implementation:
 | Data Structures | 26 |
 | Algorithmic Processes | 4 |
 | Contract Categories | 18 |
-| Total Contracts | 457 |
+| Total Contracts | 468 |
 | MLS Chapters Referenced | 21 |

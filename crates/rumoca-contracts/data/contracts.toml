@@ -3111,6 +3111,24 @@ status = 'Implemented'
 tier = 1
 
 [[contracts]]
+id = 'INST-059'
+category = 'Instantiation'
+name = 'Class redeclaration in a nested modifier'
+mls_ref = '§7.2, §7.3'
+requirement = 'A redeclare of a replaceable class element written in a nested modifier selects that class for the modified occurrence exactly as a redeclaration on its own declaration does, and only for that occurrence'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
+id = 'INST-060'
+category = 'Instantiation'
+name = 'Members of the selected class through a replaceable class alias'
+mls_ref = '§5.3, §7.3, §7.3.2'
+requirement = 'A reference through a component typed by a replaceable class alias names the member of the class its occurrence selected, including inherited members the constraining class lacks; a member absent from the selected class is rejected'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
 id = 'LEX-001'
 category = 'Lexical'
 name = 'ASCII identifiers'

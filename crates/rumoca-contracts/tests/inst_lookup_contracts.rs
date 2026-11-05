@@ -804,3 +804,82 @@ fn inst_058_redeclare_value_alias_selects_the_outer_redeclaration() {
     assert_eq!(trace.final_value("pair.a.medium.T"), 2.0);
     assert_eq!(trace.final_value("pair.b.medium.T"), 1.0);
 }
+
+// =============================================================================
+// INST-059 / INST-060: class redeclaration in a nested modifier, and members of
+// the class a replaceable class alias selected
+// =============================================================================
+
+const INST_059_060_MODEL: &str = r#"
+package Lib
+  partial model PartialSensor
+    output Real y;
+  end PartialSensor;
+  model Sensor
+    extends PartialSensor;
+  equation
+    y = 1;
+  end Sensor;
+  partial model PartialSampledSensor
+    extends PartialSensor;
+    output Real sampleTime;
+  end PartialSampledSensor;
+  partial model PartialDeviceSensor
+    extends PartialSampledSensor;
+    parameter Real period = 0.5;
+  end PartialDeviceSensor;
+  model DigitalSensor
+    extends PartialDeviceSensor;
+  equation
+    y = 2;
+    sampleTime = period;
+  end DigitalSensor;
+  model SensorSuite
+    replaceable model ImuModel = Sensor constrainedby PartialSensor;
+    ImuModel imu;
+  end SensorSuite;
+  model Vehicle
+    SensorSuite sensors;
+  end Vehicle;
+end Lib;
+
+model Configured
+  Lib.Vehicle plant(sensors(redeclare model ImuModel = Lib.DigitalSensor, imu(period = 0.25)));
+  Lib.Vehicle nominal;
+  Real sampleTime;
+equation
+  sampleTime = plant.sensors.imu.sampleTime;
+end Configured;
+
+model Absent
+  Lib.Vehicle plant(sensors(redeclare model ImuModel = Lib.DigitalSensor));
+  Real missing;
+equation
+  missing = plant.sensors.imu.noSuchMember;
+end Absent;
+"#;
+
+#[test]
+fn inst_059_nested_modifier_class_redeclare_selects_the_occurrence_class() {
+    let trace =
+        rumoca_contracts::test_support::simulate_model(INST_059_060_MODEL, "Configured", 0.1);
+    assert_eq!(trace.final_value("plant.sensors.imu.y"), 2.0);
+    assert_eq!(trace.final_value("nominal.sensors.imu.y"), 1.0);
+}
+
+#[test]
+fn inst_060_inherited_member_of_selected_alias_class() {
+    let trace =
+        rumoca_contracts::test_support::simulate_model(INST_059_060_MODEL, "Configured", 0.1);
+    assert_eq!(trace.final_value("sampleTime"), 0.25);
+}
+
+#[test]
+fn inst_060_member_absent_from_selected_alias_class_rejected() {
+    expect_failure_in_phase_with_code(
+        INST_059_060_MODEL,
+        "Absent",
+        FailedPhase::Instantiate,
+        "EI007",
+    );
+}

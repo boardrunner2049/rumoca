@@ -94,36 +94,98 @@ pub(crate) fn extract_component_class_overrides(
                 mod_expr.span(),
             )));
         };
-        validate_component_class_redeclare_target(
-            tree,
+        insert_class_redeclare_override(
+            &mut overrides,
+            (tree, target_class, nested_class),
             &target_name,
-            nested_class,
             mod_expr,
             def_id,
         )?;
-        let modifier_args = resolve_class_override_modifier_targets(
-            tree,
-            def_id,
-            class_redeclare_modifier_args(mod_expr),
-        )?;
-        // The same member may be declared by several inherited bases; each
-        // declaration takes the redeclared class (MLS §7.1.2).
-        for declaration in find_all_nested_classes_in_hierarchy(tree, target_class, &target_name) {
-            let Some(declaration_def_id) = declaration.def_id else {
-                continue;
-            };
-            overrides.insert(
-                declaration_def_id,
-                ast::ClassOverride::new(
-                    target_name.clone(),
-                    declaration_def_id,
-                    def_id,
-                    class_redeclare_target_ref(mod_expr),
-                )
-                .with_modifier_args(modifier_args.clone()),
-            );
-        }
     }
 
     Ok(overrides)
+}
+
+/// MLS §7.2, §7.3: a class redeclaration written in an enclosing modifier
+/// (`plant(sensors(redeclare model ImuModel = DigitalSensor))`) reaches the
+/// modified component through the modification environment, keyed by the
+/// component and the redeclared class element (`sensors.ImuModel`). It selects
+/// the class exactly as a redeclaration on the component's own declaration
+/// does, and as the outer modification it overrides that one (MLS §7.2.4).
+pub(crate) fn extract_outer_class_redeclare_overrides(
+    tree: &ast::ClassTree,
+    comp: &ast::Component,
+    target_class: Option<&ast::ClassDef>,
+    mod_env: &ast::ModificationEnvironment,
+    overrides: &mut ast::ClassOverrideMap,
+) -> InstantiateResult<()> {
+    let Some(target_class) = target_class else {
+        return Ok(());
+    };
+    for (key, value) in &mod_env.active {
+        let (Some(element), [(component, component_subs), (target_name, target_subs)]) =
+            (value.class_redeclare.as_deref(), key.parts.as_slice())
+        else {
+            continue;
+        };
+        if *component != comp.name || !component_subs.is_empty() || !target_subs.is_empty() {
+            continue;
+        }
+        let Some(nested_class) = find_nested_class_in_hierarchy(tree, target_class, target_name)
+        else {
+            // A component redeclaration has its own owner.
+            continue;
+        };
+        let def_id =
+            resolve_redeclare_value_def_id(tree, element, Some(mod_env)).ok_or_else(|| {
+                Box::new(InstantiateError::redeclare_error(
+                    target_name,
+                    "component redeclare value did not resolve to a class",
+                    element.span(),
+                ))
+            })?;
+        insert_class_redeclare_override(
+            overrides,
+            (tree, target_class, nested_class),
+            target_name,
+            element,
+            def_id,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate one class redeclaration of `target_class`'s member `target_name`
+/// and record it for every inherited declaration of that member.
+fn insert_class_redeclare_override(
+    overrides: &mut ast::ClassOverrideMap,
+    (tree, target_class, nested_class): (&ast::ClassTree, &ast::ClassDef, &ast::ClassDef),
+    target_name: &str,
+    mod_expr: &ast::Expression,
+    def_id: rumoca_core::DefId,
+) -> InstantiateResult<()> {
+    validate_component_class_redeclare_target(tree, target_name, nested_class, mod_expr, def_id)?;
+    let modifier_args = resolve_class_override_modifier_targets(
+        tree,
+        def_id,
+        class_redeclare_modifier_args(mod_expr),
+    )?;
+    // The same member may be declared by several inherited bases; each
+    // declaration takes the redeclared class (MLS §7.1.2).
+    for declaration in find_all_nested_classes_in_hierarchy(tree, target_class, target_name) {
+        let Some(declaration_def_id) = declaration.def_id else {
+            continue;
+        };
+        overrides.insert(
+            declaration_def_id,
+            ast::ClassOverride::new(
+                target_name.to_string(),
+                declaration_def_id,
+                def_id,
+                class_redeclare_target_ref(mod_expr),
+            )
+            .with_modifier_args(modifier_args.clone()),
+        );
+    }
+    Ok(())
 }

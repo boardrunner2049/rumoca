@@ -143,6 +143,7 @@ fn test_nested_modification_preserves_final_prefix() {
             },
             each_flags: &[],
             final_flags: &[],
+            redeclare_flags: &[],
         },
     )
     .expect("nested modification should be stored");
@@ -169,6 +170,7 @@ fn test_nested_attribute_final_flag_is_preserved() {
             prefixes: ModifierPrefixes::default(),
             each_flags: &[false],
             final_flags: &[true],
+            redeclare_flags: &[],
         },
     )
     .expect("nested final attribute modification should be stored");
@@ -205,6 +207,7 @@ fn nested_start_attribute_preserves_local_parameter_reference() {
             prefixes: ModifierPrefixes::default(),
             each_flags: &[],
             final_flags: &[],
+            redeclare_flags: &[],
         },
     )
     .expect("nested start modification should be recorded");

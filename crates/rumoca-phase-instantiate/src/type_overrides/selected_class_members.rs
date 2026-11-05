@@ -57,7 +57,12 @@ pub(super) fn resolve_member_reference_in_class(
             identities.push(component_def_id);
             if index + 1 < reference.parts.len() {
                 let next_owner_def_id = match declared_owner_def_id {
-                    Some(declared) => declared,
+                    Some(declared) => replaceable_owner_selection(
+                        tree,
+                        declared,
+                        occurrence_selection,
+                        &identities,
+                    )?,
                     None => occurrence_owner(
                         occurrence_selection,
                         &identities,
@@ -100,6 +105,31 @@ pub(super) fn resolve_member_reference_in_class(
         owner_class_def_id = target_def_id;
     }
     Ok(identities)
+}
+
+/// The class that owns the next member segment when the class tree records
+/// `declared` for the component proved so far.
+///
+/// A component typed by a replaceable class alias (`replaceable model ImuModel
+/// = Sensor constrainedby PartialSensor; ImuModel imu;`) is typed by the class a
+/// redeclaration selected for that occurrence (MLS §7.3: the declared type is
+/// replaced by the class in the redeclaration), so its members are looked up in
+/// the selected class, including members only that class inherits (MLS §5.3,
+/// §7.1). The constraining class restricts further redeclaration, not lookup
+/// (MLS §7.3.2). Without an occurrence source the alias declaration stands.
+fn replaceable_owner_selection(
+    tree: &ast::ClassTree,
+    declared: DefId,
+    occurrence_selection: &mut dyn FnMut(&[DefId]) -> InstantiateResult<Option<DefId>>,
+    path: &[DefId],
+) -> InstantiateResult<DefId> {
+    let is_replaceable = tree
+        .get_class_by_def_id(declared)
+        .is_some_and(|class| class.is_replaceable);
+    if !is_replaceable {
+        return Ok(declared);
+    }
+    Ok(occurrence_selection(path)?.unwrap_or(declared))
 }
 
 /// The class the materialized occurrences of a member path selected.

@@ -1,8 +1,8 @@
 use super::type_overrides::{
     TypeOverrideMap, build_type_override_map, class_redeclare_modifier_args,
-    extract_component_class_overrides, find_all_nested_classes_in_hierarchy,
-    find_nested_class_in_hierarchy, resolve_class_override_modifier_targets,
-    validate_component_class_redeclare_target,
+    extract_component_class_overrides, extract_outer_class_redeclare_overrides,
+    find_all_nested_classes_in_hierarchy, find_nested_class_in_hierarchy,
+    resolve_class_override_modifier_targets, validate_component_class_redeclare_target,
 };
 use super::{InstantiateContext, InstantiateError, InstantiateResult, location_to_span};
 use rumoca_core::DefId;
@@ -245,6 +245,7 @@ pub(super) fn resolve_component_nested_type_overrides(
 ) -> InstantiateResult<NestedTypeOverrides> {
     let mut class_overrides =
         extract_component_class_overrides(tree, comp, class_def, Some(mod_env))?;
+    extract_outer_class_redeclare_overrides(tree, comp, class_def, mod_env, &mut class_overrides)?;
     select_redeclare_values_in_scope(&mut class_overrides, type_overrides);
     let mut has_forwarding_class_redeclare = false;
 

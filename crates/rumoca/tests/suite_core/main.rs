@@ -222,6 +222,7 @@ mod reduced_state_charts;
 mod reinitialized_state_selection;
 mod replaceable_alias_member_suffixes;
 mod replaceable_function_redeclare;
+mod replaceable_model_alias_selected_members;
 mod replaceable_package_members;
 mod requested_states;
 mod root_time_event_coincidence;

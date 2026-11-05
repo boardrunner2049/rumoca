@@ -34,7 +34,9 @@ mod tests;
 pub(super) use class_hierarchy::{
     find_all_nested_classes_in_hierarchy, find_nested_class_in_hierarchy,
 };
-pub(super) use component_class_overrides::extract_component_class_overrides;
+pub(super) use component_class_overrides::{
+    extract_component_class_overrides, extract_outer_class_redeclare_overrides,
+};
 pub(super) use component_redeclare_validation::validate_component_class_redeclare_target;
 pub(super) use component_type_selection::apply_type_override;
 pub(super) use deferred_references::{

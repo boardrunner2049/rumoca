@@ -419,6 +419,15 @@ pub struct ModificationValue {
     pub each: bool,
     /// True if the modification has `final` prefix.
     pub final_: bool,
+    /// The whole `redeclare` element modification (`redeclare model M = C`)
+    /// when this entry redeclares a class element and was written in an
+    /// enclosing modifier (`a(b(redeclare model M = C))`, MLS §7.2, §7.3).
+    ///
+    /// The modified component's instantiation selects the class from it; the
+    /// written element keeps the `redeclare` keyword and the source span that
+    /// the plain `value` does not carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_redeclare: Option<Box<Expression>>,
 }
 
 impl ModificationValue {
@@ -433,6 +442,7 @@ impl ModificationValue {
             structural_real: None,
             each: false,
             final_: false,
+            class_redeclare: None,
         }
     }
 
@@ -448,6 +458,7 @@ impl ModificationValue {
             structural_real: None,
             each,
             final_,
+            class_redeclare: None,
         }
     }
 
@@ -480,6 +491,7 @@ impl ModificationValue {
             structural_real: None,
             each,
             final_,
+            class_redeclare: None,
         }
     }
 }
